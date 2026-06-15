@@ -1,0 +1,38 @@
+name: Tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  go:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.23.x"
+
+      - name: Vet Go
+        run: go vet ./...
+
+      - name: Test Go
+        run: go test ./... -count=1
+
+      - name: Smoke fake provider matrix
+        run: make smoke-fake-providers
+
+      - name: Smoke package layout
+        run: make package
+
+      - name: Smoke skill install plan
+        run: go run ./cmd/convo-relay install-skills --plan --json --install-root /tmp/relay-skill-stage
+
+      - name: Smoke delegated tool install
+        run: ./install-skill.sh --install --target tools --json --install-root /tmp/relay-tool-stage
+
+      - name: Smoke display help
+        run: go run ./cmd/convo-relay display --help

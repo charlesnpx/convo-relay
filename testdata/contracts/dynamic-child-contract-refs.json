@@ -1,0 +1,26 @@
+{
+  "child_invocation_ref": {
+    "digest": "sha256:3630788824cafd0341e028467f19b520032097f80ffe8b03603e123817750af3",
+    "id": "child_invocation:3630788824cafd03",
+    "kind": "artifact_ref",
+    "schema_version": 1
+  },
+  "child_result_ref": {
+    "digest": "sha256:ec368ac4218ae5f70d3f8617f3c42ccbfa80c4b56fd355513769e9c44eaac109",
+    "id": "child_result:ec368ac4218ae5f7",
+    "kind": "artifact_ref",
+    "schema_version": 1
+  },
+  "compiled_plan_ref": {
+    "digest": "sha256:8f0df39483ddee4dbd294fd0a0d71dc28d665d0bc3dd4995ea3eb1c2f3cdfea0",
+    "id": "compiled_plan:8f0df39483ddee4d",
+    "kind": "artifact_ref",
+    "schema_version": 1
+  },
+  "recipe_ref": {
+    "digest": "sha256:f9bb1259f47e8ca0fcb2e624629f3b8e69d985b10a8bfb70d90d66b359bec8b8",
+    "id": "recipe:review-panel",
+    "kind": "artifact_ref",
+    "schema_version": 1
+  }
+}

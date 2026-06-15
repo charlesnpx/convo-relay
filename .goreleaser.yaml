@@ -1,0 +1,45 @@
+version: 2
+
+project_name: convo-relay
+
+before:
+  hooks:
+    - go mod tidy
+
+builds:
+  - id: convo-relay
+    main: ./cmd/convo-relay
+    binary: convo-relay
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - darwin
+      - linux
+    goarch:
+      - amd64
+      - arm64
+    ldflags:
+      - -s -w -X main.cliVersion={{ .Version }}
+
+archives:
+  - id: default
+    ids:
+      - convo-relay
+    name_template: >-
+      {{ .ProjectName }}_
+      {{- title .Os }}_
+      {{- if eq .Arch "amd64" }}x86_64
+      {{- else if eq .Arch "arm64" }}arm64
+      {{- else }}{{ .Arch }}{{ end }}
+    files:
+      - README.md
+      - LICENSE
+      - install-skill.sh
+      - skill/**
+      - scripts/render_display_pdf.py
+
+checksum:
+  name_template: checksums.txt
+
+snapshot:
+  version_template: '{{ incpatch .Version }}-next'

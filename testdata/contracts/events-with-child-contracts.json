@@ -1,0 +1,86 @@
+[
+  {
+    "event_id": "evt_fixture_relay_backend",
+    "event_type": "relay_backend_child_completed",
+    "kind": "session_event",
+    "node_id": "root",
+    "payload": {
+      "child_session_id": "child-relay-fixture",
+      "contract_refs": {
+        "child_invocation_ref": {
+          "digest": "sha256:43ccdd3824971ebade51dc8149d78f9eea3ea60be74dac85c7a665e90b9c13d0",
+          "id": "child_invocation:43ccdd3824971eba",
+          "kind": "artifact_ref",
+          "schema_version": 1
+        },
+        "child_result_ref": {
+          "digest": "sha256:d4b1ac204c6560890ab7b969b8c2ba1db57988551a24c6664ccb692f98b4f2c9",
+          "id": "child_result:d4b1ac204c656089",
+          "kind": "artifact_ref",
+          "schema_version": 1
+        },
+        "compiled_plan_ref": {
+          "digest": "sha256:8f0df39483ddee4dbd294fd0a0d71dc28d665d0bc3dd4995ea3eb1c2f3cdfea0",
+          "id": "compiled_plan:8f0df39483ddee4d",
+          "kind": "artifact_ref",
+          "schema_version": 1
+        },
+        "recipe_ref": {
+          "digest": "sha256:f9bb1259f47e8ca0fcb2e624629f3b8e69d985b10a8bfb70d90d66b359bec8b8",
+          "id": "recipe:review-panel",
+          "kind": "artifact_ref",
+          "schema_version": 1
+        }
+      },
+      "recipe_id": "review-panel",
+      "slot_id": "slot_0"
+    },
+    "schema_version": 1,
+    "seq": 1,
+    "summary": "Relay backend completed child fixture",
+    "timestamp": "2026-05-15T00:01:00+00:00",
+    "visibility": "operator"
+  },
+  {
+    "event_id": "evt_fixture_dynamic_child",
+    "event_type": "child_session_completed",
+    "kind": "session_event",
+    "node_id": "node_dynamic_fixture",
+    "payload": {
+      "child_session_id": "child-dynamic-fixture",
+      "contract_refs": {
+        "child_invocation_ref": {
+          "digest": "sha256:3630788824cafd0341e028467f19b520032097f80ffe8b03603e123817750af3",
+          "id": "child_invocation:3630788824cafd03",
+          "kind": "artifact_ref",
+          "schema_version": 1
+        },
+        "child_result_ref": {
+          "digest": "sha256:ec368ac4218ae5f70d3f8617f3c42ccbfa80c4b56fd355513769e9c44eaac109",
+          "id": "child_result:ec368ac4218ae5f7",
+          "kind": "artifact_ref",
+          "schema_version": 1
+        },
+        "compiled_plan_ref": {
+          "digest": "sha256:8f0df39483ddee4dbd294fd0a0d71dc28d665d0bc3dd4995ea3eb1c2f3cdfea0",
+          "id": "compiled_plan:8f0df39483ddee4d",
+          "kind": "artifact_ref",
+          "schema_version": 1
+        },
+        "recipe_ref": {
+          "digest": "sha256:f9bb1259f47e8ca0fcb2e624629f3b8e69d985b10a8bfb70d90d66b359bec8b8",
+          "id": "recipe:review-panel",
+          "kind": "artifact_ref",
+          "schema_version": 1
+        }
+      },
+      "proposal_id": "sp_fixture",
+      "recipe_id": "review-panel"
+    },
+    "schema_version": 1,
+    "seq": 2,
+    "summary": "Dynamic child completed fixture",
+    "timestamp": "2026-05-15T00:02:00+00:00",
+    "visibility": "operator"
+  }
+]

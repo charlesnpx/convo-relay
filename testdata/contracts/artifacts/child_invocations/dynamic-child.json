@@ -1,0 +1,21 @@
+{
+  "admitted_rounds": 1,
+  "compiled_plan_ref": {
+    "digest": "sha256:8f0df39483ddee4dbd294fd0a0d71dc28d665d0bc3dd4995ea3eb1c2f3cdfea0",
+    "id": "compiled_plan:8f0df39483ddee4d",
+    "kind": "artifact_ref",
+    "schema_version": 1
+  },
+  "depth_policy": {
+    "graph_depth": 1,
+    "max_graph_depth": 1,
+    "max_relay_backend_depth": 1,
+    "relay_backend_depth": 0
+  },
+  "kind": "child_invocation",
+  "origin_kind": "dynamic-proposal",
+  "schema_version": 1,
+  "stall_timeout_seconds": 300,
+  "task": "Resolve fixture dynamic proposal",
+  "timeout_seconds": 600
+}

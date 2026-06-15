@@ -1,0 +1,41 @@
+{
+  "actual_rounds": 2,
+  "child_invocation_ref": {
+    "digest": "sha256:43ccdd3824971ebade51dc8149d78f9eea3ea60be74dac85c7a665e90b9c13d0",
+    "id": "child_invocation:43ccdd3824971eba",
+    "kind": "artifact_ref",
+    "schema_version": 1
+  },
+  "child_session_id": "child-relay-fixture",
+  "elapsed_seconds": 0.2,
+  "error": null,
+  "kind": "child_result",
+  "last_content": "Use the relay backend fixture result.",
+  "ledger": {
+    "contested": [],
+    "settled": [
+      "fixture relay backend result"
+    ],
+    "withdrawn": []
+  },
+  "schema_version": 1,
+  "status": "completed",
+  "stop_reason": "fixed_rounds",
+  "transcript": [
+    {
+      "content": "Use the relay backend fixture result.",
+      "kind": "transcript_entry",
+      "ledger_after": {
+        "contested": [],
+        "settled": [
+          "fixture relay backend result"
+        ],
+        "withdrawn": []
+      },
+      "round": 2,
+      "schema_version": 1,
+      "slot_id": "slot_1",
+      "speaker": "Codex Fast"
+    }
+  ]
+}

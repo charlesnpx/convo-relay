@@ -1,0 +1,12 @@
+__pycache__/
+bin/
+*.pyc
+*.pyo
+.DS_Store
+.idea/
+dist/
+*.egg-info/
+.env
+.env.local
+.env.*.local
+*.txt

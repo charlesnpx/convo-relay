@@ -1,0 +1,1 @@
+{"auto_approval":"ask","facilitator":"codex-fast","id":"review-panel","kind":"recipe","match_keywords":[],"max_depth":1,"max_rounds":6,"mode":"adversarial","participants":["codex-deep","codex-fast"],"purpose":"Use when an unresolved implementation or design risk needs a focused child relay.","reducer":"codex-deep","required_capabilities":[],"schema_version":1}
