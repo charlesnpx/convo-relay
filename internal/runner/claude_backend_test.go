@@ -21,6 +21,8 @@ type phase10Env struct {
 	homeDir    string
 }
 
+const claudeLifecycleRecoverySeconds = 2
+
 func TestClaudeHelpersMatchPythonBehavior(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
@@ -129,9 +131,9 @@ func TestClaudeBackendLifecycleOutcomes(t *testing.T) {
 	}{
 		{name: "stdout fallback", prompt: "PHASE10_STDOUT_FALLBACK", timeout: 5, wantContent: "stdout fallback", wantReturnCode: 0},
 		{name: "nonzero recovery", prompt: "PHASE10_NONZERO_RECOVERED", timeout: 5, wantContent: "recovered after nonzero", wantRecovered: true, wantReturnCode: 7, wantSource: "jsonl"},
-		{name: "timeout recovery", prompt: "PHASE10_TIMEOUT_RECOVERED", timeout: 1, stallTimeout: 10, wantContent: "recovered before timeout", wantTimedOut: true, wantRecovered: true, wantReturnCode: -1, wantSource: "jsonl"},
+		{name: "timeout recovery", prompt: "PHASE10_TIMEOUT_RECOVERED", timeout: claudeLifecycleRecoverySeconds, stallTimeout: 10, wantContent: "recovered before timeout", wantTimedOut: true, wantRecovered: true, wantReturnCode: -1, wantSource: "jsonl"},
 		{name: "timeout empty", prompt: "PHASE10_TIMEOUT_EMPTY", timeout: 1, stallTimeout: 10, wantContent: "[Claude Code timed out after 1s]", wantTimedOut: true, wantReturnCode: -1},
-		{name: "stall recovery", prompt: "PHASE10_STALL_RECOVERED", timeout: 10, stallTimeout: 1, wantContent: "recovered before stall", wantStalled: true, wantRecovered: true, wantReturnCode: -1, wantSource: "jsonl"},
+		{name: "stall recovery", prompt: "PHASE10_STALL_RECOVERED", timeout: 10, stallTimeout: claudeLifecycleRecoverySeconds, wantContent: "recovered before stall", wantStalled: true, wantRecovered: true, wantReturnCode: -1, wantSource: "jsonl"},
 		{name: "stall empty", prompt: "PHASE10_STALL_EMPTY", timeout: 10, stallTimeout: 1, wantContent: "[Claude Code stalled after 1s of no JSONL activity]", wantStalled: true, wantReturnCode: -1},
 	}
 
@@ -201,7 +203,7 @@ func TestClaudeBackendAuthTimeoutRecoveryIsNotRecovered(t *testing.T) {
 	env := setupPhase10FakeProviders(t)
 	backend := newClaudeBackend(env.relayHome, "slot_0", "Claude Code", env.projectDir, SlotConfig{})
 
-	_, err := backend.RunTurn(context.Background(), "PHASE10_TIMEOUT_AUTH", TurnOptions{TimeoutSeconds: 1, StallTimeoutSeconds: 10})
+	_, err := backend.RunTurn(context.Background(), "PHASE10_TIMEOUT_AUTH", TurnOptions{TimeoutSeconds: claudeLifecycleRecoverySeconds, StallTimeoutSeconds: 10})
 	var retryable RetryableProviderError
 	if err == nil {
 		t.Fatalf("auth timeout unexpectedly succeeded")
@@ -422,8 +424,8 @@ func TestRunPersistsClaudeLifecycleProviderResults(t *testing.T) {
 		wantRecovered  bool
 		wantReturnCode int
 	}{
-		{name: "stall recovery", task: "PHASE10_STALL_RECOVERED", timeout: 10, stallTimeout: 1, wantStalled: true, wantRecovered: true, wantReturnCode: -1},
-		{name: "timeout recovery", task: "PHASE10_TIMEOUT_RECOVERED", timeout: 1, stallTimeout: 10, wantTimedOut: true, wantRecovered: true, wantReturnCode: -1},
+		{name: "stall recovery", task: "PHASE10_STALL_RECOVERED", timeout: 10, stallTimeout: claudeLifecycleRecoverySeconds, wantStalled: true, wantRecovered: true, wantReturnCode: -1},
+		{name: "timeout recovery", task: "PHASE10_TIMEOUT_RECOVERED", timeout: claudeLifecycleRecoverySeconds, stallTimeout: 10, wantTimedOut: true, wantRecovered: true, wantReturnCode: -1},
 		{name: "nonzero recovery", task: "PHASE10_NONZERO_RECOVERED", timeout: 5, stallTimeout: 10, wantRecovered: true, wantReturnCode: 7},
 	}
 	for _, tt := range tests {

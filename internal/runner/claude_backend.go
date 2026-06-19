@@ -272,10 +272,7 @@ func (b *claudeBackend) runProcess(ctx context.Context, prompt string, jsonlPath
 	cmd := exec.CommandContext(ctx, command[0], command[1:]...)
 	cmd.Dir = b.cwd
 	cmd.Env = os.Environ()
-	stdin, err := cmd.StdinPipe()
-	if err != nil {
-		return claudeProcessResult{ReturnCode: -1}, err
-	}
+	cmd.Stdin = strings.NewReader(prompt)
 	stdoutPipe, err := cmd.StdoutPipe()
 	if err != nil {
 		return claudeProcessResult{ReturnCode: -1}, err
@@ -303,10 +300,6 @@ func (b *claudeBackend) runProcess(ctx context.Context, prompt string, jsonlPath
 	waitCh := make(chan error, 1)
 	go func() {
 		waitCh <- cmd.Wait()
-	}()
-	go func() {
-		_, _ = io.WriteString(stdin, prompt)
-		_ = stdin.Close()
 	}()
 
 	result := monitorClaudeProcess(ctx, cmd, waitCh, jsonlPath, timeoutSeconds, stallTimeoutSeconds, pollInterval)
