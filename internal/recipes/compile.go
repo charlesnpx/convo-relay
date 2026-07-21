@@ -43,6 +43,18 @@ func (e *RootOnlyRecipeError) Error() string {
 	return fmt.Sprintf("recipe %q declares integration contract %q and can only compile for the root target", e.RecipeID, e.IntegrationContract)
 }
 
+func (e *RootOnlyRecipeError) ToMap() map[string]any {
+	if e == nil {
+		return map[string]any{}
+	}
+	return map[string]any{
+		"code":                 "root_only_recipe",
+		"message":              e.Error(),
+		"recipe_id":            e.RecipeID,
+		"integration_contract": e.IntegrationContract,
+	}
+}
+
 // CompileRecipe is the sole canonical recipe compiler. Callers must choose a
 // target explicitly; integration_contract never selects a target implicitly.
 func CompileRecipe(
@@ -52,13 +64,8 @@ func CompileRecipe(
 	target CompileTarget,
 	options CompileOptions,
 ) (map[string]any, error) {
-	switch target {
-	case CompileTargetRoot, CompileTargetChild:
-	default:
-		if target == "" {
-			return nil, contracts.NewValidationError("recipe compile target is required")
-		}
-		return nil, contracts.NewValidationError("unknown recipe compile target %q", target)
+	if err := validateCompileTarget(target); err != nil {
+		return nil, err
 	}
 	if diagnostics := validateRecipeRecord(recipe, "/recipe"); len(diagnostics) > 0 {
 		return nil, contracts.NewDiagnosticError("Relay recipe configuration is invalid.", diagnostics...)
@@ -74,6 +81,17 @@ func CompileRecipe(
 		return compileChildPlan(recipePayload, profiles, relayRecipes, options)
 	}
 	return compileRootPlan(recipePayload, profiles, relayRecipes, options)
+}
+
+func validateCompileTarget(target CompileTarget) error {
+	switch target {
+	case CompileTargetRoot, CompileTargetChild:
+		return nil
+	case "":
+		return contracts.NewValidationError("recipe compile target is required")
+	default:
+		return contracts.NewValidationError("unknown recipe compile target %q", target)
+	}
 }
 
 func compileChildPlan(
@@ -386,8 +404,12 @@ func RecipeToChildLaunch(compiled map[string]any) (map[string]any, error) {
 func BuildCompileReport(
 	recipeID string,
 	config RuntimeConfig,
+	target CompileTarget,
 	options CompileOptions,
 ) (map[string]any, error) {
+	if err := validateCompileTarget(target); err != nil {
+		return nil, err
+	}
 	recipe, ok := config.RelayRecipes[recipeID]
 	if !ok {
 		return nil, ChildRelayConfigError{
@@ -401,15 +423,17 @@ func BuildCompileReport(
 			}},
 		}
 	}
-	compiled, err := CompileRecipe(recipe, config.BackendProfiles, config.RelayRecipes, CompileTargetChild, options)
+	compiled, err := CompileRecipe(recipe, config.BackendProfiles, config.RelayRecipes, target, options)
 	if err != nil {
 		return nil, err
 	}
-	launch, err := RecipeToChildLaunch(compiled)
-	if err != nil {
-		return nil, err
+	var recipePayload map[string]any
+	if target == CompileTargetChild {
+		recipePayload = ChildRecipeContractPayload(recipe)
+	} else {
+		recipePayload = RecipeContractPayload(recipe)
 	}
-	recipeDigest, err := contracts.ContractDigest(ChildRecipeContractPayload(recipe))
+	recipeDigest, err := contracts.ContractDigest(recipePayload)
 	if err != nil {
 		return nil, err
 	}
@@ -419,21 +443,31 @@ func BuildCompileReport(
 	}
 	report := map[string]any{
 		"recipe_id":            recipeID,
+		"target":               string(target),
 		"settings_path":        config.SettingsPath,
 		"recipe":               recipe,
 		"recipe_digest":        recipeDigest,
 		"compiled_plan":        compiled,
 		"compiled_plan_digest": compiledDigest,
-		"launch":               launch,
+	}
+	if target == CompileTargetChild {
+		launch, err := RecipeToChildLaunch(compiled)
+		if err != nil {
+			return nil, err
+		}
+		report["launch"] = launch
 	}
 	if trace, ok := transientRecipeDigestTraces(options.TransientSources)[recipeID]; ok {
-		if trace.RecipeDigest != "" && trace.RecipeDigest != recipeDigest {
+		if target == CompileTargetChild && trace.RecipeDigest != "" && trace.RecipeDigest != recipeDigest {
 			return nil, fmt.Errorf("transient recipe digest mismatch for %q: source metadata %s, compiled recipe %s", recipeID, trace.RecipeDigest, recipeDigest)
 		}
 		report["source_digest"] = trace.SourceDigest
 		report["source_type"] = trace.SourceType
 		report["source_path"] = trace.Path
 		report["source_display_name"] = trace.DisplayName
+		if target == CompileTargetRoot && trace.RecipeDigest != "" && trace.RecipeDigest != recipeDigest {
+			report["source_recipe_digest"] = trace.RecipeDigest
+		}
 	}
 	return report, nil
 }

@@ -8,6 +8,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/charlesnpx/convo-relay/internal/recipes"
 )
 
 func TestParseFlagsAllowsFlagsAfterPositionals(t *testing.T) {
@@ -43,7 +45,7 @@ func TestParseFlagsSupportsShortValueAfterPositionals(t *testing.T) {
 }
 
 func TestRecipeCLIValidators(t *testing.T) {
-	for _, status := range []string{"all", "usable", "unavailable", "invalid", "skipped"} {
+	for _, status := range []string{"all", "usable", "requires_integration", "unavailable", "invalid", "skipped"} {
 		if err := validateRecipeStatusFilter(status); err != nil {
 			t.Fatalf("status %q unexpectedly invalid: %v", status, err)
 		}
@@ -58,6 +60,18 @@ func TestRecipeCLIValidators(t *testing.T) {
 	}
 	if err := validateRecipeView("raw"); err == nil {
 		t.Fatalf("invalid view accepted")
+	}
+	for input, want := range map[string]recipes.CompileTarget{
+		"":      recipes.CompileTargetChild,
+		"child": recipes.CompileTargetChild,
+		"root":  recipes.CompileTargetRoot,
+	} {
+		if got, err := parseCompileTarget(input); err != nil || got != want {
+			t.Fatalf("target %q = %q, %v; want %q", input, got, err, want)
+		}
+	}
+	if _, err := parseCompileTarget("automatic"); err == nil {
+		t.Fatal("invalid compile target accepted")
 	}
 	if got := strings.Join(stringItemsLocal([]any{"codex", "gemini"}), ","); got != "codex,gemini" {
 		t.Fatalf("stringItemsLocal = %q", got)

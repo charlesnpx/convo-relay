@@ -235,7 +235,7 @@ func TestRootAndChildDigestsRetainTargetSpecificFields(t *testing.T) {
 
 func TestExistingChildPlanPayloadAndDigestsRemainCompatible(t *testing.T) {
 	config := defaultCompileConfig(t)
-	report, err := BuildCompileReport("review-panel", config, CompileOptions{CompositionPath: "root", ValidateExecutable: true})
+	report, err := BuildCompileReport("review-panel", config, CompileTargetChild, CompileOptions{CompositionPath: "root", ValidateExecutable: true})
 	if err != nil {
 		t.Fatalf("compile report: %v", err)
 	}
