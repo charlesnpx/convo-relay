@@ -157,6 +157,77 @@ func TestApproveProposalRejectsRootOnlyRecipeWithoutDurableAdmission(t *testing.
 	}
 }
 
+func TestAutomaticDynamicAdmissionRejectsRootOnlyRecipeWithoutDurableState(t *testing.T) {
+	st := store.New(filepath.Join(t.TempDir(), "automatic-root-only"))
+	item := "root-only-marker remains contested"
+	lineageID := lineageIDForItem(item)
+	lineages := map[string]any{
+		lineageID: map[string]any{
+			"lineage_id":             lineageID,
+			"depth":                  0,
+			"remaining_spawn_credit": 1,
+			"remaining_round_credit": 1,
+		},
+	}
+	ledger := map[string]any{
+		"settled":   []any{},
+		"contested": []any{item},
+		"withdrawn": []any{},
+	}
+	recipe := map[string]any{
+		"id":                   "automatic-root-only",
+		"participants":         []any{"codex", "codex"},
+		"facilitator":          "codex",
+		"reducer":              "codex",
+		"max_rounds":           1,
+		"participant_turns":    2,
+		"result_source":        "reducer",
+		"integration_contract": "consumer/opaque-contract-v1",
+		"max_depth":            2,
+		"auto_approval":        "auto-safe",
+		"match_keywords":       []any{"root-only-marker"},
+	}
+	relayRecipes := map[string]map[string]any{stringFromAny(recipe["id"]): recipe}
+	beforeGraph := st.LoadGraph()
+	beforeEvents, err := st.ReadEvents()
+	if err != nil {
+		t.Fatalf("read events before automatic admission: %v", err)
+	}
+
+	_, err = maybeCreateSpawnProposals(
+		st,
+		"auto-safe",
+		lineages,
+		ledger,
+		ledger,
+		2,
+		"evt_root_only",
+		map[string]map[string]any{},
+		relayRecipes,
+	)
+	var rootOnly *recipes.RootOnlyRecipeError
+	if !errors.As(err, &rootOnly) {
+		t.Fatalf("automatic admission error = %T %[1]v, want *recipes.RootOnlyRecipeError", err)
+	}
+	proposals, listErr := st.ListProposalMaps()
+	if listErr != nil {
+		t.Fatalf("list proposals after automatic admission: %v", listErr)
+	}
+	if len(proposals) != 0 {
+		t.Fatalf("automatic admission persisted proposals: %#v", proposals)
+	}
+	if afterGraph := st.LoadGraph(); !reflect.DeepEqual(afterGraph, beforeGraph) {
+		t.Fatalf("automatic admission mutated graph:\nbefore=%#v\nafter=%#v", beforeGraph, afterGraph)
+	}
+	afterEvents, readErr := st.ReadEvents()
+	if readErr != nil {
+		t.Fatalf("read events after automatic admission: %v", readErr)
+	}
+	if !reflect.DeepEqual(afterEvents, beforeEvents) {
+		t.Fatalf("automatic admission appended events:\nbefore=%#v\nafter=%#v", beforeEvents, afterEvents)
+	}
+}
+
 func TestEveryRunnerRecipeCompilerCallSelectsChildTargetExplicitly(t *testing.T) {
 	_, sourceFile, _, ok := runtime.Caller(0)
 	if !ok {

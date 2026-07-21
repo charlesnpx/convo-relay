@@ -421,7 +421,7 @@ func BuildCompileReport(
 	recipe, ok := config.RelayRecipes[recipeID]
 	if !ok {
 		return nil, ChildRelayConfigError{
-			Message: "Child relay recipe is not executable by the in-process runner.",
+			Message: "Relay recipe is not available for compilation.",
 			Issues: []ChildRecipeIssue{{
 				Category: "invalid_config",
 				Code:     "unknown_recipe",

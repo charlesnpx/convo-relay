@@ -195,6 +195,52 @@ max_depth = 1
 	}
 }
 
+func TestRecipeCatalogPreservesOpaqueIntegrationContractID(t *testing.T) {
+	settingsPath := writeSettings(t, `
+[relay_recipes.opaque-contract-review]
+participants = ["codex", "codex"]
+facilitator = "codex"
+reducer = "codex"
+participant_turns = 2
+result_source = "reducer"
+integration_contract = " test/contract-v1 "
+max_depth = 1
+`)
+	bundleJSON := strings.Replace(compileBundleJSON, `"test/contract-v1"`, `" test/contract-v1 "`, 1)
+	bundle, err := integration.DecodeBundleBytes([]byte(bundleJSON))
+	if err != nil {
+		t.Fatalf("decode opaque-id bundle: %v", err)
+	}
+	report, err := BuildRecipeCatalogReportWithOptions(settingsPath, RecipeCatalogOptions{
+		IntegrationBundle: bundle,
+		ReadinessCheck:    catalogReadinessCheck(nil),
+	})
+	if err != nil {
+		t.Fatalf("catalog: %v", err)
+	}
+	record, ok := FindRecipeRecord(report.Recipes, "opaque-contract-review")
+	if !ok || record.Status != RecipeStatusUsable || record.Integration == nil || record.Integration.ContractID != " test/contract-v1 " {
+		t.Fatalf("opaque contract catalog record = %#v", record)
+	}
+	config, err := LoadRuntimeConfig(settingsPath)
+	if err != nil {
+		t.Fatalf("load runtime config: %v", err)
+	}
+	plan, err := CompileRecipe(
+		config.RelayRecipes["opaque-contract-review"],
+		config.BackendProfiles,
+		config.RelayRecipes,
+		CompileTargetRoot,
+		CompileOptions{IntegrationBundle: bundle, ValidateExecutable: true},
+	)
+	if err != nil {
+		t.Fatalf("compile opaque contract root: %v", err)
+	}
+	if plan["integration_contract_id"] != " test/contract-v1 " {
+		t.Fatalf("compiled opaque contract id = %#v", plan["integration_contract_id"])
+	}
+}
+
 func TestLoadIntegrationBundleDistinguishesOmissionAndMalformedInput(t *testing.T) {
 	settingsPath := filepath.Join(t.TempDir(), "missing-settings.toml")
 	bundle, err := LoadIntegrationBundle(settingsPath, "")
@@ -434,6 +480,12 @@ func TestBuildCompileReportUsesExplicitTargetSpecificPayloads(t *testing.T) {
 	var validation contracts.ValidationError
 	if !errors.As(err, &validation) {
 		t.Fatalf("missing report target error = %T %[1]v", err)
+	}
+
+	_, err = BuildCompileReport("not-present", config, CompileTargetRoot, CompileOptions{})
+	var unavailable ChildRelayConfigError
+	if !errors.As(err, &unavailable) || strings.Contains(unavailable.Message, "Child relay") {
+		t.Fatalf("root unknown-recipe error = %T %#v", err, err)
 	}
 }
 

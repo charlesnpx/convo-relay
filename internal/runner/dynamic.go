@@ -104,7 +104,7 @@ func updateContestedLineages(rawLineages any, previousLedger any, currentLedger 
 	return lineages
 }
 
-func maybeCreateSpawnProposals(st *store.Store, dynamicMode string, lineages map[string]any, previousLedger any, currentLedger any, roundNum int, triggerEventID string, relayRecipes map[string]map[string]any) ([]map[string]any, error) {
+func maybeCreateSpawnProposals(st *store.Store, dynamicMode string, lineages map[string]any, previousLedger any, currentLedger any, roundNum int, triggerEventID string, profiles map[string]map[string]any, relayRecipes map[string]map[string]any) ([]map[string]any, error) {
 	if normalizeDynamicMode(dynamicMode) == defaultDynamicMode {
 		return nil, nil
 	}
@@ -143,6 +143,15 @@ func maybeCreateSpawnProposals(st *store.Store, dynamicMode string, lineages map
 		proposal := buildSpawnProposal(item, lineage, graph.RootNodeID, triggerEventID, recipe, rejected, requestedRounds)
 		decision := makeInitialAdmissionDecision(proposal, dynamicMode, recipe)
 		if decision["decision"] == "admit" {
+			if _, err := compileDynamicChildPlan(
+				recipe,
+				profiles,
+				relayRecipes,
+				"root.dynamic."+stringFromAny(proposal["proposal_id"]),
+				effectiveRelayBackendMaxDepth(recipe),
+			); err != nil {
+				return nil, err
+			}
 			proposal["status"] = "admitted"
 		}
 		if err := st.SaveProposalMap(proposal); err != nil {

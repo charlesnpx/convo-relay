@@ -606,8 +606,8 @@ func flattenProfileDiagnostics(profileIssues map[string][]ChildRecipeIssue) []Ch
 }
 
 func catalogIntegrationBinding(recipe map[string]any, participantTurns int, bundle *integration.Bundle) (*RecipeIntegrationBinding, []ChildRecipeIssue) {
-	contractID := strings.TrimSpace(stringValue(recipe["integration_contract"]))
-	if contractID == "" {
+	contractID := stringValue(recipe["integration_contract"])
+	if strings.TrimSpace(contractID) == "" {
 		return nil, nil
 	}
 	binding := &RecipeIntegrationBinding{
