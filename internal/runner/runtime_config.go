@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/charlesnpx/convo-relay/internal/contracts"
 	"github.com/charlesnpx/convo-relay/internal/recipes"
 	"github.com/charlesnpx/convo-relay/internal/store"
 )
@@ -58,8 +59,28 @@ func runtimeConfigSnapshotPayload(config recipes.RuntimeConfig) map[string]any {
 	}
 }
 
+func prepareRuntimeConfigSnapshot(config recipes.RuntimeConfig) (map[string]any, error) {
+	body, err := contracts.CanonicalJSONBytes(runtimeConfigSnapshotPayload(config))
+	if err != nil {
+		return nil, fmt.Errorf("runtime config snapshot is not persistable JSON: %w", err)
+	}
+	snapshot, err := contracts.DecodeJSONObjectBytes(body)
+	if err != nil {
+		return nil, fmt.Errorf("normalize runtime config snapshot: %w", err)
+	}
+	return snapshot, nil
+}
+
+func persistPreparedRuntimeConfigSnapshot(st *store.Store, snapshot map[string]any) (map[string]any, error) {
+	return st.SaveArtifact("runtime_config", "launch", snapshot)
+}
+
 func persistRuntimeConfigSnapshot(st *store.Store, config recipes.RuntimeConfig) (map[string]any, error) {
-	return st.SaveArtifact("runtime_config", "launch", runtimeConfigSnapshotPayload(config))
+	snapshot, err := prepareRuntimeConfigSnapshot(config)
+	if err != nil {
+		return nil, err
+	}
+	return persistPreparedRuntimeConfigSnapshot(st, snapshot)
 }
 
 func loadRuntimeConfigFromSnapshot(st *store.Store, ref any) (recipes.RuntimeConfig, error) {

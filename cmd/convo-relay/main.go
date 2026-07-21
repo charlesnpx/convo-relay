@@ -670,6 +670,11 @@ func runHealth(args []string) {
 func runRelay(args []string) {
 	flags := flag.NewFlagSet("run", flag.ExitOnError)
 	task := flags.String("task", "", "Task text for the relay")
+	recipeID := flags.String("recipe", "", "Run a configured recipe as the direct root execution")
+	integrationBundlePath := flags.String("integration-bundle", "", "Integration bundle JSON for an integration-bound root recipe")
+	workspaceIsolation := flags.String("workspace-isolation", "inherited", "Root recipe workspace isolation: inherited, read_only, or ephemeral")
+	var inputBindings repeatableFlagValue
+	flags.Var(&inputBindings, "input", "Bind a named root recipe input as name=path; may be repeated")
 	sessionDir := flags.String("session-dir", "", "Optional explicit session directory")
 	sessionID := flags.String("session-id", "", "Optional session id when --session-dir is omitted")
 	relayHome := flags.String("home", "", "Optional relay home; defaults to CODEX_CLAUDE_HOME or ~/.codex-claude")
@@ -716,6 +721,61 @@ func runRelay(args []string) {
 	}
 	if *task == "" && len(flags.Args()) > 0 {
 		*task = strings.Join(flags.Args(), " ")
+	}
+	visited := visitedFlagNames(flags)
+	recipeRequested := strings.TrimSpace(*recipeID) != "" || visited["recipe"] || visited["integration-bundle"] || visited["workspace-isolation"] || visited["input"]
+	if recipeRequested {
+		if strings.TrimSpace(*recipeID) == "" {
+			fmt.Fprintln(os.Stderr, "error: --recipe is required when root recipe run options are used")
+			os.Exit(2)
+		}
+		if err := validateRecipeRunStructuralOverrides(visited); err != nil {
+			fmt.Fprintf(os.Stderr, "error: %s\n", err)
+			os.Exit(2)
+		}
+		sourceAnchor, err := resolveRunRecipeSourceAnchor(*launchCWD)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "error: launch CWD: %s\n", err)
+			os.Exit(2)
+		}
+		contextFiles := anchorRecipeCLIPaths(sourceAnchor, extracted["context"])
+		skillFiles := anchorRecipeCLIPaths(sourceAnchor, extracted["skill"])
+		recipeFiles := anchorRecipeCLIPaths(sourceAnchor, extracted["recipe-file"])
+		generatedRecipeFiles := anchorRecipeCLIPaths(sourceAnchor, extracted["generated-recipe-file"])
+		launchPlan, err := loadLaunchPlanFile(anchorRecipeCLIPath(sourceAnchor, *taskPlanPath))
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "error: %s\n", err)
+			os.Exit(1)
+		}
+		transientRecipeSources := readTransientRecipeSourcesOrExit(recipeFiles, generatedRecipeFiles)
+		_ = verbose
+		_ = stream
+		ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+		defer stop()
+		result, err := runner.RunRecipe(ctx, runner.RecipeOptions{
+			SessionDir:            *sessionDir,
+			SessionID:             *sessionID,
+			RelayHome:             *relayHome,
+			Task:                  *task,
+			RecipeID:              *recipeID,
+			ContextFiles:          contextFiles,
+			SkillFiles:            skillFiles,
+			TransientSources:      transientRecipeSources,
+			IntegrationBundlePath: anchorRecipeCLIPath(sourceAnchor, *integrationBundlePath),
+			InputBindings:         append([]string{}, inputBindings...),
+			WorkspaceIsolation:    *workspaceIsolation,
+			WorkspaceExplicit:     visited["workspace-isolation"],
+			SettingsPath:          anchorRecipeCLIPath(sourceAnchor, *settingsPath),
+			LaunchCWD:             sourceAnchor,
+			TimeoutSeconds:        *timeout,
+			StallTimeoutSeconds:   *stallTimeout,
+			InvestigationMode:     *investigationMode,
+			LaunchPlan:            launchPlan,
+			TaskPlanExplicit:      visited["task-plan"],
+			SkillExplicit:         len(extracted["skill"]) > 0,
+		})
+		writeRunnerResult(result, err, *jsonOutput, output)
+		return
 	}
 	agents, usedShorthand, err := runner.ParseAgents(*agentsRaw)
 	if err != nil {
@@ -768,6 +828,96 @@ func runRelay(args []string) {
 		InvestigationMode:      *investigationMode,
 	})
 	writeRunnerResult(result, err, *jsonOutput, output)
+}
+
+type repeatableFlagValue []string
+
+func (v *repeatableFlagValue) String() string {
+	if v == nil {
+		return ""
+	}
+	return strings.Join(*v, ",")
+}
+
+func (v *repeatableFlagValue) Set(value string) error {
+	if value == "" {
+		return fmt.Errorf("value must not be empty")
+	}
+	*v = append(*v, value)
+	return nil
+}
+
+func visitedFlagNames(flags *flag.FlagSet) map[string]bool {
+	visited := map[string]bool{}
+	flags.Visit(func(flagValue *flag.Flag) {
+		visited[flagValue.Name] = true
+	})
+	return visited
+}
+
+func validateRecipeRunStructuralOverrides(visited map[string]bool) error {
+	structural := []string{
+		"agents",
+		"model-a", "effort-a", "model-b", "effort-b",
+		"facilitator-backend", "facilitator-model", "facilitator-effort",
+		"mode", "rounds", "max-rounds", "quick", "dynamic",
+	}
+	conflicts := []string{}
+	for _, name := range structural {
+		if visited[name] {
+			conflicts = append(conflicts, "--"+name)
+		}
+	}
+	if len(conflicts) == 0 {
+		return nil
+	}
+	return fmt.Errorf("run --recipe does not accept structural overrides: %s", strings.Join(conflicts, ", "))
+}
+
+func resolveRunRecipeSourceAnchor(value string) (string, error) {
+	if strings.TrimSpace(value) == "" {
+		value = "."
+	}
+	absolute, err := filepath.Abs(value)
+	if err != nil {
+		return "", err
+	}
+	resolved, err := filepath.EvalSymlinks(absolute)
+	if err != nil {
+		return "", err
+	}
+	info, err := os.Stat(resolved)
+	if err != nil {
+		return "", err
+	}
+	if !info.IsDir() {
+		return "", fmt.Errorf("%s is not a directory", resolved)
+	}
+	return filepath.Clean(resolved), nil
+}
+
+func anchorRecipeCLIPaths(sourceAnchor string, values []string) []string {
+	anchored := make([]string, len(values))
+	for index, value := range values {
+		anchored[index] = anchorRecipeCLIPath(sourceAnchor, value)
+	}
+	return anchored
+}
+
+func anchorRecipeCLIPath(sourceAnchor string, value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" || value == "-" || filepath.IsAbs(value) {
+		return value
+	}
+	if value == "~" || strings.HasPrefix(value, "~"+string(filepath.Separator)) {
+		if home, err := os.UserHomeDir(); err == nil {
+			if value == "~" {
+				return home
+			}
+			return filepath.Join(home, strings.TrimPrefix(value, "~"+string(filepath.Separator)))
+		}
+	}
+	return filepath.Join(sourceAnchor, value)
 }
 
 func runProposals(args []string) {
@@ -1470,6 +1620,14 @@ func writeRunnerResult(result map[string]any, err error, jsonOutput bool, output
 		writeJSON(result)
 		return
 	}
+	if result["execution_kind"] == "recipe" && result["status"] == "ready" {
+		fmt.Printf("Session %s ready at %s\n", result["session_id"], result["session_dir"])
+		fmt.Printf("Participant turns: %v/%v\n", result["actual_participant_turns"], result["participant_turns"])
+		if savedOutput != "" {
+			fmt.Printf("Output: %s\n", savedOutput)
+		}
+		return
+	}
 	fmt.Printf("Session %s completed at %s\n", result["session_id"], result["session_dir"])
 	fmt.Printf("Rounds: %v/%v\n", result["actual_rounds"], result["max_rounds"])
 	if savedOutput != "" {
@@ -1566,6 +1724,7 @@ func usage() {
 	fmt.Fprintln(os.Stderr, "  convo-relay compile-recipe --recipe <id> [--target root|child] [--integration-bundle <path>] --json")
 	fmt.Fprintln(os.Stderr, "  convo-relay create-session --session-dir <path> --json")
 	fmt.Fprintln(os.Stderr, "  convo-relay run --task <task> --agents codex,codex --rounds 2 --json")
+	fmt.Fprintln(os.Stderr, "  convo-relay run --task <task> --recipe <id> [--integration-bundle <path>] [--input name=path] [--workspace-isolation inherited|read_only|ephemeral] --json")
 	fmt.Fprintln(os.Stderr, "  convo-relay resume <session-id-prefix> --mode steelman --rounds 1 --json")
 	fmt.Fprintln(os.Stderr, "  convo-relay proposals <session-id-prefix> --json")
 	fmt.Fprintln(os.Stderr, "  convo-relay approve <session-id-prefix> <proposal-id> --json")
