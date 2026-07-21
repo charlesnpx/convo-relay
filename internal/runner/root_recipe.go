@@ -72,25 +72,26 @@ type RecipeOptions struct {
 }
 
 type recipePreflight struct {
-	options           RecipeOptions
-	sessionDir        string
-	sessionID         string
-	sessionPathSource string
-	launchCWD         string
-	runtimeConfig     recipes.RuntimeConfig
-	runtimeSnapshot   map[string]any
-	transientFiles    []recipes.TransientRecipeFile
-	transientRecipes  []preparedTransientRecipe
-	recipe            map[string]any
-	rootPlan          map[string]any
-	bundle            *integration.Bundle
-	selectedContract  *integration.SelectedContract
-	preparedInputs    *namedinputs.Prepared
-	launchContexts    []LaunchContext
-	launchSkills      []InputBundle
-	promptPolicy      PromptPolicy
-	backendReadiness  []readiness.Record
-	workspace         *workspace.Snapshot
+	options            RecipeOptions
+	sessionDir         string
+	sessionID          string
+	sessionPathSource  string
+	launchCWD          string
+	runtimeConfig      recipes.RuntimeConfig
+	runtimeSnapshot    map[string]any
+	transientFiles     []recipes.TransientRecipeFile
+	transientRecipes   []preparedTransientRecipe
+	recipe             map[string]any
+	rootPlan           map[string]any
+	bundle             *integration.Bundle
+	selectedContract   *integration.SelectedContract
+	assertionEvaluator *integration.AssertionEvaluator
+	preparedInputs     *namedinputs.Prepared
+	launchContexts     []LaunchContext
+	launchSkills       []InputBundle
+	promptPolicy       PromptPolicy
+	backendReadiness   []readiness.Record
+	workspace          *workspace.Snapshot
 }
 
 type preparedTransientRecipe struct {
@@ -247,6 +248,13 @@ func preflightRecipe(ctx context.Context, opts RecipeOptions) (*recipePreflight,
 	if err != nil {
 		return nil, err
 	}
+	var assertionEvaluator *integration.AssertionEvaluator
+	if selectedContract != nil {
+		assertionEvaluator, err = integration.PrepareAssertionEvaluator(selectedContract, preparedInputs.AssertionInputs())
+		if err != nil {
+			return nil, err
+		}
+	}
 
 	backendNames, err := readiness.ResolveBackendClosure(recipe, runtimeConfig.BackendProfiles, runtimeConfig.RelayRecipes, readiness.ClosureOptions{
 		IncludeReducer:        stringFromAny(rootPlan["result_source"]) == integration.ResultSourceReducer,
@@ -297,25 +305,26 @@ func preflightRecipe(ctx context.Context, opts RecipeOptions) (*recipePreflight,
 	opts.TimeoutSeconds = positiveOrDefault(opts.TimeoutSeconds, defaultTimeoutSeconds)
 	opts.StallTimeoutSeconds = positiveOrDefault(opts.StallTimeoutSeconds, defaultTimeoutSeconds/2)
 	return &recipePreflight{
-		options:           opts,
-		sessionDir:        sessionDir,
-		sessionID:         sessionID,
-		sessionPathSource: sessionPathSource,
-		launchCWD:         launchCWD,
-		runtimeConfig:     runtimeConfig,
-		runtimeSnapshot:   runtimeSnapshot,
-		transientFiles:    transientFiles,
-		transientRecipes:  transientRecipes,
-		recipe:            contracts.Materialize(recipe).(map[string]any),
-		rootPlan:          contracts.Materialize(rootPlan).(map[string]any),
-		bundle:            bundle,
-		selectedContract:  selectedContract,
-		preparedInputs:    preparedInputs,
-		launchContexts:    launchContexts,
-		launchSkills:      launchSkills,
-		promptPolicy:      promptPolicy,
-		backendReadiness:  append([]readiness.Record{}, backendReadiness...),
-		workspace:         workspaceSnapshot,
+		options:            opts,
+		sessionDir:         sessionDir,
+		sessionID:          sessionID,
+		sessionPathSource:  sessionPathSource,
+		launchCWD:          launchCWD,
+		runtimeConfig:      runtimeConfig,
+		runtimeSnapshot:    runtimeSnapshot,
+		transientFiles:     transientFiles,
+		transientRecipes:   transientRecipes,
+		recipe:             contracts.Materialize(recipe).(map[string]any),
+		rootPlan:           contracts.Materialize(rootPlan).(map[string]any),
+		bundle:             bundle,
+		selectedContract:   selectedContract,
+		assertionEvaluator: assertionEvaluator,
+		preparedInputs:     preparedInputs,
+		launchContexts:     launchContexts,
+		launchSkills:       launchSkills,
+		promptPolicy:       promptPolicy,
+		backendReadiness:   append([]readiness.Record{}, backendReadiness...),
+		workspace:          workspaceSnapshot,
 	}, nil
 }
 

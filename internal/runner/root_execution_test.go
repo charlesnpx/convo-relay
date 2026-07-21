@@ -158,7 +158,7 @@ func TestRunRecipeExecutesExactAlternatingParticipantsAndFacilitator(t *testing.
 	if err != nil {
 		t.Fatalf("RunRecipe: %v", err)
 	}
-	if result["status"] != rootParticipantsCompleteStatus ||
+	if result["status"] != "completed" ||
 		intFromAny(result["actual_participant_turns"], 0) != 4 ||
 		intFromAny(result["actual_rounds"], 0) != 4 {
 		t.Fatalf("root participant result = %#v", result)
@@ -242,7 +242,11 @@ func TestRunRecipeExecutesExactAlternatingParticipantsAndFacilitator(t *testing.
 			t.Fatalf("facilitator output metadata = %#v", output)
 		}
 	}
-	checkpoint := assertRootRecipeArtifact(t, st, result["latest_root_checkpoint_ref"], contracts.RootArtifactKindRootCheckpoint, 2)
+	checkpointRefs := result["root_checkpoint_refs"].([]any)
+	if len(checkpointRefs) != 4 {
+		t.Fatalf("root checkpoint refs = %#v", checkpointRefs)
+	}
+	checkpoint := assertRootRecipeArtifact(t, st, checkpointRefs[1], contracts.RootArtifactKindRootCheckpoint, 2)
 	if checkpoint["phase"] != "participant_turns_complete" || intFromAny(checkpoint["participant_turns_completed"], 0) != 4 {
 		t.Fatalf("participant checkpoint = %#v", checkpoint)
 	}
@@ -257,6 +261,12 @@ func TestRunRecipeScopesContractInstructionsAndProviderInputsPerTurn(t *testing.
 		t.Fatalf("write named input: %v", err)
 	}
 	recorder := &rootBackendRecorder{}
+	recorder.handler = func(_ context.Context, call rootBackendCall) (TurnResult, error) {
+		if call.SlotID == "facilitator" {
+			return successfulRootTurn(call.Backend, `{"settled":[],"contested":[],"withdrawn":[]}`), nil
+		}
+		return successfulRootTurn(call.Backend, `{"value":"scoped"}`), nil
+	}
 	result, err := RunRecipe(context.Background(), RecipeOptions{
 		SessionDir:        filepath.Join(t.TempDir(), "session"),
 		Task:              "Use the contract without leaking future instructions",
@@ -271,7 +281,7 @@ func TestRunRecipeScopesContractInstructionsAndProviderInputsPerTurn(t *testing.
 	if err != nil {
 		t.Fatalf("RunRecipe: %v", err)
 	}
-	if result["status"] != rootParticipantsCompleteStatus {
+	if result["status"] != "completed" {
 		t.Fatalf("root status = %v", result["status"])
 	}
 	participantPrompts := []string{}
@@ -1107,7 +1117,7 @@ func TestRootRecipeSteeringCannotReplaceContractScheduleOrInstructions(t *testin
 		if call.SlotID == "facilitator" {
 			return successfulRootTurn(call.Backend, "{\"settled\":[],\"contested\":[\"continue\"],\"withdrawn\":[]}"), nil
 		}
-		return successfulRootTurn(call.Backend, "contract participant response"), nil
+		return successfulRootTurn(call.Backend, `{"value":"contract participant response"}`), nil
 	}
 	sessionDir := filepath.Join(t.TempDir(), "session")
 	launchCWD := t.TempDir()
