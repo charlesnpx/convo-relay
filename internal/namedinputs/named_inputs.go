@@ -312,16 +312,12 @@ func readRegularFile(rawPath string, sourceAnchor string, maxBytes int64) (strin
 	if info.Size() > maxBytes {
 		return "", nil, errTooLarge
 	}
-	handle, err := os.Open(absolutePath)
+	handle, openedInfo, err := openNamedInputFile(absolutePath)
 	if err != nil {
 		return "", nil, err
 	}
 	defer handle.Close()
-	openedInfo, err := handle.Stat()
-	if err != nil {
-		return "", nil, err
-	}
-	if !openedInfo.Mode().IsRegular() || !os.SameFile(info, openedInfo) {
+	if !os.SameFile(info, openedInfo) {
 		return "", nil, errNotRegular
 	}
 	if openedInfo.Size() > maxBytes {
@@ -335,6 +331,23 @@ func readRegularFile(rawPath string, sourceAnchor string, maxBytes int64) (strin
 		return "", nil, err
 	}
 	return filepath.Clean(absolutePath), data, nil
+}
+
+func openNamedInputFile(path string) (*os.File, os.FileInfo, error) {
+	handle, err := openNamedInputFileNoFollow(path)
+	if err != nil {
+		return nil, nil, err
+	}
+	info, err := handle.Stat()
+	if err != nil {
+		_ = handle.Close()
+		return nil, nil, err
+	}
+	if !info.Mode().IsRegular() {
+		_ = handle.Close()
+		return nil, nil, errNotRegular
+	}
+	return handle, info, nil
 }
 
 var (

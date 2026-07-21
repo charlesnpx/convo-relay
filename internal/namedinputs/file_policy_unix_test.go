@@ -1,12 +1,14 @@
-//go:build !windows
+//go:build darwin || dragonfly || freebsd || linux || netbsd || openbsd
 
 package namedinputs
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"syscall"
 	"testing"
+	"time"
 
 	"github.com/charlesnpx/convo-relay/internal/integration"
 	"github.com/charlesnpx/convo-relay/internal/store"
@@ -63,5 +65,41 @@ func TestMaterializeRejectsSymlinkedSessionDirectoryComponents(t *testing.T) {
 	requireDiagnosticCode(t, err, DiagnosticCodeIntegrity)
 	if _, err := os.Stat(filepath.Join(outside, "inputs")); !os.IsNotExist(err) {
 		t.Fatalf("materialization escaped through a symlink: %v", err)
+	}
+}
+
+func TestSecureOpenRejectsSymlinksAndFIFOsWithoutBlocking(t *testing.T) {
+	root := t.TempDir()
+	regular := writeInputFile(t, root, "regular.bin", []byte("value"))
+	symlink := filepath.Join(root, "symlink.bin")
+	if err := os.Symlink(regular, symlink); err != nil {
+		t.Fatalf("symlink: %v", err)
+	}
+	if handle, _, err := openNamedInputFile(symlink); !errors.Is(err, errNotRegular) {
+		if handle != nil {
+			_ = handle.Close()
+		}
+		t.Fatalf("secure symlink open error = %v", err)
+	}
+
+	fifo := filepath.Join(root, "input.fifo")
+	if err := syscall.Mkfifo(fifo, 0o600); err != nil {
+		t.Fatalf("mkfifo: %v", err)
+	}
+	result := make(chan error, 1)
+	go func() {
+		handle, _, err := openNamedInputFile(fifo)
+		if handle != nil {
+			_ = handle.Close()
+		}
+		result <- err
+	}()
+	select {
+	case err := <-result:
+		if !errors.Is(err, errNotRegular) {
+			t.Fatalf("secure FIFO open error = %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("secure FIFO open blocked")
 	}
 }

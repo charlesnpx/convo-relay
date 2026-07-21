@@ -423,6 +423,8 @@ func TestMaterializeRejectsPathsOutsideSessionAndUnexpectedEntries(t *testing.T)
 	}
 	_, err = Materialize(st, persisted.ManifestRef, filepath.Join(root, "outside-session"))
 	requireDiagnosticCode(t, err, DiagnosticCodeIntegrity)
+	_, err = Materialize(st, persisted.ManifestRef, filepath.Join(st.Root, "artifacts", "inputs"))
+	requireDiagnosticCode(t, err, DiagnosticCodeIntegrity)
 
 	executionDir := filepath.Join(st.Root, "execution", "inputs")
 	if err := os.MkdirAll(executionDir, 0o700); err != nil {

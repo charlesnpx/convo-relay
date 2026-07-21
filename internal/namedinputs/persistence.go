@@ -373,16 +373,21 @@ func safeMaterializationDirectory(sessionRoot string, requestedPath string) (str
 	if err != nil {
 		return "", err
 	}
-	relativePath, err := filepath.Rel(absoluteRoot, absolutePath)
-	if err != nil || relativePath == "." || filepath.IsAbs(relativePath) || relativePath == ".." || strings.HasPrefix(relativePath, ".."+string(filepath.Separator)) {
+	absoluteExecutionRoot := filepath.Join(absoluteRoot, "execution")
+	relativeExecutionPath, err := filepath.Rel(absoluteExecutionRoot, absolutePath)
+	if err != nil || relativeExecutionPath == "." || filepath.IsAbs(relativeExecutionPath) || relativeExecutionPath == ".." || strings.HasPrefix(relativeExecutionPath, ".."+string(filepath.Separator)) {
 		return "", diagnosticError(
 			err,
 			DiagnosticCodeIntegrity,
 			contracts.DiagnosticPhasePolicy,
 			"",
-			"Named inputs must be materialized in a dedicated directory inside the session.",
+			"Named inputs must be materialized in a dedicated directory inside the session execution area.",
 			map[string]any{"execution_input_dir": absolutePath},
 		)
+	}
+	relativePath, err := filepath.Rel(absoluteRoot, absolutePath)
+	if err != nil {
+		return "", err
 	}
 	rootInfo, err := os.Lstat(absoluteRoot)
 	if err != nil {
