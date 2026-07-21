@@ -183,6 +183,7 @@ func TestSchemaReferencesMustBeResolvedLocalDefinitions(t *testing.T) {
 	valid := []string{
 		`{"$defs":{"value":{"type":"string"}},"$ref":"#/$defs/value"}`,
 		`{"$defs":{"a/b~c":{"type":"integer"}},"$ref":"#/$defs/a~1b~0c"}`,
+		`{"$defs":{"a b":{"type":"integer"}},"$ref":"#/$defs/a%20b"}`,
 		`{"$defs":{"outer":{"$defs":{"inner":{"type":"boolean"}},"$ref":"#/$defs/outer/$defs/inner"}},"$ref":"#/$defs/outer"}`,
 	}
 	for index, raw := range valid {
@@ -200,6 +201,7 @@ func TestSchemaReferencesMustBeResolvedLocalDefinitions(t *testing.T) {
 		{name: "root fragment", ref: "#/properties/value"},
 		{name: "unresolved", ref: "#/$defs/missing"},
 		{name: "bad escape", ref: "#/$defs/a~2b"},
+		{name: "bad percent escape", ref: "#/$defs/a%2"},
 	}
 	for _, test := range invalid {
 		t.Run(test.name, func(t *testing.T) {
@@ -229,7 +231,17 @@ func TestSchemaReferencesCannotTargetDataObjects(t *testing.T) {
 			name: "enum object",
 			schema: `{
               "$defs":{"holder":{"enum":[{"type":"string","pattern":"^allowed$"}]}},
-              "$ref":"#/$defs/holder/enum/0"
+				"$ref":"#/$defs/holder/enum/0"
+			}`,
+		},
+		{
+			name: "percent encoded separator",
+			schema: `{
+              "$defs":{
+                "holder":{"const":{"type":"string","pattern":"^allowed$"}},
+                "holder%2Fconst":{"type":"integer"}
+              },
+              "$ref":"#/$defs/holder%2Fconst"
             }`,
 		},
 	}

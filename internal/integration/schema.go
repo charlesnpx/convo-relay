@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"math"
 	"math/big"
+	"net/url"
 	"strconv"
 	"strings"
 
@@ -322,7 +323,11 @@ func decodeLocalReference(ref string) ([]string, error) {
 	if !strings.HasPrefix(ref, "#/") {
 		return nil, fmt.Errorf("reference must begin with #/")
 	}
-	rawSegments := strings.Split(strings.TrimPrefix(ref, "#/"), "/")
+	fragment, err := url.PathUnescape(strings.TrimPrefix(ref, "#"))
+	if err != nil {
+		return nil, fmt.Errorf("invalid percent escape: %w", err)
+	}
+	rawSegments := strings.Split(strings.TrimPrefix(fragment, "/"), "/")
 	segments := make([]string, len(rawSegments))
 	for index, raw := range rawSegments {
 		var builder strings.Builder
