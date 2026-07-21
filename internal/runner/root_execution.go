@@ -207,7 +207,11 @@ func (s *rootExecutionState) run(ctx context.Context) (map[string]any, error) {
 			return s.markFailed("participant", err)
 		}
 	}
-	return s.markParticipantsComplete()
+	participantResult, err := s.markParticipantsComplete()
+	if err != nil {
+		return participantResult, err
+	}
+	return s.runRootResultPhases(ctx)
 }
 
 func (s *rootExecutionState) runParticipantTurn(

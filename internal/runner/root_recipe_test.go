@@ -101,7 +101,7 @@ func TestRunRecipeUsesExplicitRootTargetAndPersistsDirectContractlessSession(t *
 	if readinessSessionExisted {
 		t.Fatal("session existed during backend readiness preflight")
 	}
-	if result["execution_kind"] != "recipe" || result["status"] != rootParticipantsCompleteStatus || intFromAny(result["actual_participant_turns"], -1) != 2 {
+	if result["execution_kind"] != "recipe" || result["status"] != "completed" || intFromAny(result["actual_participant_turns"], -1) != 2 {
 		t.Fatalf("root result = %#v", result)
 	}
 	if result["integration_contract_ref"] != nil || result["named_input_manifest_ref"] != nil {
@@ -134,16 +134,21 @@ func TestRunRecipeUsesExplicitRootTargetAndPersistsDirectContractlessSession(t *
 	}
 	assertRootRecipeArtifact(t, st, meta.Get("root_recipe_plan_ref"), contracts.RootArtifactKindRootRecipePlan, 0)
 	checkpointRefs := meta.Slice("root_checkpoint_refs")
-	if len(checkpointRefs) != 2 {
+	if len(checkpointRefs) != 4 {
 		t.Fatalf("root checkpoint refs = %#v", checkpointRefs)
 	}
 	workspaceCheckpoint := assertRootRecipeArtifact(t, st, checkpointRefs[0], contracts.RootArtifactKindRootCheckpoint, 1)
 	if workspaceCheckpoint["phase"] != "workspace_ready" || workspaceCheckpoint["preflight_complete"] != true || workspaceCheckpoint["workspace_ready"] != true {
 		t.Fatalf("workspace checkpoint = %#v", workspaceCheckpoint)
 	}
-	participantCheckpoint := assertRootRecipeArtifact(t, st, meta.Get("latest_root_checkpoint_ref"), contracts.RootArtifactKindRootCheckpoint, 2)
+	participantCheckpoint := assertRootRecipeArtifact(t, st, checkpointRefs[1], contracts.RootArtifactKindRootCheckpoint, 2)
 	if participantCheckpoint["phase"] != "participant_turns_complete" || intFromAny(participantCheckpoint["participant_turns_completed"], 0) != 2 {
 		t.Fatalf("participant checkpoint = %#v", participantCheckpoint)
+	}
+	assertRootRecipeArtifact(t, st, meta.Get("raw_result_ref"), contracts.RootArtifactKindRawResult, 0)
+	assertRootRecipeArtifact(t, st, meta.Get("result_validation_ref"), contracts.RootArtifactKindResultValidation, 0)
+	if meta.Get("canonical_result_ref") != nil || meta.String("validation_status") != "not_required" {
+		t.Fatalf("contractless result invented canonical validation: %#v", meta.ToMap())
 	}
 	assertRootRecipeArtifact(t, st, meta.Get("execution_workspace_ref"), contracts.RootArtifactKindExecutionWorkspace, 0)
 
@@ -167,6 +172,13 @@ func TestRunRecipeBindsContractInputsAndPersistsExactArtifacts(t *testing.T) {
 	bundle := decodeRootRecipeTestBundle(t, rootRecipeTestBundle)
 	sessionDir := filepath.Join(t.TempDir(), "session")
 	var compileTarget recipes.CompileTarget
+	recorder := &rootBackendRecorder{}
+	recorder.handler = func(_ context.Context, call rootBackendCall) (TurnResult, error) {
+		if call.SlotID == "facilitator" {
+			return successfulRootTurn(call.Backend, `{"settled":[],"contested":[],"withdrawn":[]}`), nil
+		}
+		return successfulRootTurn(call.Backend, `{"value":"stable"}`), nil
+	}
 
 	result, err := RunRecipe(context.Background(), RecipeOptions{
 		SessionDir:        sessionDir,
@@ -177,7 +189,7 @@ func TestRunRecipeBindsContractInputsAndPersistsExactArtifacts(t *testing.T) {
 		RuntimeConfig:     rootRecipeRuntimeConfig("neutral/contract-v1"),
 		IntegrationBundle: bundle,
 		ReadinessCheck:    readyRootRecipeCheck,
-		backendFactory:    successfulRootBackendFactory(),
+		backendFactory:    recorder.factory(),
 		compileRecipe: func(recipe map[string]any, profiles map[string]map[string]any, relayRecipes map[string]map[string]any, target recipes.CompileTarget, options recipes.CompileOptions) (map[string]any, error) {
 			compileTarget = target
 			return recipes.CompileRecipe(recipe, profiles, relayRecipes, target, options)
@@ -290,6 +302,12 @@ func TestRunRecipeContractWithoutNamedInputsAllowsContext(t *testing.T) {
 	writeRootRecipeTestFile(t, filepath.Join(launchCWD, "context.md"), "ordinary positional context\n")
 	sessionDir := filepath.Join(t.TempDir(), "session")
 	recorder := &rootBackendRecorder{}
+	recorder.handler = func(_ context.Context, call rootBackendCall) (TurnResult, error) {
+		if call.SlotID == "facilitator" {
+			return successfulRootTurn(call.Backend, `{"settled":[],"contested":[],"withdrawn":[]}`), nil
+		}
+		return successfulRootTurn(call.Backend, `{"value":"context"}`), nil
+	}
 	result, err := RunRecipe(context.Background(), RecipeOptions{
 		SessionDir:        sessionDir,
 		Task:              "Context-compatible contract",

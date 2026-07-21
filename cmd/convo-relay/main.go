@@ -1597,42 +1597,53 @@ func resolveSessionDirOrExit(sessionDir string, sessionID string, relayHome stri
 }
 
 func writeRunnerResult(result map[string]any, err error, jsonOutput bool, outputPath string) {
-	if err != nil {
-		if result != nil && jsonOutput {
-			writeJSON(result)
-		}
-		fmt.Fprintf(os.Stderr, "error: %s\n", err)
-		if errors.Is(err, context.Canceled) {
+	emitErr := emitRunnerResult(os.Stdout, result, err, jsonOutput, outputPath)
+	if emitErr != nil {
+		fmt.Fprintf(os.Stderr, "error: %s\n", emitErr)
+		if errors.Is(emitErr, context.Canceled) {
 			os.Exit(130)
 		}
 		os.Exit(1)
 	}
-	savedOutput := ""
-	if strings.TrimSpace(outputPath) != "" {
-		var saveErr error
-		savedOutput, saveErr = saveRunnerOutput(result, outputPath, jsonOutput)
-		if saveErr != nil {
-			fmt.Fprintf(os.Stderr, "error: %s\n", saveErr)
-			os.Exit(1)
+}
+
+func emitRunnerResult(writer io.Writer, result map[string]any, runErr error, jsonOutput bool, outputPath string) error {
+	if result == nil {
+		if runErr != nil {
+			return runErr
 		}
+		return errors.New("runner returned no session result")
+	}
+	savedOutput := ""
+	var saveErr error
+	if strings.TrimSpace(outputPath) != "" {
+		savedOutput, saveErr = saveRunnerOutput(result, outputPath, jsonOutput)
 	}
 	if jsonOutput {
-		writeJSON(result)
-		return
+		encoder := json.NewEncoder(writer)
+		encoder.SetIndent("", "  ")
+		return errors.Join(runErr, saveErr, encoder.Encode(result))
 	}
-	if result["execution_kind"] == "recipe" && result["status"] == "ready" {
-		fmt.Printf("Session %s ready at %s\n", result["session_id"], result["session_dir"])
-		fmt.Printf("Participant turns: %v/%v\n", result["actual_participant_turns"], result["participant_turns"])
+	var emitErr error
+	write := func(format string, args ...any) {
+		_, err := fmt.Fprintf(writer, format, args...)
+		emitErr = errors.Join(emitErr, err)
+	}
+	if result["execution_kind"] == "recipe" {
+		status := firstNonEmptyString(stringValue(result["status"]), "completed")
+		write("Session %s %s at %s\n", result["session_id"], status, result["session_dir"])
+		write("Participant turns: %v/%v\n", result["actual_participant_turns"], result["participant_turns"])
 		if savedOutput != "" {
-			fmt.Printf("Output: %s\n", savedOutput)
+			write("Output: %s\n", savedOutput)
 		}
-		return
+		return errors.Join(runErr, saveErr, emitErr)
 	}
-	fmt.Printf("Session %s completed at %s\n", result["session_id"], result["session_dir"])
-	fmt.Printf("Rounds: %v/%v\n", result["actual_rounds"], result["max_rounds"])
+	write("Session %s completed at %s\n", result["session_id"], result["session_dir"])
+	write("Rounds: %v/%v\n", result["actual_rounds"], result["max_rounds"])
 	if savedOutput != "" {
-		fmt.Printf("Output: %s\n", savedOutput)
+		write("Output: %s\n", savedOutput)
 	}
+	return errors.Join(runErr, saveErr, emitErr)
 }
 
 func saveRunnerOutput(result map[string]any, outputPath string, jsonOutput bool) (string, error) {

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -12,6 +13,7 @@ import (
 	"testing"
 
 	"github.com/charlesnpx/convo-relay/internal/recipes"
+	"github.com/charlesnpx/convo-relay/internal/store"
 )
 
 func TestParseFlagsAllowsFlagsAfterPositionals(t *testing.T) {
@@ -582,6 +584,12 @@ case "$prompt" in
   *"Return the updated ledger as JSON"*)
     printf '%s\n' '{"type":"item.completed","item":{"text":"{\"settled\":[\"cli\"],\"contested\":[],\"withdrawn\":[]}"}}'
     ;;
+  *"Invalid structured result"*)
+    printf '%s\n' '{"type":"item.completed","item":{"text":"not a JSON result"}}'
+    ;;
+  *"Integration Contract Instructions for This Turn"*)
+    printf '%s\n' '{"type":"item.completed","item":{"text":"{\"value\":\"cli\"}"}}'
+    ;;
   *)
     printf '{"type":"item.completed","item":{"text":"CLI participant %s"}}\n' "$suffix"
     ;;
@@ -610,7 +618,7 @@ esac
 		t.Fatalf("run recipe CLI: %v\n%s", err, output)
 	}
 	result := decodeJSONObject(t, string(output))
-	if result["execution_kind"] != "recipe" || result["status"] != "participants_complete" || result["recipe_id"] != "neutral-root" || intValue(result["actual_participant_turns"]) != 2 {
+	if result["execution_kind"] != "recipe" || result["status"] != "completed" || result["recipe_id"] != "neutral-root" || intValue(result["actual_participant_turns"]) != 2 {
 		t.Fatalf("root CLI result = %#v", result)
 	}
 	if result["root_recipe_plan_ref"] == nil || result["latest_root_checkpoint_ref"] == nil {
@@ -736,6 +744,91 @@ esac
 		t.Fatalf("unexpected provider invocation log after compatible run:\n%s", logData)
 	}
 
+	for _, mode := range []struct {
+		name       string
+		jsonOutput bool
+		withOutput bool
+	}{
+		{name: "plain stdout"},
+		{name: "plain output file", withOutput: true},
+		{name: "json stdout", jsonOutput: true},
+		{name: "json output file", jsonOutput: true, withOutput: true},
+	} {
+		t.Run("invalid result "+mode.name, func(t *testing.T) {
+			sessionDir := filepath.Join(tempDir, strings.ReplaceAll("invalid-"+mode.name, " ", "-"))
+			args := []string{
+				"run", "Invalid structured result",
+				"--recipe", "bound-root",
+				"--settings", "settings.toml",
+				"--recipe-file", "root-recipes.toml",
+				"--integration-bundle", "bundle.json",
+				"--input", "payload=payload.json",
+				"--session-dir", sessionDir,
+				"--launch-cwd", launchCWD,
+			}
+			if mode.jsonOutput {
+				args = append(args, "--json")
+			}
+			outputPath := ""
+			if mode.withOutput {
+				extension := ".md"
+				if mode.jsonOutput {
+					extension = ".json"
+				}
+				outputPath = filepath.Join(tempDir, strings.ReplaceAll(mode.name, " ", "-")+extension)
+				args = append(args, "-o", outputPath)
+			}
+			invalid := exec.Command(binary, args...)
+			invalid.Env = command.Env
+			var stdout strings.Builder
+			var stderr strings.Builder
+			invalid.Stdout = &stdout
+			invalid.Stderr = &stderr
+			runErr := invalid.Run()
+			var exitErr *exec.ExitError
+			if !errors.As(runErr, &exitErr) || exitErr.ExitCode() != 1 {
+				t.Fatalf("invalid result exit = %v, stdout=%s, stderr=%s", runErr, stdout.String(), stderr.String())
+			}
+			if !strings.Contains(stderr.String(), "JSON input is not syntactically valid") {
+				t.Fatalf("invalid result stderr = %s", stderr.String())
+			}
+			if mode.jsonOutput {
+				stdoutResult := decodeJSONObject(t, stdout.String())
+				if stdoutResult["status"] != "invalid_result" || stdoutResult["result_validation_failed"] != true {
+					t.Fatalf("invalid JSON stdout = %#v", stdoutResult)
+				}
+			} else if !strings.Contains(stdout.String(), " invalid_result at ") || !strings.Contains(stdout.String(), "Participant turns: 2/2") {
+				t.Fatalf("invalid plain stdout = %s", stdout.String())
+			}
+			metaData, readErr := os.ReadFile(filepath.Join(sessionDir, "meta.json"))
+			if readErr != nil {
+				t.Fatalf("read invalid result metadata: %v", readErr)
+			}
+			meta := decodeJSONObject(t, string(metaData))
+			if meta["status"] != "invalid_result" || meta["raw_result_ref"] == nil || meta["result_validation_ref"] == nil || meta["canonical_result_ref"] != nil {
+				t.Fatalf("persisted invalid result = %#v", meta)
+			}
+			validation, loadErr := store.New(sessionDir).LoadArtifact(meta["result_validation_ref"].(map[string]any))
+			if loadErr != nil || validation["status"] != "failed" || len(validation["diagnostics"].([]any)) == 0 {
+				t.Fatalf("persisted invalid diagnostics = %#v, %v", validation, loadErr)
+			}
+			if mode.withOutput {
+				outputData, readErr := os.ReadFile(outputPath)
+				if readErr != nil {
+					t.Fatalf("read invalid output file: %v", readErr)
+				}
+				if mode.jsonOutput {
+					fileResult := decodeJSONObject(t, string(outputData))
+					if fileResult["status"] != "invalid_result" || fileResult["session_id"] != meta["session_id"] {
+						t.Fatalf("invalid JSON output file = %#v", fileResult)
+					}
+				} else if !strings.Contains(string(outputData), "not a JSON result") {
+					t.Fatalf("invalid Markdown output file = %s", outputData)
+				}
+			}
+		})
+	}
+
 	for _, rejection := range []struct {
 		name string
 		args []string
@@ -807,6 +900,44 @@ func TestSaveRunnerOutputWritesMarkdownAndJSON(t *testing.T) {
 	}
 	if !strings.Contains(string(jsonData), `"session_id": "abc123"`) {
 		t.Fatalf("json output:\n%s", jsonData)
+	}
+}
+
+func TestEmitRunnerResultStillWritesStdoutWhenOutputSaveFails(t *testing.T) {
+	runErr := errors.New("invalid root result")
+	result := map[string]any{
+		"execution_kind":           "recipe",
+		"session_id":               "invalid123",
+		"session_dir":              "/tmp/invalid123",
+		"status":                   "invalid_result",
+		"actual_participant_turns": 2,
+		"participant_turns":        2,
+	}
+	blockedParent := filepath.Join(t.TempDir(), "not-a-directory")
+	if err := os.WriteFile(blockedParent, []byte("block child creation"), 0o644); err != nil {
+		t.Fatalf("write blocking parent: %v", err)
+	}
+
+	for _, jsonOutput := range []bool{false, true} {
+		name := "plain"
+		if jsonOutput {
+			name = "json"
+		}
+		t.Run(name, func(t *testing.T) {
+			var stdout bytes.Buffer
+			err := emitRunnerResult(&stdout, result, runErr, jsonOutput, filepath.Join(blockedParent, "result.out"))
+			if !errors.Is(err, runErr) {
+				t.Fatalf("emit error does not retain run error: %v", err)
+			}
+			if jsonOutput {
+				payload := decodeJSONObject(t, stdout.String())
+				if payload["status"] != "invalid_result" || payload["session_id"] != "invalid123" {
+					t.Fatalf("JSON stdout result = %#v", payload)
+				}
+			} else if !strings.Contains(stdout.String(), "Session invalid123 invalid_result") {
+				t.Fatalf("plain stdout result = %q", stdout.String())
+			}
+		})
 	}
 }
 
