@@ -25,11 +25,11 @@ func TestResolvePolicyOrderingAndExplicitOverrides(t *testing.T) {
 		wantAchieved       string
 		wantDiagnosticCode string
 	}{
-		{name: "defaults", wantEffective: PolicyInherited, wantAchieved: PolicyInherited},
-		{name: "recipe minimum survives ordinary default", minimum: PolicyReadOnly, requested: PolicyInherited, wantEffective: PolicyReadOnly, wantAchieved: PolicyEphemeral},
-		{name: "explicit strengthening", minimum: PolicyInherited, requested: PolicyReadOnly, explicit: true, wantEffective: PolicyReadOnly, wantAchieved: PolicyEphemeral},
-		{name: "explicit strongest", minimum: PolicyReadOnly, requested: PolicyEphemeral, explicit: true, wantEffective: PolicyEphemeral, wantAchieved: PolicyEphemeral},
-		{name: "same explicit policy", minimum: PolicyReadOnly, requested: PolicyReadOnly, explicit: true, wantEffective: PolicyReadOnly, wantAchieved: PolicyEphemeral},
+		{name: "defaults", wantEffective: PolicyInherited},
+		{name: "recipe minimum survives ordinary default", minimum: PolicyReadOnly, requested: PolicyInherited, wantEffective: PolicyReadOnly},
+		{name: "explicit strengthening", minimum: PolicyInherited, requested: PolicyReadOnly, explicit: true, wantEffective: PolicyReadOnly},
+		{name: "explicit strongest", minimum: PolicyReadOnly, requested: PolicyEphemeral, explicit: true, wantEffective: PolicyEphemeral},
+		{name: "same explicit policy", minimum: PolicyReadOnly, requested: PolicyReadOnly, explicit: true, wantEffective: PolicyReadOnly},
 		{name: "empty explicit request", minimum: PolicyInherited, requested: "", explicit: true, wantDiagnosticCode: DiagnosticCodeInvalidPolicy},
 		{name: "explicit weakening", minimum: PolicyEphemeral, requested: PolicyReadOnly, explicit: true, wantDiagnosticCode: DiagnosticCodePolicyWeakened},
 		{name: "invalid minimum", minimum: "shared", wantDiagnosticCode: DiagnosticCodeInvalidPolicy},
@@ -52,6 +52,17 @@ func TestResolvePolicyOrderingAndExplicitOverrides(t *testing.T) {
 				t.Fatalf("resolution = %#v", resolution)
 			}
 		})
+	}
+}
+
+func TestPreflightDoesNotClaimAchievedPolicy(t *testing.T) {
+	root := newCommittedRepo(t)
+	snapshot := mustPreflight(t, Options{LaunchCWD: root, SessionDir: filepath.Join(t.TempDir(), "session"), MinimumPolicy: PolicyReadOnly})
+	if snapshot.Policy().Achieved != "" {
+		t.Fatalf("preflight achieved policy = %q", snapshot.Policy().Achieved)
+	}
+	if _, exists := snapshot.Report()["achieved_policy"]; exists {
+		t.Fatalf("preflight report claimed an achieved policy: %#v", snapshot.Report())
 	}
 }
 
@@ -166,6 +177,83 @@ func TestPreflightInventoryIncludesRawSymlinkAndExecutableModes(t *testing.T) {
 	}
 	if got := tracked["committed-link"]["raw_digest"]; got != digestBytes([]byte("committed.txt")) {
 		t.Fatalf("symlink raw digest = %#v", got)
+	}
+}
+
+func TestPreflightInventoriesStagedFileDirectoryTransitions(t *testing.T) {
+	t.Run("file to directory", func(t *testing.T) {
+		root := newCommittedRepo(t)
+		writeTestFile(t, filepath.Join(root, "node"), []byte("file\n"), 0o644)
+		testGit(t, root, "add", "--", "node")
+		testGit(t, root, "commit", "-q", "-m", "add file node")
+		if err := os.Remove(filepath.Join(root, "node")); err != nil {
+			t.Fatalf("remove file node: %v", err)
+		}
+		writeTestFile(t, filepath.Join(root, "node", "child.txt"), []byte("child\n"), 0o644)
+		testGit(t, root, "add", "--all")
+
+		snapshot := mustPreflight(t, Options{LaunchCWD: root, SessionDir: filepath.Join(t.TempDir(), "session")})
+		tracked := inventoryEntries(t, snapshot.sourceReport, "tracked_worktree")
+		if tracked["node"]["present"] != false || tracked["node"]["obstruction"] != "directory" {
+			t.Fatalf("replaced file inventory = %#v", tracked["node"])
+		}
+		if tracked["node/child.txt"]["present"] != true {
+			t.Fatalf("staged descendant inventory = %#v", tracked["node/child.txt"])
+		}
+	})
+
+	t.Run("directory to file", func(t *testing.T) {
+		root := newCommittedRepo(t)
+		writeTestFile(t, filepath.Join(root, "node", "child.txt"), []byte("child\n"), 0o644)
+		testGit(t, root, "add", "--", "node/child.txt")
+		testGit(t, root, "commit", "-q", "-m", "add directory node")
+		if err := os.RemoveAll(filepath.Join(root, "node")); err != nil {
+			t.Fatalf("remove directory node: %v", err)
+		}
+		writeTestFile(t, filepath.Join(root, "node"), []byte("file\n"), 0o644)
+		testGit(t, root, "add", "--all")
+
+		snapshot := mustPreflight(t, Options{LaunchCWD: root, SessionDir: filepath.Join(t.TempDir(), "session")})
+		tracked := inventoryEntries(t, snapshot.sourceReport, "tracked_worktree")
+		if tracked["node"]["present"] != true {
+			t.Fatalf("replacement file inventory = %#v", tracked["node"])
+		}
+		if tracked["node/child.txt"]["present"] != false || tracked["node/child.txt"]["obstruction"] != "ancestor_not_directory" {
+			t.Fatalf("replaced descendant inventory = %#v", tracked["node/child.txt"])
+		}
+	})
+}
+
+func TestPreflightInventoriesInitializedDirtyAndDeinitializedSubmodules(t *testing.T) {
+	submoduleRoot := newCommittedRepo(t)
+	root := newCommittedRepo(t)
+	testGit(t, root, "-c", "protocol.file.allow=always", "submodule", "add", "-q", submoduleRoot, "vendor/module")
+	testGit(t, root, "commit", "-q", "-m", "add submodule")
+
+	clean := mustPreflight(t, Options{LaunchCWD: root, SessionDir: filepath.Join(t.TempDir(), "clean-session")})
+	cleanEntry := inventoryEntries(t, clean.sourceReport, "tracked_worktree")["vendor/module"]
+	if cleanEntry["present"] != true || cleanEntry["mode"] != "160000" || cleanEntry["gitlink_state"] != "initialized" {
+		t.Fatalf("initialized submodule inventory = %#v", cleanEntry)
+	}
+	if cleanEntry["submodule_head"] != testGit(t, submoduleRoot, "rev-parse", "HEAD") || cleanEntry["submodule_source_digest"] == "" {
+		t.Fatalf("initialized submodule identity = %#v", cleanEntry)
+	}
+
+	writeTestFile(t, filepath.Join(root, "vendor", "module", "committed.txt"), []byte("dirty submodule\n"), 0o644)
+	dirty := mustPreflight(t, Options{LaunchCWD: root, SessionDir: filepath.Join(t.TempDir(), "dirty-session")})
+	dirtyEntry := inventoryEntries(t, dirty.sourceReport, "tracked_worktree")["vendor/module"]
+	if dirty.SourceDigest() == clean.SourceDigest() || dirtyEntry["submodule_source_digest"] == cleanEntry["submodule_source_digest"] {
+		t.Fatalf("dirty submodule did not change inventory: clean=%#v dirty=%#v", cleanEntry, dirtyEntry)
+	}
+
+	testGit(t, root, "submodule", "deinit", "-q", "-f", "--", "vendor/module")
+	deinitialized := mustPreflight(t, Options{LaunchCWD: root, SessionDir: filepath.Join(t.TempDir(), "deinitialized-session")})
+	deinitializedEntry := inventoryEntries(t, deinitialized.sourceReport, "tracked_worktree")["vendor/module"]
+	if deinitializedEntry["present"] != false || deinitializedEntry["gitlink_state"] != "uninitialized" {
+		t.Fatalf("deinitialized submodule inventory = %#v", deinitializedEntry)
+	}
+	if _, exists := deinitializedEntry["submodule_head"]; exists {
+		t.Fatalf("deinitialized submodule claimed a HEAD: %#v", deinitializedEntry)
 	}
 }
 

@@ -50,7 +50,8 @@ type Options struct {
 }
 
 // PolicyResolution records the recipe minimum, caller request, effective
-// policy, and actual policy that the workspace implementation will achieve.
+// policy, and actual policy after successful materialization. Achieved remains
+// empty during pure preflight.
 type PolicyResolution struct {
 	Minimum           string
 	Requested         string
@@ -111,18 +112,11 @@ func ResolvePolicy(minimum string, requested string, requestedExplicit bool) (Po
 	if requestedRank > minimumRank {
 		effective = requested
 	}
-	achieved := PolicyInherited
-	if effective != PolicyInherited {
-		// Version 1 implements both required policies with a detached writable
-		// worktree, which is the stronger ephemeral behavior.
-		achieved = PolicyEphemeral
-	}
 	return PolicyResolution{
 		Minimum:           minimum,
 		Requested:         requested,
 		RequestedExplicit: requestedExplicit,
 		Effective:         effective,
-		Achieved:          achieved,
 	}, nil
 }
 
@@ -257,17 +251,20 @@ func (s *Snapshot) Report() map[string]any {
 	if s == nil {
 		return nil
 	}
-	return map[string]any{
+	report := map[string]any{
 		"minimum_policy":      s.policy.Minimum,
 		"requested_policy":    s.policy.Requested,
 		"requested_explicit":  s.policy.RequestedExplicit,
 		"effective_policy":    s.policy.Effective,
-		"achieved_policy":     s.policy.Achieved,
 		"session_dir":         s.sessionDir,
 		"session_path_source": s.sessionPathSource,
 		"source":              cloneMap(s.sourceReport),
 		"exclusions":          cloneMap(s.exclusions),
 	}
+	if s.policy.Achieved != "" {
+		report["achieved_policy"] = s.policy.Achieved
+	}
+	return report
 }
 
 func normalizePolicyDefault(value string) string {

@@ -14,11 +14,13 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"syscall"
 )
 
 var (
 	errNotGitRepository = errors.New("not a Git repository")
 	errUnbornRepository = errors.New("Git repository has no committed HEAD")
+	errInventoryDrift   = errors.New("source changed while its inventory was being captured")
 )
 
 type repositorySnapshot struct {
@@ -49,13 +51,16 @@ type headEntry struct {
 }
 
 type filesystemEntry struct {
-	path        string
-	present     bool
-	mode        string
-	permissions string
-	sizeBytes   int64
-	rawDigest   string
-	submoduleID string
+	path            string
+	present         bool
+	mode            string
+	permissions     string
+	sizeBytes       int64
+	rawDigest       string
+	obstruction     string
+	gitlinkState    string
+	submoduleID     string
+	submoduleDigest string
 }
 
 type gitCommandError struct {
@@ -74,6 +79,57 @@ func (e *gitCommandError) Error() string {
 func (e *gitCommandError) Unwrap() error { return e.cause }
 
 func inspectRepository(ctx context.Context, gitBinary string, launchCWD string) (*repositorySnapshot, error) {
+	previous, err := inspectRepositoryPass(ctx, gitBinary, launchCWD)
+	if err != nil {
+		return nil, err
+	}
+	// Require two matching complete inventories. One additional pass is a
+	// bounded retry for a source that changed between the first two passes.
+	for attempt := 0; attempt < 2; attempt++ {
+		current, err := inspectRepositoryPass(ctx, gitBinary, launchCWD)
+		if err != nil {
+			return nil, err
+		}
+		stable, err := repositorySnapshotsEquivalent(previous, current)
+		if err != nil {
+			return nil, err
+		}
+		if stable {
+			return current, nil
+		}
+		previous = current
+	}
+	return nil, errInventoryDrift
+}
+
+func repositorySnapshotsEquivalent(left *repositorySnapshot, right *repositorySnapshot) (bool, error) {
+	if left == nil || right == nil {
+		return left == right, nil
+	}
+	leftDigest, err := semanticDigest(map[string]any{
+		"root":           left.root,
+		"launch_cwd":     left.launchCWD,
+		"launch_subpath": left.launchSubpath,
+		"source":         left.sourceReport,
+		"exclusions":     left.exclusions,
+	})
+	if err != nil {
+		return false, err
+	}
+	rightDigest, err := semanticDigest(map[string]any{
+		"root":           right.root,
+		"launch_cwd":     right.launchCWD,
+		"launch_subpath": right.launchSubpath,
+		"source":         right.sourceReport,
+		"exclusions":     right.exclusions,
+	})
+	if err != nil {
+		return false, err
+	}
+	return leftDigest == rightDigest, nil
+}
+
+func inspectRepositoryPass(ctx context.Context, gitBinary string, launchCWD string) (*repositorySnapshot, error) {
 	rootOutput, err := runGit(ctx, gitBinary, launchCWD, "rev-parse", "--show-toplevel")
 	if err != nil {
 		if ctx != nil && ctx.Err() != nil {
@@ -139,7 +195,7 @@ func inspectRepository(ctx context.Context, gitBinary string, launchCWD string) 
 	trackedPaths := trackedPathUnion(indexEntries, headEntries)
 	trackedFilesystem := make([]filesystemEntry, 0, len(trackedPaths))
 	for _, path := range trackedPaths {
-		expectedGitlink := pathIsGitlink(path, indexEntries, headEntries)
+		expectedGitlink := pathIsGitlink(path, indexEntries)
 		entry, err := inspectFilesystemEntry(ctx, gitBinary, root, path, expectedGitlink)
 		if err != nil {
 			return nil, fmt.Errorf("tracked path %q: %w", path, err)
@@ -342,13 +398,8 @@ func trackedPathUnion(indexEntries []indexEntry, headEntries []headEntry) []stri
 	return result
 }
 
-func pathIsGitlink(path string, indexEntries []indexEntry, headEntries []headEntry) bool {
+func pathIsGitlink(path string, indexEntries []indexEntry) bool {
 	for _, entry := range indexEntries {
-		if entry.path == path && entry.mode == "160000" {
-			return true
-		}
-	}
-	for _, entry := range headEntries {
 		if entry.path == path && entry.mode == "160000" {
 			return true
 		}
@@ -363,8 +414,15 @@ func inspectFilesystemEntry(ctx context.Context, gitBinary string, root string, 
 	fullPath := filepath.Join(root, filepath.FromSlash(gitPath))
 	before, err := os.Lstat(fullPath)
 	if err != nil {
-		if os.IsNotExist(err) {
-			return filesystemEntry{path: gitPath, present: false}, nil
+		if os.IsNotExist(err) || errors.Is(err, syscall.ENOTDIR) {
+			entry := filesystemEntry{path: gitPath, present: false}
+			if errors.Is(err, syscall.ENOTDIR) {
+				entry.obstruction = "ancestor_not_directory"
+			}
+			if expectedGitlink {
+				entry.gitlinkState = "uninitialized"
+			}
+			return entry, nil
 		}
 		return filesystemEntry{}, err
 	}
@@ -383,15 +441,11 @@ func inspectFilesystemEntry(ctx context.Context, gitBinary string, root string, 
 		entry.rawDigest = digestBytes([]byte(target))
 		return entry, nil
 	}
-	if before.IsDir() && expectedGitlink {
-		output, err := runGit(ctx, gitBinary, fullPath, "rev-parse", "--verify", "HEAD^{commit}")
-		if err != nil {
-			return filesystemEntry{}, fmt.Errorf("gitlink HEAD: %w", err)
+	if before.IsDir() {
+		if expectedGitlink {
+			return inspectGitlinkEntry(ctx, gitBinary, fullPath, entry)
 		}
-		entry.mode = "160000"
-		entry.submoduleID = strings.TrimSpace(string(output))
-		entry.rawDigest = digestBytes([]byte(entry.submoduleID))
-		return entry, nil
+		return filesystemEntry{path: gitPath, present: false, obstruction: "directory"}, nil
 	}
 	if !before.Mode().IsRegular() {
 		return filesystemEntry{}, fmt.Errorf("source inventory supports regular files, symlinks, and gitlinks only")
@@ -428,6 +482,36 @@ func inspectFilesystemEntry(ctx context.Context, gitBinary string, root string, 
 	return entry, nil
 }
 
+func inspectGitlinkEntry(ctx context.Context, gitBinary string, fullPath string, entry filesystemEntry) (filesystemEntry, error) {
+	rootOutput, err := runGit(ctx, gitBinary, fullPath, "rev-parse", "--show-toplevel")
+	if err != nil {
+		entry.present = false
+		entry.gitlinkState = "uninitialized"
+		entry.permissions = ""
+		return entry, nil
+	}
+	discoveredRoot, err := canonicalExistingDirectory(strings.TrimSpace(string(rootOutput)))
+	if err != nil {
+		return filesystemEntry{}, err
+	}
+	if !pathsEquivalent(discoveredRoot, fullPath) {
+		entry.present = false
+		entry.gitlinkState = "uninitialized"
+		entry.permissions = ""
+		return entry, nil
+	}
+	submodule, err := inspectRepository(ctx, gitBinary, fullPath)
+	if err != nil {
+		return filesystemEntry{}, fmt.Errorf("gitlink inventory: %w", err)
+	}
+	entry.mode = "160000"
+	entry.gitlinkState = "initialized"
+	entry.submoduleID = submodule.headCommit
+	entry.submoduleDigest = submodule.sourceDigest
+	entry.rawDigest = submodule.sourceDigest
+	return entry, nil
+}
+
 func validateGitPath(path string) error {
 	if path == "" || strings.IndexByte(path, 0) >= 0 || filepath.IsAbs(filepath.FromSlash(path)) {
 		return fmt.Errorf("invalid Git path")
@@ -461,6 +545,12 @@ func filesystemEntriesReport(entries []filesystemEntry) []any {
 	for _, entry := range entries {
 		item := pathMap(entry.path)
 		item["present"] = entry.present
+		if entry.obstruction != "" {
+			item["obstruction"] = entry.obstruction
+		}
+		if entry.gitlinkState != "" {
+			item["gitlink_state"] = entry.gitlinkState
+		}
 		if entry.present {
 			item["mode"] = entry.mode
 			item["permissions"] = entry.permissions
@@ -468,6 +558,9 @@ func filesystemEntriesReport(entries []filesystemEntry) []any {
 			item["raw_digest"] = entry.rawDigest
 			if entry.submoduleID != "" {
 				item["submodule_head"] = entry.submoduleID
+			}
+			if entry.submoduleDigest != "" {
+				item["submodule_source_digest"] = entry.submoduleDigest
 			}
 		}
 		result = append(result, item)

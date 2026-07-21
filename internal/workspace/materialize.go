@@ -233,6 +233,12 @@ func verifyMaterializedWorktree(ctx context.Context, repository *repositorySnaps
 }
 
 func workspaceArtifact(snapshot *Snapshot, sessionDir string, worktreePath string, executionCWD string, registration worktreeRegistration) (map[string]any, error) {
+	achievedPolicy := PolicyInherited
+	if worktreePath != "" {
+		// Version 1 implements both required policies with a detached writable
+		// worktree, which is the stronger ephemeral behavior.
+		achievedPolicy = PolicyEphemeral
+	}
 	identity := map[string]any{
 		"session_dir":         sessionDir,
 		"session_path_source": snapshot.sessionPathSource,
@@ -284,7 +290,7 @@ func workspaceArtifact(snapshot *Snapshot, sessionDir string, worktreePath strin
 			"requested":          snapshot.policy.Requested,
 			"requested_explicit": snapshot.policy.RequestedExplicit,
 			"effective":          snapshot.policy.Effective,
-			"achieved":           snapshot.policy.Achieved,
+			"achieved":           achievedPolicy,
 		},
 		"identity":     identity,
 		"registration": registrationPayload,
