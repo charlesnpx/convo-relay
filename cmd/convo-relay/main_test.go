@@ -64,6 +64,117 @@ func TestRecipeCLIValidators(t *testing.T) {
 	}
 }
 
+func TestBackendsStatusJSONRunsOnlyVersionProbesByDefault(t *testing.T) {
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "backends.log")
+	t.Setenv("BACKENDS_TEST_LOG", logPath)
+	writeBackendProbeExecutable(t, dir, "claude", `
+case "$*" in
+  "--version") printf 'claude 1.0\n' ;;
+  *) printf 'unexpected:%s\n' "$*" >&2; exit 90 ;;
+esac`)
+	writeBackendProbeExecutable(t, dir, "codex", `
+case "$*" in
+  "--version") printf 'codex 1.0\n' ;;
+  *) printf 'unexpected:%s\n' "$*" >&2; exit 90 ;;
+esac`)
+	writeBackendProbeExecutable(t, dir, "gemini", `
+case "$*" in
+  "--version") printf 'gemini 1.0\n' ;;
+  *) printf 'unexpected:%s\n' "$*" >&2; exit 90 ;;
+esac`)
+	t.Setenv("PATH", dir)
+
+	oldArgs := os.Args
+	os.Args = []string{"convo-relay", "backends", "status", "--json"}
+	defer func() { os.Args = oldArgs }()
+	output := captureStdout(t, main)
+	report := decodeJSONObject(t, output)
+	if report["scope"] != "backends" || report["probe_auth"] != false {
+		t.Fatalf("backend report metadata = %#v", report)
+	}
+	backends, ok := report["backends"].([]any)
+	if !ok || len(backends) != 4 {
+		t.Fatalf("backend records = %#v", report["backends"])
+	}
+	for _, raw := range backends[:3] {
+		record := raw.(map[string]any)
+		if record["status"] != "installed_auth_unknown" || record["authentication_status"] != "unknown" {
+			t.Fatalf("default backend record = %#v", record)
+		}
+		auth := record["probe_detail"].(map[string]any)["authentication"].(map[string]any)
+		if auth["attempted"] != false || auth["status"] != "not_run" {
+			t.Fatalf("default authentication probe = %#v", auth)
+		}
+	}
+	relay := backends[3].(map[string]any)
+	if relay["backend"] != "relay" || relay["status"] != "ready" || relay["executable_path"] != "built-in" {
+		t.Fatalf("relay record = %#v", relay)
+	}
+	assertBackendProbeLog(t, logPath, []string{"claude:--version", "codex:--version", "gemini:--version"})
+}
+
+func TestBackendsStatusProbeAuthHumanOutput(t *testing.T) {
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "backends.log")
+	t.Setenv("BACKENDS_TEST_LOG", logPath)
+	writeBackendProbeExecutable(t, dir, "claude", `
+case "$*" in
+  "--version") printf 'claude 1.0\n' ;;
+  "auth status --json") printf '{"loggedIn":true}\n' ;;
+  *) exit 90 ;;
+esac`)
+	writeBackendProbeExecutable(t, dir, "codex", `
+case "$*" in
+  "--version") printf 'codex 1.0\n' ;;
+  "login status") printf 'Not logged in\n' >&2; exit 1 ;;
+  *) exit 90 ;;
+esac`)
+	writeBackendProbeExecutable(t, dir, "gemini", `
+case "$*" in
+  "--version") printf 'gemini 1.0\n' ;;
+  *) exit 90 ;;
+esac`)
+	t.Setenv("PATH", dir)
+
+	output := captureStdout(t, func() {
+		runBackends([]string{"status", "--probe-auth"})
+	})
+	for _, expected := range []string{"Backend readiness:", "claude  ready", "codex   auth_failed", "gemini  unsupported_probe", "relay   ready", "auth=unauthenticated", "auth=unsupported"} {
+		if !strings.Contains(output, expected) {
+			t.Fatalf("human backend output missing %q:\n%s", expected, output)
+		}
+	}
+	assertBackendProbeLog(t, logPath, []string{
+		"claude:--version",
+		"claude:auth status --json",
+		"codex:--version",
+		"codex:login status",
+		"gemini:--version",
+	})
+}
+
+func writeBackendProbeExecutable(t *testing.T, dir string, name string, body string) {
+	t.Helper()
+	path := filepath.Join(dir, name)
+	script := "#!/bin/sh\nprintf '" + name + ":%s\\n' \"$*\" >> \"$BACKENDS_TEST_LOG\"\n" + strings.TrimSpace(body) + "\n"
+	if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
+		t.Fatalf("write backend probe %s: %v", name, err)
+	}
+}
+
+func assertBackendProbeLog(t *testing.T, path string, want []string) {
+	t.Helper()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read backend probe log: %v", err)
+	}
+	got := strings.Split(strings.TrimSpace(string(data)), "\n")
+	if strings.Join(got, "|") != strings.Join(want, "|") {
+		t.Fatalf("backend probe log = %#v, want %#v", got, want)
+	}
+}
+
 func TestCompileRecipeJSONReportsTransientDigestPairs(t *testing.T) {
 	generatedTOML := `
 [relay_recipes.gen-cli-review]
