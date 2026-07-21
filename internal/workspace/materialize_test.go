@@ -233,6 +233,33 @@ func TestMaterializeRollsBackWorktreeWhenArtifactPersistenceFails(t *testing.T) 
 	}
 }
 
+func TestMaterializeCompensatesArtifactStateWhenFinalGraphWriteFails(t *testing.T) {
+	root := newCommittedRepo(t)
+	sessionDir := filepath.Join(t.TempDir(), "session")
+	graphPath := filepath.Join(sessionDir, store.GraphFilename)
+	if err := os.MkdirAll(graphPath, 0o755); err != nil {
+		t.Fatalf("create graph write blocker: %v", err)
+	}
+	snapshot := mustPreflight(t, Options{LaunchCWD: root, SessionDir: sessionDir, MinimumPolicy: PolicyEphemeral})
+	target := filepath.Join(sessionDir, "execution", "worktree")
+
+	materialized, err := Materialize(context.Background(), store.New(sessionDir), snapshot)
+	if materialized != nil {
+		t.Fatalf("late persistence failure returned materialized workspace: %#v", materialized)
+	}
+	requireDiagnosticCode(t, err, DiagnosticCodeIntegrity)
+	requirePathAbsent(t, target)
+	requirePathAbsent(t, filepath.Join(sessionDir, "artifacts", executionWorkspaceCategory, "selected.json"))
+	requirePathAbsent(t, filepath.Join(sessionDir, "artifacts", store.ArtifactIndexFilename))
+	if info, statErr := os.Stat(graphPath); statErr != nil || !info.IsDir() {
+		t.Fatalf("graph write blocker changed: %v, %v", info, statErr)
+	}
+	registered, inspectErr := repositoryWorktreeRegistered(context.Background(), snapshot.repository, target)
+	if inspectErr != nil || registered {
+		t.Fatalf("rolled back registration = %v, %v", registered, inspectErr)
+	}
+}
+
 func TestMaterializeRejectsStoreThatDiffersFromPreflight(t *testing.T) {
 	root := newCommittedRepo(t)
 	sessionDir := filepath.Join(t.TempDir(), "session-one")

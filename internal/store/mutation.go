@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -281,16 +282,131 @@ func (s *Store) saveIndexedArtifact(category string, artifactID string, payload 
 	if err != nil {
 		return nil, err
 	}
-	if err := AtomicWriteFile(filepath.Join(s.Root, filepath.FromSlash(relPath)), body); err != nil {
+	payloadPath := filepath.Join(s.Root, filepath.FromSlash(relPath))
+	rollbackFiles, err := captureArtifactWriteRollback([]string{
+		payloadPath,
+		filepath.Join(s.Root, "artifacts", ArtifactIndexFilename),
+		filepath.Join(s.Root, GraphFilename),
+	})
+	if err != nil {
 		return nil, err
+	}
+	if err := AtomicWriteFile(payloadPath, body); err != nil {
+		return nil, rollbackArtifactWrite(rollbackFiles, err)
 	}
 	if err := s.updateArtifactIndex(ref, relPath); err != nil {
-		return nil, err
+		return nil, rollbackArtifactWrite(rollbackFiles, err)
 	}
 	if err := s.recordArtifactGraphEntry(category, artifactID, relPath, ref); err != nil {
-		return nil, err
+		return nil, rollbackArtifactWrite(rollbackFiles, err)
 	}
 	return ref, nil
+}
+
+type artifactWriteRollbackKind uint8
+
+const (
+	artifactWriteAbsent artifactWriteRollbackKind = iota
+	artifactWriteRegular
+	artifactWriteSymlink
+	artifactWriteDirectory
+)
+
+type artifactWriteRollbackFile struct {
+	path       string
+	kind       artifactWriteRollbackKind
+	mode       os.FileMode
+	body       []byte
+	linkTarget string
+}
+
+func captureArtifactWriteRollback(paths []string) ([]artifactWriteRollbackFile, error) {
+	result := make([]artifactWriteRollbackFile, 0, len(paths))
+	for _, path := range paths {
+		snapshot := artifactWriteRollbackFile{path: path, kind: artifactWriteAbsent}
+		info, err := os.Lstat(path)
+		if os.IsNotExist(err) {
+			result = append(result, snapshot)
+			continue
+		}
+		if err != nil {
+			return nil, err
+		}
+		snapshot.mode = info.Mode()
+		switch {
+		case info.Mode().IsRegular():
+			snapshot.kind = artifactWriteRegular
+			snapshot.body, err = os.ReadFile(path)
+		case info.Mode()&os.ModeSymlink != 0:
+			snapshot.kind = artifactWriteSymlink
+			snapshot.linkTarget, err = os.Readlink(path)
+		case info.IsDir():
+			snapshot.kind = artifactWriteDirectory
+		default:
+			return nil, fmt.Errorf("artifact persistence target %s is not a regular file, symlink, directory, or absent", path)
+		}
+		if err != nil {
+			return nil, err
+		}
+		result = append(result, snapshot)
+	}
+	return result, nil
+}
+
+func rollbackArtifactWrite(files []artifactWriteRollbackFile, cause error) error {
+	errorsToJoin := []error{cause}
+	for index := len(files) - 1; index >= 0; index-- {
+		if err := files[index].restore(); err != nil {
+			errorsToJoin = append(errorsToJoin, fmt.Errorf("restore %s: %w", files[index].path, err))
+		}
+	}
+	return errors.Join(errorsToJoin...)
+}
+
+func (snapshot artifactWriteRollbackFile) restore() error {
+	info, err := os.Lstat(snapshot.path)
+	if err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	exists := err == nil
+	switch snapshot.kind {
+	case artifactWriteAbsent:
+		if !exists {
+			return nil
+		}
+		if info.IsDir() {
+			return fmt.Errorf("rollback target changed into a directory")
+		}
+		return os.Remove(snapshot.path)
+	case artifactWriteRegular:
+		if exists && info.IsDir() {
+			return fmt.Errorf("rollback target changed into a directory")
+		}
+		if err := AtomicWriteFile(snapshot.path, snapshot.body); err != nil {
+			return err
+		}
+		return os.Chmod(snapshot.path, snapshot.mode.Perm())
+	case artifactWriteSymlink:
+		if exists {
+			if info.IsDir() {
+				return fmt.Errorf("rollback target changed into a directory")
+			}
+			if err := os.Remove(snapshot.path); err != nil {
+				return err
+			}
+		}
+		if err := os.MkdirAll(filepath.Dir(snapshot.path), 0o755); err != nil {
+			return err
+		}
+		return os.Symlink(snapshot.linkTarget, snapshot.path)
+	case artifactWriteDirectory:
+		if exists && info.IsDir() {
+			return nil
+		}
+		return fmt.Errorf("rollback directory target changed during persistence")
+	default:
+		return fmt.Errorf("unknown artifact rollback state")
+	}
 }
 
 func (s *Store) artifactWritePath(stableRelPath string, payload map[string]any) (string, error) {

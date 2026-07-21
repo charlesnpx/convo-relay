@@ -240,12 +240,27 @@ func runGit(ctx context.Context, gitBinary string, cwd string, args ...string) (
 	}
 	commandArgs = append(commandArgs, args...)
 	command := exec.CommandContext(ctx, gitBinary, commandArgs...)
-	command.Env = append(os.Environ(), "LC_ALL=C", "GIT_TERMINAL_PROMPT=0", "GIT_OPTIONAL_LOCKS=0")
+	command.Env = controlledGitEnvironment(os.Environ())
 	output, err := command.CombinedOutput()
 	if err != nil {
 		return nil, &gitCommandError{args: args, detail: strings.TrimSpace(string(output)), cause: err}
 	}
 	return output, nil
+}
+
+func controlledGitEnvironment(environ []string) []string {
+	result := make([]string, 0, len(environ)+3)
+	for _, entry := range environ {
+		key := entry
+		if separator := strings.IndexByte(entry, '='); separator >= 0 {
+			key = entry[:separator]
+		}
+		if strings.EqualFold(key, "LC_ALL") || strings.HasPrefix(strings.ToUpper(key), "GIT_") {
+			continue
+		}
+		result = append(result, entry)
+	}
+	return append(result, "LC_ALL=C", "GIT_TERMINAL_PROMPT=0", "GIT_OPTIONAL_LOCKS=0")
 }
 
 func parseIndexEntries(data []byte) ([]indexEntry, error) {

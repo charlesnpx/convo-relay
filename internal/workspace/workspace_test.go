@@ -169,6 +169,41 @@ func TestPreflightInventoryIncludesRawSymlinkAndExecutableModes(t *testing.T) {
 	}
 }
 
+func TestPreflightIgnoresAmbientGitRepositoryRouting(t *testing.T) {
+	root := newCommittedRepo(t)
+	wantHead := testGit(t, root, "rev-parse", "HEAD")
+	redirected := newCommittedRepo(t)
+	writeTestFile(t, filepath.Join(redirected, "redirected.txt"), []byte("wrong repository\n"), 0o644)
+	testGit(t, redirected, "add", "--", "redirected.txt")
+	testGit(t, redirected, "commit", "-q", "-m", "redirected state")
+
+	t.Run("Git directory and work tree", func(t *testing.T) {
+		t.Setenv("GIT_DIR", filepath.Join(redirected, ".git"))
+		t.Setenv("GIT_WORK_TREE", redirected)
+
+		snapshot := mustPreflight(t, Options{LaunchCWD: root, SessionDir: filepath.Join(t.TempDir(), "session")})
+		if snapshot.GitRoot() != root {
+			t.Fatalf("Git root = %q, want %q", snapshot.GitRoot(), root)
+		}
+		if snapshot.HeadCommit() != wantHead {
+			t.Fatalf("HEAD was redirected: %s", snapshot.HeadCommit())
+		}
+	})
+
+	t.Run("alternate index", func(t *testing.T) {
+		t.Setenv("GIT_INDEX_FILE", filepath.Join(redirected, ".git", "index"))
+
+		snapshot := mustPreflight(t, Options{LaunchCWD: root, SessionDir: filepath.Join(t.TempDir(), "session")})
+		entries := inventoryEntries(t, snapshot.sourceReport, "index_entries")
+		if _, exists := entries["redirected.txt"]; exists {
+			t.Fatalf("inventory used ambient alternate index: %#v", entries["redirected.txt"])
+		}
+		if _, exists := entries["committed.txt"]; !exists {
+			t.Fatalf("inventory omitted intended index entries: %#v", entries)
+		}
+	})
+}
+
 func TestPreflightRequiredIsolationRejectsUnavailableGitStatesAndPathsWithoutMutation(t *testing.T) {
 	t.Run("non Git", func(t *testing.T) {
 		launch := t.TempDir()
