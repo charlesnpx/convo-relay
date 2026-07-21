@@ -39,6 +39,11 @@ type TransientRecipeSource struct {
 	RecipeIDs     []string          `json:"recipe_ids"`
 	RecipeDigests map[string]string `json:"recipe_digests,omitempty"`
 	ProfileIDs    []string          `json:"profile_ids,omitempty"`
+
+	// effectiveRawRecipes captures the merge point for this source so its
+	// source/recipe digest pair remains accurate when a later ordinary source
+	// overrides the same recipe ID. It is never serialized or persisted.
+	effectiveRawRecipes map[string]any
 }
 
 type TransientRecipeFile = TransientRecipeSource
@@ -72,8 +77,12 @@ func LoadRuntimeConfigWithTransientSources(settingsPath string, sources []Transi
 	if err != nil {
 		return RuntimeConfig{}, nil, err
 	}
+	if err := ValidateRawRelayRecipes(rawRecipes); err != nil {
+		return RuntimeConfig{}, nil, err
+	}
 	normalizedProfiles := NormalizeBackendProfiles(rawProfiles)
 	normalizedRecipes := NormalizeRelayRecipes(rawRecipes)
+	populateTransientRecipeDigests(transientFiles, normalizedRecipes)
 	if err := validateTransientRecipes(transientFiles, normalizedProfiles, normalizedRecipes); err != nil {
 		return RuntimeConfig{}, nil, err
 	}
@@ -95,8 +104,12 @@ func ApplyTransientRecipeSources(base RuntimeConfig, sources []TransientRecipeSo
 	if err != nil {
 		return RuntimeConfig{}, nil, err
 	}
+	if err := ValidateRawRelayRecipes(rawRecipes); err != nil {
+		return RuntimeConfig{}, nil, err
+	}
 	normalizedProfiles := NormalizeBackendProfiles(rawProfiles)
 	normalizedRecipes := NormalizeRelayRecipes(rawRecipes)
+	populateTransientRecipeDigests(transientFiles, normalizedRecipes)
 	if err := validateTransientRecipes(transientFiles, normalizedProfiles, normalizedRecipes); err != nil {
 		return RuntimeConfig{}, nil, err
 	}
@@ -241,10 +254,14 @@ func NormalizeRelayRecipes(rawRecipes map[string]any) map[string]map[string]any 
 			"reducer":               reducer,
 			"mode":                  normalizeMode(recipe["mode"]),
 			"max_rounds":            positiveInt(recipe["max_rounds"], 1),
+			"participant_turns":     positiveInt(recipe["participant_turns"], positiveInt(recipe["max_rounds"], 1)),
+			"result_source":         normalizeResultSource(recipe["result_source"]),
+			"integration_contract":  recipe["integration_contract"],
 			"max_depth":             positiveInt(recipe["max_depth"], 1),
 			"required_capabilities": cleanStringList(recipe["required_capabilities"], false),
 			"auto_approval":         normalizeAutoApproval(recipe["auto_approval"]),
 			"match_keywords":        cleanStringList(recipe["match_keywords"], true),
+			"lifecycle":             recipe["lifecycle"],
 			"origin":                recipe["origin"],
 			"generated_from_ref":    recipe["generated_from_ref"],
 			"generated_source":      recipe["generated_source"],
@@ -349,8 +366,12 @@ func loadTransientRecipeSources(sources []TransientRecipeSource, rawProfiles map
 		source.Content = string(data)
 		source.RawTOML = append([]byte(nil), data...)
 		source.RecipeIDs = recipeIDs
-		source.RecipeDigests = recipeDigestsForIDs(recipeIDs, NormalizeRelayRecipes(rawRecipes))
 		source.ProfileIDs = profileIDs
+		effectiveRawRecipes := make(map[string]any, len(recipeIDs))
+		for _, recipeID := range recipeIDs {
+			effectiveRawRecipes[recipeID] = contracts.Materialize(rawRecipes[recipeID])
+		}
+		source.effectiveRawRecipes = effectiveRawRecipes
 		files = append(files, source)
 	}
 	return files, nil
@@ -490,12 +511,23 @@ func recipeDigestsForIDs(recipeIDs []string, normalizedRecipes map[string]map[st
 		if recipe == nil {
 			continue
 		}
-		digest, err := contracts.ContractDigest(RecipeContractPayload(recipe))
+		digest, err := contracts.ContractDigest(ChildRecipeContractPayload(recipe))
 		if err == nil {
 			result[recipeID] = digest
 		}
 	}
 	return result
+}
+
+func populateTransientRecipeDigests(files []TransientRecipeSource, normalizedRecipes map[string]map[string]any) {
+	for index := range files {
+		effectiveRecipes := normalizedRecipes
+		if files[index].effectiveRawRecipes != nil {
+			effectiveRecipes = NormalizeRelayRecipes(files[index].effectiveRawRecipes)
+		}
+		files[index].RecipeDigests = recipeDigestsForIDs(files[index].RecipeIDs, effectiveRecipes)
+		files[index].effectiveRawRecipes = nil
+	}
 }
 
 func runtimeMapAsRaw(values map[string]map[string]any) map[string]any {

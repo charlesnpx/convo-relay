@@ -939,7 +939,7 @@ func persistTransientRecipeContractArtifacts(st *store.Store, files []recipes.Tr
 		if recipe == nil {
 			return nil, fmt.Errorf("transient recipe %q is missing from effective runtime config", recipeID)
 		}
-		ref, err := st.SaveContractArtifact("recipes", recipeID, recipes.RecipeContractPayload(recipe), "recipe:"+recipeID)
+		ref, err := st.SaveContractArtifact("recipes", recipeID, recipes.ChildRecipeContractPayload(recipe), "recipe:"+recipeID)
 		if err != nil {
 			return nil, err
 		}

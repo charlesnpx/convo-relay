@@ -303,7 +303,7 @@ func admitDynamicChild(st *store.Store, meta map[string]any, proposal map[string
 		"relay_backend_depth":     0,
 		"max_relay_backend_depth": effectiveRelayBackendMaxDepth(recipe),
 	}
-	compiledPlan, err := recipes.CompileRecipeToChildPlan(recipe, profiles, relayRecipes, recipes.CompileOptions{
+	compiledPlan, err := recipes.CompileRecipe(recipe, profiles, relayRecipes, recipes.CompileTargetChild, recipes.CompileOptions{
 		CompositionPath:      stringFromAny(runContext["composition_path"]),
 		RelayBackendDepth:    0,
 		MaxRelayBackendDepth: intFromAny(depthPolicy["max_relay_backend_depth"], 1),
@@ -316,7 +316,7 @@ func admitDynamicChild(st *store.Store, meta map[string]any, proposal map[string
 	if err != nil {
 		return dynamicAdmittedChild{}, proposal, err
 	}
-	recipePayload := recipes.RecipeContractPayload(recipe)
+	recipePayload := recipes.ChildRecipeContractPayload(recipe)
 	if recipeRef, ok := compiledPlan["recipe_ref"].(map[string]any); ok {
 		if _, err := st.SaveContractArtifact("recipes", stringFromAny(recipePayload["id"]), recipePayload, stringFromAny(recipeRef["id"])); err != nil {
 			return dynamicAdmittedChild{}, proposal, err
