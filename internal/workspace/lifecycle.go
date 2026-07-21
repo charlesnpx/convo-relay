@@ -106,16 +106,19 @@ func Finalize(ctx context.Context, st *store.Store) (*Finalization, error) {
 		return nil, contracts.NewValidationError("execution_workspace with source_before_digest requires persisted source Git paths")
 	}
 
-	repository, err := inspectRepository(ctx, "git", paths.sourceLaunchCWD)
+	// The source digest covers the complete repository and does not depend on
+	// the launch subdirectory. Inventory from the stable Git root so deleting
+	// or replacing that subdirectory is classified as source mutation instead
+	// of making terminal finalization impossible.
+	repository, err := inspectRepository(ctx, "git", paths.sourceGitRoot)
 	if err != nil {
 		return nil, fmt.Errorf("recompute source workspace inventory: %w", err)
 	}
 	if !pathsEquivalent(repository.root, paths.sourceGitRoot) {
 		return nil, contracts.NewValidationError("execution_workspace source Git root changed from %s to %s", paths.sourceGitRoot, repository.root)
 	}
-	if repository.launchSubpath != paths.launchSubpath {
-		return nil, contracts.NewValidationError("execution_workspace launch subpath changed from %s to %s", paths.launchSubpath, repository.launchSubpath)
-	}
+	repository.sourceReport["launch_cwd"] = paths.sourceLaunchCWD
+	repository.sourceReport["launch_subpath"] = paths.launchSubpath
 	after := repository.sourceDigest
 	changed := before != after
 	mutated := changed && policy.achieved != PolicyInherited
@@ -386,24 +389,17 @@ func validatePersistedWorkspace(st *store.Store, artifact map[string]any) (persi
 		}
 		paths.sourceGitRoot = canonicalRoot
 	}
-	if paths.sourceLaunchCWD != "" {
-		canonicalLaunch, err := canonicalExistingDirectory(paths.sourceLaunchCWD)
-		if err != nil {
-			return persistedWorkspacePaths{}, fmt.Errorf("resolve persisted source launch directory: %w", err)
+	if paths.sourceLaunchCWD != "" && paths.sourceGitRoot != "" {
+		relative := filepath.Clean(filepath.FromSlash(paths.launchSubpath))
+		if paths.launchSubpath == "" || filepath.IsAbs(relative) || relative == ".." || strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
+			return persistedWorkspacePaths{}, contracts.NewValidationError("execution_workspace launch subpath is outside its Git root")
 		}
-		paths.sourceLaunchCWD = canonicalLaunch
-		if paths.sourceGitRoot != "" {
-			relative, relErr := filepath.Rel(paths.sourceGitRoot, canonicalLaunch)
-			if relErr != nil || filepath.IsAbs(relative) || relative == ".." || strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
-				return persistedWorkspacePaths{}, contracts.NewValidationError("execution_workspace source launch directory is outside its Git root")
-			}
-			if relative == "" {
-				relative = "."
-			}
-			if filepath.ToSlash(relative) != paths.launchSubpath {
-				return persistedWorkspacePaths{}, contracts.NewValidationError("execution_workspace launch subpath does not match persisted source paths")
-			}
+		expectedLaunch := filepath.Clean(filepath.Join(paths.sourceGitRoot, relative))
+		storedLaunch, err := filepath.Abs(paths.sourceLaunchCWD)
+		if err != nil || !pathsEquivalent(filepath.Clean(storedLaunch), expectedLaunch) {
+			return persistedWorkspacePaths{}, contracts.NewValidationError("execution_workspace launch subpath does not match persisted source paths")
 		}
+		paths.sourceLaunchCWD = filepath.Clean(storedLaunch)
 	}
 	return paths, nil
 }

@@ -88,6 +88,73 @@ func TestFinalizePersistsSourceAfterAndRetainsIsolatedEvidence(t *testing.T) {
 	}
 }
 
+func TestFinalizeDeletedLaunchSubdirectoryRecordsMutationAndAllowsCleanup(t *testing.T) {
+	root := newCommittedRepo(t)
+	launchDir := filepath.Join(root, "nested", "launch")
+	writeTestFile(t, filepath.Join(launchDir, "source.txt"), []byte("committed launch source\n"), 0o644)
+	testGit(t, root, "add", "--all")
+	testGit(t, root, "commit", "-m", "add launch directory")
+
+	sessionDir := filepath.Join(t.TempDir(), "session")
+	snapshot := mustPreflight(t, Options{LaunchCWD: launchDir, SessionDir: sessionDir, MinimumPolicy: PolicyEphemeral})
+	st := store.New(sessionDir)
+	materialized, err := Materialize(context.Background(), st, snapshot)
+	if err != nil {
+		t.Fatalf("Materialize: %v", err)
+	}
+	registerWorktreeCleanup(t, root, materialized.WorktreePath)
+	if err := os.RemoveAll(filepath.Join(root, "nested")); err != nil {
+		t.Fatalf("remove source launch directory: %v", err)
+	}
+
+	finalized, err := Finalize(context.Background(), st)
+	if err != nil {
+		t.Fatalf("Finalize deleted launch directory: %v", err)
+	}
+	if !finalized.SourceChanged || !finalized.SourceMutated || finalized.SourceAfterDigest == "" {
+		t.Fatalf("deleted launch directory finalization = %#v", finalized)
+	}
+	if sourceAfter, _ := finalized.Artifact["source_after"].(map[string]any); sourceAfter["launch_cwd"] != launchDir || sourceAfter["launch_subpath"] != "nested/launch" {
+		t.Fatalf("source-after launch identity = %#v", sourceAfter)
+	}
+
+	cleanup, err := Cleanup(context.Background(), st)
+	if err != nil || !cleanup.WorktreeRemoved || !cleanup.MetadataPruned {
+		t.Fatalf("Cleanup deleted launch directory = %#v, %v", cleanup, err)
+	}
+	requirePathAbsent(t, materialized.WorktreePath)
+}
+
+func TestCleanupAllowsLaunchSubdirectoryRemovalAfterFinalization(t *testing.T) {
+	root := newCommittedRepo(t)
+	launchDir := filepath.Join(root, "nested", "launch")
+	writeTestFile(t, filepath.Join(launchDir, "source.txt"), []byte("committed launch source\n"), 0o644)
+	testGit(t, root, "add", "--all")
+	testGit(t, root, "commit", "-m", "add launch directory")
+
+	sessionDir := filepath.Join(t.TempDir(), "session")
+	snapshot := mustPreflight(t, Options{LaunchCWD: launchDir, SessionDir: sessionDir, MinimumPolicy: PolicyEphemeral})
+	st := store.New(sessionDir)
+	materialized, err := Materialize(context.Background(), st, snapshot)
+	if err != nil {
+		t.Fatalf("Materialize: %v", err)
+	}
+	registerWorktreeCleanup(t, root, materialized.WorktreePath)
+	finalized, err := Finalize(context.Background(), st)
+	if err != nil || finalized.SourceChanged {
+		t.Fatalf("initial Finalize = %#v, %v", finalized, err)
+	}
+	if err := os.RemoveAll(filepath.Join(root, "nested")); err != nil {
+		t.Fatalf("remove finalized launch directory: %v", err)
+	}
+
+	cleanup, err := Cleanup(context.Background(), st)
+	if err != nil || !cleanup.WorktreeRemoved || !cleanup.MetadataPruned {
+		t.Fatalf("Cleanup after finalized launch removal = %#v, %v", cleanup, err)
+	}
+	requirePathAbsent(t, materialized.WorktreePath)
+}
+
 func TestFinalizeInheritedRecordsChangeWithoutSourceMutationOverride(t *testing.T) {
 	root := newCommittedRepo(t)
 	sessionDir := filepath.Join(t.TempDir(), "session")
