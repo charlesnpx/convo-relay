@@ -911,6 +911,11 @@ func TestRunRejectsOversizedTransientRecipeBeforeSessionCreation(t *testing.T) {
 func TestMutateSessionRuntimeConfigPersistsSnapshotGraphAndSupportsApproval(t *testing.T) {
 	env := setupFakeCodex(t)
 	sessionDir := filepath.Join(env.relayHome, "sessions", "runtime-config-mutation")
+	runtimeConfig, err := recipes.LoadRuntimeConfig(filepath.Join(env.relayHome, "missing-runtime-limits.toml"))
+	if err != nil {
+		t.Fatalf("load runtime config: %v", err)
+	}
+	runtimeConfig.Limits.IntegrationBundleMaxBytes = 2_097_152
 	if _, err := Run(context.Background(), Options{
 		SessionDir:     sessionDir,
 		Task:           "Runtime config mutation seed",
@@ -918,6 +923,7 @@ func TestMutateSessionRuntimeConfigPersistsSnapshotGraphAndSupportsApproval(t *t
 		Rounds:         1,
 		TimeoutSeconds: 5,
 		LaunchCWD:      env.projectDir,
+		RuntimeConfig:  runtimeConfig,
 	}); err != nil {
 		t.Fatalf("run seed: %v", err)
 	}
@@ -999,6 +1005,22 @@ max_depth = 1
 	}
 	if approval["status"] != "collapsed" {
 		t.Fatalf("approval = %#v", approval)
+	}
+	childSessionID := stringFromAny(approval["child_session_id"])
+	childDir := filepath.Join(env.relayHome, "sessions", childSessionID)
+	childStore := store.New(childDir)
+	childMeta := mustLoadMeta(t, childDir)
+	childSnapshot, err := childStore.LoadArtifact(childMeta["runtime_config_ref"].(map[string]any))
+	if err != nil {
+		t.Fatalf("load child runtime snapshot: %v", err)
+	}
+	childSnapshotLimits := childSnapshot["limits"].(map[string]any)
+	if fmt.Sprint(childSnapshotLimits["integration_bundle_max_bytes"]) != "2097152" {
+		t.Fatalf("child runtime snapshot limits = %#v", childSnapshotLimits)
+	}
+	childGraphLimits := childStore.LoadGraph()["runtime_limits"].(map[string]any)
+	if fmt.Sprint(childGraphLimits["integration_bundle_max_bytes"]) != "2097152" {
+		t.Fatalf("child graph runtime limits = %#v", childGraphLimits)
 	}
 }
 

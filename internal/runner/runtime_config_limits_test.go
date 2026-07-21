@@ -2,6 +2,7 @@ package runner
 
 import (
 	"fmt"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -36,17 +37,15 @@ func TestRuntimeConfigV2SnapshotRoundTripPreservesLimits(t *testing.T) {
 	}
 }
 
-func TestRuntimeConfigV1SnapshotRemainsReadableWithDefaultLimit(t *testing.T) {
-	st := store.New(t.TempDir())
-	config := runtimeLimitsTestConfig(0)
-	ref, err := st.SaveArtifact("runtime_config", "legacy-v1", map[string]any{
-		"version":          RuntimeConfigSnapshotVersionV1,
-		"settings_path":    config.SettingsPath,
-		"backend_profiles": config.BackendProfiles,
-		"relay_recipes":    config.RelayRecipes,
-	})
+func TestRuntimeConfigV1SnapshotFixtureRemainsReadableWithDefaultLimit(t *testing.T) {
+	fixtureRoot, err := filepath.Abs(filepath.Join("..", "..", "testdata", "sessions", "runtime-config-v1"))
 	if err != nil {
-		t.Fatalf("persist v1 snapshot: %v", err)
+		t.Fatalf("resolve fixture root: %v", err)
+	}
+	st := store.New(fixtureRoot)
+	ref, err := st.ResolveArtifactRef("artifacts/runtime_config/launch.json", "")
+	if err != nil {
+		t.Fatalf("resolve v1 snapshot fixture: %v", err)
 	}
 	loaded, err := loadRuntimeConfigFromSnapshot(st, ref)
 	if err != nil {
@@ -54,6 +53,9 @@ func TestRuntimeConfigV1SnapshotRemainsReadableWithDefaultLimit(t *testing.T) {
 	}
 	if loaded.Limits != recipes.DefaultRuntimeLimits() {
 		t.Fatalf("v1 limits = %#v", loaded.Limits)
+	}
+	if loaded.BackendProfiles["fixture-profile"]["backend"] != "codex" || loaded.RelayRecipes["fixture-recipe"] == nil {
+		t.Fatalf("v1 runtime config = %#v", loaded)
 	}
 }
 
