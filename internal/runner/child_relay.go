@@ -73,7 +73,7 @@ func runChildRelay(ctx context.Context, spec childRelaySpec) (*childRelayResult,
 	compiledPlan := spec.CompiledPlan
 	if compiledPlan == nil {
 		var err error
-		compiledPlan, err = recipes.CompileRecipeToChildPlan(spec.Recipe, spec.Profiles, spec.Recipes, recipes.CompileOptions{
+		compiledPlan, err = recipes.CompileRecipe(spec.Recipe, spec.Profiles, spec.Recipes, recipes.CompileTargetChild, recipes.CompileOptions{
 			CompositionPath:      compositionPath,
 			RelayBackendDepth:    intFromAny(spec.DepthPolicy["relay_backend_depth"], 0),
 			MaxRelayBackendDepth: intFromAny(spec.DepthPolicy["max_relay_backend_depth"], 1),
@@ -285,7 +285,7 @@ func saveChildContractArtifacts(st *store.Store, artifactID string, result *chil
 	if result == nil {
 		return refs, nil
 	}
-	recipePayload := recipes.RecipeContractPayload(recipe)
+	recipePayload := recipes.ChildRecipeContractPayload(recipe)
 	if recipeRef, ok := result.CompiledPlanContract["recipe_ref"].(map[string]any); ok {
 		ref, err := st.SaveContractArtifact("recipes", stringFromAny(recipePayload["id"]), recipePayload, stringFromAny(recipeRef["id"]))
 		if err != nil {

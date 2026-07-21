@@ -56,6 +56,11 @@ func BuildRecipeCatalogReportWithTransientSources(settingsPath string, sources [
 	if err != nil {
 		return RecipeCatalogReport{}, err
 	}
+	rawProfiles := mergeNamedRecords(defaultBackendProfiles, rawProfileOverrides)
+	rawRecipes := mergeNamedRecords(defaultRelayRecipes, rawRecipeOverrides)
+	normalizedProfiles := NormalizeBackendProfiles(rawProfileOverrides)
+	normalizedRecipes := NormalizeRelayRecipes(rawRecipeOverrides)
+	populateTransientRecipeDigests(transientSources, normalizedRecipes)
 	transientRecipeIDs := map[string]bool{}
 	for _, source := range transientSources {
 		for _, recipeID := range source.RecipeIDs {
@@ -63,10 +68,6 @@ func BuildRecipeCatalogReportWithTransientSources(settingsPath string, sources [
 		}
 	}
 	transientTraces := transientRecipeDigestTraces(transientSources)
-	rawProfiles := mergeNamedRecords(defaultBackendProfiles, rawProfileOverrides)
-	rawRecipes := mergeNamedRecords(defaultRelayRecipes, rawRecipeOverrides)
-	normalizedProfiles := NormalizeBackendProfiles(rawProfileOverrides)
-	normalizedRecipes := NormalizeRelayRecipes(rawRecipeOverrides)
 	profileIssues := profileDiagnostics(rawProfiles, normalizedProfiles, rawProfileOverrides)
 
 	records := make([]RecipeRecord, 0, len(rawRecipes)+len(rawRecipeOverrides))
@@ -297,33 +298,15 @@ func BuildRecipeIssueGroups(records []RecipeRecord, globalIssues []ChildRecipeIs
 }
 
 func recipeShapeIssues(recipeID string, recipe map[string]any) []ChildRecipeIssue {
-	issues := []ChildRecipeIssue{}
-	participants := cleanStringList(recipe["participants"], false)
-	if len(participants) != 2 {
+	diagnostics := validateRecipeRecord(recipe, appendRecipePointer("/relay_recipes", recipeID))
+	issues := make([]ChildRecipeIssue, 0, len(diagnostics))
+	for _, diagnostic := range diagnostics {
 		issues = append(issues, ChildRecipeIssue{
 			Category: "invalid_config",
-			Code:     "invalid_participants",
-			Message:  "Relay recipe must declare exactly two participants.",
-			Path:     "relay_recipes." + recipeID + ".participants",
-			Detail:   map[string]any{"participants": recipe["participants"]},
-		})
-	}
-	if _, ok := parseInt(recipe["max_rounds"]); recipe["max_rounds"] != nil && !ok {
-		issues = append(issues, ChildRecipeIssue{
-			Category: "invalid_config",
-			Code:     "invalid_max_rounds",
-			Message:  "Relay recipe max_rounds must be a positive integer.",
-			Path:     "relay_recipes." + recipeID + ".max_rounds",
-			Detail:   map[string]any{"max_rounds": recipe["max_rounds"]},
-		})
-	}
-	if _, ok := parseInt(recipe["max_depth"]); recipe["max_depth"] != nil && !ok {
-		issues = append(issues, ChildRecipeIssue{
-			Category: "invalid_config",
-			Code:     "invalid_max_depth",
-			Message:  "Relay recipe max_depth must be a positive integer.",
-			Path:     "relay_recipes." + recipeID + ".max_depth",
-			Detail:   map[string]any{"max_depth": recipe["max_depth"]},
+			Code:     diagnostic.Code,
+			Message:  diagnostic.Message,
+			Path:     diagnostic.Path,
+			Detail:   diagnostic.Details,
 		})
 	}
 	return issues

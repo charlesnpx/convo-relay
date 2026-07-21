@@ -7,6 +7,22 @@ import (
 )
 
 func normalizeRecipePayload(data map[string]any) map[string]any {
+	payload := normalizeLegacyRecipePayload(data)
+	participantTurns := positiveInt(data["participant_turns"], intFromAny(payload["max_rounds"], 1))
+	payload["participant_turns"] = participantTurns
+	payload["result_source"] = normalizeResultSource(data["result_source"])
+	payload["lifecycle"] = normalizeLifecyclePayload(data["lifecycle"])
+	if integrationContract := stringValue(data["integration_contract"]); strings.TrimSpace(integrationContract) != "" {
+		payload["integration_contract"] = integrationContract
+	}
+	return payload
+}
+
+// normalizeLegacyRecipePayload is the stable recipe projection referenced by
+// compiled_plan/v1. Root-only recipe fields deliberately do not enter this
+// payload so existing child plans, refs, and persisted fixtures retain their
+// established digests.
+func normalizeLegacyRecipePayload(data map[string]any) map[string]any {
 	participants := cleanStringList(data["participants"], false)
 	requiredCapabilities := cleanStringList(data["required_capabilities"], false)
 	matchKeywords := cleanStringList(data["match_keywords"], true)
@@ -42,6 +58,49 @@ func normalizeRecipePayload(data map[string]any) map[string]any {
 
 func RecipeContractPayload(data map[string]any) map[string]any {
 	return normalizeRecipePayload(data)
+}
+
+// ChildRecipeContractPayload returns the compatibility projection used by
+// compiled_plan/v1 and its persisted recipe artifact.
+func ChildRecipeContractPayload(data map[string]any) map[string]any {
+	return normalizeLegacyRecipePayload(data)
+}
+
+func normalizeResultSource(value any) string {
+	switch strings.TrimSpace(stringValue(value)) {
+	case "reducer":
+		return "reducer"
+	default:
+		return "last_turn"
+	}
+}
+
+func normalizeLifecyclePayload(value any) map[string]any {
+	lifecycle, _ := value.(map[string]any)
+	return map[string]any{
+		"resume":              normalizeAllowForbid(lifecycle["resume"]),
+		"steering":            normalizeAllowForbid(lifecycle["steering"]),
+		"dynamic":             normalizeAllowForbid(lifecycle["dynamic"]),
+		"workspace_isolation": normalizeWorkspaceIsolation(lifecycle["workspace_isolation"]),
+	}
+}
+
+func normalizeAllowForbid(value any) string {
+	if strings.TrimSpace(stringValue(value)) == "forbid" {
+		return "forbid"
+	}
+	return "allow"
+}
+
+func normalizeWorkspaceIsolation(value any) string {
+	switch strings.TrimSpace(stringValue(value)) {
+	case "read_only":
+		return "read_only"
+	case "ephemeral":
+		return "ephemeral"
+	default:
+		return "inherited"
+	}
 }
 
 func normalizeCompiledPlanPayload(data map[string]any) (map[string]any, error) {
