@@ -38,7 +38,7 @@ func LoadBundleFile(path string, maxBytes int64) (*Bundle, error) {
 	if err != nil {
 		return nil, err
 	}
-	bundle.SourcePath = absolutePath
+	bundle.sourcePath = absolutePath
 	return bundle, nil
 }
 
@@ -54,7 +54,7 @@ func SelectContract(bundle *Bundle, contractID string, requirement ScheduleRequi
 	if bundle == nil {
 		return nil, preflightError(DiagnosticCodeInvalidBundle, "", "Integration bundle is required.", nil)
 	}
-	contract, exists := bundle.Contracts[contractID]
+	contract, exists := bundle.contracts[contractID]
 	if !exists {
 		return nil, preflightError(
 			DiagnosticCodeContractNotFound,
@@ -66,7 +66,7 @@ func SelectContract(bundle *Bundle, contractID string, requirement ScheduleRequi
 	if err := validateContractSchedule(contractID, contract, requirement); err != nil {
 		return nil, err
 	}
-	selected := &SelectedContract{ID: contractID, Contract: contract}
+	selected := &SelectedContract{id: contractID, contract: contract}
 	digest, err := integrationSemanticDigest(selected.ToMap())
 	if err != nil {
 		return nil, wrapPreflightError(
@@ -77,7 +77,7 @@ func SelectContract(bundle *Bundle, contractID string, requirement ScheduleRequi
 			nil,
 		)
 	}
-	selected.Digest = digest
+	selected.digest = digest
 	return selected, nil
 }
 
@@ -110,9 +110,9 @@ func normalizeBundle(object map[string]any) (*Bundle, error) {
 	}
 
 	bundle := &Bundle{
-		SchemaVersion: BundleSchemaVersion,
-		ID:            bundleID,
-		Contracts:     make(map[string]*Contract, len(contractObjects)),
+		schemaVersion: BundleSchemaVersion,
+		id:            bundleID,
+		contracts:     make(map[string]*Contract, len(contractObjects)),
 	}
 	for _, contractID := range sortedKeys(contractObjects) {
 		if strings.TrimSpace(contractID) == "" {
@@ -127,13 +127,13 @@ func normalizeBundle(object map[string]any) (*Bundle, error) {
 		if err != nil {
 			return nil, err
 		}
-		bundle.Contracts[contractID] = contract
+		bundle.contracts[contractID] = contract
 	}
 	digest, err := integrationSemanticDigest(bundle.ToMap())
 	if err != nil {
 		return nil, wrapPreflightError(err, DiagnosticCodeInvalidBundle, "", "Integration bundle could not be hashed.", nil)
 	}
-	bundle.Digest = digest
+	bundle.digest = digest
 	return bundle, nil
 }
 

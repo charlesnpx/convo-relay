@@ -184,6 +184,8 @@ func TestSchemaReferencesMustBeResolvedLocalDefinitions(t *testing.T) {
 		`{"$defs":{"value":{"type":"string"}},"$ref":"#/$defs/value"}`,
 		`{"$defs":{"a/b~c":{"type":"integer"}},"$ref":"#/$defs/a~1b~0c"}`,
 		`{"$defs":{"a b":{"type":"integer"}},"$ref":"#/$defs/a%20b"}`,
+		`{"$defs":{"value":{"type":"integer"}},"$ref":"#/%24defs/value"}`,
+		`{"$defs":{"value":{"type":"integer"}},"$ref":"#%2F%24defs%2Fvalue"}`,
 		`{"$defs":{"outer":{"$defs":{"inner":{"type":"boolean"}},"$ref":"#/$defs/outer/$defs/inner"}},"$ref":"#/$defs/outer"}`,
 	}
 	for index, raw := range valid {
@@ -276,6 +278,18 @@ func TestSchemaKeywordShapesAndBoundsAreValidated(t *testing.T) {
 			_, err := CompileSchema(decodeJSONValue(t, raw), "/schema")
 			assertDiagnostic(t, err, DiagnosticCodeInvalidSchema, contracts.DiagnosticPhasePreflight)
 		})
+	}
+}
+
+func TestSchemaIntegerBoundsAcceptEquivalentJSONNumberForms(t *testing.T) {
+	_, err := CompileSchema(decodeJSONValue(t, `{
+      "type":"array",
+      "minItems":1.0,
+      "maxItems":1e2,
+      "items":{"type":"string","minLength":0.0,"maxLength":2e1}
+    }`), "/schema")
+	if err != nil {
+		t.Fatalf("compile integer-valued bounds: %v", err)
 	}
 }
 

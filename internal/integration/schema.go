@@ -200,7 +200,7 @@ func validateSchemaObject(schema map[string]any, path string, pointer string, re
 		case "const":
 			// Every JSON value is valid for const.
 		case "minLength", "maxLength", "minItems", "maxItems":
-			if _, ok := nonNegativeJSONInteger(value); !ok {
+			if !isNonNegativeSchemaInteger(value) {
 				return invalidSchemaValue(keywordPath, keyword+" must be a non-negative integer.")
 			}
 		case "minimum", "maximum", "exclusiveMinimum", "exclusiveMaximum":
@@ -235,7 +235,8 @@ func validateSchemaObject(schema map[string]any, path string, pointer string, re
 			}
 		case "$ref":
 			ref, ok := value.(string)
-			if !ok || !strings.HasPrefix(ref, "#/$defs/") {
+			segments, refErr := decodeLocalReference(ref)
+			if !ok || refErr != nil || len(segments) < 2 || segments[0] != "$defs" {
 				return preflightError(
 					DiagnosticCodeInvalidSchemaReference,
 					keywordPath,
@@ -320,12 +321,15 @@ func validateSchemaReference(root map[string]any, reference schemaReference, sch
 }
 
 func decodeLocalReference(ref string) ([]string, error) {
-	if !strings.HasPrefix(ref, "#/") {
-		return nil, fmt.Errorf("reference must begin with #/")
+	if !strings.HasPrefix(ref, "#") {
+		return nil, fmt.Errorf("reference must be a fragment")
 	}
 	fragment, err := url.PathUnescape(strings.TrimPrefix(ref, "#"))
 	if err != nil {
 		return nil, fmt.Errorf("invalid percent escape: %w", err)
+	}
+	if !strings.HasPrefix(fragment, "/") {
+		return nil, fmt.Errorf("reference fragment must contain a JSON Pointer")
 	}
 	rawSegments := strings.Split(strings.TrimPrefix(fragment, "/"), "/")
 	segments := make([]string, len(rawSegments))
@@ -352,6 +356,33 @@ func decodeLocalReference(ref string) ([]string, error) {
 		segments[index] = builder.String()
 	}
 	return segments, nil
+}
+
+func isNonNegativeSchemaInteger(value any) bool {
+	switch typed := value.(type) {
+	case json.Number:
+		parsed, ok := new(big.Rat).SetString(typed.String())
+		return ok && parsed.Sign() >= 0 && parsed.IsInt()
+	case int:
+		return typed >= 0
+	case int8:
+		return typed >= 0
+	case int16:
+		return typed >= 0
+	case int32:
+		return typed >= 0
+	case int64:
+		return typed >= 0
+	case uint, uint8, uint16, uint32, uint64:
+		return true
+	case float32:
+		value := float64(typed)
+		return !math.IsNaN(value) && !math.IsInf(value, 0) && value >= 0 && math.Trunc(value) == value
+	case float64:
+		return !math.IsNaN(typed) && !math.IsInf(typed, 0) && typed >= 0 && math.Trunc(typed) == typed
+	default:
+		return false
+	}
 }
 
 func unresolvedSchemaReference(reference schemaReference) error {

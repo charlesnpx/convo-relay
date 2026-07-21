@@ -47,22 +47,26 @@ func TestDecodeBundleNormalizesDefaultsAndComputesSeparateDigests(t *testing.T) 
 	if err != nil {
 		t.Fatalf("decode bundle: %v", err)
 	}
-	if bundle.SchemaVersion != BundleSchemaVersion || bundle.ID != "neutral/integration-v1" {
+	if bundle.SchemaVersion() != BundleSchemaVersion || bundle.ID() != "neutral/integration-v1" {
 		t.Fatalf("bundle identity = %#v", bundle)
 	}
-	input := bundle.Contracts["neutral/contract-v1"].Inputs["payload"]
+	contract, exists := bundle.Contract("neutral/contract-v1")
+	if !exists {
+		t.Fatal("normalized contract missing")
+	}
+	input := contract.Inputs["payload"]
 	if input.Required || input.Cardinality != CardinalityOne || input.MediaType != DefaultMediaType || input.MaxBytes != 64 {
 		t.Fatalf("normalized input = %#v", input)
 	}
-	if got := bundle.Contracts["neutral/contract-v1"].Result.Assertions; got == nil || len(got) != 0 {
+	if got := contract.Result.Assertions; got == nil || len(got) != 0 {
 		t.Fatalf("default assertions = %#v, want nonnil empty", got)
 	}
 	wantBundleDigest, err := integrationSemanticDigest(bundle.ToMap())
 	if err != nil {
 		t.Fatalf("bundle digest: %v", err)
 	}
-	if bundle.Digest != wantBundleDigest || !strings.HasPrefix(bundle.Digest, contracts.DigestPrefix) {
-		t.Fatalf("bundle digest = %q, want %q", bundle.Digest, wantBundleDigest)
+	if bundle.Digest() != wantBundleDigest || !strings.HasPrefix(bundle.Digest(), contracts.DigestPrefix) {
+		t.Fatalf("bundle digest = %q, want %q", bundle.Digest(), wantBundleDigest)
 	}
 
 	turns, err := AlternatingSchedule(2)
@@ -77,17 +81,17 @@ func TestDecodeBundleNormalizesDefaultsAndComputesSeparateDigests(t *testing.T) 
 	if err != nil {
 		t.Fatalf("selected digest: %v", err)
 	}
-	if selected.Digest != wantContractDigest || selected.Digest == bundle.Digest {
-		t.Fatalf("selected digest = %q, bundle digest = %q", selected.Digest, bundle.Digest)
+	if selected.Digest() != wantContractDigest || selected.Digest() == bundle.Digest() {
+		t.Fatalf("selected digest = %q, bundle digest = %q", selected.Digest(), bundle.Digest())
 	}
 
 	normalized := bundle.ToMap()
-	contract := normalized["contracts"].(map[string]any)["neutral/contract-v1"].(map[string]any)
-	normalizedInput := contract["inputs"].(map[string]any)["payload"].(map[string]any)
+	normalizedContract := normalized["contracts"].(map[string]any)["neutral/contract-v1"].(map[string]any)
+	normalizedInput := normalizedContract["inputs"].(map[string]any)["payload"].(map[string]any)
 	if normalizedInput["required"] != false || normalizedInput["media_type"] != DefaultMediaType {
 		t.Fatalf("normalized map input = %#v", normalizedInput)
 	}
-	assertions := contract["result"].(map[string]any)["assertions"].([]any)
+	assertions := normalizedContract["result"].(map[string]any)["assertions"].([]any)
 	if assertions == nil || len(assertions) != 0 {
 		t.Fatalf("normalized assertions = %#v", assertions)
 	}
@@ -107,8 +111,8 @@ func TestLoadBundleFileEnforcesRawByteLimitBeforeDecode(t *testing.T) {
 		t.Fatalf("load exact boundary: %v", err)
 	}
 	absolutePath, _ := filepath.Abs(path)
-	if bundle.SourcePath != absolutePath {
-		t.Fatalf("source path = %q, want %q", bundle.SourcePath, absolutePath)
+	if bundle.SourcePath() != absolutePath {
+		t.Fatalf("source path = %q, want %q", bundle.SourcePath(), absolutePath)
 	}
 
 	assertDiagnostic(t, loadBundleError(path, int64(len(validBundleJSON)-1)), DiagnosticCodeBundleReadFailed, contracts.DiagnosticPhasePreflight)
@@ -264,7 +268,11 @@ func TestContractTurnDeclarationsNormalizeByParticipantOrdinal(t *testing.T) {
 	if err != nil {
 		t.Fatalf("decode unordered declarations: %v", err)
 	}
-	for index, turn := range bundle.Contracts["neutral/contract-v1"].Turns {
+	contract, exists := bundle.Contract("neutral/contract-v1")
+	if !exists {
+		t.Fatal("normalized contract missing")
+	}
+	for index, turn := range contract.Turns {
 		if turn.ParticipantTurn != index+1 {
 			t.Fatalf("normalized turn %d = %#v", index, turn)
 		}
@@ -283,8 +291,8 @@ func TestBundleMayImplementMultipleOpaqueContracts(t *testing.T) {
 	if err != nil {
 		t.Fatalf("decode multi-contract bundle: %v", err)
 	}
-	if len(bundle.Contracts) != 2 {
-		t.Fatalf("contracts = %d, want 2", len(bundle.Contracts))
+	if len(bundle.Contracts()) != 2 {
+		t.Fatalf("contracts = %d, want 2", len(bundle.Contracts()))
 	}
 	turns, _ := AlternatingSchedule(2)
 	first, err := SelectContract(bundle, "neutral/contract-v1", ScheduleRequirement{Turns: turns, ResultSource: ResultSourceReducer})
@@ -295,7 +303,7 @@ func TestBundleMayImplementMultipleOpaqueContracts(t *testing.T) {
 	if err != nil {
 		t.Fatalf("select opaque: %v", err)
 	}
-	if first.Digest == second.Digest {
+	if first.Digest() == second.Digest() {
 		t.Fatal("selected contract digest did not bind the opaque contract id")
 	}
 }
@@ -328,7 +336,11 @@ func TestAssertionDeclarationsNormalizeAllVersionOneShapes(t *testing.T) {
 	if err != nil {
 		t.Fatalf("decode assertions: %v", err)
 	}
-	got := bundle.Contracts["neutral/contract-v1"].ToMap()["result"].(map[string]any)["assertions"]
+	contract, exists := bundle.Contract("neutral/contract-v1")
+	if !exists {
+		t.Fatal("normalized contract missing")
+	}
+	got := contract.ToMap()["result"].(map[string]any)["assertions"]
 	want := firstResult(object)["assertions"]
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("normalized assertions = %#v, want %#v", got, want)
@@ -373,11 +385,11 @@ func TestUnrelatedBundleContractsDoNotChangeSelectedContractDigest(t *testing.T)
 	turns, _ := AlternatingSchedule(2)
 	firstSelected, _ := SelectContract(firstBundle, "neutral/contract-v1", ScheduleRequirement{Turns: turns, ResultSource: ResultSourceReducer})
 	secondSelected, _ := SelectContract(secondBundle, "neutral/contract-v1", ScheduleRequirement{Turns: turns, ResultSource: ResultSourceReducer})
-	if firstBundle.Digest == secondBundle.Digest {
+	if firstBundle.Digest() == secondBundle.Digest() {
 		t.Fatal("bundle digest ignored an added contract")
 	}
-	if firstSelected.Digest != secondSelected.Digest {
-		t.Fatalf("unrelated contract changed selected digest: %q != %q", firstSelected.Digest, secondSelected.Digest)
+	if firstSelected.Digest() != secondSelected.Digest() {
+		t.Fatalf("unrelated contract changed selected digest: %q != %q", firstSelected.Digest(), secondSelected.Digest())
 	}
 }
 
@@ -466,7 +478,7 @@ func TestIntegrationDigestsBindSemanticKeysExcludedByLegacyDigest(t *testing.T) 
 			if err != nil {
 				t.Fatalf("decode after: %v", err)
 			}
-			if before.Digest == after.Digest {
+			if before.Digest() == after.Digest() {
 				t.Fatal("semantic bundle change did not change bundle digest")
 			}
 
@@ -478,10 +490,64 @@ func TestIntegrationDigestsBindSemanticKeysExcludedByLegacyDigest(t *testing.T) 
 			if err != nil {
 				t.Fatalf("select after: %v", err)
 			}
-			if beforeSelected.Digest == afterSelected.Digest {
+			if beforeSelected.Digest() == afterSelected.Digest() {
 				t.Fatal("semantic contract change did not change selected-contract digest")
 			}
 		})
+	}
+}
+
+func TestBundleAndSelectionAccessorsCannotInvalidateCachedDigests(t *testing.T) {
+	bundle, err := DecodeBundleBytes([]byte(validBundleJSON))
+	if err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	bundleMap := bundle.ToMap()
+	bundleDigest := bundle.Digest()
+
+	contract, exists := bundle.Contract("neutral/contract-v1")
+	if !exists {
+		t.Fatal("contract missing")
+	}
+	contract.Turns[0].Instructions = "mutated copy"
+	contract.Inputs["payload"].MaxBytes = 1
+	contractsCopy := bundle.Contracts()
+	delete(contractsCopy, "neutral/contract-v1")
+	returnedMap := bundle.ToMap()
+	returnedMap["id"] = "mutated copy"
+	returnedMap["contracts"].(map[string]any)["neutral/contract-v1"].(map[string]any)["turns"].([]any)[0].(map[string]any)["instructions"] = "mutated map"
+
+	if !reflect.DeepEqual(bundle.ToMap(), bundleMap) {
+		t.Fatalf("bundle changed through accessor copy: %#v", bundle.ToMap())
+	}
+	if bundle.Digest() != bundleDigest {
+		t.Fatalf("bundle digest changed through accessor copy: %q != %q", bundle.Digest(), bundleDigest)
+	}
+	wantBundleDigest, err := integrationSemanticDigest(bundle.ToMap())
+	if err != nil || wantBundleDigest != bundle.Digest() {
+		t.Fatalf("bundle digest no longer matches material: got %q want %q err=%v", bundle.Digest(), wantBundleDigest, err)
+	}
+
+	turns, _ := AlternatingSchedule(2)
+	selected, err := SelectContract(bundle, "neutral/contract-v1", ScheduleRequirement{Turns: turns, ResultSource: ResultSourceReducer})
+	if err != nil {
+		t.Fatalf("select: %v", err)
+	}
+	selectedMap := selected.ToMap()
+	selectedDigest := selected.Digest()
+	selectedCopy := selected.Contract()
+	selectedCopy.Turns[0].Instructions = "mutated selected copy"
+	selectedSchemaCopy := selectedCopy.Result.Schema.Document()
+	selectedSchemaCopy["type"] = "array"
+	if !reflect.DeepEqual(selected.ToMap(), selectedMap) {
+		t.Fatalf("selected contract changed through accessor copy: %#v", selected.ToMap())
+	}
+	if selected.ID() != "neutral/contract-v1" || selected.Digest() != selectedDigest {
+		t.Fatalf("selected identity changed: id=%q digest=%q", selected.ID(), selected.Digest())
+	}
+	wantSelectedDigest, err := integrationSemanticDigest(selected.ToMap())
+	if err != nil || wantSelectedDigest != selected.Digest() {
+		t.Fatalf("selected digest no longer matches material: got %q want %q err=%v", selected.Digest(), wantSelectedDigest, err)
 	}
 }
 

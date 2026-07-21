@@ -34,11 +34,11 @@ const (
 // integration bundle. SourcePath is informational and is deliberately absent
 // from ToMap and Digest.
 type Bundle struct {
-	SchemaVersion string
-	ID            string
-	Contracts     map[string]*Contract
-	SourcePath    string
-	Digest        string
+	schemaVersion string
+	id            string
+	contracts     map[string]*Contract
+	sourcePath    string
+	digest        string
 }
 
 type Contract struct {
@@ -101,21 +101,71 @@ type ScheduleRequirement struct {
 }
 
 type SelectedContract struct {
-	ID       string
-	Contract *Contract
-	Digest   string
+	id       string
+	contract *Contract
+	digest   string
 }
 
 func (b *Bundle) ToMap() map[string]any {
-	contractMaps := make(map[string]any, len(b.Contracts))
-	for id, contract := range b.Contracts {
+	contractMaps := make(map[string]any, len(b.contracts))
+	for id, contract := range b.contracts {
 		contractMaps[id] = contract.ToMap()
 	}
 	return map[string]any{
-		"schema_version": b.SchemaVersion,
-		"id":             b.ID,
+		"schema_version": b.schemaVersion,
+		"id":             b.id,
 		"contracts":      contractMaps,
 	}
+}
+
+func (b *Bundle) SchemaVersion() string {
+	if b == nil {
+		return ""
+	}
+	return b.schemaVersion
+}
+
+func (b *Bundle) ID() string {
+	if b == nil {
+		return ""
+	}
+	return b.id
+}
+
+func (b *Bundle) SourcePath() string {
+	if b == nil {
+		return ""
+	}
+	return b.sourcePath
+}
+
+func (b *Bundle) Digest() string {
+	if b == nil {
+		return ""
+	}
+	return b.digest
+}
+
+func (b *Bundle) Contract(id string) (*Contract, bool) {
+	if b == nil {
+		return nil, false
+	}
+	contract, exists := b.contracts[id]
+	if !exists {
+		return nil, false
+	}
+	return cloneContract(contract), true
+}
+
+func (b *Bundle) Contracts() map[string]*Contract {
+	if b == nil {
+		return nil
+	}
+	result := make(map[string]*Contract, len(b.contracts))
+	for id, contract := range b.contracts {
+		result[id] = cloneContract(contract)
+	}
+	return result
 }
 
 func (c *Contract) ToMap() map[string]any {
@@ -161,9 +211,30 @@ func (d *InputDeclaration) ToMap() map[string]any {
 }
 
 func (s *SelectedContract) ToMap() map[string]any {
-	payload := s.Contract.ToMap()
-	payload["id"] = s.ID
+	payload := s.contract.ToMap()
+	payload["id"] = s.id
 	return payload
+}
+
+func (s *SelectedContract) ID() string {
+	if s == nil {
+		return ""
+	}
+	return s.id
+}
+
+func (s *SelectedContract) Contract() *Contract {
+	if s == nil {
+		return nil
+	}
+	return cloneContract(s.contract)
+}
+
+func (s *SelectedContract) Digest() string {
+	if s == nil {
+		return ""
+	}
+	return s.digest
 }
 
 func assertionMaps(assertions []AssertionDeclaration) []any {
@@ -218,5 +289,41 @@ func AlternatingSchedule(participantTurns int) ([]ScheduledTurn, error) {
 
 func cloneMap(value map[string]any) map[string]any {
 	cloned, _ := contracts.Materialize(value).(map[string]any)
+	return cloned
+}
+
+func cloneContract(contract *Contract) *Contract {
+	if contract == nil {
+		return nil
+	}
+	cloned := &Contract{
+		Turns:  append([]TurnDeclaration(nil), contract.Turns...),
+		Inputs: make(map[string]*InputDeclaration, len(contract.Inputs)),
+		Result: contract.Result,
+	}
+	if contract.Reducer != nil {
+		reducer := *contract.Reducer
+		cloned.Reducer = &reducer
+	}
+	for name, input := range contract.Inputs {
+		if input == nil {
+			cloned.Inputs[name] = nil
+			continue
+		}
+		declaration := *input
+		cloned.Inputs[name] = &declaration
+	}
+	cloned.Result.Assertions = make([]AssertionDeclaration, len(contract.Result.Assertions))
+	for index, assertion := range contract.Result.Assertions {
+		cloned.Result.Assertions[index] = assertion
+		if assertion.Left != nil {
+			left := *assertion.Left
+			cloned.Result.Assertions[index].Left = &left
+		}
+		if assertion.Right != nil {
+			right := *assertion.Right
+			cloned.Result.Assertions[index].Right = &right
+		}
+	}
 	return cloned
 }
