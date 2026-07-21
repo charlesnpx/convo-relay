@@ -129,6 +129,25 @@ func TestRepairAndSaveFromEventsWritesGraphSnapshot(t *testing.T) {
 	}
 }
 
+func TestArtifactGraphEntriesKeepStableContractRefIdentityAcrossRevisions(t *testing.T) {
+	first := artifactRef("execution_workspace:selected")
+	second := artifactRef("execution_workspace:selected")
+	second["digest"] = "sha256:1111111111111111111111111111111111111111111111111111111111111111"
+	artifacts := artifactGraphEntries(map[string]any{
+		"entries": []any{
+			map[string]any{"path": "artifacts/execution_workspace/selected.json", "ref": first},
+			map[string]any{"path": "artifacts/execution_workspace/selected-111111111111.json", "ref": second},
+		},
+	})
+	if len(artifacts) != 1 {
+		t.Fatalf("artifact revisions produced unstable graph keys: %#v", artifacts)
+	}
+	latest, ok := artifacts["execution_workspace/selected"].(map[string]any)
+	if !ok || latest["path"] != "artifacts/execution_workspace/selected-111111111111.json" || latest["ref"].(map[string]any)["digest"] != second["digest"] {
+		t.Fatalf("latest stable artifact entry = %#v", latest)
+	}
+}
+
 func TestSummaryIncludesNodesAndProposals(t *testing.T) {
 	graph := DefaultGraph()
 	graph["nodes"] = map[string]any{
