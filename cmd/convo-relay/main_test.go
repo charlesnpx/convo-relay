@@ -409,7 +409,7 @@ func TestRecipeRunStructuralOverridesUseOnlyVisitedFlags(t *testing.T) {
 	}
 }
 
-func TestRunRecipeCLIDispatchesDirectRootPreflightWithoutProviderLaunch(t *testing.T) {
+func TestRunRecipeCLIDispatchesDirectRootExecution(t *testing.T) {
 	tempDir := t.TempDir()
 	binary := filepath.Join(tempDir, "convo-relay")
 	build := exec.Command("go", "build", "-o", binary, ".")
@@ -572,8 +572,20 @@ if [ "$1" = "--version" ]; then
   printf 'codex test 1.0\n'
   exit 0
 fi
-printf 'provider launch was not expected\n' >&2
-exit 91
+prompt=$(cat)
+suffix=$(basename "${CODEX_HOME:-codex}")
+case " $* " in
+  *" resume "*) ;;
+  *) printf '{"type":"thread.started","thread_id":"root-cli-%s"}\n' "$suffix" ;;
+esac
+case "$prompt" in
+  *"Return the updated ledger as JSON"*)
+    printf '%s\n' '{"type":"item.completed","item":{"text":"{\"settled\":[\"cli\"],\"contested\":[],\"withdrawn\":[]}"}}'
+    ;;
+  *)
+    printf '{"type":"item.completed","item":{"text":"CLI participant %s"}}\n' "$suffix"
+    ;;
+esac
 `
 	if err := os.WriteFile(fakeCodex, []byte(fakeScript), 0o755); err != nil {
 		t.Fatalf("write fake codex: %v", err)
@@ -598,7 +610,7 @@ exit 91
 		t.Fatalf("run recipe CLI: %v\n%s", err, output)
 	}
 	result := decodeJSONObject(t, string(output))
-	if result["execution_kind"] != "recipe" || result["status"] != "ready" || result["recipe_id"] != "neutral-root" {
+	if result["execution_kind"] != "recipe" || result["status"] != "participants_complete" || result["recipe_id"] != "neutral-root" || intValue(result["actual_participant_turns"]) != 2 {
 		t.Fatalf("root CLI result = %#v", result)
 	}
 	if result["root_recipe_plan_ref"] == nil || result["latest_root_checkpoint_ref"] == nil {
@@ -611,7 +623,7 @@ exit 91
 	if err != nil {
 		t.Fatalf("read provider log: %v", err)
 	}
-	if strings.TrimSpace(string(logData)) != "--version" {
+	if lines := strings.Split(strings.TrimSpace(string(logData)), "\n"); len(lines) != 5 {
 		t.Fatalf("unexpected provider invocation log:\n%s", logData)
 	}
 	graphData, err := os.ReadFile(filepath.Join(sessionDir, "graph.json"))
@@ -656,7 +668,7 @@ exit 91
 	if err != nil {
 		t.Fatalf("read provider log after bound run: %v", err)
 	}
-	if strings.TrimSpace(string(logData)) != "--version\n--version" {
+	if lines := strings.Split(strings.TrimSpace(string(logData)), "\n"); len(lines) != 10 {
 		t.Fatalf("unexpected provider invocation log after bound run:\n%s", logData)
 	}
 
@@ -720,7 +732,7 @@ exit 91
 	if err != nil {
 		t.Fatalf("read provider log after compatible run: %v", err)
 	}
-	if strings.TrimSpace(string(logData)) != "--version\n--version\n--version" {
+	if lines := strings.Split(strings.TrimSpace(string(logData)), "\n"); len(lines) != 15 {
 		t.Fatalf("unexpected provider invocation log after compatible run:\n%s", logData)
 	}
 

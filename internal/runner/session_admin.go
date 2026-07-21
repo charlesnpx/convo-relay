@@ -99,7 +99,15 @@ func QueueSteeringPrompt(sessionDir string, prompt string) (map[string]any, erro
 	if text == "" {
 		return nil, fmt.Errorf("steering prompt cannot be empty")
 	}
-	if _, err := loadMeta(sessionDir); err != nil {
+	lock, err := lockSessionMutation(sessionDir)
+	if err != nil {
+		return nil, err
+	}
+	defer func() {
+		_ = lock.Unlock()
+	}()
+	meta, err := loadSessionMeta(sessionDir)
+	if err != nil {
 		return nil, err
 	}
 	item := map[string]any{
@@ -107,6 +115,31 @@ func QueueSteeringPrompt(sessionDir string, prompt string) (map[string]any, erro
 		"prompt":     text,
 		"source":     "steer",
 		"created_at": utcNow(),
+	}
+	if meta.String("execution_kind") == "recipe" {
+		lifecycle, _ := meta.Get("lifecycle").(map[string]any)
+		if strings.TrimSpace(stringFromAny(lifecycle["steering"])) == "forbid" {
+			return nil, rootRecipeDiagnostic(
+				diagnosticCodeRootSteeringForbidden,
+				contracts.DiagnosticPhasePolicy,
+				"/lifecycle/steering",
+				"Steering is forbidden by the root recipe lifecycle policy.",
+				nil,
+			)
+		}
+		nextOrdinal := meta.Int("next_unsealed_participant_turn", 0)
+		totalTurns := meta.Int("participant_turns", 0)
+		status := meta.String("status")
+		if (status != "ready" && status != "running") || nextOrdinal < 1 || nextOrdinal > totalTurns {
+			return nil, rootRecipeDiagnostic(
+				diagnosticCodeRootSteeringUnavailable,
+				contracts.DiagnosticPhasePolicy,
+				"/steering",
+				"Root recipe steering requires an unsealed participant prompt.",
+				map[string]any{"status": status, "participant_turns": totalTurns, "next_unsealed_participant_turn": emptyIntAsNil(nextOrdinal)},
+			)
+		}
+		item["target_participant_turn"] = nextOrdinal
 	}
 	prompts, err := loadSteeringPrompts(sessionDir)
 	if err != nil {
@@ -117,6 +150,98 @@ func QueueSteeringPrompt(sessionDir string, prompt string) (map[string]any, erro
 		return nil, err
 	}
 	return item, nil
+}
+
+func claimRootParticipantSteering(sessionDir string, ordinal int) ([]map[string]any, model.SessionMeta, error) {
+	lock, err := lockSessionMutation(sessionDir)
+	if err != nil {
+		return nil, model.EmptySessionMeta(), err
+	}
+	defer func() {
+		_ = lock.Unlock()
+	}()
+	meta, err := loadSessionMeta(sessionDir)
+	if err != nil {
+		return nil, model.EmptySessionMeta(), err
+	}
+	if meta.String("execution_kind") != "recipe" {
+		return nil, model.EmptySessionMeta(), rootRecipeDiagnostic(
+			diagnosticCodeRootSteeringStateInvalid,
+			contracts.DiagnosticPhasePolicy,
+			"/execution_kind",
+			"Participant prompt sealing requires a root recipe session.",
+			nil,
+		)
+	}
+	if ordinal < 1 || meta.Int("next_unsealed_participant_turn", 0) != ordinal {
+		return nil, model.EmptySessionMeta(), rootRecipeDiagnostic(
+			diagnosticCodeRootSteeringStateInvalid,
+			contracts.DiagnosticPhasePolicy,
+			"/next_unsealed_participant_turn",
+			"Root recipe participant prompts must be sealed exactly once in compiled order.",
+			map[string]any{"participant_turn": ordinal, "next_unsealed_participant_turn": meta.Get("next_unsealed_participant_turn")},
+		)
+	}
+	prompts, err := loadSteeringPrompts(sessionDir)
+	if err != nil {
+		return nil, model.EmptySessionMeta(), err
+	}
+	claimed := make([]map[string]any, 0, len(prompts))
+	remaining := make([]map[string]any, 0, len(prompts))
+	for _, item := range prompts {
+		target := intFromAny(item["target_participant_turn"], 0)
+		if target < 1 {
+			return nil, model.EmptySessionMeta(), rootRecipeDiagnostic(
+				diagnosticCodeRootSteeringStateInvalid,
+				contracts.DiagnosticPhasePolicy,
+				"/steering",
+				"Queued root recipe steering is missing its target participant turn.",
+				map[string]any{"steering_id": item["id"]},
+			)
+		}
+		if target < ordinal {
+			return nil, model.EmptySessionMeta(), rootRecipeDiagnostic(
+				diagnosticCodeRootSteeringStateInvalid,
+				contracts.DiagnosticPhasePolicy,
+				"/steering",
+				"Queued root recipe steering targets an already sealed participant turn.",
+				map[string]any{"steering_id": item["id"], "target_participant_turn": target},
+			)
+		}
+		if target == ordinal {
+			claimed = append(claimed, cloneMap(item))
+			continue
+		}
+		remaining = append(remaining, cloneMap(item))
+	}
+
+	updatedMeta := meta
+	for _, item := range claimed {
+		historyItem := cloneMap(item)
+		historyItem["consumed_at"] = utcNow()
+		historyItem["status"] = "consumed"
+		updatedMeta = updatedMeta.AppendToSlice("steering_history", historyItem)
+	}
+	updatedMeta = updatedMeta.
+		AppendToSlice("sealed_participant_turns", ordinal).
+		With("participant_prompt_sealed_through", ordinal).
+		With("participant_prompt_sealed_at", utcNow())
+	totalTurns := updatedMeta.Int("participant_turns", 0)
+	if ordinal < totalTurns {
+		updatedMeta = updatedMeta.With("next_unsealed_participant_turn", ordinal+1)
+	} else {
+		updatedMeta = updatedMeta.With("next_unsealed_participant_turn", nil)
+	}
+	if err := store.New(sessionDir).SaveMeta(updatedMeta); err != nil {
+		return nil, model.EmptySessionMeta(), err
+	}
+	if len(claimed) > 0 {
+		if err := saveSteeringPrompts(sessionDir, remaining); err != nil {
+			rollbackErr := store.New(sessionDir).SaveMeta(meta)
+			return nil, model.EmptySessionMeta(), errors.Join(err, rollbackErr)
+		}
+	}
+	return claimed, updatedMeta, nil
 }
 
 func CleanSession(sessionDir string) (map[string]any, error) {
@@ -641,6 +766,13 @@ func saveSteeringPrompts(sessionDir string, prompts []map[string]any) error {
 }
 
 func consumeSteeringPrompts(sessionDir string) ([]map[string]any, error) {
+	lock, err := lockSessionMutation(sessionDir)
+	if err != nil {
+		return nil, err
+	}
+	defer func() {
+		_ = lock.Unlock()
+	}()
 	prompts, err := loadSteeringPrompts(sessionDir)
 	if err != nil {
 		return nil, err
@@ -651,6 +783,13 @@ func consumeSteeringPrompts(sessionDir string) ([]map[string]any, error) {
 		}
 	}
 	return prompts, nil
+}
+
+func emptyIntAsNil(value int) any {
+	if value <= 0 {
+		return nil
+	}
+	return value
 }
 
 func appendSteeringBlock(prompt string, steeringPrompts []map[string]any) string {
