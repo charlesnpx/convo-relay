@@ -73,12 +73,7 @@ func runChildRelay(ctx context.Context, spec childRelaySpec) (*childRelayResult,
 	compiledPlan := spec.CompiledPlan
 	if compiledPlan == nil {
 		var err error
-		compiledPlan, err = recipes.CompileRecipe(spec.Recipe, spec.Profiles, spec.Recipes, recipes.CompileTargetChild, recipes.CompileOptions{
-			CompositionPath:      compositionPath,
-			RelayBackendDepth:    intFromAny(spec.DepthPolicy["relay_backend_depth"], 0),
-			MaxRelayBackendDepth: intFromAny(spec.DepthPolicy["max_relay_backend_depth"], 1),
-			ValidateExecutable:   true,
-		})
+		compiledPlan, err = compileChildRelayPlan(spec, compositionPath)
 		if err != nil {
 			return nil, childRelayConfigError(err)
 		}
@@ -148,6 +143,15 @@ func runChildRelay(ctx context.Context, spec childRelaySpec) (*childRelayResult,
 		result.Error = err.Error()
 	}
 	return result, err
+}
+
+func compileChildRelayPlan(spec childRelaySpec, compositionPath string) (map[string]any, error) {
+	return recipes.CompileRecipe(spec.Recipe, spec.Profiles, spec.Recipes, recipes.CompileTargetChild, recipes.CompileOptions{
+		CompositionPath:      compositionPath,
+		RelayBackendDepth:    intFromAny(spec.DepthPolicy["relay_backend_depth"], 0),
+		MaxRelayBackendDepth: intFromAny(spec.DepthPolicy["max_relay_backend_depth"], 1),
+		ValidateExecutable:   true,
+	})
 }
 
 func runtimeConfigForChildSpec(spec childRelaySpec) recipes.RuntimeConfig {

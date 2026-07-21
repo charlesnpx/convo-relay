@@ -56,6 +56,28 @@ func ExecutableIssues(
 	depthPolicy DepthPolicy,
 	compositionPath string,
 ) []ChildRecipeIssue {
+	return executableIssues(recipe, profiles, relayRecipes, depthPolicy, compositionPath, true)
+}
+
+func rootExecutableIssues(
+	recipe map[string]any,
+	profiles map[string]map[string]any,
+	relayRecipes map[string]map[string]any,
+	depthPolicy DepthPolicy,
+	compositionPath string,
+) []ChildRecipeIssue {
+	includeReducer := normalizeResultSource(recipe["result_source"]) == "reducer"
+	return executableIssues(recipe, profiles, relayRecipes, depthPolicy, compositionPath, includeReducer)
+}
+
+func executableIssues(
+	recipe map[string]any,
+	profiles map[string]map[string]any,
+	relayRecipes map[string]map[string]any,
+	depthPolicy DepthPolicy,
+	compositionPath string,
+	includeReducer bool,
+) []ChildRecipeIssue {
 	issues := []ChildRecipeIssue{}
 	recipeID := strings.TrimSpace(stringValue(recipe["id"]))
 	if recipeID == "" {
@@ -87,11 +109,13 @@ func ExecutableIssues(
 	}
 	appendProfileIssues(&issues, facilitatorRef, profiles, "recipe.facilitator", "facilitator", relayRecipes, false)
 
-	reducerRef := strings.TrimSpace(stringValue(recipe["reducer"]))
-	if reducerRef == "" {
-		reducerRef = facilitatorRef
+	if includeReducer {
+		reducerRef := strings.TrimSpace(stringValue(recipe["reducer"]))
+		if reducerRef == "" {
+			reducerRef = facilitatorRef
+		}
+		appendProfileIssues(&issues, reducerRef, profiles, "recipe.reducer", "reducer", relayRecipes, false)
 	}
-	appendProfileIssues(&issues, reducerRef, profiles, "recipe.reducer", "reducer", relayRecipes, false)
 
 	if len(issues) == 0 {
 		maxDepth := depthPolicy.MaxRelayBackendDepth

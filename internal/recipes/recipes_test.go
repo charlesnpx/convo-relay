@@ -15,7 +15,7 @@ func TestDefaultReviewPanelCompilesWithStablePythonDigest(t *testing.T) {
 	if err != nil {
 		t.Fatalf("load config: %v", err)
 	}
-	report, err := BuildCompileReport("review-panel", config, CompileOptions{
+	report, err := BuildCompileReport("review-panel", config, CompileTargetChild, CompileOptions{
 		CompositionPath:    "root",
 		ValidateExecutable: true,
 	})
@@ -65,7 +65,7 @@ max_depth = 1
 	if err != nil {
 		t.Fatalf("load config: %v", err)
 	}
-	report, err := BuildCompileReport("parent-review", config, CompileOptions{
+	report, err := BuildCompileReport("parent-review", config, CompileTargetChild, CompileOptions{
 		CompositionPath:    "root.slot_1",
 		ValidateExecutable: true,
 	})
@@ -231,7 +231,10 @@ max_depth = 1
 	if err != nil {
 		t.Fatalf("read source: %v", err)
 	}
-	report, err := BuildRecipeCatalogReportWithTransientSources(filepath.Join(t.TempDir(), "missing.toml"), sources)
+	report, err := BuildRecipeCatalogReportWithOptions(filepath.Join(t.TempDir(), "missing.toml"), RecipeCatalogOptions{
+		TransientSources: sources,
+		ReadinessCheck:   catalogReadinessCheck(nil),
+	})
 	if err != nil {
 		t.Fatalf("doctor report: %v", err)
 	}
@@ -251,7 +254,7 @@ max_depth = 1
 	if record.SourceDigest != sourceDigest || record.RecipeDigest != recipeDigest {
 		t.Fatalf("doctor digest pair = source %q recipe %q, want %q %q", record.SourceDigest, record.RecipeDigest, sourceDigest, recipeDigest)
 	}
-	compile, err := BuildCompileReport("stdin-review", config, CompileOptions{
+	compile, err := BuildCompileReport("stdin-review", config, CompileTargetChild, CompileOptions{
 		ValidateExecutable: true,
 		TransientSources:   transientRefs,
 	})
@@ -431,7 +434,7 @@ auto_approval = "auto-safe"
 	if contract["origin"] != "generated" || contract["generated_from_ref"] != "generated.toml" {
 		t.Fatalf("contract provenance = %#v", contract)
 	}
-	compile, err := BuildCompileReport("gen-review", config, CompileOptions{
+	compile, err := BuildCompileReport("gen-review", config, CompileTargetChild, CompileOptions{
 		ValidateExecutable: true,
 		TransientSources:   transientRefs,
 	})
@@ -471,7 +474,7 @@ reducer = "codex-deep"
 max_rounds = 2
 max_depth = 1
 `)
-	report, err := BuildRecipeCatalogReport(settingsPath)
+	report, err := BuildRecipeCatalogReportWithOptions(settingsPath, RecipeCatalogOptions{ReadinessCheck: catalogReadinessCheck(nil)})
 	if err != nil {
 		t.Fatalf("catalog: %v", err)
 	}
@@ -516,7 +519,7 @@ purpose = "Broken but parseable."
 participants = ["codex-fast"]
 max_rounds = "many"
 `)
-	report, err := BuildRecipeCatalogReport(settingsPath)
+	report, err := BuildRecipeCatalogReportWithOptions(settingsPath, RecipeCatalogOptions{ReadinessCheck: catalogReadinessCheck(nil)})
 	if err != nil {
 		t.Fatalf("catalog: %v", err)
 	}
@@ -570,7 +573,7 @@ reducer = "codex-deep"
 max_rounds = 1
 max_depth = 1
 `)
-	report, err := BuildRecipeCatalogReport(settingsPath)
+	report, err := BuildRecipeCatalogReportWithOptions(settingsPath, RecipeCatalogOptions{ReadinessCheck: catalogReadinessCheck(nil)})
 	if err != nil {
 		t.Fatalf("catalog: %v", err)
 	}
@@ -578,12 +581,12 @@ max_depth = 1
 		t.Fatalf("status = %s", report.Status)
 	}
 	unknown, _ := FindRecipeRecord(report.Recipes, "unknown-profile-review")
-	if unknown.Status != RecipeStatusUnavailable || !issueCodes(unknown.Diagnostics)["unknown_participant_profile"] {
+	if unknown.Status != RecipeStatusInvalid || !issueCodes(unknown.Diagnostics)["unknown_participant_profile"] {
 		t.Fatalf("unknown profile record = %#v", unknown)
 	}
 	parent, _ := FindRecipeRecord(report.Recipes, "parent-review")
 	codes := issueCodes(parent.Diagnostics)
-	if parent.Status != RecipeStatusUnavailable || !codes["invalid_relay_profile_effort"] || !codes["relay_backend_role_unsupported"] {
+	if parent.Status != RecipeStatusInvalid || !codes["invalid_relay_profile_effort"] || !codes["relay_backend_role_unsupported"] {
 		t.Fatalf("parent diagnostics = %#v", parent)
 	}
 	doctor := FormatRecipeDoctor(report)
@@ -631,7 +634,7 @@ max_depth = 1
 	if err != nil {
 		t.Fatalf("load config: %v", err)
 	}
-	_, err = BuildCompileReport("parent-review", config, CompileOptions{
+	_, err = BuildCompileReport("parent-review", config, CompileTargetChild, CompileOptions{
 		CompositionPath:    "root",
 		ValidateExecutable: true,
 	})
@@ -673,7 +676,7 @@ max_depth = 2
 		t.Fatalf("load config: %v", err)
 	}
 
-	_, err = BuildCompileReport("unknown-profile-review", config, CompileOptions{ValidateExecutable: true})
+	_, err = BuildCompileReport("unknown-profile-review", config, CompileTargetChild, CompileOptions{ValidateExecutable: true})
 	configErr, ok := err.(ChildRelayConfigError)
 	if !ok {
 		t.Fatalf("unknown profile error = %T %[1]v, want ChildRelayConfigError", err)
@@ -682,7 +685,7 @@ max_depth = 2
 		t.Fatalf("missing unknown profile issue: %#v", configErr.Issues)
 	}
 
-	_, err = BuildCompileReport("unknown-child-review", config, CompileOptions{ValidateExecutable: true})
+	_, err = BuildCompileReport("unknown-child-review", config, CompileTargetChild, CompileOptions{ValidateExecutable: true})
 	configErr, ok = err.(ChildRelayConfigError)
 	if !ok {
 		t.Fatalf("unknown child recipe error = %T %[1]v, want ChildRelayConfigError", err)
@@ -729,7 +732,7 @@ max_depth = 3
 		t.Fatalf("load config: %v", err)
 	}
 	for _, recipeID := range []string{"self-review", "parent-review"} {
-		_, err := BuildCompileReport(recipeID, config, CompileOptions{
+		_, err := BuildCompileReport(recipeID, config, CompileTargetChild, CompileOptions{
 			CompositionPath:    "root",
 			ValidateExecutable: true,
 		})
@@ -742,7 +745,7 @@ max_depth = 3
 		}
 	}
 
-	_, err = BuildCompileReport("parent-review", config, CompileOptions{
+	_, err = BuildCompileReport("parent-review", config, CompileTargetChild, CompileOptions{
 		CompositionPath:      "root",
 		MaxRelayBackendDepth: 1,
 		ValidateExecutable:   true,
@@ -761,7 +764,7 @@ func TestCompiledPlanDigestMatchesContractDigest(t *testing.T) {
 	if err != nil {
 		t.Fatalf("load config: %v", err)
 	}
-	report, err := BuildCompileReport("review-panel", config, CompileOptions{ValidateExecutable: true})
+	report, err := BuildCompileReport("review-panel", config, CompileTargetChild, CompileOptions{ValidateExecutable: true})
 	if err != nil {
 		t.Fatalf("compile: %v", err)
 	}

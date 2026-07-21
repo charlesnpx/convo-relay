@@ -684,7 +684,7 @@ func (s *runState) finalizeTurn(ctx context.Context, roundNum int, slot Backend,
 	}
 	lineages := updateContestedLineages(s.meta.Get("contested_lineages"), previousLedger.ToMap(), ledger.ToMap(), roundNum, stringFromAny(event["event_id"]))
 	if normalizeDynamicMode(s.dynamicMode) != defaultDynamicMode {
-		if _, err := maybeCreateSpawnProposals(s.st, s.dynamicMode, lineages, previousLedger.ToMap(), ledger.ToMap(), roundNum, stringFromAny(event["event_id"]), s.runtimeConfig.RelayRecipes); err != nil {
+		if _, err := maybeCreateSpawnProposals(s.st, s.dynamicMode, lineages, previousLedger.ToMap(), ledger.ToMap(), roundNum, stringFromAny(event["event_id"]), s.runtimeConfig.BackendProfiles, s.runtimeConfig.RelayRecipes); err != nil {
 			return err
 		}
 	}

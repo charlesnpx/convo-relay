@@ -305,9 +305,13 @@ convo-relay recipes list --status all --json
 convo-relay recipes show review-panel
 convo-relay recipes show review-panel --view resolved
 convo-relay recipes doctor
+convo-relay compile-recipe --recipe review-panel --target child
+convo-relay compile-recipe --recipe review-panel --target root
 ```
 
-`recipes list` shows usable recipes by default in human output. JSON output includes all statuses unless `--status` is supplied, including invalid or skipped parseable records that would otherwise be hidden by runtime normalization. `recipes show` reports declared recipe data and resolved participants/backends; invalid parseable recipes still display with diagnostics. `recipes doctor` validates settings parseability, recipe/profile references, nested relay profile rules, and grouped root-cause diagnostics.
+`recipes list` shows usable recipes and recipes that require an integration bundle by default in human output. JSON output includes all statuses unless `--status` is supplied, including invalid or skipped parseable records that would otherwise be hidden by runtime normalization. `recipes show` reports declared recipe data, integration binding, and resolved participant/backend readiness. `recipes doctor` validates settings parseability, recipe/profile references, nested relay profile rules, installation-only backend readiness, and grouped root-cause diagnostics. A missing integration bundle reports `requires_integration` without degrading list or doctor; pass `--integration-bundle <file>` to list, show, doctor, or root compilation to bind an exact contract.
+
+`compile-recipe` defaults `--target` to `child` for compatibility. Child compilation emits `compiled_plan/v1` and rejects integration-bound recipes as root-only. Explicit `--target root` emits `root_recipe_plan/v1` and binds a matching integration bundle when the recipe declares a contract.
 
 When a top-level slot uses the `relay` backend, `--model-a` or `--model-b` selects the relay backend recipe for that slot. Nested relay profiles do not read those top-level model flags; their recipe and profile selection comes from the settings file.
 
@@ -516,15 +520,17 @@ Then read /tmp/auth-review.md and summarize what each agent found.
 | `--task-plan FILE` | run | Attach the launch task plan from a JSON or markdown/text file so display exports can show it |
 | `--investigation {auto,normal,context_only}` | run | Prompt policy for evidence behavior. Default `auto` cites inspected files/context; `normal` is conceptual; `context_only` requires `--context` and avoids repo exploration |
 | `--dynamic {off,ask,auto-safe}` | run | Enable dynamic spawn proposal handling. Default is `off` |
-| `--settings FILE` | run, resume, approve, health, recipes | Read backend profiles and relay recipes from a TOML settings file |
+| `--settings FILE` | run, resume, approve, health, recipes, compile-recipe | Read backend profiles and relay recipes from a TOML settings file |
 | `--facilitator-backend BACKEND` | run | Override the facilitator backend |
 | `--facilitator-model MODEL` | run, resume | Override the facilitator model. Default is `gpt-5.5` for Codex facilitator runs |
 | `-v, --verbose` | run, resume | Print progress to stderr |
 | `-s, --stream` | run | Stream live subprocess stdout to stderr |
 | `-o, --output` | run, resume, export | Write an export to a specific file. Required for `export`; optional for `run` and `resume` |
-| `--json` | run, show, export, health, recipes, resume, contracts | Use JSON instead of markdown |
-| `--status {usable,unavailable,invalid,skipped,all}` | recipes list | Filter recipes by diagnostic status |
+| `--json` | run, show, export, health, recipes, compile-recipe, backends, resume, contracts | Use JSON instead of markdown |
+| `--status {usable,requires_integration,unavailable,invalid,skipped,all}` | recipes list | Filter recipes by catalog status |
 | `--view {all,declared,resolved}` | recipes show | Select declared and/or resolved recipe details |
+| `--target {root,child}` | compile-recipe | Select a recipe compile target; defaults to `child` |
+| `--integration-bundle FILE` | recipes list/show/doctor, compile-recipe | Bind catalog records or an explicitly root-targeted compile to a strict integration bundle |
 | `--raw` | contracts | Include full loaded artifact payloads |
 | `--ref REF_ID`, `--digest DIGEST` | contracts | Resolve one artifact ref from the index, using digest when ref ids are ambiguous |
 | `--html-only` | display | Generate HTML only, skip PDF rendering |

@@ -251,7 +251,7 @@ max_depth = 1
 	if secondDigest != wantFinal {
 		t.Fatalf("second source recipe digest = %s, want final digest %s", secondDigest, wantFinal)
 	}
-	report, err := BuildCompileReport("shared-review", config, CompileOptions{TransientSources: sources})
+	report, err := BuildCompileReport("shared-review", config, CompileTargetChild, CompileOptions{TransientSources: sources})
 	if err != nil {
 		t.Fatalf("compile final transient override: %v", err)
 	}
