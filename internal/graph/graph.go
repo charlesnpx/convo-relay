@@ -236,6 +236,13 @@ func artifactGraphEntries(index map[string]any) map[string]any {
 		}
 		category := parts[1]
 		artifactID := strings.TrimSuffix(path.Base(parts[len(parts)-1]), path.Ext(parts[len(parts)-1]))
+		if ref, ok := entry["ref"].(map[string]any); ok {
+			if refID, ok := ref["id"].(string); ok && strings.HasPrefix(refID, category+":") {
+				if stableID := strings.TrimPrefix(refID, category+":"); stableID != "" && stableID != "." && stableID != ".." && !strings.ContainsAny(stableID, "/\\") {
+					artifactID = stableID
+				}
+			}
+		}
 		artifacts[category+"/"+artifactID] = map[string]any{
 			"artifact_id": artifactID,
 			"category":    category,
