@@ -28,6 +28,7 @@ const (
 	DiagnosticCodeInvalidSchemaReference = "invalid_schema_reference"
 	DiagnosticCodeSchemaMismatch         = "schema_mismatch"
 	DiagnosticCodeInvalidAssertion       = "invalid_assertion_declaration"
+	DiagnosticCodeAssertionFailed        = "assertion_failed"
 )
 
 // Bundle is the normalized, immutable representation of one consumer-owned

@@ -67,6 +67,9 @@ func SelectContract(bundle *Bundle, contractID string, requirement ScheduleRequi
 		return nil, err
 	}
 	selected := &SelectedContract{id: contractID, contract: contract}
+	if err := validateAssertionDeclarations(selected); err != nil {
+		return nil, err
+	}
 	digest, err := integrationSemanticDigest(selected.ToMap())
 	if err != nil {
 		return nil, wrapPreflightError(
