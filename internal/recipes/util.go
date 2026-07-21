@@ -2,6 +2,7 @@ package recipes
 
 import (
 	"fmt"
+	"math"
 	"sort"
 	"strconv"
 	"strings"
@@ -93,11 +94,17 @@ func parseInt(value any) (int, bool) {
 	case int:
 		return typed, true
 	case int64:
+		if !fitsNativeInt(typed) {
+			return 0, false
+		}
 		return int(typed), true
 	case int32:
 		return int(typed), true
 	case float64:
-		return int(typed), typed == float64(int(typed))
+		if math.Trunc(typed) != typed || !floatFitsNativeInt(typed) {
+			return 0, false
+		}
+		return int(typed), true
 	case string:
 		parsed, err := strconv.Atoi(strings.TrimSpace(typed))
 		return parsed, err == nil
@@ -105,6 +112,14 @@ func parseInt(value any) (int, bool) {
 		parsed, err := strconv.Atoi(strings.TrimSpace(fmt.Sprint(value)))
 		return parsed, err == nil
 	}
+}
+
+func floatFitsNativeInt(value float64) bool {
+	if strconv.IntSize == 32 {
+		return value >= float64(math.MinInt32) && value <= float64(math.MaxInt32)
+	}
+	limit := math.Exp2(63)
+	return value >= -limit && value < limit
 }
 
 func normalizeMode(value any) string {

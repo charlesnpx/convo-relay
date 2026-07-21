@@ -170,6 +170,29 @@ func TestRootCompilationResolvesReducerOnlyWhenUsed(t *testing.T) {
 	}
 }
 
+func TestRootCompilationBoundsMaterializedParticipantSchedule(t *testing.T) {
+	config := defaultCompileConfig(t)
+	recipe := cloneObject(config.RelayRecipes["review-panel"])
+	recipe["participant_turns"] = maxCompiledParticipantTurns
+	plan, err := CompileRecipe(recipe, config.BackendProfiles, config.RelayRecipes, CompileTargetRoot, CompileOptions{})
+	if err != nil {
+		t.Fatalf("compile boundary schedule: %v", err)
+	}
+	if schedule := plan["participant_schedule"].([]any); len(schedule) != maxCompiledParticipantTurns {
+		t.Fatalf("boundary schedule length = %d, want %d", len(schedule), maxCompiledParticipantTurns)
+	}
+
+	recipe["participant_turns"] = maxCompiledParticipantTurns + 1
+	_, err = CompileRecipe(recipe, config.BackendProfiles, config.RelayRecipes, CompileTargetRoot, CompileOptions{})
+	diagnostic := requireRecipeDiagnostic(t, err, DiagnosticCodeInvalidParticipantTurns)
+	if diagnostic.Path != "/participant_turns" {
+		t.Fatalf("bounded schedule diagnostic path = %q", diagnostic.Path)
+	}
+	if _, err := CompileRecipe(recipe, config.BackendProfiles, config.RelayRecipes, CompileTargetChild, CompileOptions{}); err != nil {
+		t.Fatalf("child target should ignore root-only participant_turns bound: %v", err)
+	}
+}
+
 func TestRootAndChildDigestsRetainTargetSpecificFields(t *testing.T) {
 	config := defaultCompileConfig(t)
 	base := cloneObject(config.RelayRecipes["review-panel"])
@@ -242,6 +265,7 @@ func TestCompileRecipeIsOnlyExportedCanonicalCompiler(t *testing.T) {
 	if err != nil {
 		t.Fatalf("parse recipes package: %v", err)
 	}
+	compilerCount := 0
 	for _, parsed := range packages {
 		for _, file := range parsed.Files {
 			for _, declaration := range file.Decls {
@@ -249,12 +273,18 @@ func TestCompileRecipeIsOnlyExportedCanonicalCompiler(t *testing.T) {
 				if !ok || !function.Name.IsExported() {
 					continue
 				}
-				switch function.Name.Name {
-				case "CompileRootRecipe", "CompileRecipeToChildPlan":
-					t.Fatalf("parallel exported compiler %s remains", function.Name.Name)
+				name := function.Name.Name
+				if strings.HasPrefix(name, "Compile") && strings.Contains(name, "Recipe") {
+					if name != "CompileRecipe" {
+						t.Fatalf("parallel exported compiler %s remains", name)
+					}
+					compilerCount++
 				}
 			}
 		}
+	}
+	if compilerCount != 1 {
+		t.Fatalf("exported canonical compiler count = %d, want exactly one CompileRecipe", compilerCount)
 	}
 }
 

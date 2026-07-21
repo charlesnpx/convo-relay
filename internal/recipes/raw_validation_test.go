@@ -2,7 +2,9 @@ package recipes
 
 import (
 	"errors"
+	"math"
 	"path/filepath"
+	"strconv"
 	"testing"
 
 	"github.com/charlesnpx/convo-relay/internal/contracts"
@@ -179,6 +181,23 @@ func TestCompileRecipeValidatesDirectRawPayloadBeforeNormalization(t *testing.T)
 	}
 }
 
+func TestParticipantTurnIntegerValidationRejectsNativeOverflow(t *testing.T) {
+	err := ValidateRawRelayRecipes(map[string]any{
+		"overflow": map[string]any{
+			"participant_turns": math.Exp2(63),
+		},
+	})
+	requireRecipeDiagnostic(t, err, DiagnosticCodeInvalidParticipantTurns)
+	if _, ok := parseInt(math.Exp2(63)); ok {
+		t.Fatal("parseInt accepted a float outside int64 range")
+	}
+	if strconv.IntSize == 32 {
+		if _, ok := parseInt(int64(math.MaxInt32) + 1); ok {
+			t.Fatal("parseInt accepted an int64 outside native int range")
+		}
+	}
+}
+
 func TestRawRecipeDiagnosticPathsEscapeOpaqueRecipeIDs(t *testing.T) {
 	err := ValidateRawRelayRecipes(map[string]any{
 		"opaque/id~v1": map[string]any{"unknown": true},
@@ -187,6 +206,72 @@ func TestRawRecipeDiagnosticPathsEscapeOpaqueRecipeIDs(t *testing.T) {
 	if diagnostic.Path != "/relay_recipes/opaque~1id~0v1/unknown" {
 		t.Fatalf("escaped path = %q", diagnostic.Path)
 	}
+}
+
+func TestTransientRecipeDigestsTrackEachSourceMergePoint(t *testing.T) {
+	first := transientSourceForTest(TransientRecipeSourceOrdinary, "first.toml", `
+[relay_recipes.shared-review]
+participants = ["codex-deep", "codex-fast"]
+facilitator = "codex-fast"
+reducer = "codex-deep"
+max_rounds = 1
+max_depth = 1
+`)
+	second := transientSourceForTest(TransientRecipeSourceOrdinary, "second.toml", `
+[relay_recipes.shared-review]
+participants = ["codex-fast", "codex-deep"]
+facilitator = "codex-fast"
+reducer = "codex-deep"
+max_rounds = 2
+max_depth = 1
+`)
+	config, sources, err := LoadRuntimeConfigWithTransientSources(
+		filepath.Join(t.TempDir(), "missing.toml"),
+		[]TransientRecipeSource{first, second},
+	)
+	if err != nil {
+		t.Fatalf("load overriding transient sources: %v", err)
+	}
+	if len(sources) != 2 {
+		t.Fatalf("source count = %d", len(sources))
+	}
+	firstDigest := sources[0].RecipeDigests["shared-review"]
+	secondDigest := sources[1].RecipeDigests["shared-review"]
+	if firstDigest == "" || secondDigest == "" || firstDigest == secondDigest {
+		t.Fatalf("per-source recipe digests = first %q second %q", firstDigest, secondDigest)
+	}
+	wantFirst := normalizedRecipeDigestForTOML(t, string(first.RawTOML), "shared-review")
+	if firstDigest != wantFirst {
+		t.Fatalf("first source recipe digest = %s, want merge-point digest %s", firstDigest, wantFirst)
+	}
+	wantFinal, err := contracts.ContractDigest(ChildRecipeContractPayload(config.RelayRecipes["shared-review"]))
+	if err != nil {
+		t.Fatalf("final recipe digest: %v", err)
+	}
+	if secondDigest != wantFinal {
+		t.Fatalf("second source recipe digest = %s, want final digest %s", secondDigest, wantFinal)
+	}
+	report, err := BuildCompileReport("shared-review", config, CompileOptions{TransientSources: sources})
+	if err != nil {
+		t.Fatalf("compile final transient override: %v", err)
+	}
+	if report["source_digest"] != sources[1].SourceDigest || report["recipe_digest"] != secondDigest {
+		t.Fatalf("compile trace did not select final source: %#v", report)
+	}
+}
+
+func normalizedRecipeDigestForTOML(t *testing.T, content string, recipeID string) string {
+	t.Helper()
+	parsed, err := decodeTOMLBytes([]byte(content))
+	if err != nil {
+		t.Fatalf("decode recipe TOML: %v", err)
+	}
+	recipe := NormalizeRelayRecipes(asObject(parsed["relay_recipes"]))[recipeID]
+	digest, err := contracts.ContractDigest(ChildRecipeContractPayload(recipe))
+	if err != nil {
+		t.Fatalf("digest normalized recipe: %v", err)
+	}
+	return digest
 }
 
 func requireRecipeDiagnostic(t *testing.T, err error, code string) contracts.Diagnostic {

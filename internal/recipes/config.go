@@ -39,6 +39,11 @@ type TransientRecipeSource struct {
 	RecipeIDs     []string          `json:"recipe_ids"`
 	RecipeDigests map[string]string `json:"recipe_digests,omitempty"`
 	ProfileIDs    []string          `json:"profile_ids,omitempty"`
+
+	// effectiveRawRecipes captures the merge point for this source so its
+	// source/recipe digest pair remains accurate when a later ordinary source
+	// overrides the same recipe ID. It is never serialized or persisted.
+	effectiveRawRecipes map[string]any
 }
 
 type TransientRecipeFile = TransientRecipeSource
@@ -362,6 +367,11 @@ func loadTransientRecipeSources(sources []TransientRecipeSource, rawProfiles map
 		source.RawTOML = append([]byte(nil), data...)
 		source.RecipeIDs = recipeIDs
 		source.ProfileIDs = profileIDs
+		effectiveRawRecipes := make(map[string]any, len(recipeIDs))
+		for _, recipeID := range recipeIDs {
+			effectiveRawRecipes[recipeID] = contracts.Materialize(rawRecipes[recipeID])
+		}
+		source.effectiveRawRecipes = effectiveRawRecipes
 		files = append(files, source)
 	}
 	return files, nil
@@ -511,7 +521,12 @@ func recipeDigestsForIDs(recipeIDs []string, normalizedRecipes map[string]map[st
 
 func populateTransientRecipeDigests(files []TransientRecipeSource, normalizedRecipes map[string]map[string]any) {
 	for index := range files {
-		files[index].RecipeDigests = recipeDigestsForIDs(files[index].RecipeIDs, normalizedRecipes)
+		effectiveRecipes := normalizedRecipes
+		if files[index].effectiveRawRecipes != nil {
+			effectiveRecipes = NormalizeRelayRecipes(files[index].effectiveRawRecipes)
+		}
+		files[index].RecipeDigests = recipeDigestsForIDs(files[index].RecipeIDs, effectiveRecipes)
+		files[index].effectiveRawRecipes = nil
 	}
 }
 

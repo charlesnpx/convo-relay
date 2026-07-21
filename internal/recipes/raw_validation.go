@@ -156,7 +156,7 @@ func validateRecipeRecord(recipe map[string]any, path string) []contracts.Diagno
 	for _, field := range []string{"max_rounds", "max_depth"} {
 		if value, exists := recipe[field]; exists {
 			integer, ok := strictInteger(value)
-			if !ok || integer < 1 {
+			if !ok || integer < 1 || !fitsNativeInt(integer) {
 				diagnostics = append(diagnostics, recipeDiagnostic(
 					"invalid_"+field,
 					appendRecipePointer(path, field),
@@ -168,7 +168,7 @@ func validateRecipeRecord(recipe map[string]any, path string) []contracts.Diagno
 	}
 	if value, exists := recipe["participant_turns"]; exists {
 		integer, ok := strictInteger(value)
-		if !ok || integer < 1 {
+		if !ok || integer < 1 || !fitsNativeInt(integer) {
 			diagnostics = append(diagnostics, recipeDiagnostic(
 				DiagnosticCodeInvalidParticipantTurns,
 				appendRecipePointer(path, "participant_turns"),
@@ -305,12 +305,12 @@ func strictInteger(value any) (int64, bool) {
 		return int64(typed), true
 	case float32:
 		value64 := float64(typed)
-		if math.Trunc(value64) != value64 || value64 > math.MaxInt64 || value64 < math.MinInt64 {
+		if math.Trunc(value64) != value64 || !floatFitsInt64(value64) {
 			return 0, false
 		}
 		return int64(value64), true
 	case float64:
-		if math.Trunc(typed) != typed || typed > math.MaxInt64 || typed < math.MinInt64 {
+		if math.Trunc(typed) != typed || !floatFitsInt64(typed) {
 			return 0, false
 		}
 		return int64(typed), true
@@ -320,6 +320,18 @@ func strictInteger(value any) (int64, bool) {
 	default:
 		return 0, false
 	}
+}
+
+func floatFitsInt64(value float64) bool {
+	limit := math.Exp2(63)
+	return value >= -limit && value < limit
+}
+
+func fitsNativeInt(value int64) bool {
+	if strconv.IntSize == 32 {
+		return value >= math.MinInt32 && value <= math.MaxInt32
+	}
+	return true
 }
 
 func stringInSet(value string, choices []string) bool {

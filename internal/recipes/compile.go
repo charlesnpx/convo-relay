@@ -13,6 +13,11 @@ type CompileTarget string
 const (
 	CompileTargetRoot  CompileTarget = "root"
 	CompileTargetChild CompileTarget = "child"
+
+	// A root plan materializes one schedule record per participant turn. This
+	// bound keeps malformed or impractical configuration from allocating an
+	// unbounded plan before execution can reject it.
+	maxCompiledParticipantTurns = 10_000
 )
 
 type CompileOptions struct {
@@ -223,6 +228,14 @@ func compileRootPlan(
 	}
 
 	participantTurns := intFromAny(recipe["participant_turns"], intFromAny(recipe["max_rounds"], 1))
+	if participantTurns > maxCompiledParticipantTurns {
+		return nil, rootCompileDiagnostic(
+			DiagnosticCodeInvalidParticipantTurns,
+			"/participant_turns",
+			fmt.Sprintf("Root recipe participant_turns must not exceed %d.", maxCompiledParticipantTurns),
+			map[string]any{"participant_turns": participantTurns, "maximum": maxCompiledParticipantTurns},
+		)
+	}
 	scheduledTurns, err := integration.AlternatingSchedule(participantTurns)
 	if err != nil {
 		return nil, contracts.NewValidationError("root recipe participant schedule: %v", err)
