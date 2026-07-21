@@ -1,6 +1,8 @@
 package integration
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"math"
 	"path/filepath"
@@ -65,7 +67,7 @@ func SelectContract(bundle *Bundle, contractID string, requirement ScheduleRequi
 		return nil, err
 	}
 	selected := &SelectedContract{ID: contractID, Contract: contract}
-	digest, err := contracts.ContractDigest(selected.ToMap())
+	digest, err := integrationSemanticDigest(selected.ToMap())
 	if err != nil {
 		return nil, wrapPreflightError(
 			err,
@@ -127,7 +129,7 @@ func normalizeBundle(object map[string]any) (*Bundle, error) {
 		}
 		bundle.Contracts[contractID] = contract
 	}
-	digest, err := contracts.ContractDigest(bundle.ToMap())
+	digest, err := integrationSemanticDigest(bundle.ToMap())
 	if err != nil {
 		return nil, wrapPreflightError(err, DiagnosticCodeInvalidBundle, "", "Integration bundle could not be hashed.", nil)
 	}
@@ -169,6 +171,9 @@ func normalizeContract(object map[string]any, path string) (*Contract, error) {
 		seenTurns[turn.ParticipantTurn] = true
 		turns = append(turns, turn)
 	}
+	sort.Slice(turns, func(left, right int) bool {
+		return turns[left].ParticipantTurn < turns[right].ParticipantTurn
+	})
 
 	var reducer *ReducerDeclaration
 	if rawReducer, exists := object["reducer"]; exists {
@@ -214,6 +219,19 @@ func normalizeContract(object map[string]any, path string) (*Contract, error) {
 		return nil, err
 	}
 	return &Contract{Turns: turns, Reducer: reducer, Inputs: inputs, Result: result}, nil
+}
+
+// integrationSemanticDigest hashes every field in a normalized integration
+// value. ContractDigest deliberately omits storage metadata keys recursively,
+// but those same names are valid semantic data in opaque integration maps and
+// JSON Schemas.
+func integrationSemanticDigest(value any) (string, error) {
+	canonical, err := contracts.CanonicalJSONBytes(value)
+	if err != nil {
+		return "", err
+	}
+	sum := sha256.Sum256(canonical)
+	return contracts.DigestPrefix + hex.EncodeToString(sum[:]), nil
 }
 
 func normalizeTurn(object map[string]any, path string) (TurnDeclaration, error) {

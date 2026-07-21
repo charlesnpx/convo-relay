@@ -73,11 +73,12 @@ func CompileSchema(value any, path string) (*CompiledSchema, error) {
 	}
 	document = cloneMap(document)
 	refs := make([]schemaReference, 0)
-	if err := validateSchemaObject(document, path, &refs); err != nil {
+	schemaPositions := make(map[string]bool)
+	if err := validateSchemaObject(document, path, "", &refs, schemaPositions); err != nil {
 		return nil, err
 	}
 	for _, ref := range refs {
-		if err := validateSchemaReference(document, ref); err != nil {
+		if err := validateSchemaReference(document, ref, schemaPositions); err != nil {
 			return nil, err
 		}
 	}
@@ -138,13 +139,15 @@ func (disabledSchemaLoader) Load(url string) (any, error) {
 	return nil, fmt.Errorf("external schema loading is disabled: %s", url)
 }
 
-func validateSchemaObject(schema map[string]any, path string, refs *[]schemaReference) error {
+func validateSchemaObject(schema map[string]any, path string, pointer string, refs *[]schemaReference, schemaPositions map[string]bool) error {
+	schemaPositions[pointer] = true
 	if err := rejectUnknownFields(schema, supportedSchemaKeywords, path, "JSON Schema", DiagnosticCodeUnsupportedSchema); err != nil {
 		return err
 	}
 	for _, keyword := range sortedKeys(schema) {
 		value := schema[keyword]
 		keywordPath := appendPointer(path, keyword)
+		keywordPointer := appendPointer(pointer, keyword)
 		switch keyword {
 		case "type":
 			if err := validateSchemaType(value, keywordPath); err != nil {
@@ -171,11 +174,12 @@ func validateSchemaObject(schema map[string]any, path string, refs *[]schemaRefe
 			for _, name := range sortedKeys(children) {
 				child := children[name]
 				childPath := appendPointer(keywordPath, name)
+				childPointer := appendPointer(keywordPointer, name)
 				childSchema, ok := child.(map[string]any)
 				if !ok {
 					return invalidSchemaValue(childPath, "Schema positions must contain schema objects, not standalone booleans or other values.")
 				}
-				if err := validateSchemaObject(childSchema, childPath, refs); err != nil {
+				if err := validateSchemaObject(childSchema, childPath, childPointer, refs, schemaPositions); err != nil {
 					return err
 				}
 			}
@@ -184,7 +188,7 @@ func validateSchemaObject(schema map[string]any, path string, refs *[]schemaRefe
 			if !ok {
 				return invalidSchemaValue(keywordPath, "Schema positions must contain schema objects, not standalone booleans or other values.")
 			}
-			if err := validateSchemaObject(childSchema, keywordPath, refs); err != nil {
+			if err := validateSchemaObject(childSchema, keywordPath, keywordPointer, refs, schemaPositions); err != nil {
 				return err
 			}
 		case "enum":
@@ -206,7 +210,7 @@ func validateSchemaObject(schema map[string]any, path string, refs *[]schemaRefe
 			switch typed := value.(type) {
 			case bool:
 			case map[string]any:
-				if err := validateSchemaObject(typed, keywordPath, refs); err != nil {
+				if err := validateSchemaObject(typed, keywordPath, keywordPointer, refs, schemaPositions); err != nil {
 					return err
 				}
 			default:
@@ -219,11 +223,12 @@ func validateSchemaObject(schema map[string]any, path string, refs *[]schemaRefe
 			}
 			for index, item := range items {
 				itemPath := appendPointer(keywordPath, strconv.Itoa(index))
+				itemPointer := appendPointer(keywordPointer, strconv.Itoa(index))
 				childSchema, ok := item.(map[string]any)
 				if !ok {
 					return invalidSchemaValue(itemPath, "Schema positions must contain schema objects, not standalone booleans or other values.")
 				}
-				if err := validateSchemaObject(childSchema, itemPath, refs); err != nil {
+				if err := validateSchemaObject(childSchema, itemPath, itemPointer, refs, schemaPositions); err != nil {
 					return err
 				}
 			}
@@ -275,7 +280,7 @@ func validateSchemaType(value any, path string) error {
 	}
 }
 
-func validateSchemaReference(root map[string]any, reference schemaReference) error {
+func validateSchemaReference(root map[string]any, reference schemaReference, schemaPositions map[string]bool) error {
 	segments, err := decodeLocalReference(reference.ref)
 	if err != nil {
 		return wrapPreflightError(
@@ -287,7 +292,9 @@ func validateSchemaReference(root map[string]any, reference schemaReference) err
 		)
 	}
 	var current any = root
+	targetPointer := ""
 	for _, segment := range segments {
+		targetPointer = appendPointer(targetPointer, segment)
 		switch typed := current.(type) {
 		case map[string]any:
 			value, exists := typed[segment]
@@ -305,7 +312,7 @@ func validateSchemaReference(root map[string]any, reference schemaReference) err
 			return unresolvedSchemaReference(reference)
 		}
 	}
-	if _, ok := current.(map[string]any); !ok {
+	if _, ok := current.(map[string]any); !ok || !schemaPositions[targetPointer] {
 		return unresolvedSchemaReference(reference)
 	}
 	return nil

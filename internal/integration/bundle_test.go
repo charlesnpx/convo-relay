@@ -57,7 +57,7 @@ func TestDecodeBundleNormalizesDefaultsAndComputesSeparateDigests(t *testing.T) 
 	if got := bundle.Contracts["neutral/contract-v1"].Result.Assertions; got == nil || len(got) != 0 {
 		t.Fatalf("default assertions = %#v, want nonnil empty", got)
 	}
-	wantBundleDigest, err := contracts.ContractDigest(bundle.ToMap())
+	wantBundleDigest, err := integrationSemanticDigest(bundle.ToMap())
 	if err != nil {
 		t.Fatalf("bundle digest: %v", err)
 	}
@@ -73,7 +73,7 @@ func TestDecodeBundleNormalizesDefaultsAndComputesSeparateDigests(t *testing.T) 
 	if err != nil {
 		t.Fatalf("select contract: %v", err)
 	}
-	wantContractDigest, err := contracts.ContractDigest(selected.ToMap())
+	wantContractDigest, err := integrationSemanticDigest(selected.ToMap())
 	if err != nil {
 		t.Fatalf("selected digest: %v", err)
 	}
@@ -238,11 +238,6 @@ func TestContractTurnGapsDuplicatesAndSlotMismatchesAreRejected(t *testing.T) {
 		{name: "gap", mutate: func(bundle map[string]any) {
 			firstContract(bundle)["turns"].([]any)[1].(map[string]any)["participant_turn"] = json.Number("3")
 		}},
-		{name: "out of order", mutate: func(bundle map[string]any) {
-			turns := firstContract(bundle)["turns"].([]any)
-			turns[0].(map[string]any)["participant_turn"] = json.Number("2")
-			turns[1].(map[string]any)["participant_turn"] = json.Number("1")
-		}},
 		{name: "slot mismatch", mutate: func(bundle map[string]any) {
 			firstContract(bundle)["turns"].([]any)[1].(map[string]any)["slot"] = "slot_0"
 		}},
@@ -258,6 +253,25 @@ func TestContractTurnGapsDuplicatesAndSlotMismatchesAreRejected(t *testing.T) {
 			expected, _ := AlternatingSchedule(2)
 			assertDiagnostic(t, selectContractError(bundle, "neutral/contract-v1", expected, ResultSourceReducer), DiagnosticCodeScheduleMismatch, contracts.DiagnosticPhasePreflight)
 		})
+	}
+}
+
+func TestContractTurnDeclarationsNormalizeByParticipantOrdinal(t *testing.T) {
+	object := validBundleObject(t)
+	turns := firstContract(object)["turns"].([]any)
+	turns[0], turns[1] = turns[1], turns[0]
+	bundle, err := DecodeBundleBytes(encodeJSON(t, object))
+	if err != nil {
+		t.Fatalf("decode unordered declarations: %v", err)
+	}
+	for index, turn := range bundle.Contracts["neutral/contract-v1"].Turns {
+		if turn.ParticipantTurn != index+1 {
+			t.Fatalf("normalized turn %d = %#v", index, turn)
+		}
+	}
+	expected, _ := AlternatingSchedule(2)
+	if _, err := SelectContract(bundle, "neutral/contract-v1", ScheduleRequirement{Turns: expected, ResultSource: ResultSourceReducer}); err != nil {
+		t.Fatalf("select unordered declarations: %v", err)
 	}
 }
 
@@ -364,6 +378,110 @@ func TestUnrelatedBundleContractsDoNotChangeSelectedContractDigest(t *testing.T)
 	}
 	if firstSelected.Digest != secondSelected.Digest {
 		t.Fatalf("unrelated contract changed selected digest: %q != %q", firstSelected.Digest, secondSelected.Digest)
+	}
+}
+
+func TestIntegrationDigestsBindSemanticKeysExcludedByLegacyDigest(t *testing.T) {
+	tests := []struct {
+		name       string
+		contractID string
+		prepare    func(map[string]any)
+		mutate     func(map[string]any)
+	}{
+		{
+			name:       "contract id path",
+			contractID: "path",
+			prepare: func(bundle map[string]any) {
+				contractsMap := bundle["contracts"].(map[string]any)
+				contractsMap["path"] = contractsMap["neutral/contract-v1"]
+				delete(contractsMap, "neutral/contract-v1")
+			},
+			mutate: func(bundle map[string]any) {
+				bundle["contracts"].(map[string]any)["path"].(map[string]any)["turns"].([]any)[0].(map[string]any)["instructions"] = "Changed semantics."
+			},
+		},
+		{
+			name:       "input name path",
+			contractID: "neutral/contract-v1",
+			prepare: func(bundle map[string]any) {
+				inputs := firstContract(bundle)["inputs"].(map[string]any)
+				inputs["path"] = inputs["payload"]
+				delete(inputs, "payload")
+			},
+			mutate: func(bundle map[string]any) {
+				firstContract(bundle)["inputs"].(map[string]any)["path"].(map[string]any)["max_bytes"] = json.Number("65")
+			},
+		},
+		{
+			name:       "property name created_at",
+			contractID: "neutral/contract-v1",
+			prepare: func(bundle map[string]any) {
+				firstResult(bundle)["schema"] = map[string]any{
+					"type":       "object",
+					"properties": map[string]any{"created_at": map[string]any{"type": "string"}},
+				}
+			},
+			mutate: func(bundle map[string]any) {
+				firstResult(bundle)["schema"].(map[string]any)["properties"].(map[string]any)["created_at"].(map[string]any)["type"] = "integer"
+			},
+		},
+		{
+			name:       "definition name path",
+			contractID: "neutral/contract-v1",
+			prepare: func(bundle map[string]any) {
+				firstResult(bundle)["schema"] = map[string]any{
+					"$defs": map[string]any{"path": map[string]any{"type": "string"}},
+					"$ref":  "#/$defs/path",
+				}
+			},
+			mutate: func(bundle map[string]any) {
+				firstResult(bundle)["schema"].(map[string]any)["$defs"].(map[string]any)["path"].(map[string]any)["type"] = "integer"
+			},
+		},
+		{
+			name:       "const member path",
+			contractID: "neutral/contract-v1",
+			prepare: func(bundle map[string]any) {
+				firstResult(bundle)["schema"] = map[string]any{"const": map[string]any{"path": "first"}}
+			},
+			mutate: func(bundle map[string]any) {
+				firstResult(bundle)["schema"].(map[string]any)["const"].(map[string]any)["path"] = "second"
+			},
+		},
+	}
+
+	turns, _ := AlternatingSchedule(2)
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			beforeObject := validBundleObject(t)
+			test.prepare(beforeObject)
+			afterObject := contracts.Materialize(beforeObject).(map[string]any)
+			test.mutate(afterObject)
+
+			before, err := DecodeBundleBytes(encodeJSON(t, beforeObject))
+			if err != nil {
+				t.Fatalf("decode before: %v", err)
+			}
+			after, err := DecodeBundleBytes(encodeJSON(t, afterObject))
+			if err != nil {
+				t.Fatalf("decode after: %v", err)
+			}
+			if before.Digest == after.Digest {
+				t.Fatal("semantic bundle change did not change bundle digest")
+			}
+
+			beforeSelected, err := SelectContract(before, test.contractID, ScheduleRequirement{Turns: turns, ResultSource: ResultSourceReducer})
+			if err != nil {
+				t.Fatalf("select before: %v", err)
+			}
+			afterSelected, err := SelectContract(after, test.contractID, ScheduleRequirement{Turns: turns, ResultSource: ResultSourceReducer})
+			if err != nil {
+				t.Fatalf("select after: %v", err)
+			}
+			if beforeSelected.Digest == afterSelected.Digest {
+				t.Fatal("semantic contract change did not change selected-contract digest")
+			}
+		})
 	}
 }
 

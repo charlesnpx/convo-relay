@@ -213,6 +213,37 @@ func TestSchemaReferencesMustBeResolvedLocalDefinitions(t *testing.T) {
 	}
 }
 
+func TestSchemaReferencesCannotTargetDataObjects(t *testing.T) {
+	tests := []struct {
+		name   string
+		schema string
+	}{
+		{
+			name: "const object",
+			schema: `{
+              "$defs":{"holder":{"const":{"type":"string","pattern":"^allowed$"}}},
+              "$ref":"#/$defs/holder/const"
+            }`,
+		},
+		{
+			name: "enum object",
+			schema: `{
+              "$defs":{"holder":{"enum":[{"type":"string","pattern":"^allowed$"}]}},
+              "$ref":"#/$defs/holder/enum/0"
+            }`,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			_, err := CompileSchema(decodeJSONValue(t, test.schema), "/schema")
+			diagnostic := assertDiagnostic(t, err, DiagnosticCodeInvalidSchemaReference, contracts.DiagnosticPhasePreflight)
+			if diagnostic.Path != "/schema/$ref" {
+				t.Fatalf("path = %q, want /schema/$ref", diagnostic.Path)
+			}
+		})
+	}
+}
+
 func TestSchemaKeywordShapesAndBoundsAreValidated(t *testing.T) {
 	tests := []string{
 		`{"type":[]}`,
