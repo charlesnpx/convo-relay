@@ -290,6 +290,36 @@ func TestCleanupPrunesMissingManagedWorktreeRegistration(t *testing.T) {
 	}
 }
 
+func TestCleanupRejectsDirtyReplacementWorktree(t *testing.T) {
+	root := newCommittedRepo(t)
+	writeTestFile(t, filepath.Join(root, "second.txt"), []byte("second commit\n"), 0o644)
+	testGit(t, root, "add", "--all")
+	testGit(t, root, "commit", "-m", "second commit")
+	sessionDir := filepath.Join(t.TempDir(), "session")
+	snapshot := mustPreflight(t, Options{LaunchCWD: root, SessionDir: sessionDir, MinimumPolicy: PolicyEphemeral})
+	st := store.New(sessionDir)
+	materialized, err := Materialize(context.Background(), st, snapshot)
+	if err != nil {
+		t.Fatalf("Materialize: %v", err)
+	}
+	registerWorktreeCleanup(t, root, materialized.WorktreePath)
+	testGit(t, root, "worktree", "remove", "--force", materialized.WorktreePath)
+	testGit(t, root, "worktree", "add", "-b", "replacement-worktree", materialized.WorktreePath, "HEAD~1")
+	sentinel := filepath.Join(materialized.WorktreePath, "preserve-replacement.txt")
+	writeTestFile(t, sentinel, []byte("do not delete replacement\n"), 0o644)
+
+	if result, err := Cleanup(context.Background(), st); result != nil || err == nil || !strings.Contains(err.Error(), "no longer matches") {
+		t.Fatalf("replacement cleanup = %#v, %v", result, err)
+	}
+	if data, err := os.ReadFile(sentinel); err != nil || string(data) != "do not delete replacement\n" {
+		t.Fatalf("replacement sentinel changed: %q, %v", data, err)
+	}
+	record, registered, err := repositoryWorktreeRegistration(context.Background(), snapshot.repository, materialized.WorktreePath)
+	if err != nil || !registered || record.Detached || record.Branch == "" || record.Head == snapshot.repository.headCommit {
+		t.Fatalf("replacement registration changed = %#v, %v, %v", record, registered, err)
+	}
+}
+
 func TestCleanupFailureRetainsRegistrationForIdempotentRetry(t *testing.T) {
 	root := newCommittedRepo(t)
 	sessionDir := filepath.Join(t.TempDir(), "session")

@@ -207,13 +207,19 @@ func cleanupBackendArtifactsForSession(meta map[string]any, sessionDir string) e
 	}
 	var errs []error
 	for _, record := range records {
-		cwd := firstNonEmpty(stringFromAny(record.state["cwd"]), stringFromAny(meta["execution_cwd"]), stringFromAny(meta["launch_cwd"]), sessionDir)
+		cwd, err := backendCleanupCWD(record, meta, sessionDir)
+		if err != nil {
+			errs = append(errs, err)
+			continue
+		}
 		backend, err := newBackend(record.backend, sessionDir, record.slotID, record.label, cwd, SlotConfig{})
 		if err != nil {
 			errs = append(errs, fmt.Errorf("restore %s provider %s: %w", record.role, record.slotID, err))
 			continue
 		}
-		if err := backend.RestoreState(record.state, SlotConfig{}); err != nil {
+		restoreState := cloneMap(record.state)
+		restoreState["cwd"] = cwd
+		if err := backend.RestoreState(restoreState, SlotConfig{}); err != nil {
 			errs = append(errs, fmt.Errorf("%s provider %s has invalid %s state: %w", record.role, record.slotID, record.backend, err))
 			continue
 		}
@@ -246,6 +252,70 @@ func cleanupBackendArtifactsForSession(meta map[string]any, sessionDir string) e
 		}
 	}
 	return errors.Join(errs...)
+}
+
+func backendCleanupCWD(record backendCleanupRecord, meta map[string]any, sessionDir string) (string, error) {
+	allowed := cleanupCWDsForRole(record.role, meta, sessionDir)
+	persisted := ""
+	if rawCWD, exists := record.state["cwd"]; exists && rawCWD != nil {
+		value, ok := rawCWD.(string)
+		if !ok {
+			return "", fmt.Errorf("%s provider %s has invalid cleanup cwd: cwd must be a string", record.role, record.slotID)
+		}
+		persisted = strings.TrimSpace(value)
+	}
+	if persisted == "" {
+		if len(allowed) == 0 {
+			return "", fmt.Errorf("%s provider %s has no authoritative cleanup cwd", record.role, record.slotID)
+		}
+		return allowed[0], nil
+	}
+	canonicalPersisted, err := canonicalCleanupCWD(persisted)
+	if err != nil {
+		return "", fmt.Errorf("%s provider %s has invalid cleanup cwd: %w", record.role, record.slotID, err)
+	}
+	for _, candidate := range allowed {
+		canonicalCandidate, candidateErr := canonicalCleanupCWD(candidate)
+		if candidateErr == nil && canonicalCandidate == canonicalPersisted {
+			return candidate, nil
+		}
+	}
+	return "", fmt.Errorf("%s provider %s cleanup cwd does not match an allowed session execution location", record.role, record.slotID)
+}
+
+func cleanupCWDsForRole(role string, meta map[string]any, sessionDir string) []string {
+	ordered := []string{}
+	if role == "facilitator" || role == "reducer" {
+		ordered = append(ordered, stringFromAny(meta["execution_cwd"]), sessionDir, stringFromAny(meta["launch_cwd"]))
+	} else {
+		ordered = append(ordered, stringFromAny(meta["execution_cwd"]), stringFromAny(meta["launch_cwd"]), sessionDir)
+	}
+	seen := map[string]bool{}
+	allowed := make([]string, 0, len(ordered))
+	for _, candidate := range ordered {
+		candidate = strings.TrimSpace(candidate)
+		if candidate == "" {
+			continue
+		}
+		canonical, err := canonicalCleanupCWD(candidate)
+		if err != nil || seen[canonical] {
+			continue
+		}
+		seen[canonical] = true
+		allowed = append(allowed, candidate)
+	}
+	return allowed
+}
+
+func canonicalCleanupCWD(value string) (string, error) {
+	if strings.TrimSpace(value) == "" {
+		return "", errors.New("cwd is required")
+	}
+	absolute, err := filepath.Abs(value)
+	if err != nil {
+		return "", err
+	}
+	return filepath.Clean(absolute), nil
 }
 
 type backendCleanupRecord struct {

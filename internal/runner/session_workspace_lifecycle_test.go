@@ -306,6 +306,57 @@ func TestCleanSessionRejectsUnsafeClaudeSessionIDsForEveryProviderRole(t *testin
 	}
 }
 
+func TestCleanSessionRejectsForeignClaudeCWDForEveryProviderRole(t *testing.T) {
+	for _, role := range []string{"participant", "facilitator", "reducer"} {
+		t.Run(role, func(t *testing.T) {
+			providerHome := t.TempDir()
+			t.Setenv("HOME", providerHome)
+			fixture := newIsolatedSessionFixture(t, "crashed")
+			st := store.New(fixture.sessionDir)
+			foreignCWD := filepath.Join(t.TempDir(), "foreign-project")
+			if err := os.MkdirAll(foreignCWD, 0o755); err != nil {
+				t.Fatalf("create foreign cwd: %v", err)
+			}
+			sessionID := "safe-foreign-" + role
+			foreignArtifacts := createClaudeCleanupArtifacts(t, foreignCWD, sessionID)
+			foreignMarker := filepath.Join(foreignArtifacts[1], "marker")
+
+			envelope := claudeCleanupEnvelope(sessionID, role, foreignCWD)
+			meta := mustLoadMeta(t, fixture.sessionDir)
+			switch role {
+			case "participant":
+				meta["slots"] = []any{envelope}
+			case "facilitator":
+				meta["facilitator_provider_state"] = envelope
+			case "reducer":
+				meta["reducer_provider_state"] = envelope
+			}
+			if err := st.SaveMetaMap(meta); err != nil {
+				t.Fatalf("save foreign %s state: %v", role, err)
+			}
+
+			report, err := CleanSession(fixture.sessionDir)
+			if report != nil || err == nil || !strings.Contains(err.Error(), "cleanup cwd") {
+				t.Fatalf("foreign %s cleanup = %#v, %v", role, report, err)
+			}
+			if data, err := os.ReadFile(foreignMarker); err != nil || string(data) != "provider state\n" {
+				t.Fatalf("foreign marker changed: %q, %v", data, err)
+			}
+			persisted := mustLoadMeta(t, fixture.sessionDir)
+			checkpoint := persisted["workspace_cleanup"].(map[string]any)
+			if checkpoint["status"] != "failed" || checkpoint["stage"] != "provider_artifacts" {
+				t.Fatalf("foreign cleanup checkpoint = %#v", checkpoint)
+			}
+			if _, err := os.Stat(fixture.worktreePath); err != nil {
+				t.Fatalf("foreign cleanup removed retryable worktree: %v", err)
+			}
+			if _, err := os.Stat(fixture.sessionDir); err != nil {
+				t.Fatalf("foreign cleanup removed session evidence: %v", err)
+			}
+		})
+	}
+}
+
 type isolatedSessionFixture struct {
 	sourceRoot   string
 	sessionDir   string

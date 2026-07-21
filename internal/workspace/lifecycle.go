@@ -163,6 +163,10 @@ func Cleanup(ctx context.Context, st *store.Store) (*CleanupResult, error) {
 	if paths.sourceGitRoot == "" || paths.worktreePath == "" {
 		return nil, contracts.NewValidationError("isolated execution_workspace requires source Git root and worktree paths")
 	}
+	expectedHead, err := persistedDetachedWorktreeHead(artifact)
+	if err != nil {
+		return nil, err
+	}
 
 	repository, err := repositoryForCleanup(ctx, paths.sourceGitRoot)
 	if err != nil {
@@ -178,6 +182,9 @@ func Cleanup(ctx context.Context, st *store.Store) (*CleanupResult, error) {
 			return nil, contracts.NewValidationError("execution workspace registration unexpectedly identifies a bare worktree")
 		}
 		if !record.Prunable {
+			if !record.Detached || record.Branch != "" || strings.TrimSpace(record.Head) != expectedHead {
+				return nil, contracts.NewValidationError("execution worktree registration no longer matches the persisted detached workspace")
+			}
 			if _, err := runGit(ctx, repository.gitBinary, repository.root, "worktree", "remove", "--force", paths.worktreePath); err != nil {
 				return nil, fmt.Errorf("remove execution worktree: %w", err)
 			}
@@ -194,6 +201,25 @@ func Cleanup(ctx context.Context, st *store.Store) (*CleanupResult, error) {
 		return nil, errors.New("execution worktree remains registered after cleanup")
 	}
 	return result, nil
+}
+
+func persistedDetachedWorktreeHead(artifact map[string]any) (string, error) {
+	registration, ok := artifact["registration"].(map[string]any)
+	if !ok {
+		return "", contracts.NewValidationError("isolated execution_workspace registration must be an object")
+	}
+	registered, registeredOK := registration["registered"].(bool)
+	detached, detachedOK := registration["detached"].(bool)
+	writable, writableOK := registration["writable"].(bool)
+	head := strings.TrimSpace(stringValue(registration["head_commit"]))
+	if registration["mode"] != "detached_worktree" || !registeredOK || !registered || !detachedOK || !detached || !writableOK || !writable || head == "" {
+		return "", contracts.NewValidationError("isolated execution_workspace registration is inconsistent with a detached worktree")
+	}
+	base, ok := artifact["base"].(map[string]any)
+	if !ok || strings.TrimSpace(stringValue(base["head_commit"])) != head {
+		return "", contracts.NewValidationError("execution_workspace registration HEAD does not match its persisted base")
+	}
+	return head, nil
 }
 
 type persistedWorkspacePaths struct {
