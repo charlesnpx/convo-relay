@@ -208,18 +208,19 @@ func loadExecutionWorkspace(st *store.Store) (map[string]any, map[string]any, bo
 	if st == nil || strings.TrimSpace(st.Root) == "" {
 		return nil, nil, false, contracts.NewValidationError("execution workspace lifecycle requires a session store")
 	}
+	present, err := executionWorkspaceStatePresent(st)
+	if err != nil {
+		return nil, nil, false, err
+	}
+	if !present {
+		return nil, nil, false, nil
+	}
 	ref, found, err := latestExecutionWorkspaceRef(st)
 	if err != nil {
 		return nil, nil, false, err
 	}
 	if !found {
-		worktreePath := filepath.Join(st.Root, "execution", "worktree")
-		if _, statErr := os.Lstat(worktreePath); statErr == nil {
-			return nil, nil, false, contracts.NewValidationError("session has an execution worktree but no execution_workspace artifact")
-		} else if !os.IsNotExist(statErr) {
-			return nil, nil, false, fmt.Errorf("inspect untracked execution worktree: %w", statErr)
-		}
-		return nil, nil, false, nil
+		return nil, nil, false, contracts.NewValidationError("session has execution workspace state but no execution_workspace artifact ref")
 	}
 	payload, err := st.LoadArtifactPayloadRaw(ref)
 	if err != nil {
@@ -232,6 +233,28 @@ func loadExecutionWorkspace(st *store.Store) (map[string]any, map[string]any, bo
 		return nil, nil, false, err
 	}
 	return cloneMap(payload), cloneMap(ref), true, nil
+}
+
+func executionWorkspaceStatePresent(st *store.Store) (bool, error) {
+	for _, path := range []string{
+		filepath.Join(st.Root, "execution", "worktree"),
+		filepath.Join(st.Root, "artifacts", executionWorkspaceCategory),
+	} {
+		if _, err := os.Lstat(path); err == nil {
+			return true, nil
+		} else if !os.IsNotExist(err) {
+			return false, fmt.Errorf("inspect execution workspace state: %w", err)
+		}
+	}
+	if meta, err := st.LoadMeta(); err == nil && meta.Get("execution_workspace_ref") != nil {
+		return true, nil
+	}
+	graph := st.LoadGraph()
+	if artifacts, ok := graph["artifacts"].(map[string]any); ok {
+		_, exists := artifacts[executionWorkspaceCategory+"/selected"]
+		return exists, nil
+	}
+	return false, nil
 }
 
 func latestExecutionWorkspaceRef(st *store.Store) (map[string]any, bool, error) {

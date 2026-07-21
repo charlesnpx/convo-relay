@@ -317,6 +317,12 @@ func TestFinalizeOrdinarySessionIsNoOp(t *testing.T) {
 	if err := st.SaveMetaMap(map[string]any{"status": "completed"}); err != nil {
 		t.Fatalf("save ordinary session: %v", err)
 	}
+	if err := os.MkdirAll(filepath.Join(st.Root, "artifacts"), 0o755); err != nil {
+		t.Fatalf("create ordinary artifacts directory: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(st.Root, "artifacts", store.ArtifactIndexFilename), []byte("ordinary-corrupt-index\n"), 0o644); err != nil {
+		t.Fatalf("write unrelated corrupt index: %v", err)
+	}
 	finalized, err := Finalize(context.Background(), st)
 	if err != nil || finalized.Managed {
 		t.Fatalf("ordinary finalization = %#v, %v", finalized, err)
