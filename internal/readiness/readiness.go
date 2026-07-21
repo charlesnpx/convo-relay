@@ -38,6 +38,7 @@ const (
 
 	DefaultProbeTimeout = 5 * time.Second
 	maxProbeOutputBytes = 64 * 1024
+	probeWaitDelay      = 250 * time.Millisecond
 )
 
 var registeredBackends = []string{"claude", "codex", "gemini", "relay"}
@@ -311,6 +312,7 @@ func runProbeCommand(parent context.Context, timeout time.Duration, path string,
 
 func runCommand(ctx context.Context, path string, args ...string) commandResult {
 	cmd := exec.CommandContext(ctx, path, args...)
+	configureProbeCommand(cmd)
 	output := &limitedBuffer{remaining: maxProbeOutputBytes}
 	cmd.Stdout = output
 	cmd.Stderr = output
