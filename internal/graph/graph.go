@@ -115,7 +115,7 @@ func applyEvent(graph map[string]any, event map[string]any) {
 
 	switch eventType {
 	case "node_started":
-		nodes(graph)[nodeID] = setDefaultObject(nodes(graph), nodeID, map[string]any{
+		node := setDefaultObject(nodes(graph), nodeID, map[string]any{
 			"node_id":        nodeID,
 			"parent_node_id": nil,
 			"depth":          0,
@@ -126,6 +126,12 @@ func applyEvent(graph map[string]any, event map[string]any) {
 			"created_at":     timestamp,
 			"updated_at":     timestamp,
 		})
+		for _, key := range []string{"execution_kind", "recipe_id", "recipe_ref", "root_recipe_plan_ref", "root_checkpoint_ref"} {
+			if value, exists := payload[key]; exists && value != nil {
+				node[key] = value
+			}
+		}
+		nodes(graph)[nodeID] = node
 	case "node_completed", "node_interrupted", "node_failed":
 		node := setDefaultObject(nodes(graph), nodeID, map[string]any{"node_id": nodeID})
 		node["status"] = map[string]string{

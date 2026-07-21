@@ -196,6 +196,17 @@ func compileRootPlan(
 	options CompileOptions,
 ) (map[string]any, error) {
 	compositionPath := defaultCompositionPath(options.CompositionPath)
+	if options.ValidateExecutable {
+		if issues := rootExecutableIssues(recipe, profiles, relayRecipes, DepthPolicy{
+			RelayBackendDepth:    options.RelayBackendDepth,
+			MaxRelayBackendDepth: options.MaxRelayBackendDepth,
+		}, compositionPath); len(issues) > 0 {
+			return nil, ChildRelayConfigError{
+				Message: "Root recipe is not executable by the in-process runner.",
+				Issues:  issues,
+			}
+		}
+	}
 	participants := stringSlice(recipe["participants"])
 	if len(participants) != 2 {
 		return nil, contracts.NewValidationError("root recipe participants must contain exactly two entries")

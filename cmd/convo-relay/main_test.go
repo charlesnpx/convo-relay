@@ -2,9 +2,11 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"flag"
 	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -334,6 +336,426 @@ func TestRunCompatibilityFlagsBuildContextSkillsPlanAndQuickMode(t *testing.T) {
 	steps, _ := plan["plan"].([]any)
 	if plan["explanation"] != "Prepare" || len(steps) != 1 {
 		t.Fatalf("launch plan = %#v", launchPlan)
+	}
+}
+
+func TestRecipeRunStructuralOverridesUseOnlyVisitedFlags(t *testing.T) {
+	newFlags := func() *flag.FlagSet {
+		flags := flag.NewFlagSet("run", flag.ContinueOnError)
+		flags.SetOutput(io.Discard)
+		_ = flags.String("recipe", "", "recipe")
+		_ = flags.String("agents", "codex,codex", "agents")
+		_ = flags.String("model-a", "", "model a")
+		_ = flags.String("effort-a", "", "effort a")
+		_ = flags.String("model-b", "", "model b")
+		_ = flags.String("effort-b", "", "effort b")
+		_ = flags.String("facilitator-backend", "", "facilitator backend")
+		_ = flags.String("facilitator-model", "", "facilitator model")
+		_ = flags.String("facilitator-effort", "", "facilitator effort")
+		_ = flags.String("mode", "adversarial", "mode")
+		_ = flags.Int("rounds", 0, "rounds")
+		_ = flags.Int("max-rounds", 50, "max rounds")
+		_ = flags.Bool("quick", false, "quick")
+		_ = flags.String("dynamic", "off", "dynamic")
+		return flags
+	}
+
+	flags := newFlags()
+	if err := parseFlags(flags, []string{"ordinary task", "--recipe", "neutral-root"}); err != nil {
+		t.Fatalf("parse default recipe flags: %v", err)
+	}
+	visited := visitedFlagNames(flags)
+	if err := validateRecipeRunStructuralOverrides(visited); err != nil {
+		t.Fatalf("ordinary defaults created a structural conflict: %v (visited %#v)", err, visited)
+	}
+
+	structural := []struct {
+		name  string
+		value string
+	}{
+		{name: "agents", value: "codex"},
+		{name: "model-a", value: "model-a"},
+		{name: "effort-a", value: "high"},
+		{name: "model-b", value: "model-b"},
+		{name: "effort-b", value: "low"},
+		{name: "facilitator-backend", value: "codex"},
+		{name: "facilitator-model", value: "facilitator-model"},
+		{name: "facilitator-effort", value: "medium"},
+		{name: "mode", value: "cooperative"},
+		{name: "rounds", value: "1"},
+		{name: "max-rounds", value: "1"},
+		{name: "quick"},
+		{name: "dynamic", value: "ask"},
+	}
+	for _, override := range structural {
+		t.Run(override.name, func(t *testing.T) {
+			flags := newFlags()
+			args := []string{"ordinary task", "--recipe", "neutral-root", "--" + override.name}
+			if override.value != "" {
+				args = append(args, override.value)
+			}
+			if err := parseFlags(flags, args); err != nil {
+				t.Fatalf("parse explicit override: %v", err)
+			}
+			visited := visitedFlagNames(flags)
+			if !visited[override.name] {
+				t.Fatalf("explicit override %s was not visited: %#v", override.name, visited)
+			}
+			err := validateRecipeRunStructuralOverrides(visited)
+			if err == nil || !strings.Contains(err.Error(), "--"+override.name) {
+				t.Fatalf("override %s error = %v", override.name, err)
+			}
+		})
+	}
+}
+
+func TestRunRecipeCLIDispatchesDirectRootPreflightWithoutProviderLaunch(t *testing.T) {
+	tempDir := t.TempDir()
+	binary := filepath.Join(tempDir, "convo-relay")
+	build := exec.Command("go", "build", "-o", binary, ".")
+	if output, err := build.CombinedOutput(); err != nil {
+		t.Fatalf("build CLI: %v\n%s", err, output)
+	}
+
+	launchCWD := filepath.Join(tempDir, "launch")
+	if err := os.MkdirAll(launchCWD, 0o755); err != nil {
+		t.Fatalf("mkdir launch CWD: %v", err)
+	}
+	settingsPath := filepath.Join(launchCWD, "settings.toml")
+	settings := `
+[backend_profiles.cli-a]
+backend = "codex"
+model = "fake-a"
+effort = "medium"
+capabilities = []
+
+[backend_profiles.cli-b]
+backend = "codex"
+model = "fake-b"
+effort = "medium"
+capabilities = []
+
+[backend_profiles.cli-f]
+backend = "codex"
+model = "fake-f"
+effort = "medium"
+capabilities = []
+
+[backend_profiles.cli-r]
+backend = "codex"
+model = "fake-r"
+effort = "medium"
+capabilities = []
+`
+	if err := os.WriteFile(settingsPath, []byte(settings), 0o644); err != nil {
+		t.Fatalf("write settings: %v", err)
+	}
+	recipePath := filepath.Join(launchCWD, "root-recipes.toml")
+	recipeSource := `
+[relay_recipes.neutral-root]
+purpose = "Neutral CLI root recipe"
+participants = ["cli-a", "cli-b"]
+facilitator = "cli-f"
+reducer = "cli-r"
+mode = "cooperative"
+max_rounds = 2
+participant_turns = 2
+result_source = "last_turn"
+max_depth = 1
+required_capabilities = []
+auto_approval = "never"
+match_keywords = []
+
+[relay_recipes.neutral-root.lifecycle]
+resume = "allow"
+steering = "allow"
+dynamic = "forbid"
+workspace_isolation = "inherited"
+
+[relay_recipes.bound-root]
+purpose = "Neutral integration-bound CLI root recipe"
+participants = ["cli-a", "cli-b"]
+facilitator = "cli-f"
+reducer = "cli-r"
+mode = "cooperative"
+max_rounds = 2
+participant_turns = 2
+result_source = "last_turn"
+integration_contract = "neutral/contract-v1"
+max_depth = 1
+required_capabilities = []
+auto_approval = "never"
+match_keywords = []
+
+[relay_recipes.bound-root.lifecycle]
+resume = "allow"
+steering = "forbid"
+dynamic = "forbid"
+workspace_isolation = "inherited"
+`
+	if err := os.WriteFile(recipePath, []byte(recipeSource), 0o644); err != nil {
+		t.Fatalf("write recipe source: %v", err)
+	}
+	bundlePath := filepath.Join(launchCWD, "bundle.json")
+	bundleSource := `{
+  "schema_version": "relay-integration-bundle-v1",
+  "id": "neutral/integration-v1",
+  "contracts": {
+    "neutral/contract-v1": {
+      "turns": [
+        {"participant_turn": 1, "slot": "slot_0", "instructions": "Present the payload."},
+        {"participant_turn": 2, "slot": "slot_1", "instructions": "Challenge the payload."}
+      ],
+      "inputs": {
+        "payload": {
+          "required": true,
+          "cardinality": "one",
+          "media_type": "application/json",
+          "max_bytes": 1024,
+          "schema": {"type": "object"}
+        }
+      },
+      "result": {"transport": "json", "schema": {"type": "object"}}
+    }
+  }
+}`
+	if err := os.WriteFile(bundlePath, []byte(bundleSource), 0o644); err != nil {
+		t.Fatalf("write bundle: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(launchCWD, "payload.json"), []byte(`{"value":"cli"}`), 0o644); err != nil {
+		t.Fatalf("write named input: %v", err)
+	}
+	generatedRecipePath := filepath.Join(launchCWD, "generated-recipes.toml")
+	generatedRecipeSource := `
+[relay_recipes.generated-helper]
+purpose = "Generated helper recipe"
+participants = ["cli-a", "cli-b"]
+facilitator = "cli-f"
+reducer = "cli-r"
+mode = "cooperative"
+max_rounds = 2
+participant_turns = 2
+result_source = "last_turn"
+max_depth = 1
+required_capabilities = []
+auto_approval = "never"
+match_keywords = []
+
+[relay_recipes.generated-helper.lifecycle]
+resume = "allow"
+steering = "allow"
+dynamic = "forbid"
+workspace_isolation = "inherited"
+`
+	if err := os.WriteFile(generatedRecipePath, []byte(generatedRecipeSource), 0o644); err != nil {
+		t.Fatalf("write generated recipe source: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(launchCWD, "context.md"), []byte("compatibility context\n"), 0o644); err != nil {
+		t.Fatalf("write context: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(launchCWD, "skill.md"), []byte("compatibility skill\n"), 0o644); err != nil {
+		t.Fatalf("write skill: %v", err)
+	}
+	taskPlanSource := `{"explanation":"Compatibility plan","plan":[{"step":"Inspect","status":"pending"}]}`
+	if err := os.WriteFile(filepath.Join(launchCWD, "task-plan.json"), []byte(taskPlanSource), 0o644); err != nil {
+		t.Fatalf("write task plan: %v", err)
+	}
+	fakeBin := filepath.Join(tempDir, "bin")
+	if err := os.MkdirAll(fakeBin, 0o755); err != nil {
+		t.Fatalf("mkdir fake bin: %v", err)
+	}
+	providerLog := filepath.Join(tempDir, "provider.log")
+	fakeCodex := filepath.Join(fakeBin, "codex")
+	fakeScript := `#!/bin/sh
+printf '%s\n' "$*" >> "$ROOT_RECIPE_CLI_LOG"
+if [ "$1" = "--version" ]; then
+  printf 'codex test 1.0\n'
+  exit 0
+fi
+printf 'provider launch was not expected\n' >&2
+exit 91
+`
+	if err := os.WriteFile(fakeCodex, []byte(fakeScript), 0o755); err != nil {
+		t.Fatalf("write fake codex: %v", err)
+	}
+
+	sessionDir := filepath.Join(tempDir, "session")
+	command := exec.Command(binary,
+		"run", "CLI positional task",
+		"--recipe", "neutral-root",
+		"--settings", "settings.toml",
+		"--recipe-file", "root-recipes.toml",
+		"--session-dir", sessionDir,
+		"--launch-cwd", launchCWD,
+		"--json",
+	)
+	command.Env = append(os.Environ(),
+		"PATH="+fakeBin+string(os.PathListSeparator)+os.Getenv("PATH"),
+		"ROOT_RECIPE_CLI_LOG="+providerLog,
+	)
+	output, err := command.CombinedOutput()
+	if err != nil {
+		t.Fatalf("run recipe CLI: %v\n%s", err, output)
+	}
+	result := decodeJSONObject(t, string(output))
+	if result["execution_kind"] != "recipe" || result["status"] != "ready" || result["recipe_id"] != "neutral-root" {
+		t.Fatalf("root CLI result = %#v", result)
+	}
+	if result["root_recipe_plan_ref"] == nil || result["latest_root_checkpoint_ref"] == nil {
+		t.Fatalf("root CLI result refs = %#v", result)
+	}
+	if len(result["transient_recipe_refs"].([]any)) != 1 || len(result["transient_recipe_contract_refs"].([]any)) != 2 {
+		t.Fatalf("root CLI transient recipe refs = %#v / %#v", result["transient_recipe_refs"], result["transient_recipe_contract_refs"])
+	}
+	logData, err := os.ReadFile(providerLog)
+	if err != nil {
+		t.Fatalf("read provider log: %v", err)
+	}
+	if strings.TrimSpace(string(logData)) != "--version" {
+		t.Fatalf("unexpected provider invocation log:\n%s", logData)
+	}
+	graphData, err := os.ReadFile(filepath.Join(sessionDir, "graph.json"))
+	if err != nil {
+		t.Fatalf("read graph: %v", err)
+	}
+	graphPayload := decodeJSONObject(t, string(graphData))
+	nodes := graphPayload["nodes"].(map[string]any)
+	if len(nodes) != 1 || nodes["root"] == nil || len(graphPayload["edges"].([]any)) != 0 {
+		t.Fatalf("root CLI graph = %#v", graphPayload)
+	}
+
+	boundSessionDir := filepath.Join(tempDir, "bound-session")
+	boundCommand := exec.Command(binary,
+		"run", "Bound CLI task",
+		"--recipe", "bound-root",
+		"--settings", "settings.toml",
+		"--recipe-file", "root-recipes.toml",
+		"--integration-bundle", "bundle.json",
+		"--input", "payload=payload.json",
+		"--session-dir", boundSessionDir,
+		"--launch-cwd", launchCWD,
+		"--json",
+	)
+	boundCommand.Env = command.Env
+	boundOutput, err := boundCommand.CombinedOutput()
+	if err != nil {
+		t.Fatalf("run bound recipe CLI: %v\n%s", err, boundOutput)
+	}
+	boundResult := decodeJSONObject(t, string(boundOutput))
+	for _, field := range []string{"integration_bundle_ref", "integration_contract_ref", "named_input_manifest_ref", "execution_workspace_ref"} {
+		if boundResult[field] == nil {
+			t.Fatalf("bound root CLI result missing %s: %#v", field, boundResult)
+		}
+	}
+	boundInputs := boundResult["provider_inputs"].(map[string]any)["inputs"].([]any)
+	if len(boundInputs) != 1 || boundInputs[0].(map[string]any)["name"] != "payload" {
+		t.Fatalf("bound root provider inputs = %#v", boundInputs)
+	}
+
+	logData, err = os.ReadFile(providerLog)
+	if err != nil {
+		t.Fatalf("read provider log after bound run: %v", err)
+	}
+	if strings.TrimSpace(string(logData)) != "--version\n--version" {
+		t.Fatalf("unexpected provider invocation log after bound run:\n%s", logData)
+	}
+
+	compatibilityHome := filepath.Join(tempDir, "compatibility-home")
+	compatibilityOutput := filepath.Join(tempDir, "compatibility-output.json")
+	compatibilityCommand := exec.Command(binary,
+		"run",
+		"--task", "Compatible CLI task",
+		"--recipe", "neutral-root",
+		"--context", "context.md",
+		"--skill", "skill.md",
+		"--task-plan", "task-plan.json",
+		"--settings", "settings.toml",
+		"--recipe-file", "root-recipes.toml",
+		"--generated-recipe-file", "generated-recipes.toml",
+		"--timeout", "77",
+		"--stall-timeout", "33",
+		"--investigation", "context_only",
+		"--launch-cwd", launchCWD,
+		"--session-id", "compat-session",
+		"--home", compatibilityHome,
+		"--verbose",
+		"--stream",
+		"--output", compatibilityOutput,
+		"--json",
+	)
+	compatibilityCommand.Env = command.Env
+	compatibilityRaw, err := compatibilityCommand.CombinedOutput()
+	if err != nil {
+		t.Fatalf("run recipe with compatible flags: %v\n%s", err, compatibilityRaw)
+	}
+	compatibilityResult := decodeJSONObject(t, string(compatibilityRaw))
+	if compatibilityResult["session_id"] != "compat-session" || compatibilityResult["task"] != "Compatible CLI task" {
+		t.Fatalf("compatible run identity = %#v", compatibilityResult)
+	}
+	if intValue(compatibilityResult["timeout_seconds"]) != 77 || intValue(compatibilityResult["stall_timeout_seconds"]) != 33 {
+		t.Fatalf("compatible run timeouts = %#v / %#v", compatibilityResult["timeout_seconds"], compatibilityResult["stall_timeout_seconds"])
+	}
+	canonicalLaunchCWD, err := filepath.EvalSymlinks(launchCWD)
+	if err != nil {
+		t.Fatalf("canonical launch CWD: %v", err)
+	}
+	if compatibilityResult["investigation_mode"] != "context_only" || compatibilityResult["source_launch_cwd"] != canonicalLaunchCWD {
+		t.Fatalf("compatible run launch policy = %#v", compatibilityResult)
+	}
+	if len(compatibilityResult["launch_context_refs"].([]any)) != 1 || len(compatibilityResult["input_bundle_refs"].([]any)) != 2 {
+		t.Fatalf("compatible context and skill refs = %#v / %#v", compatibilityResult["launch_context_refs"], compatibilityResult["input_bundle_refs"])
+	}
+	if compatibilityResult["launch_plan"] == nil || len(compatibilityResult["transient_recipe_refs"].([]any)) != 2 {
+		t.Fatalf("compatible task plan or recipe sources missing = %#v", compatibilityResult)
+	}
+	outputData, err := os.ReadFile(compatibilityOutput)
+	if err != nil {
+		t.Fatalf("read compatible JSON output: %v", err)
+	}
+	outputResult := decodeJSONObject(t, string(outputData))
+	if outputResult["session_id"] != "compat-session" {
+		t.Fatalf("compatible JSON output = %#v", outputResult)
+	}
+	logData, err = os.ReadFile(providerLog)
+	if err != nil {
+		t.Fatalf("read provider log after compatible run: %v", err)
+	}
+	if strings.TrimSpace(string(logData)) != "--version\n--version\n--version" {
+		t.Fatalf("unexpected provider invocation log after compatible run:\n%s", logData)
+	}
+
+	for _, rejection := range []struct {
+		name string
+		args []string
+		want string
+	}{
+		{name: "no target flag", args: []string{"--target", "root"}, want: "flag provided but not defined"},
+		{name: "explicit structural override", args: []string{"--agents", "codex"}, want: "does not accept structural overrides"},
+	} {
+		t.Run(rejection.name, func(t *testing.T) {
+			rejectedSession := filepath.Join(tempDir, strings.ReplaceAll(rejection.name, " ", "-"))
+			args := []string{
+				"run", "Rejected task",
+				"--recipe", "neutral-root",
+				"--settings", settingsPath,
+				"--session-dir", rejectedSession,
+				"--launch-cwd", launchCWD,
+			}
+			args = append(args, rejection.args...)
+			rejected := exec.Command(binary, args...)
+			rejected.Env = command.Env
+			rejectedOutput, rejectedErr := rejected.CombinedOutput()
+			var exitError *exec.ExitError
+			if !errors.As(rejectedErr, &exitError) || exitError.ExitCode() != 2 {
+				t.Fatalf("rejected command error = %v, output = %s", rejectedErr, rejectedOutput)
+			}
+			if !strings.Contains(string(rejectedOutput), rejection.want) {
+				t.Fatalf("rejected output missing %q:\n%s", rejection.want, rejectedOutput)
+			}
+			if _, statErr := os.Stat(rejectedSession); !os.IsNotExist(statErr) {
+				t.Fatalf("rejected command created session, err = %v", statErr)
+			}
+		})
 	}
 }
 

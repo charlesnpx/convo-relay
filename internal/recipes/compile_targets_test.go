@@ -84,6 +84,37 @@ func TestContractlessRecipeCompilesForRootAndChildTargets(t *testing.T) {
 	}
 }
 
+func TestRootCompilationValidateExecutableRejectsInvalidNestedRelay(t *testing.T) {
+	config := defaultCompileConfig(t)
+	profiles := cloneNestedObject(config.BackendProfiles)
+	profiles["missing-child"] = map[string]any{
+		"id":      "missing-child",
+		"backend": "relay",
+		"model":   "does-not-exist",
+	}
+	recipe := cloneObject(config.RelayRecipes["review-panel"])
+	recipe["participants"] = []any{"missing-child", "codex-fast"}
+
+	if _, err := CompileRecipe(recipe, profiles, config.RelayRecipes, CompileTargetRoot, CompileOptions{}); err != nil {
+		t.Fatalf("compile without executable validation: %v", err)
+	}
+	_, err := CompileRecipe(recipe, profiles, config.RelayRecipes, CompileTargetRoot, CompileOptions{ValidateExecutable: true})
+	var configErr ChildRelayConfigError
+	if !errors.As(err, &configErr) {
+		t.Fatalf("validated root compile error = %T %[1]v, want ChildRelayConfigError", err)
+	}
+	found := false
+	for _, issue := range configErr.Issues {
+		if issue.Code == "unknown_relay_profile_recipe" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("validated root compile issues = %#v, want unknown_relay_profile_recipe", configErr.Issues)
+	}
+}
+
 func TestIntegrationBoundRecipeCompilesOnlyForRootWithMatchingBundle(t *testing.T) {
 	config := defaultCompileConfig(t)
 	bundle, err := integration.DecodeBundleBytes([]byte(compileBundleJSON))
