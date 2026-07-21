@@ -1,6 +1,9 @@
 package contracts
 
-import "strings"
+import (
+	"encoding/json"
+	"strings"
+)
 
 const (
 	DiagnosticPhaseDecode           = "decode"
@@ -58,9 +61,14 @@ func NewDiagnosticError(message string, diagnostics ...Diagnostic) *DiagnosticEr
 }
 
 func WrapDiagnosticError(cause error, message string, diagnostics ...Diagnostic) *DiagnosticError {
+	clonedDiagnostics := make([]Diagnostic, len(diagnostics))
+	for index, diagnostic := range diagnostics {
+		clonedDiagnostics[index] = diagnostic
+		clonedDiagnostics[index].Details = cloneDiagnosticDetails(diagnostic.Details)
+	}
 	return &DiagnosticError{
 		Message:     strings.TrimSpace(message),
-		Diagnostics: append([]Diagnostic(nil), diagnostics...),
+		Diagnostics: clonedDiagnostics,
 		Cause:       cause,
 	}
 }
@@ -86,6 +94,10 @@ func (e *DiagnosticError) Unwrap() error {
 		return nil
 	}
 	return e.Cause
+}
+
+func (e *DiagnosticError) MarshalJSON() ([]byte, error) {
+	return json.Marshal(e.ToMap())
 }
 
 func (e *DiagnosticError) ToMap() map[string]any {
