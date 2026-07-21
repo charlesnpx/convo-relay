@@ -353,7 +353,7 @@ func repositoryWorktreeRegistration(ctx context.Context, repository *repositoryS
 		if err != nil {
 			return worktreeRegistration{}, false, err
 		}
-		if candidate == target {
+		if pathsEquivalent(candidate, target) {
 			record.Path = candidate
 			return record, true, nil
 		}

@@ -273,6 +273,27 @@ func TestPreflightRequiredIsolationRejectsUnavailableGitStatesAndPathsWithoutMut
 		})
 	}
 
+	t.Run("case-variant session inside source", func(t *testing.T) {
+		root := newCommittedRepo(t)
+		caseVariantRoot := strings.ToUpper(root)
+		rootInfo, rootErr := os.Stat(root)
+		variantInfo, variantErr := os.Stat(caseVariantRoot)
+		if caseVariantRoot == root || rootErr != nil || variantErr != nil || !os.SameFile(rootInfo, variantInfo) {
+			t.Skip("filesystem is case-sensitive")
+		}
+		for _, source := range []string{SessionPathExplicit, SessionPathRelayHome} {
+			session := filepath.Join(caseVariantRoot, "sessions", source)
+			_, err := Preflight(context.Background(), Options{
+				LaunchCWD:         root,
+				SessionDir:        session,
+				SessionPathSource: source,
+				MinimumPolicy:     PolicyReadOnly,
+			})
+			requireDiagnosticCode(t, err, DiagnosticCodeSessionConflict)
+			requirePathAbsent(t, session)
+		}
+	})
+
 	t.Run("session above source", func(t *testing.T) {
 		base := t.TempDir()
 		root := filepath.Join(base, "source")

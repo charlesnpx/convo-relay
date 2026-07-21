@@ -260,6 +260,28 @@ func TestMaterializeCompensatesArtifactStateWhenFinalGraphWriteFails(t *testing.
 	}
 }
 
+func TestWorktreeRegistrationMatchesCaseVariantPath(t *testing.T) {
+	root := newCommittedRepo(t)
+	sessionDir := filepath.Join(t.TempDir(), "case-registration-session")
+	snapshot := mustPreflight(t, Options{LaunchCWD: root, SessionDir: sessionDir, MinimumPolicy: PolicyEphemeral})
+	materialized, err := Materialize(context.Background(), store.New(sessionDir), snapshot)
+	if err != nil {
+		t.Fatalf("Materialize: %v", err)
+	}
+	registerWorktreeCleanup(t, root, materialized.WorktreePath)
+
+	caseVariantPath := strings.ToUpper(materialized.WorktreePath)
+	originalInfo, originalErr := os.Stat(materialized.WorktreePath)
+	variantInfo, variantErr := os.Stat(caseVariantPath)
+	if caseVariantPath == materialized.WorktreePath || originalErr != nil || variantErr != nil || !os.SameFile(originalInfo, variantInfo) {
+		t.Skip("filesystem is case-sensitive")
+	}
+	registered, inspectErr := repositoryWorktreeRegistered(context.Background(), snapshot.repository, caseVariantPath)
+	if inspectErr != nil || !registered {
+		t.Fatalf("case-variant registration = %v, %v", registered, inspectErr)
+	}
+}
+
 func TestMaterializeRejectsStoreThatDiffersFromPreflight(t *testing.T) {
 	root := newCommittedRepo(t)
 	sessionDir := filepath.Join(t.TempDir(), "session-one")

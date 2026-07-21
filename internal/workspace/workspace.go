@@ -363,10 +363,33 @@ func pathsOverlap(left string, right string) bool {
 
 func pathContains(parent string, candidate string) bool {
 	relative, err := filepath.Rel(parent, candidate)
-	if err != nil || filepath.IsAbs(relative) {
+	if err == nil && !filepath.IsAbs(relative) && (relative == "." || (relative != ".." && !strings.HasPrefix(relative, ".."+string(filepath.Separator)))) {
+		return true
+	}
+	parentInfo, err := os.Stat(parent)
+	if err != nil || !parentInfo.IsDir() {
 		return false
 	}
-	return relative == "." || (relative != ".." && !strings.HasPrefix(relative, ".."+string(filepath.Separator)))
+	current := filepath.Clean(candidate)
+	for {
+		if candidateInfo, statErr := os.Stat(current); statErr == nil && os.SameFile(parentInfo, candidateInfo) {
+			return true
+		}
+		next := filepath.Dir(current)
+		if next == current {
+			return false
+		}
+		current = next
+	}
+}
+
+func pathsEquivalent(left string, right string) bool {
+	if filepath.Clean(left) == filepath.Clean(right) {
+		return true
+	}
+	leftInfo, leftErr := os.Stat(left)
+	rightInfo, rightErr := os.Stat(right)
+	return leftErr == nil && rightErr == nil && os.SameFile(leftInfo, rightInfo)
 }
 
 func semanticDigest(value any) (string, error) {
