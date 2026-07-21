@@ -3,6 +3,7 @@ package runner
 import (
 	"context"
 	"errors"
+	"math"
 	"os"
 	"path/filepath"
 	"strings"
@@ -309,6 +310,20 @@ func TestRunRecipePurePreflightFailuresLeaveNoSession(t *testing.T) {
 		{name: "missing task", configure: func(options *RecipeOptions) { options.Task = "" }, wantCode: diagnosticCodeTaskRequired},
 		{name: "unknown recipe", configure: func(options *RecipeOptions) { options.RecipeID = "absent" }, wantCode: diagnosticCodeRecipeUnknown},
 		{
+			name: "task plan contains unsupported value",
+			configure: func(options *RecipeOptions) {
+				options.LaunchPlan = map[string]any{"unsupported": make(chan int)}
+			},
+			wantCode: diagnosticCodeTaskPlanInvalid,
+		},
+		{
+			name: "task plan contains non-finite number",
+			configure: func(options *RecipeOptions) {
+				options.LaunchPlan = map[string]any{"estimate": math.NaN()}
+			},
+			wantCode: diagnosticCodeTaskPlanInvalid,
+		},
+		{
 			name: "missing integration bundle",
 			configure: func(options *RecipeOptions) {
 				options.RuntimeConfig = rootRecipeRuntimeConfig("neutral/contract-v1")
@@ -343,6 +358,71 @@ func TestRunRecipePurePreflightFailuresLeaveNoSession(t *testing.T) {
 				t.Fatalf("session created after pure preflight failure, err = %v", statErr)
 			}
 		})
+	}
+}
+
+func TestRunRecipeRejectsEscapingRecipeArtifactIDsBeforeSessionCreation(t *testing.T) {
+	t.Run("selected recipe", func(t *testing.T) {
+		parent := t.TempDir()
+		sessionDir := filepath.Join(parent, "session")
+		unsafeID := "../../../outside-selected"
+		config := rootRecipeRuntimeConfig("")
+		recipe := config.RelayRecipes["neutral-root"]
+		recipe["id"] = unsafeID
+		config.RelayRecipes = map[string]map[string]any{unsafeID: recipe}
+
+		_, err := RunRecipe(context.Background(), RecipeOptions{
+			SessionDir:     sessionDir,
+			Task:           "Reject unsafe selected recipe identity",
+			RecipeID:       unsafeID,
+			LaunchCWD:      t.TempDir(),
+			RuntimeConfig:  config,
+			ReadinessCheck: readyRootRecipeCheck,
+		})
+		assertRootRecipeDiagnostic(t, err, diagnosticCodeArtifactIDInvalid)
+		assertNoUnsafeRootRecipePersistence(t, sessionDir, filepath.Join(parent, "outside-selected.json"))
+	})
+
+	t.Run("unselected transient recipe", func(t *testing.T) {
+		parent := t.TempDir()
+		sessionDir := filepath.Join(parent, "session")
+		source := recipes.TransientRecipeSource{
+			SourceType:  recipes.TransientRecipeSourceOrdinary,
+			Path:        "unsafe-transient.toml",
+			DisplayName: "unsafe-transient.toml",
+			RawTOML: []byte(`
+[relay_recipes."../../../outside-transient"]
+purpose = "Must never become an artifact path."
+participants = ["codex-deep", "codex-fast"]
+facilitator = "codex-fast"
+reducer = "codex-deep"
+mode = "cooperative"
+max_rounds = 1
+max_depth = 1
+`),
+		}
+
+		_, err := RunRecipe(context.Background(), RecipeOptions{
+			SessionDir:       sessionDir,
+			Task:             "Reject unsafe transient recipe identity",
+			RecipeID:         "review-panel",
+			LaunchCWD:        t.TempDir(),
+			SettingsPath:     filepath.Join(t.TempDir(), "missing-settings.toml"),
+			TransientSources: []recipes.TransientRecipeSource{source},
+			ReadinessCheck:   readyRootRecipeCheck,
+		})
+		assertRootRecipeDiagnostic(t, err, diagnosticCodeArtifactIDInvalid)
+		assertNoUnsafeRootRecipePersistence(t, sessionDir, filepath.Join(parent, "outside-transient.json"))
+	})
+}
+
+func assertNoUnsafeRootRecipePersistence(t *testing.T, sessionDir string, outsidePath string) {
+	t.Helper()
+	if _, err := os.Stat(sessionDir); !os.IsNotExist(err) {
+		t.Fatalf("unsafe recipe ID created session directory, err = %v", err)
+	}
+	if _, err := os.Stat(outsidePath); !os.IsNotExist(err) {
+		t.Fatalf("unsafe recipe ID wrote outside session, err = %v", err)
 	}
 }
 

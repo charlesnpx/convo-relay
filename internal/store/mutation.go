@@ -85,6 +85,14 @@ func (s *Store) SaveContractArtifact(category string, artifactID string, payload
 	return s.saveIndexedArtifact(category, artifactID, payload, refID)
 }
 
+// ValidateArtifactLocation verifies that an artifact identity resolves inside
+// its requested category. It performs no filesystem access, so callers can use
+// it during pure preflight before creating a session.
+func ValidateArtifactLocation(category string, artifactID string) error {
+	_, err := stableArtifactRelativePath(category, artifactID)
+	return err
+}
+
 func (s *Store) AppendSessionEventV1(eventType string, nodeID string, summary string, payload map[string]any, options EventOptions) (map[string]any, error) {
 	if err := s.EnsureSession(); err != nil {
 		return nil, err
@@ -263,10 +271,13 @@ func (s *Store) RecordAdmissionDecisionMap(decision map[string]any) error {
 }
 
 func (s *Store) saveIndexedArtifact(category string, artifactID string, payload map[string]any, refID string) (map[string]any, error) {
+	stableRelPath, err := stableArtifactRelativePath(category, artifactID)
+	if err != nil {
+		return nil, err
+	}
 	if err := s.EnsureSession(); err != nil {
 		return nil, err
 	}
-	stableRelPath := filepath.ToSlash(filepath.Join("artifacts", category, artifactID+".json"))
 	relPath, err := s.artifactWritePath(stableRelPath, payload)
 	if err != nil {
 		return nil, err
@@ -301,6 +312,35 @@ func (s *Store) saveIndexedArtifact(category string, artifactID string, payload 
 		return nil, rollbackArtifactWrite(rollbackFiles, err)
 	}
 	return ref, nil
+}
+
+func stableArtifactRelativePath(category string, artifactID string) (string, error) {
+	if strings.TrimSpace(category) == "" {
+		return "", contracts.NewValidationError("artifact category must not be empty")
+	}
+	if filepath.IsAbs(category) || filepath.VolumeName(category) != "" {
+		return "", contracts.NewValidationError("artifact category %q must be relative", category)
+	}
+	artifactsRoot := filepath.Clean("artifacts")
+	categoryPath := filepath.Clean(filepath.Join(artifactsRoot, category))
+	categoryRel, err := filepath.Rel(artifactsRoot, categoryPath)
+	if err != nil || relativePathEscapes(categoryRel) {
+		return "", contracts.NewValidationError("artifact category %q escapes the artifacts directory", category)
+	}
+
+	if filepath.IsAbs(artifactID) || filepath.VolumeName(artifactID) != "" {
+		return "", contracts.NewValidationError("artifact ID %q must be relative", artifactID)
+	}
+	stablePath := filepath.Clean(filepath.Join(categoryPath, artifactID+".json"))
+	artifactRel, err := filepath.Rel(categoryPath, stablePath)
+	if err != nil || relativePathEscapes(artifactRel) {
+		return "", contracts.NewValidationError("artifact ID %q escapes category %q", artifactID, category)
+	}
+	return filepath.ToSlash(stablePath), nil
+}
+
+func relativePathEscapes(path string) bool {
+	return filepath.IsAbs(path) || path == ".." || strings.HasPrefix(path, ".."+string(filepath.Separator))
 }
 
 type artifactWriteRollbackKind uint8

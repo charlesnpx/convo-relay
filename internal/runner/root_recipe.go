@@ -28,6 +28,8 @@ const (
 	diagnosticCodeBackendCheckMissing  = "root_recipe_backend_check_missing"
 	diagnosticCodeSessionPathInvalid   = "root_recipe_session_path_invalid"
 	diagnosticCodePersistenceIntegrity = "root_recipe_persistence_integrity"
+	diagnosticCodeArtifactIDInvalid    = "root_recipe_artifact_id_invalid"
+	diagnosticCodeTaskPlanInvalid      = "root_recipe_task_plan_invalid"
 )
 
 // RecipeOptions describes a direct root-recipe run. Unlike Options, it does
@@ -159,6 +161,9 @@ func preflightRecipe(ctx context.Context, opts RecipeOptions) (*recipePreflight,
 	if !exists || recipe == nil {
 		return nil, rootRecipeDiagnostic(diagnosticCodeRecipeUnknown, contracts.DiagnosticPhasePreflight, "/recipe", "The requested root recipe is not present in the effective runtime configuration.", map[string]any{"recipe_id": recipeID})
 	}
+	if err := validateRootRecipeArtifactLocations(recipeID, transientFiles); err != nil {
+		return nil, err
+	}
 
 	bundle := opts.IntegrationBundle
 	if bundle == nil && strings.TrimSpace(integrationBundlePath) != "" {
@@ -200,6 +205,11 @@ func preflightRecipe(ctx context.Context, opts RecipeOptions) (*recipePreflight,
 	if selectedContract != nil && (opts.TaskPlanExplicit || opts.LaunchPlan != nil) {
 		return nil, rootRecipeDiagnostic(diagnosticCodePolicyConflict, contracts.DiagnosticPhasePolicy, "/task_plan", "An explicit task plan is not represented by an integration-bound root plan.", nil)
 	}
+	normalizedLaunchPlan, err := normalizeRootRecipeLaunchPlan(opts.LaunchPlan)
+	if err != nil {
+		return nil, err
+	}
+	opts.LaunchPlan = normalizedLaunchPlan
 	preparedInputs, err := namedinputs.Prepare(namedinputs.Options{
 		Contract:               selectedContract,
 		Bindings:               append([]string{}, opts.InputBindings...),
@@ -277,6 +287,49 @@ func preflightRecipe(ctx context.Context, opts RecipeOptions) (*recipePreflight,
 		backendReadiness:  append([]readiness.Record{}, backendReadiness...),
 		workspace:         workspaceSnapshot,
 	}, nil
+}
+
+func validateRootRecipeArtifactLocations(recipeID string, transientFiles []recipes.TransientRecipeFile) error {
+	ids := append([]string{recipeID}, effectiveTransientRecipeIDs(transientFiles)...)
+	for _, artifactID := range ids {
+		if err := store.ValidateArtifactLocation("recipes", artifactID); err != nil {
+			return rootRecipeDiagnostic(
+				diagnosticCodeArtifactIDInvalid,
+				contracts.DiagnosticPhasePreflight,
+				"/recipe",
+				"Recipe IDs must resolve inside the session recipe artifact directory.",
+				map[string]any{"recipe_id": artifactID, "cause": err.Error()},
+			)
+		}
+	}
+	return nil
+}
+
+func normalizeRootRecipeLaunchPlan(value any) (any, error) {
+	if value == nil {
+		return nil, nil
+	}
+	canonical, err := contracts.CanonicalJSONBytes(value)
+	if err != nil {
+		return nil, rootRecipeDiagnostic(
+			diagnosticCodeTaskPlanInvalid,
+			contracts.DiagnosticPhasePreflight,
+			"/task_plan",
+			"Task plan data must be persistable JSON.",
+			map[string]any{"cause": err.Error()},
+		)
+	}
+	normalized, err := contracts.DecodeStrictJSONBytes(canonical)
+	if err != nil {
+		return nil, rootRecipeDiagnostic(
+			diagnosticCodeTaskPlanInvalid,
+			contracts.DiagnosticPhasePreflight,
+			"/task_plan",
+			"Task plan data must be persistable JSON.",
+			map[string]any{"cause": err.Error()},
+		)
+	}
+	return normalized, nil
 }
 
 func startRecipeRun(ctx context.Context, preflight *recipePreflight) (map[string]any, error) {

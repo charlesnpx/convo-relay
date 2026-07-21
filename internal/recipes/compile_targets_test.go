@@ -173,6 +173,74 @@ func TestRootCompilationValidatesReachableRecipesAsChildTargets(t *testing.T) {
 			t.Fatalf("nested child role error = %T %#v, want relay_backend_role_unsupported", err, err)
 		}
 	})
+
+	t.Run("integration-bound grandchild remains reachable", func(t *testing.T) {
+		profiles := cloneNestedObject(config.BackendProfiles)
+		relayRecipes := cloneNestedObject(config.RelayRecipes)
+		profiles["child-profile"] = map[string]any{
+			"id": "child-profile", "backend": "relay", "model": "child", "effort": 1,
+		}
+		profiles["bound-grandchild-profile"] = map[string]any{
+			"id": "bound-grandchild-profile", "backend": "relay", "model": "bound-grandchild", "effort": 1,
+		}
+		child := cloneObject(config.RelayRecipes["review-panel"])
+		child["id"] = "child"
+		child["participants"] = []any{"bound-grandchild-profile", "codex-fast"}
+		child["max_depth"] = 4
+		relayRecipes["child"] = child
+		grandchild := cloneObject(config.RelayRecipes["review-panel"])
+		grandchild["id"] = "bound-grandchild"
+		grandchild["integration_contract"] = "test/contract-v1"
+		relayRecipes["bound-grandchild"] = grandchild
+		root := cloneObject(config.RelayRecipes["review-panel"])
+		root["id"] = "root-with-bound-grandchild"
+		root["participants"] = []any{"child-profile", "codex-fast"}
+		root["max_depth"] = 4
+
+		_, err := CompileRecipe(root, profiles, relayRecipes, CompileTargetRoot, CompileOptions{ValidateExecutable: true})
+		var rootOnly *RootOnlyRecipeError
+		if !errors.As(err, &rootOnly) || rootOnly.RecipeID != "bound-grandchild" {
+			t.Fatalf("nested bound grandchild error = %T %#v, want typed root-only error", err, err)
+		}
+	})
+
+	t.Run("diamond graph does not hide integration-bound descendant", func(t *testing.T) {
+		profiles := cloneNestedObject(config.BackendProfiles)
+		relayRecipes := cloneNestedObject(config.RelayRecipes)
+		for profileID, recipeID := range map[string]string{
+			"left-profile": "left-child", "right-profile": "right-child", "shared-profile": "shared-child", "bound-leaf-profile": "bound-leaf",
+		} {
+			profiles[profileID] = map[string]any{
+				"id": profileID, "backend": "relay", "model": recipeID, "effort": 1,
+			}
+		}
+		for _, recipeID := range []string{"left-child", "right-child"} {
+			child := cloneObject(config.RelayRecipes["review-panel"])
+			child["id"] = recipeID
+			child["participants"] = []any{"shared-profile", "codex-fast"}
+			child["max_depth"] = 5
+			relayRecipes[recipeID] = child
+		}
+		shared := cloneObject(config.RelayRecipes["review-panel"])
+		shared["id"] = "shared-child"
+		shared["participants"] = []any{"bound-leaf-profile", "codex-fast"}
+		shared["max_depth"] = 5
+		relayRecipes["shared-child"] = shared
+		boundLeaf := cloneObject(config.RelayRecipes["review-panel"])
+		boundLeaf["id"] = "bound-leaf"
+		boundLeaf["integration_contract"] = "test/contract-v1"
+		relayRecipes["bound-leaf"] = boundLeaf
+		root := cloneObject(config.RelayRecipes["review-panel"])
+		root["id"] = "diamond-root"
+		root["participants"] = []any{"left-profile", "right-profile"}
+		root["max_depth"] = 5
+
+		_, err := CompileRecipe(root, profiles, relayRecipes, CompileTargetRoot, CompileOptions{ValidateExecutable: true})
+		var rootOnly *RootOnlyRecipeError
+		if !errors.As(err, &rootOnly) || rootOnly.RecipeID != "bound-leaf" {
+			t.Fatalf("diamond descendant error = %T %#v, want typed root-only error", err, err)
+		}
+	})
 }
 
 func TestIntegrationBoundRecipeCompilesOnlyForRootWithMatchingBundle(t *testing.T) {

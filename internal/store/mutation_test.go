@@ -49,6 +49,51 @@ func TestSaveContractArtifactPreservesHistoricalDuplicateRefIDs(t *testing.T) {
 	}
 }
 
+func TestArtifactPersistenceRejectsEscapingLocationsBeforeCreatingSession(t *testing.T) {
+	payload := map[string]any{"kind": "recipe", "schema_version": 1, "id": "unsafe"}
+	tests := []struct {
+		name string
+		save func(*Store) error
+	}{
+		{
+			name: "contract artifact ID",
+			save: func(st *Store) error {
+				_, err := st.SaveContractArtifact("recipes", "../../../outside", payload, "recipe:unsafe")
+				return err
+			},
+		},
+		{
+			name: "wrapped artifact ID",
+			save: func(st *Store) error {
+				_, err := st.SaveArtifact("notes", "../../../outside", map[string]any{"message": "unsafe"})
+				return err
+			},
+		},
+		{
+			name: "category",
+			save: func(st *Store) error {
+				_, err := st.SaveContractArtifact("../../outside", "artifact", payload, "recipe:unsafe")
+				return err
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			parent := t.TempDir()
+			sessionDir := filepath.Join(parent, "session")
+			if err := test.save(New(sessionDir)); err == nil {
+				t.Fatal("escaping artifact location unexpectedly succeeded")
+			}
+			if _, err := os.Stat(sessionDir); !os.IsNotExist(err) {
+				t.Fatalf("artifact validation created session directory, err = %v", err)
+			}
+			if _, err := os.Stat(filepath.Join(parent, "outside.json")); !os.IsNotExist(err) {
+				t.Fatalf("artifact validation wrote outside category, err = %v", err)
+			}
+		})
+	}
+}
+
 func TestAtomicWriteFileCreatesParentsAndOverwrites(t *testing.T) {
 	root := t.TempDir()
 	path := filepath.Join(root, "missing", "nested", "payload.json")
