@@ -76,6 +76,38 @@ func TestExplicitAuthenticationProbesNormalizeSupportedAndUnsupportedBackends(t 
 	})
 }
 
+func TestClaudeAuthenticationParsesStdoutAndRetainsStderr(t *testing.T) {
+	dir := t.TempDir()
+	writeProbeExecutable(t, dir, "claude", `
+case "$*" in
+  "--version") printf 'claude 1.0\n' ;;
+  "auth status --json")
+    printf '{"loggedIn":true}\n'
+    printf 'benign update warning\n' >&2
+    ;;
+  *) exit 90 ;;
+esac`)
+	t.Setenv("PATH", dir)
+
+	record := checkOne(t, "claude", Options{ProbeAuth: true})
+	if record.Status != StatusReady || record.AuthenticationStatus != AuthenticationAuthenticated {
+		t.Fatalf("claude readiness = %#v", record)
+	}
+	if output := record.ProbeDetail.Authentication.Output; output != "{\"loggedIn\":true}\nbenign update warning" {
+		t.Fatalf("authentication diagnostics = %q", output)
+	}
+}
+
+func TestCommandCompletedSuccessfullyRejectsTimedOutResult(t *testing.T) {
+	exitCode := 0
+	if commandCompletedSuccessfully(commandResult{exitCode: &exitCode, timedOut: true}) {
+		t.Fatal("timed-out command was accepted as successful")
+	}
+	if !commandCompletedSuccessfully(commandResult{exitCode: &exitCode}) {
+		t.Fatal("clean zero-exit command was rejected")
+	}
+}
+
 func TestReadinessNormalizesMissingFailedMalformedAndTimedOutProbes(t *testing.T) {
 	t.Run("not installed", func(t *testing.T) {
 		records, err := Check(context.Background(), []string{"codex"}, Options{

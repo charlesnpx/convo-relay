@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync/atomic"
 	"time"
 )
 
@@ -90,6 +91,8 @@ type backendSpec struct {
 
 type commandResult struct {
 	output    string
+	stdout    string
+	stderr    string
 	exitCode  *int
 	err       error
 	timedOut  bool
@@ -179,7 +182,7 @@ func checkBackend(ctx context.Context, spec backendSpec, options Options) Record
 
 	versionResult := runProbeCommand(ctx, options.Timeout, record.ExecutablePath, spec.versionArgs...)
 	record.ProbeDetail.Version = probeFromResult(spec.name, spec.versionArgs, versionResult)
-	if versionResult.err != nil || versionResult.exitCode == nil || *versionResult.exitCode != 0 || strings.TrimSpace(versionResult.output) == "" {
+	if !commandCompletedSuccessfully(versionResult) || strings.TrimSpace(versionResult.output) == "" {
 		if record.ProbeDetail.Version.Error == "" && strings.TrimSpace(versionResult.output) == "" {
 			record.ProbeDetail.Version.Error = "version probe returned empty output"
 		}
@@ -210,7 +213,7 @@ func checkBackend(ctx context.Context, spec backendSpec, options Options) Record
 		record.Status = StatusAuthFailed
 		return record
 	}
-	if recognized && authentication == AuthenticationAuthenticated && authResult.err == nil && authResult.exitCode != nil && *authResult.exitCode == 0 {
+	if recognized && authentication == AuthenticationAuthenticated && commandCompletedSuccessfully(authResult) {
 		record.AuthenticationStatus = AuthenticationAuthenticated
 		record.Status = StatusReady
 		return record
@@ -312,16 +315,23 @@ func runProbeCommand(parent context.Context, timeout time.Duration, path string,
 
 func runCommand(ctx context.Context, path string, args ...string) commandResult {
 	cmd := exec.CommandContext(ctx, path, args...)
-	configureProbeCommand(cmd)
-	output := &limitedBuffer{remaining: maxProbeOutputBytes}
-	cmd.Stdout = output
-	cmd.Stderr = output
+	var interrupted atomic.Bool
+	configureProbeCommand(cmd, func() { interrupted.Store(true) })
+	stdout := &limitedBuffer{remaining: maxProbeOutputBytes}
+	stderr := &limitedBuffer{remaining: maxProbeOutputBytes}
+	cmd.Stdout = stdout
+	cmd.Stderr = stderr
 	err := cmd.Run()
+	stdoutText := strings.TrimSpace(stdout.buffer.String())
+	stderrText := strings.TrimSpace(stderr.buffer.String())
+	output, outputTruncated := combineProbeOutput(stdoutText, stderrText)
 	result := commandResult{
-		output:    strings.TrimSpace(output.buffer.String()),
+		output:    output,
+		stdout:    stdoutText,
+		stderr:    stderrText,
 		err:       err,
-		timedOut:  errors.Is(ctx.Err(), context.DeadlineExceeded),
-		truncated: output.truncated,
+		timedOut:  interrupted.Load() && errors.Is(ctx.Err(), context.DeadlineExceeded),
+		truncated: stdout.truncated || stderr.truncated || outputTruncated,
 	}
 	if cmd.ProcessState != nil {
 		exitCode := cmd.ProcessState.ExitCode()
@@ -350,6 +360,10 @@ func probeFromResult(name string, args []string, result commandResult) Probe {
 	return probe
 }
 
+func commandCompletedSuccessfully(result commandResult) bool {
+	return !result.timedOut && result.err == nil && result.exitCode != nil && *result.exitCode == 0
+}
+
 func parseCodexAuth(result commandResult) (string, bool) {
 	value := strings.ToLower(strings.TrimSpace(result.output))
 	for _, marker := range []string{"not logged in", "logged out", "unauthenticated", "not authenticated"} {
@@ -367,7 +381,7 @@ func parseCodexAuth(result commandResult) (string, bool) {
 
 func parseClaudeAuth(result commandResult) (string, bool) {
 	var payload map[string]any
-	if err := json.Unmarshal([]byte(result.output), &payload); err != nil {
+	if err := json.Unmarshal([]byte(result.stdout), &payload); err != nil {
 		return "", false
 	}
 	for _, key := range []string{"loggedIn", "authenticated", "isAuthenticated"} {
@@ -383,6 +397,20 @@ func parseClaudeAuth(result commandResult) (string, bool) {
 		}
 	}
 	return "", false
+}
+
+func combineProbeOutput(stdout string, stderr string) (string, bool) {
+	output := &limitedBuffer{remaining: maxProbeOutputBytes}
+	if stdout != "" {
+		_, _ = output.Write([]byte(stdout))
+	}
+	if stdout != "" && stderr != "" {
+		_, _ = output.Write([]byte("\n"))
+	}
+	if stderr != "" {
+		_, _ = output.Write([]byte(stderr))
+	}
+	return strings.TrimSpace(output.buffer.String()), output.truncated
 }
 
 func firstProbeFailure(record Record) string {

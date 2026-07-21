@@ -9,7 +9,7 @@ import (
 	"syscall"
 )
 
-func configureProbeCommand(command *exec.Cmd) {
+func configureProbeCommand(command *exec.Cmd, markInterrupted func()) {
 	command.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	command.Cancel = func() error {
 		if command.Process == nil {
@@ -19,6 +19,7 @@ func configureProbeCommand(command *exec.Cmd) {
 		if errors.Is(err, syscall.ESRCH) {
 			return os.ErrProcessDone
 		}
+		markInterrupted()
 		return err
 	}
 	command.WaitDelay = probeWaitDelay
