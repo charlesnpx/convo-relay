@@ -164,6 +164,13 @@ func BuildRecipeCatalogReportWithOptions(settingsPath string, options RecipeCata
 			records = append(records, record)
 			continue
 		}
+		participantTurns, turnErr := validatedRootParticipantTurns(recipe)
+		if turnErr != nil {
+			record.Status = RecipeStatusInvalid
+			record.Diagnostics = catalogDiagnosticIssues(turnErr, "invalid_config", "invalid_participant_turns")
+			records = append(records, record)
+			continue
+		}
 		issues := ExecutableIssues(recipe, normalizedProfiles, normalizedRecipes, DepthPolicy{}, "root")
 		issues = annotateProfileReferenceIssues(issues, profileIssues)
 		record.Diagnostics = issues
@@ -188,7 +195,7 @@ func BuildRecipeCatalogReportWithOptions(settingsPath string, options RecipeCata
 			records = append(records, record)
 			continue
 		}
-		record.Integration, issues = catalogIntegrationBinding(recipe, options.IntegrationBundle)
+		record.Integration, issues = catalogIntegrationBinding(recipe, participantTurns, options.IntegrationBundle)
 		record.Diagnostics = append(record.Diagnostics, issues...)
 		switch {
 		case record.Integration != nil && record.Integration.Status != RecipeIntegrationStatusBound:
@@ -598,7 +605,7 @@ func flattenProfileDiagnostics(profileIssues map[string][]ChildRecipeIssue) []Ch
 	return issues
 }
 
-func catalogIntegrationBinding(recipe map[string]any, bundle *integration.Bundle) (*RecipeIntegrationBinding, []ChildRecipeIssue) {
+func catalogIntegrationBinding(recipe map[string]any, participantTurns int, bundle *integration.Bundle) (*RecipeIntegrationBinding, []ChildRecipeIssue) {
 	contractID := strings.TrimSpace(stringValue(recipe["integration_contract"]))
 	if contractID == "" {
 		return nil, nil
@@ -618,7 +625,7 @@ func catalogIntegrationBinding(recipe map[string]any, bundle *integration.Bundle
 	}
 	binding.BundleID = bundle.ID()
 	binding.BundleDigest = bundle.Digest()
-	scheduledTurns, err := integration.AlternatingSchedule(intFromAny(recipe["participant_turns"], intFromAny(recipe["max_rounds"], 1)))
+	scheduledTurns, err := integration.AlternatingSchedule(participantTurns)
 	if err != nil {
 		return binding, []ChildRecipeIssue{{
 			Category: "integration_binding",
@@ -641,12 +648,16 @@ func catalogIntegrationBinding(recipe map[string]any, bundle *integration.Bundle
 }
 
 func catalogIntegrationIssues(err error) []ChildRecipeIssue {
+	return catalogDiagnosticIssues(err, "integration_binding", "integration_binding_failed")
+}
+
+func catalogDiagnosticIssues(err error, category string, fallbackCode string) []ChildRecipeIssue {
 	var diagnosticError *contracts.DiagnosticError
 	if errors.As(err, &diagnosticError) && len(diagnosticError.Diagnostics) > 0 {
 		issues := make([]ChildRecipeIssue, 0, len(diagnosticError.Diagnostics))
 		for _, diagnostic := range diagnosticError.Diagnostics {
 			issues = append(issues, ChildRecipeIssue{
-				Category: "integration_binding",
+				Category: category,
 				Code:     diagnostic.Code,
 				Message:  diagnostic.Message,
 				Path:     diagnostic.Path,
@@ -656,9 +667,9 @@ func catalogIntegrationIssues(err error) []ChildRecipeIssue {
 		return issues
 	}
 	return []ChildRecipeIssue{{
-		Category: "integration_binding",
-		Code:     "integration_binding_failed",
-		Message:  "Integration contract could not be bound.",
+		Category: category,
+		Code:     fallbackCode,
+		Message:  err.Error(),
 		Detail:   map[string]any{"cause": err.Error()},
 	}}
 }

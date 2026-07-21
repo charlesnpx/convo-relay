@@ -258,6 +258,76 @@ max_depth = 1
 	}
 }
 
+func TestRecipeCatalogSharesRootParticipantTurnAllocationBound(t *testing.T) {
+	settingsPath := writeSettings(t, `
+[relay_recipes.boundary-contractless]
+participants = ["codex", "codex"]
+facilitator = "codex"
+reducer = "codex"
+participant_turns = 10000
+max_depth = 1
+
+[relay_recipes.overflow-contractless]
+participants = ["codex", "codex"]
+facilitator = "codex"
+reducer = "codex"
+participant_turns = 10001
+max_depth = 1
+
+[relay_recipes.boundary-bound]
+participants = ["codex", "codex"]
+facilitator = "codex"
+reducer = "codex"
+participant_turns = 10000
+integration_contract = "test/contract-v1"
+max_depth = 1
+
+[relay_recipes.overflow-bound]
+participants = ["codex", "codex"]
+facilitator = "codex"
+reducer = "codex"
+participant_turns = 10001
+integration_contract = "test/contract-v1"
+max_depth = 1
+`)
+	assertStatuses := func(t *testing.T, report RecipeCatalogReport) {
+		t.Helper()
+		for recipeID, want := range map[string]string{
+			"boundary-contractless": RecipeStatusUsable,
+			"overflow-contractless": RecipeStatusInvalid,
+			"boundary-bound":        RecipeStatusRequiresIntegration,
+			"overflow-bound":        RecipeStatusInvalid,
+		} {
+			record, ok := FindRecipeRecord(report.Recipes, recipeID)
+			if !ok || record.Status != want {
+				t.Fatalf("%s record = %#v, want %s", recipeID, record, want)
+			}
+			if strings.HasPrefix(recipeID, "overflow-") && !issueCodes(record.Diagnostics)[DiagnosticCodeInvalidParticipantTurns] {
+				t.Fatalf("%s diagnostics = %#v", recipeID, record.Diagnostics)
+			}
+		}
+	}
+
+	withoutBundle, err := BuildRecipeCatalogReportWithOptions(settingsPath, RecipeCatalogOptions{ReadinessCheck: catalogReadinessCheck(nil)})
+	if err != nil {
+		t.Fatalf("catalog without bundle: %v", err)
+	}
+	assertStatuses(t, withoutBundle)
+
+	bundle, err := integration.DecodeBundleBytes([]byte(compileBundleJSON))
+	if err != nil {
+		t.Fatalf("decode bundle: %v", err)
+	}
+	withBundle, err := BuildRecipeCatalogReportWithOptions(settingsPath, RecipeCatalogOptions{
+		IntegrationBundle: bundle,
+		ReadinessCheck:    catalogReadinessCheck(nil),
+	})
+	if err != nil {
+		t.Fatalf("catalog with bundle: %v", err)
+	}
+	assertStatuses(t, withBundle)
+}
+
 func TestBuildCompileReportUsesExplicitTargetSpecificPayloads(t *testing.T) {
 	config := defaultCompileConfig(t)
 	child, err := BuildCompileReport("review-panel", config, CompileTargetChild, CompileOptions{

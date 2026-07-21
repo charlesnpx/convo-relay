@@ -245,14 +245,9 @@ func compileRootPlan(
 		)
 	}
 
-	participantTurns := intFromAny(recipe["participant_turns"], intFromAny(recipe["max_rounds"], 1))
-	if participantTurns > maxCompiledParticipantTurns {
-		return nil, rootCompileDiagnostic(
-			DiagnosticCodeInvalidParticipantTurns,
-			"/participant_turns",
-			fmt.Sprintf("Root recipe participant_turns must not exceed %d.", maxCompiledParticipantTurns),
-			map[string]any{"participant_turns": participantTurns, "maximum": maxCompiledParticipantTurns},
-		)
+	participantTurns, err := validatedRootParticipantTurns(recipe)
+	if err != nil {
+		return nil, err
 	}
 	scheduledTurns, err := integration.AlternatingSchedule(participantTurns)
 	if err != nil {
@@ -362,6 +357,19 @@ func compileRootPlan(
 		planFields["integration_contract_digest"] = selected.Digest()
 	}
 	return contracts.NormalizeRootArtifact(contracts.RootArtifactKindRootRecipePlan, planFields)
+}
+
+func validatedRootParticipantTurns(recipe map[string]any) (int, error) {
+	participantTurns := intFromAny(recipe["participant_turns"], intFromAny(recipe["max_rounds"], 1))
+	if participantTurns > maxCompiledParticipantTurns {
+		return 0, rootCompileDiagnostic(
+			DiagnosticCodeInvalidParticipantTurns,
+			"/participant_turns",
+			fmt.Sprintf("Root recipe participant_turns must not exceed %d.", maxCompiledParticipantTurns),
+			map[string]any{"participant_turns": participantTurns, "maximum": maxCompiledParticipantTurns},
+		)
+	}
+	return participantTurns, nil
 }
 
 func rootCompileDiagnostic(code string, path string, message string, details map[string]any) error {
