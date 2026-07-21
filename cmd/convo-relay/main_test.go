@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -899,6 +900,44 @@ func TestSaveRunnerOutputWritesMarkdownAndJSON(t *testing.T) {
 	}
 	if !strings.Contains(string(jsonData), `"session_id": "abc123"`) {
 		t.Fatalf("json output:\n%s", jsonData)
+	}
+}
+
+func TestEmitRunnerResultStillWritesStdoutWhenOutputSaveFails(t *testing.T) {
+	runErr := errors.New("invalid root result")
+	result := map[string]any{
+		"execution_kind":           "recipe",
+		"session_id":               "invalid123",
+		"session_dir":              "/tmp/invalid123",
+		"status":                   "invalid_result",
+		"actual_participant_turns": 2,
+		"participant_turns":        2,
+	}
+	blockedParent := filepath.Join(t.TempDir(), "not-a-directory")
+	if err := os.WriteFile(blockedParent, []byte("block child creation"), 0o644); err != nil {
+		t.Fatalf("write blocking parent: %v", err)
+	}
+
+	for _, jsonOutput := range []bool{false, true} {
+		name := "plain"
+		if jsonOutput {
+			name = "json"
+		}
+		t.Run(name, func(t *testing.T) {
+			var stdout bytes.Buffer
+			err := emitRunnerResult(&stdout, result, runErr, jsonOutput, filepath.Join(blockedParent, "result.out"))
+			if !errors.Is(err, runErr) {
+				t.Fatalf("emit error does not retain run error: %v", err)
+			}
+			if jsonOutput {
+				payload := decodeJSONObject(t, stdout.String())
+				if payload["status"] != "invalid_result" || payload["session_id"] != "invalid123" {
+					t.Fatalf("JSON stdout result = %#v", payload)
+				}
+			} else if !strings.Contains(stdout.String(), "Session invalid123 invalid_result") {
+				t.Fatalf("plain stdout result = %q", stdout.String())
+			}
+		})
 	}
 }
 

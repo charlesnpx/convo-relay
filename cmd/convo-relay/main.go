@@ -1615,36 +1615,35 @@ func emitRunnerResult(writer io.Writer, result map[string]any, runErr error, jso
 		return errors.New("runner returned no session result")
 	}
 	savedOutput := ""
+	var saveErr error
 	if strings.TrimSpace(outputPath) != "" {
-		var saveErr error
 		savedOutput, saveErr = saveRunnerOutput(result, outputPath, jsonOutput)
-		if saveErr != nil {
-			return errors.Join(runErr, saveErr)
-		}
 	}
 	if jsonOutput {
 		encoder := json.NewEncoder(writer)
 		encoder.SetIndent("", "  ")
-		if err := encoder.Encode(result); err != nil {
-			return errors.Join(runErr, err)
-		}
-		return runErr
+		return errors.Join(runErr, saveErr, encoder.Encode(result))
+	}
+	var emitErr error
+	write := func(format string, args ...any) {
+		_, err := fmt.Fprintf(writer, format, args...)
+		emitErr = errors.Join(emitErr, err)
 	}
 	if result["execution_kind"] == "recipe" {
 		status := firstNonEmptyString(stringValue(result["status"]), "completed")
-		fmt.Fprintf(writer, "Session %s %s at %s\n", result["session_id"], status, result["session_dir"])
-		fmt.Fprintf(writer, "Participant turns: %v/%v\n", result["actual_participant_turns"], result["participant_turns"])
+		write("Session %s %s at %s\n", result["session_id"], status, result["session_dir"])
+		write("Participant turns: %v/%v\n", result["actual_participant_turns"], result["participant_turns"])
 		if savedOutput != "" {
-			fmt.Fprintf(writer, "Output: %s\n", savedOutput)
+			write("Output: %s\n", savedOutput)
 		}
-		return runErr
+		return errors.Join(runErr, saveErr, emitErr)
 	}
-	fmt.Fprintf(writer, "Session %s completed at %s\n", result["session_id"], result["session_dir"])
-	fmt.Fprintf(writer, "Rounds: %v/%v\n", result["actual_rounds"], result["max_rounds"])
+	write("Session %s completed at %s\n", result["session_id"], result["session_dir"])
+	write("Rounds: %v/%v\n", result["actual_rounds"], result["max_rounds"])
 	if savedOutput != "" {
-		fmt.Fprintf(writer, "Output: %s\n", savedOutput)
+		write("Output: %s\n", savedOutput)
 	}
-	return runErr
+	return errors.Join(runErr, saveErr, emitErr)
 }
 
 func saveRunnerOutput(result map[string]any, outputPath string, jsonOutput bool) (string, error) {

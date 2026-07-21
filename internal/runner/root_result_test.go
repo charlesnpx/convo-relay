@@ -3,12 +3,14 @@ package runner
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 
 	"github.com/charlesnpx/convo-relay/internal/contracts"
+	"github.com/charlesnpx/convo-relay/internal/graph"
 	"github.com/charlesnpx/convo-relay/internal/integration"
 	"github.com/charlesnpx/convo-relay/internal/recipes"
 	"github.com/charlesnpx/convo-relay/internal/store"
@@ -394,6 +396,52 @@ func TestRunRecipeRefusesRelayReducerAtExecutionBoundary(t *testing.T) {
 		if call.SlotID == "reducer" {
 			t.Fatalf("relay reducer was constructed or invoked: %#v", call)
 		}
+	}
+}
+
+func TestRootResultCompletionWriteFailuresBecomeConsistentTerminalFailures(t *testing.T) {
+	for _, stage := range []string{"metadata", "event", "graph"} {
+		t.Run(stage, func(t *testing.T) {
+			injected := fmt.Errorf("injected %s result completion failure", stage)
+			rootResultCompletionAfterWrite = func(completedStage string) error {
+				if completedStage == stage {
+					return injected
+				}
+				return nil
+			}
+			t.Cleanup(func() { rootResultCompletionAfterWrite = nil })
+
+			config := rootRecipeRuntimeConfig("")
+			config.RelayRecipes["neutral-root"]["participant_turns"] = 1
+			config.RelayRecipes["neutral-root"]["max_rounds"] = 1
+			sessionDir := filepath.Join(t.TempDir(), "session")
+			result, err := RunRecipe(context.Background(), RecipeOptions{
+				SessionDir:     sessionDir,
+				Task:           "Fail one root result completion write",
+				RecipeID:       "neutral-root",
+				LaunchCWD:      t.TempDir(),
+				RuntimeConfig:  config,
+				ReadinessCheck: readyRootRecipeCheck,
+				backendFactory: successfulRootBackendFactory(),
+			})
+			if !errors.Is(err, injected) || result["status"] != "failed" || result["execution_phase"] != "result_completion_persistence" {
+				t.Fatalf("completion failure = result %#v, err %v", result, err)
+			}
+			persisted := mustLoadMeta(t, sessionDir)
+			if persisted["status"] != "failed" || persisted["execution_phase"] != "result_completion_persistence" {
+				t.Fatalf("persisted completion failure = %#v", persisted)
+			}
+			events, readErr := os.ReadFile(filepath.Join(sessionDir, "events.jsonl"))
+			if readErr != nil || !strings.Contains(string(events), `"event_type":"node_failed"`) {
+				t.Fatalf("completion failure events = %v\n%s", readErr, events)
+			}
+			graphPayload := store.New(sessionDir).LoadGraph()
+			nodes, _ := graphPayload["nodes"].(map[string]any)
+			root, _ := nodes[graph.RootNodeID].(map[string]any)
+			if root["status"] != "failed" {
+				t.Fatalf("completion failure graph = %#v", root)
+			}
+		})
 	}
 }
 

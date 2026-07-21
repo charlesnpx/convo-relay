@@ -21,6 +21,11 @@ const (
 	rootValidationFailedPhase   = "result_validation_failed"
 )
 
+// rootResultCompletionAfterWrite is a test-only failpoint used to prove that
+// interruption after any result-completion write becomes one consistent
+// terminal failure. Production leaves it nil.
+var rootResultCompletionAfterWrite func(string) error
+
 type rootCandidate struct {
 	content         string
 	source          string
@@ -560,7 +565,10 @@ func (s *rootExecutionState) markRootResultCompleted() (map[string]any, error) {
 		s.meta = workspaceIntegrityFailureMeta(s.meta, terminalErr)
 	}
 	if err := s.saveProgress(); err != nil {
-		return s.result(), errors.Join(terminalErr, err)
+		return s.markFailed("result_completion_persistence", errors.Join(terminalErr, err))
+	}
+	if err := runRootResultCompletionFailpoint("metadata"); err != nil {
+		return s.markFailed("result_completion_persistence", errors.Join(terminalErr, err))
 	}
 	if terminalErr != nil {
 		_, _ = s.st.AppendSessionEventV1("node_failed", graph.RootNodeID, "Root recipe result finalization failed: "+terminalErr.Error(), map[string]any{
@@ -579,12 +587,25 @@ func (s *rootExecutionState) markRootResultCompleted() (map[string]any, error) {
 		"result_validation_ref":    s.meta.Get("result_validation_ref"),
 		"canonical_result_ref":     s.meta.Get("canonical_result_ref"),
 	}, store.EventOptions{}); err != nil {
-		return s.result(), err
+		return s.markFailed("result_completion_persistence", err)
+	}
+	if err := runRootResultCompletionFailpoint("event"); err != nil {
+		return s.markFailed("result_completion_persistence", err)
 	}
 	if err := s.saveGraph("completed"); err != nil {
-		return s.result(), err
+		return s.markFailed("result_completion_persistence", err)
+	}
+	if err := runRootResultCompletionFailpoint("graph"); err != nil {
+		return s.markFailed("result_completion_persistence", err)
 	}
 	return s.result(), nil
+}
+
+func runRootResultCompletionFailpoint(stage string) error {
+	if rootResultCompletionAfterWrite == nil {
+		return nil
+	}
+	return rootResultCompletionAfterWrite(stage)
 }
 
 func (s *rootExecutionState) markReducerFailed(runErr error) (map[string]any, error) {
