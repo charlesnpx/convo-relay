@@ -115,6 +115,66 @@ func TestRootCompilationValidateExecutableRejectsInvalidNestedRelay(t *testing.T
 	}
 }
 
+func TestRootCompilationValidatesReachableRecipesAsChildTargets(t *testing.T) {
+	config := defaultCompileConfig(t)
+
+	t.Run("integration-bound child is typed root-only", func(t *testing.T) {
+		profiles := cloneNestedObject(config.BackendProfiles)
+		relayRecipes := cloneNestedObject(config.RelayRecipes)
+		profiles["bound-child-profile"] = map[string]any{
+			"id":      "bound-child-profile",
+			"backend": "relay",
+			"model":   "bound-child",
+			"effort":  1,
+		}
+		child := cloneObject(config.RelayRecipes["review-panel"])
+		child["id"] = "bound-child"
+		child["integration_contract"] = "test/contract-v1"
+		relayRecipes["bound-child"] = child
+		root := cloneObject(config.RelayRecipes["review-panel"])
+		root["id"] = "root-with-bound-child"
+		root["participants"] = []any{"bound-child-profile", "codex-fast"}
+		root["max_depth"] = 3
+
+		_, err := CompileRecipe(root, profiles, relayRecipes, CompileTargetRoot, CompileOptions{ValidateExecutable: true})
+		var rootOnly *RootOnlyRecipeError
+		if !errors.As(err, &rootOnly) || rootOnly.RecipeID != "bound-child" || rootOnly.IntegrationContract != "test/contract-v1" {
+			t.Fatalf("nested bound child error = %T %#v, want typed root-only error", err, err)
+		}
+	})
+
+	t.Run("child relay role constraints are enforced", func(t *testing.T) {
+		profiles := cloneNestedObject(config.BackendProfiles)
+		relayRecipes := cloneNestedObject(config.RelayRecipes)
+		profiles["invalid-child-profile"] = map[string]any{
+			"id":      "invalid-child-profile",
+			"backend": "relay",
+			"model":   "invalid-child",
+			"effort":  1,
+		}
+		profiles["relay-facilitator"] = map[string]any{
+			"id":      "relay-facilitator",
+			"backend": "relay",
+			"model":   "review-panel",
+			"effort":  1,
+		}
+		child := cloneObject(config.RelayRecipes["review-panel"])
+		child["id"] = "invalid-child"
+		child["facilitator"] = "relay-facilitator"
+		relayRecipes["invalid-child"] = child
+		root := cloneObject(config.RelayRecipes["review-panel"])
+		root["id"] = "root-with-invalid-child"
+		root["participants"] = []any{"invalid-child-profile", "codex-fast"}
+		root["max_depth"] = 3
+
+		_, err := CompileRecipe(root, profiles, relayRecipes, CompileTargetRoot, CompileOptions{ValidateExecutable: true})
+		var configErr ChildRelayConfigError
+		if !errors.As(err, &configErr) || !issueCodes(configErr.Issues)["relay_backend_role_unsupported"] {
+			t.Fatalf("nested child role error = %T %#v, want relay_backend_role_unsupported", err, err)
+		}
+	})
+}
+
 func TestIntegrationBoundRecipeCompilesOnlyForRootWithMatchingBundle(t *testing.T) {
 	config := defaultCompileConfig(t)
 	bundle, err := integration.DecodeBundleBytes([]byte(compileBundleJSON))

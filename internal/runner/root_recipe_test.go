@@ -68,10 +68,10 @@ func TestRunRecipeUsesExplicitRootTargetAndPersistsDirectContractlessSession(t *
 	var compileTarget recipes.CompileTarget
 	var readinessSessionExisted bool
 
-	result, err := RunRecipe(context.Background(), RecipeOptions{
+	result, err := RunRecipe(nil, RecipeOptions{
 		SessionDir:       sessionDir,
 		Task:             "Frame this ordinary prose task",
-		RecipeID:         "neutral-root",
+		RecipeID:         "  neutral-root  ",
 		ContextFiles:     []string{"context.md"},
 		SkillFiles:       []string{"skill.md"},
 		SkillExplicit:    true,
@@ -112,6 +112,9 @@ func TestRunRecipeUsesExplicitRootTargetAndPersistsDirectContractlessSession(t *
 	}
 	if meta.String("task") != "Frame this ordinary prose task" || meta.Get("launch_plan") == nil {
 		t.Fatalf("contractless framing metadata = %#v", meta.ToMap())
+	}
+	if meta.String("recipe_id") != "neutral-root" {
+		t.Fatalf("normalized recipe id = %q", meta.String("recipe_id"))
 	}
 	contextRefs := meta.Slice("launch_context_refs")
 	inputRefs := meta.Slice("input_bundle_refs")
@@ -232,6 +235,14 @@ func TestRunRecipeContractPoliciesRejectBeforeSessionCreation(t *testing.T) {
 			wantCode: diagnosticCodePolicyConflict,
 		},
 		{
+			name: "programmatic task plan without CLI explicit marker",
+			configure: func(options *RecipeOptions) {
+				options.LaunchPlan = map[string]any{"plan": []any{}}
+				options.InputBindings = []string{"payload=payload.json"}
+			},
+			wantCode: diagnosticCodePolicyConflict,
+		},
+		{
 			name: "context with declared named inputs",
 			configure: func(options *RecipeOptions) {
 				options.ContextFiles = []string{"context.md"}
@@ -332,6 +343,49 @@ func TestRunRecipePurePreflightFailuresLeaveNoSession(t *testing.T) {
 				t.Fatalf("session created after pure preflight failure, err = %v", statErr)
 			}
 		})
+	}
+}
+
+func TestRunRecipeRejectsIntegrationBoundNestedChildBeforeReadinessOrSession(t *testing.T) {
+	config := rootRecipeRuntimeConfig("")
+	config.BackendProfiles["bound-child-profile"] = map[string]any{
+		"id":      "bound-child-profile",
+		"backend": "relay",
+		"model":   "bound-child",
+		"effort":  1,
+	}
+	root := config.RelayRecipes["neutral-root"]
+	root["participants"] = []any{"bound-child-profile", "participant-b"}
+	root["max_depth"] = 3
+	child := cloneMap(root)
+	child["id"] = "bound-child"
+	child["participants"] = []any{"participant-a", "participant-b"}
+	child["max_depth"] = 1
+	child["integration_contract"] = "neutral/contract-v1"
+	config.RelayRecipes["bound-child"] = child
+
+	sessionDir := filepath.Join(t.TempDir(), "session")
+	readinessCalled := false
+	_, err := RunRecipe(context.Background(), RecipeOptions{
+		SessionDir:    sessionDir,
+		Task:          "Nested recipes must be preflighted",
+		RecipeID:      "neutral-root",
+		LaunchCWD:     t.TempDir(),
+		RuntimeConfig: config,
+		ReadinessCheck: func(context.Context, []string, readiness.Options) ([]readiness.Record, error) {
+			readinessCalled = true
+			return nil, nil
+		},
+	})
+	var rootOnly *recipes.RootOnlyRecipeError
+	if !errors.As(err, &rootOnly) || rootOnly.RecipeID != "bound-child" {
+		t.Fatalf("nested child preflight error = %T %#v, want typed root-only error", err, err)
+	}
+	if readinessCalled {
+		t.Fatal("backend readiness ran after nested child compilation failed")
+	}
+	if _, statErr := os.Stat(sessionDir); !os.IsNotExist(statErr) {
+		t.Fatalf("session created after nested child compilation failed, err = %v", statErr)
 	}
 }
 

@@ -71,6 +71,8 @@ func CompileRecipe(
 		return nil, contracts.NewDiagnosticError("Relay recipe configuration is invalid.", diagnostics...)
 	}
 	recipePayload := normalizeRecipePayload(recipe)
+	var compiled map[string]any
+	var err error
 	if target == CompileTargetChild {
 		if contractID := stringValue(recipePayload["integration_contract"]); strings.TrimSpace(contractID) != "" {
 			return nil, &RootOnlyRecipeError{
@@ -78,9 +80,72 @@ func CompileRecipe(
 				IntegrationContract: contractID,
 			}
 		}
-		return compileChildPlan(recipePayload, profiles, relayRecipes, options)
+		compiled, err = compileChildPlan(recipePayload, profiles, relayRecipes, options)
+	} else {
+		compiled, err = compileRootPlan(recipePayload, profiles, relayRecipes, options)
 	}
-	return compileRootPlan(recipePayload, profiles, relayRecipes, options)
+	if err != nil {
+		return nil, err
+	}
+	if options.ValidateExecutable {
+		closureOptions := options
+		if closureOptions.MaxRelayBackendDepth <= 0 {
+			closureOptions.MaxRelayBackendDepth = intFromAny(recipePayload["max_depth"], 1)
+		}
+		visited := map[string]bool{strings.TrimSpace(stringValue(recipePayload["id"])): true}
+		if err := validateNestedChildCompileTargets(recipePayload, profiles, relayRecipes, closureOptions, visited); err != nil {
+			return nil, err
+		}
+	}
+	return compiled, nil
+}
+
+// validateNestedChildCompileTargets closes the gap between validating relay
+// linkage and validating the recipes reached through that linkage. Every
+// reachable relay participant is compiled under child rules before the parent
+// plan can cross a persistence boundary.
+func validateNestedChildCompileTargets(
+	parent map[string]any,
+	profiles map[string]map[string]any,
+	relayRecipes map[string]map[string]any,
+	options CompileOptions,
+	visited map[string]bool,
+) error {
+	compositionPath := defaultCompositionPath(options.CompositionPath)
+	for index, ref := range stringSlice(parent["participants"]) {
+		profile, err := ResolveProfileRef(ref, profiles)
+		if err != nil || stringValue(profile["backend"]) != "relay" {
+			continue
+		}
+		childRecipeID := strings.TrimSpace(stringValue(profile["model"]))
+		childRecipe, exists := relayRecipes[childRecipeID]
+		if !exists || childRecipe == nil || visited[childRecipeID] {
+			continue
+		}
+		if diagnostics := validateRecipeRecord(childRecipe, "/recipe"); len(diagnostics) > 0 {
+			return contracts.NewDiagnosticError("Relay recipe configuration is invalid.", diagnostics...)
+		}
+		childPayload := normalizeRecipePayload(childRecipe)
+		if contractID := strings.TrimSpace(stringValue(childPayload["integration_contract"])); contractID != "" {
+			return &RootOnlyRecipeError{
+				RecipeID:            stringValue(childPayload["id"]),
+				IntegrationContract: contractID,
+			}
+		}
+
+		childOptions := options
+		childOptions.CompositionPath = fmt.Sprintf("%s.slot_%d", compositionPath, index)
+		childOptions.RelayBackendDepth = options.RelayBackendDepth + 1
+		childOptions.IntegrationBundle = nil
+		if _, err := compileChildPlan(childPayload, profiles, relayRecipes, childOptions); err != nil {
+			return err
+		}
+		visited[childRecipeID] = true
+		if err := validateNestedChildCompileTargets(childPayload, profiles, relayRecipes, childOptions, visited); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func validateCompileTarget(target CompileTarget) error {

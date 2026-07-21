@@ -106,6 +106,9 @@ type persistedRecipeRun struct {
 // before creating a session, then durably records the direct root execution
 // boundary. Participant execution is deliberately separate from ordinary Run.
 func RunRecipe(ctx context.Context, opts RecipeOptions) (map[string]any, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	preflight, err := preflightRecipe(ctx, opts)
 	if err != nil {
 		return nil, err
@@ -194,7 +197,7 @@ func preflightRecipe(ctx context.Context, opts RecipeOptions) (*recipePreflight,
 	if selectedContract != nil && (opts.SkillExplicit || len(opts.SkillFiles) > 0) {
 		return nil, rootRecipeDiagnostic(diagnosticCodePolicyConflict, contracts.DiagnosticPhasePolicy, "/skill", "Explicit skill inputs are not represented by an integration-bound root plan.", nil)
 	}
-	if selectedContract != nil && opts.TaskPlanExplicit {
+	if selectedContract != nil && (opts.TaskPlanExplicit || opts.LaunchPlan != nil) {
 		return nil, rootRecipeDiagnostic(diagnosticCodePolicyConflict, contracts.DiagnosticPhasePolicy, "/task_plan", "An explicit task plan is not represented by an integration-bound root plan.", nil)
 	}
 	preparedInputs, err := namedinputs.Prepare(namedinputs.Options{
@@ -249,6 +252,7 @@ func preflightRecipe(ctx context.Context, opts RecipeOptions) (*recipePreflight,
 		return nil, err
 	}
 
+	opts.RecipeID = recipeID
 	opts.SettingsPath = settingsPath
 	opts.IntegrationBundlePath = integrationBundlePath
 	opts.LaunchCWD = launchCWD
