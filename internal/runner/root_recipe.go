@@ -65,6 +65,10 @@ type RecipeOptions struct {
 	// compileRecipe is an internal test seam that proves the caller-selected
 	// target without creating a second compiler API.
 	compileRecipe func(map[string]any, map[string]map[string]any, map[string]map[string]any, recipes.CompileTarget, recipes.CompileOptions) (map[string]any, error)
+
+	// backendFactory is an internal test seam. Production root execution uses
+	// the same low-level backend factory as ordinary relay execution.
+	backendFactory rootBackendFactory
 }
 
 type recipePreflight struct {
@@ -383,7 +387,7 @@ func startRecipeRun(ctx context.Context, preflight *recipePreflight) (map[string
 	if _, _, err := graph.RepairAndSaveFromEvents(persisted.st); err != nil {
 		return nil, err
 	}
-	return sessionResult(preflight.sessionDir, meta, transcript), nil
+	return runRootParticipants(ctx, preflight, persisted, meta, transcript)
 }
 
 func persistRecipePreflight(ctx context.Context, preflight *recipePreflight) (*persistedRecipeRun, error) {
@@ -534,6 +538,9 @@ func rootRecipeMeta(preflight *recipePreflight, persisted *persistedRecipeRun) m
 		"latest_root_checkpoint_ref":      persisted.checkpointRef,
 		"participant_turns":               participantTurns,
 		"actual_participant_turns":        0,
+		"participant_turns_completed":     0,
+		"next_unsealed_participant_turn":  1,
+		"sealed_participant_turns":        []any{},
 		"actual_rounds":                   0,
 		"max_rounds":                      participantTurns,
 		"round_limit_mode":                "fixed",

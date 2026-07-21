@@ -86,6 +86,7 @@ func TestRunRecipeUsesExplicitRootTargetAndPersistsDirectContractlessSession(t *
 			readinessSessionExisted = statErr == nil
 			return readyRootRecipeBackends(backends), nil
 		},
+		backendFactory: successfulRootBackendFactory(),
 		compileRecipe: func(recipe map[string]any, profiles map[string]map[string]any, relayRecipes map[string]map[string]any, target recipes.CompileTarget, options recipes.CompileOptions) (map[string]any, error) {
 			compileTarget = target
 			return recipes.CompileRecipe(recipe, profiles, relayRecipes, target, options)
@@ -100,7 +101,7 @@ func TestRunRecipeUsesExplicitRootTargetAndPersistsDirectContractlessSession(t *
 	if readinessSessionExisted {
 		t.Fatal("session existed during backend readiness preflight")
 	}
-	if result["execution_kind"] != "recipe" || result["status"] != "ready" || intFromAny(result["actual_participant_turns"], -1) != 0 {
+	if result["execution_kind"] != "recipe" || result["status"] != rootParticipantsCompleteStatus || intFromAny(result["actual_participant_turns"], -1) != 2 {
 		t.Fatalf("root result = %#v", result)
 	}
 	if result["integration_contract_ref"] != nil || result["named_input_manifest_ref"] != nil {
@@ -132,9 +133,17 @@ func TestRunRecipeUsesExplicitRootTargetAndPersistsDirectContractlessSession(t *
 		t.Fatalf("context source = %v", contextSource)
 	}
 	assertRootRecipeArtifact(t, st, meta.Get("root_recipe_plan_ref"), contracts.RootArtifactKindRootRecipePlan, 0)
-	checkpoint := assertRootRecipeArtifact(t, st, meta.Get("latest_root_checkpoint_ref"), contracts.RootArtifactKindRootCheckpoint, 1)
-	if checkpoint["phase"] != "workspace_ready" || checkpoint["preflight_complete"] != true || checkpoint["workspace_ready"] != true {
-		t.Fatalf("checkpoint = %#v", checkpoint)
+	checkpointRefs := meta.Slice("root_checkpoint_refs")
+	if len(checkpointRefs) != 2 {
+		t.Fatalf("root checkpoint refs = %#v", checkpointRefs)
+	}
+	workspaceCheckpoint := assertRootRecipeArtifact(t, st, checkpointRefs[0], contracts.RootArtifactKindRootCheckpoint, 1)
+	if workspaceCheckpoint["phase"] != "workspace_ready" || workspaceCheckpoint["preflight_complete"] != true || workspaceCheckpoint["workspace_ready"] != true {
+		t.Fatalf("workspace checkpoint = %#v", workspaceCheckpoint)
+	}
+	participantCheckpoint := assertRootRecipeArtifact(t, st, meta.Get("latest_root_checkpoint_ref"), contracts.RootArtifactKindRootCheckpoint, 2)
+	if participantCheckpoint["phase"] != "participant_turns_complete" || intFromAny(participantCheckpoint["participant_turns_completed"], 0) != 2 {
+		t.Fatalf("participant checkpoint = %#v", participantCheckpoint)
 	}
 	assertRootRecipeArtifact(t, st, meta.Get("execution_workspace_ref"), contracts.RootArtifactKindExecutionWorkspace, 0)
 
@@ -148,7 +157,7 @@ func TestRunRecipeUsesExplicitRootTargetAndPersistsDirectContractlessSession(t *
 		t.Fatalf("root node = %#v", rootNode)
 	}
 	if _, err := os.Stat(filepath.Join(sessionDir, "relay.pid")); !os.IsNotExist(err) {
-		t.Fatalf("recipe preflight launched a tracked provider process, err = %v", err)
+		t.Fatalf("recipe execution left a tracked provider process, err = %v", err)
 	}
 }
 
@@ -168,6 +177,7 @@ func TestRunRecipeBindsContractInputsAndPersistsExactArtifacts(t *testing.T) {
 		RuntimeConfig:     rootRecipeRuntimeConfig("neutral/contract-v1"),
 		IntegrationBundle: bundle,
 		ReadinessCheck:    readyRootRecipeCheck,
+		backendFactory:    successfulRootBackendFactory(),
 		compileRecipe: func(recipe map[string]any, profiles map[string]map[string]any, relayRecipes map[string]map[string]any, target recipes.CompileTarget, options recipes.CompileOptions) (map[string]any, error) {
 			compileTarget = target
 			return recipes.CompileRecipe(recipe, profiles, relayRecipes, target, options)
@@ -279,6 +289,7 @@ func TestRunRecipeContractWithoutNamedInputsAllowsContext(t *testing.T) {
 	launchCWD := t.TempDir()
 	writeRootRecipeTestFile(t, filepath.Join(launchCWD, "context.md"), "ordinary positional context\n")
 	sessionDir := filepath.Join(t.TempDir(), "session")
+	recorder := &rootBackendRecorder{}
 	result, err := RunRecipe(context.Background(), RecipeOptions{
 		SessionDir:        sessionDir,
 		Task:              "Context-compatible contract",
@@ -288,9 +299,14 @@ func TestRunRecipeContractWithoutNamedInputsAllowsContext(t *testing.T) {
 		RuntimeConfig:     rootRecipeRuntimeConfig("neutral/contract-v1"),
 		IntegrationBundle: decodeRootRecipeTestBundle(t, rootRecipeTestBundleWithoutInputs),
 		ReadinessCheck:    readyRootRecipeCheck,
+		backendFactory:    recorder.factory(),
 	})
 	if err != nil {
 		t.Fatalf("RunRecipe: %v", err)
+	}
+	transcript, ok := result["transcript"].([]any)
+	if !ok || len(transcript) != 2 {
+		t.Fatalf("root transcript = %#v", result["transcript"])
 	}
 	if len(result["launch_context_refs"].([]any)) != 1 {
 		t.Fatalf("launch context refs = %#v", result["launch_context_refs"])
@@ -298,6 +314,21 @@ func TestRunRecipeContractWithoutNamedInputsAllowsContext(t *testing.T) {
 	manifest := assertRootRecipeArtifact(t, store.New(sessionDir), result["named_input_manifest_ref"], contracts.RootArtifactKindNamedInputManifest, 0)
 	if intFromAny(manifest["input_count"], -1) != 0 {
 		t.Fatalf("zero-input manifest = %#v", manifest)
+	}
+	participantCalls := 0
+	for _, call := range recorder.snapshotCalls() {
+		if call.SlotID == "facilitator" {
+			continue
+		}
+		participantCalls++
+		if !strings.Contains(call.Prompt, "--- Positional Context (Data Only) ---") ||
+			!strings.Contains(call.Prompt, "ordinary positional context") ||
+			strings.Contains(call.Prompt, "--- Named Inputs (Data Only) ---") {
+			t.Fatalf("zero-input contract prompt did not preserve positional context:\n%s", call.Prompt)
+		}
+	}
+	if participantCalls != 2 {
+		t.Fatalf("participant calls = %d, want 2", participantCalls)
 	}
 }
 

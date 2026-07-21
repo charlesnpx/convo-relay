@@ -17,6 +17,23 @@ import (
 	"github.com/charlesnpx/convo-relay/internal/workspace"
 )
 
+const rootSteeringClaimJournalName = "root-steering-claim.json"
+
+// rootSteeringClaimAfterQueueWrite is a test-only failpoint for proving that
+// the durable claim journal can complete a move interrupted between the queue
+// and metadata replacements. Production leaves it nil.
+var rootSteeringClaimAfterQueueWrite func() error
+
+type rootSteeringClaimJournal struct {
+	participantTurn int
+	sealedAt        string
+	nextTurn        any
+	claimedHistory  []map[string]any
+	remaining       []map[string]any
+	original        []map[string]any
+	metaBefore      map[string]any
+}
+
 func ResolveSessionDir(home string, sessionDir string, sessionIDPrefix string) (string, error) {
 	if strings.TrimSpace(sessionDir) != "" {
 		return sessionDir, nil
@@ -99,7 +116,18 @@ func QueueSteeringPrompt(sessionDir string, prompt string) (map[string]any, erro
 	if text == "" {
 		return nil, fmt.Errorf("steering prompt cannot be empty")
 	}
-	if _, err := loadMeta(sessionDir); err != nil {
+	lock, err := lockSessionMutation(sessionDir)
+	if err != nil {
+		return nil, err
+	}
+	defer func() {
+		_ = lock.Unlock()
+	}()
+	if _, err := recoverRootSteeringClaimLocked(sessionDir); err != nil {
+		return nil, err
+	}
+	meta, err := loadSessionMeta(sessionDir)
+	if err != nil {
 		return nil, err
 	}
 	item := map[string]any{
@@ -107,6 +135,31 @@ func QueueSteeringPrompt(sessionDir string, prompt string) (map[string]any, erro
 		"prompt":     text,
 		"source":     "steer",
 		"created_at": utcNow(),
+	}
+	if meta.String("execution_kind") == "recipe" {
+		lifecycle, _ := meta.Get("lifecycle").(map[string]any)
+		if strings.TrimSpace(stringFromAny(lifecycle["steering"])) == "forbid" {
+			return nil, rootRecipeDiagnostic(
+				diagnosticCodeRootSteeringForbidden,
+				contracts.DiagnosticPhasePolicy,
+				"/lifecycle/steering",
+				"Steering is forbidden by the root recipe lifecycle policy.",
+				nil,
+			)
+		}
+		nextOrdinal := meta.Int("next_unsealed_participant_turn", 0)
+		totalTurns := meta.Int("participant_turns", 0)
+		status := meta.String("status")
+		if (status != "ready" && status != "running") || nextOrdinal < 1 || nextOrdinal > totalTurns {
+			return nil, rootRecipeDiagnostic(
+				diagnosticCodeRootSteeringUnavailable,
+				contracts.DiagnosticPhasePolicy,
+				"/steering",
+				"Root recipe steering requires an unsealed participant prompt.",
+				map[string]any{"status": status, "participant_turns": totalTurns, "next_unsealed_participant_turn": emptyIntAsNil(nextOrdinal)},
+			)
+		}
+		item["target_participant_turn"] = nextOrdinal
 	}
 	prompts, err := loadSteeringPrompts(sessionDir)
 	if err != nil {
@@ -117,6 +170,370 @@ func QueueSteeringPrompt(sessionDir string, prompt string) (map[string]any, erro
 		return nil, err
 	}
 	return item, nil
+}
+
+func claimRootParticipantSteering(sessionDir string, ordinal int) ([]map[string]any, model.SessionMeta, error) {
+	lock, err := lockSessionMutation(sessionDir)
+	if err != nil {
+		return nil, model.EmptySessionMeta(), err
+	}
+	defer func() {
+		_ = lock.Unlock()
+	}()
+	if _, err := recoverRootSteeringClaimLocked(sessionDir); err != nil {
+		return nil, model.EmptySessionMeta(), err
+	}
+	meta, err := loadSessionMeta(sessionDir)
+	if err != nil {
+		return nil, model.EmptySessionMeta(), err
+	}
+	if meta.String("execution_kind") != "recipe" {
+		return nil, model.EmptySessionMeta(), rootRecipeDiagnostic(
+			diagnosticCodeRootSteeringStateInvalid,
+			contracts.DiagnosticPhasePolicy,
+			"/execution_kind",
+			"Participant prompt sealing requires a root recipe session.",
+			nil,
+		)
+	}
+	if ordinal < 1 || meta.Int("next_unsealed_participant_turn", 0) != ordinal {
+		return nil, model.EmptySessionMeta(), rootRecipeDiagnostic(
+			diagnosticCodeRootSteeringStateInvalid,
+			contracts.DiagnosticPhasePolicy,
+			"/next_unsealed_participant_turn",
+			"Root recipe participant prompts must be sealed exactly once in compiled order.",
+			map[string]any{"participant_turn": ordinal, "next_unsealed_participant_turn": meta.Get("next_unsealed_participant_turn")},
+		)
+	}
+	prompts, err := loadSteeringPrompts(sessionDir)
+	if err != nil {
+		return nil, model.EmptySessionMeta(), err
+	}
+	claimed := make([]map[string]any, 0, len(prompts))
+	remaining := make([]map[string]any, 0, len(prompts))
+	for _, item := range prompts {
+		target := intFromAny(item["target_participant_turn"], 0)
+		if target < 1 {
+			return nil, model.EmptySessionMeta(), rootRecipeDiagnostic(
+				diagnosticCodeRootSteeringStateInvalid,
+				contracts.DiagnosticPhasePolicy,
+				"/steering",
+				"Queued root recipe steering is missing its target participant turn.",
+				map[string]any{"steering_id": item["id"]},
+			)
+		}
+		if target < ordinal {
+			return nil, model.EmptySessionMeta(), rootRecipeDiagnostic(
+				diagnosticCodeRootSteeringStateInvalid,
+				contracts.DiagnosticPhasePolicy,
+				"/steering",
+				"Queued root recipe steering targets an already sealed participant turn.",
+				map[string]any{"steering_id": item["id"], "target_participant_turn": target},
+			)
+		}
+		if target == ordinal {
+			claimed = append(claimed, cloneMap(item))
+			continue
+		}
+		remaining = append(remaining, cloneMap(item))
+	}
+
+	sealedAt := utcNow()
+	claimedHistory := make([]map[string]any, 0, len(claimed))
+	for _, item := range claimed {
+		historyItem := cloneMap(item)
+		historyItem["consumed_at"] = sealedAt
+		historyItem["status"] = "consumed"
+		claimedHistory = append(claimedHistory, historyItem)
+	}
+	totalTurns := meta.Int("participant_turns", 0)
+	var nextTurn any
+	if ordinal < totalTurns {
+		nextTurn = ordinal + 1
+	}
+	journal := rootSteeringClaimJournal{
+		participantTurn: ordinal,
+		sealedAt:        sealedAt,
+		nextTurn:        nextTurn,
+		claimedHistory:  claimedHistory,
+		remaining:       remaining,
+		original:        prompts,
+		metaBefore:      meta.ToMap(),
+	}
+	if err := saveRootSteeringClaimJournal(sessionDir, journal); err != nil {
+		return nil, model.EmptySessionMeta(), err
+	}
+	updatedMeta, err := applyRootSteeringClaimJournalLocked(sessionDir, journal, true)
+	if err != nil {
+		_, rollbackErr := rollbackRootSteeringClaimJournalLocked(sessionDir, journal)
+		return nil, model.EmptySessionMeta(), errors.Join(err, rollbackErr)
+	}
+	return claimed, updatedMeta, nil
+}
+
+func recoverRootSteeringClaimLocked(sessionDir string) (model.SessionMeta, error) {
+	journal, exists, err := loadRootSteeringClaimJournal(sessionDir)
+	if err != nil {
+		return model.EmptySessionMeta(), err
+	}
+	if !exists {
+		return model.EmptySessionMeta(), nil
+	}
+	return rollbackRootSteeringClaimJournalLocked(sessionDir, journal)
+}
+
+// rollbackRootSteeringClaimJournalLocked restores the exact queue and metadata
+// snapshot that preceded an unacknowledged claim. The journal remains in place
+// until both replacements succeed, so recovery is itself idempotent across
+// interruption. A claim is consumed only after apply removes the journal and
+// returns its batch to the prompt-building caller.
+func rollbackRootSteeringClaimJournalLocked(sessionDir string, journal rootSteeringClaimJournal) (model.SessionMeta, error) {
+	if err := saveSteeringPrompts(sessionDir, journal.original); err != nil {
+		return model.EmptySessionMeta(), err
+	}
+	restoredMeta := model.NewSessionMeta(journal.metaBefore)
+	if err := store.New(sessionDir).SaveMeta(restoredMeta); err != nil {
+		return model.EmptySessionMeta(), err
+	}
+	if err := os.Remove(filepath.Join(sessionDir, rootSteeringClaimJournalName)); err != nil && !os.IsNotExist(err) {
+		return model.EmptySessionMeta(), err
+	}
+	return restoredMeta, nil
+}
+
+func applyRootSteeringClaimJournalLocked(sessionDir string, journal rootSteeringClaimJournal, useFailpoint bool) (model.SessionMeta, error) {
+	if err := saveSteeringPrompts(sessionDir, journal.remaining); err != nil {
+		return model.EmptySessionMeta(), err
+	}
+	if useFailpoint && rootSteeringClaimAfterQueueWrite != nil {
+		if err := rootSteeringClaimAfterQueueWrite(); err != nil {
+			return model.EmptySessionMeta(), err
+		}
+	}
+	meta, err := loadSessionMeta(sessionDir)
+	if err != nil {
+		return model.EmptySessionMeta(), err
+	}
+	updatedMeta, err := applyRootSteeringClaimMeta(meta, journal)
+	if err != nil {
+		return model.EmptySessionMeta(), err
+	}
+	if err := store.New(sessionDir).SaveMeta(updatedMeta); err != nil {
+		return model.EmptySessionMeta(), err
+	}
+	if err := os.Remove(filepath.Join(sessionDir, rootSteeringClaimJournalName)); err != nil && !os.IsNotExist(err) {
+		return model.EmptySessionMeta(), err
+	}
+	return updatedMeta, nil
+}
+
+func applyRootSteeringClaimMeta(meta model.SessionMeta, journal rootSteeringClaimJournal) (model.SessionMeta, error) {
+	if meta.String("execution_kind") != "recipe" {
+		return model.EmptySessionMeta(), rootRecipeDiagnostic(
+			diagnosticCodeRootSteeringStateInvalid,
+			contracts.DiagnosticPhasePolicy,
+			"/execution_kind",
+			"A durable steering claim belongs to a root recipe session.",
+			nil,
+		)
+	}
+	historyIDs := map[string]bool{}
+	for _, raw := range meta.Slice("steering_history") {
+		if item, ok := raw.(map[string]any); ok {
+			historyIDs[strings.TrimSpace(stringFromAny(item["id"]))] = true
+		}
+	}
+	updatedMeta := meta
+	for _, item := range journal.claimedHistory {
+		id := strings.TrimSpace(stringFromAny(item["id"]))
+		if id == "" || historyIDs[id] {
+			continue
+		}
+		updatedMeta = updatedMeta.AppendToSlice("steering_history", item)
+		historyIDs[id] = true
+	}
+	sealed := updatedMeta.Slice("sealed_participant_turns")
+	alreadySealed := false
+	for _, raw := range sealed {
+		if intFromAny(raw, 0) == journal.participantTurn {
+			alreadySealed = true
+			break
+		}
+	}
+	if !alreadySealed {
+		updatedMeta = updatedMeta.AppendToSlice("sealed_participant_turns", journal.participantTurn)
+	}
+	updatedMeta = updatedMeta.
+		With("participant_prompt_sealed_through", journal.participantTurn).
+		With("participant_prompt_sealed_at", journal.sealedAt).
+		With("next_unsealed_participant_turn", journal.nextTurn)
+	return updatedMeta, nil
+}
+
+func saveRootSteeringClaimJournal(sessionDir string, journal rootSteeringClaimJournal) error {
+	claimed := make([]any, 0, len(journal.claimedHistory))
+	for _, item := range journal.claimedHistory {
+		claimed = append(claimed, cloneMap(item))
+	}
+	remaining := make([]any, 0, len(journal.remaining))
+	for _, item := range journal.remaining {
+		remaining = append(remaining, cloneMap(item))
+	}
+	original := make([]any, 0, len(journal.original))
+	for _, item := range journal.original {
+		original = append(original, cloneMap(item))
+	}
+	payload := map[string]any{
+		"schema_version":                 1,
+		"participant_turn":               journal.participantTurn,
+		"sealed_at":                      journal.sealedAt,
+		"next_unsealed_participant_turn": journal.nextTurn,
+		"claimed_history":                claimed,
+		"remaining_prompts":              remaining,
+		"original_prompts":               original,
+		"meta_before":                    cloneMap(journal.metaBefore),
+	}
+	body, err := contracts.CanonicalJSONBytes(payload)
+	if err != nil {
+		return err
+	}
+	return store.AtomicWriteFile(filepath.Join(sessionDir, rootSteeringClaimJournalName), body)
+}
+
+func loadRootSteeringClaimJournal(sessionDir string) (rootSteeringClaimJournal, bool, error) {
+	data, err := os.ReadFile(filepath.Join(sessionDir, rootSteeringClaimJournalName))
+	if err != nil {
+		if os.IsNotExist(err) {
+			return rootSteeringClaimJournal{}, false, nil
+		}
+		return rootSteeringClaimJournal{}, false, err
+	}
+	payload, err := contracts.DecodeStrictJSONObjectBytes(data)
+	if err != nil {
+		return rootSteeringClaimJournal{}, false, err
+	}
+	participantTurn := intFromAny(payload["participant_turn"], 0)
+	sealedAt := strings.TrimSpace(stringFromAny(payload["sealed_at"]))
+	if intFromAny(payload["schema_version"], 0) != 1 || participantTurn < 1 || sealedAt == "" {
+		return rootSteeringClaimJournal{}, false, rootRecipeDiagnostic(
+			diagnosticCodeRootSteeringStateInvalid,
+			contracts.DiagnosticPhasePolicy,
+			"/steering_claim",
+			"The durable root steering claim journal is invalid.",
+			nil,
+		)
+	}
+	nextTurn := payload["next_unsealed_participant_turn"]
+	if nextTurn != nil {
+		nextOrdinal := intFromAny(nextTurn, 0)
+		if nextOrdinal <= participantTurn {
+			return rootSteeringClaimJournal{}, false, rootRecipeDiagnostic(
+				diagnosticCodeRootSteeringStateInvalid,
+				contracts.DiagnosticPhasePolicy,
+				"/steering_claim/next_unsealed_participant_turn",
+				"The durable root steering claim journal has an invalid next turn.",
+				nil,
+			)
+		}
+		nextTurn = nextOrdinal
+	}
+	claimedHistory, err := rootSteeringJournalItems(payload["claimed_history"], participantTurn, true)
+	if err != nil {
+		return rootSteeringClaimJournal{}, false, err
+	}
+	remaining, err := rootSteeringJournalItems(payload["remaining_prompts"], participantTurn, false)
+	if err != nil {
+		return rootSteeringClaimJournal{}, false, err
+	}
+	original, err := rootSteeringOriginalJournalItems(payload["original_prompts"], participantTurn)
+	if err != nil {
+		return rootSteeringClaimJournal{}, false, err
+	}
+	metaBefore, ok := payload["meta_before"].(map[string]any)
+	if !ok || stringFromAny(metaBefore["execution_kind"]) != "recipe" || intFromAny(metaBefore["next_unsealed_participant_turn"], 0) != participantTurn {
+		return rootSteeringClaimJournal{}, false, rootRecipeDiagnostic(
+			diagnosticCodeRootSteeringStateInvalid,
+			contracts.DiagnosticPhasePolicy,
+			"/steering_claim/meta_before",
+			"The durable root steering claim journal has an invalid rollback snapshot.",
+			nil,
+		)
+	}
+	return rootSteeringClaimJournal{
+		participantTurn: participantTurn,
+		sealedAt:        sealedAt,
+		nextTurn:        nextTurn,
+		claimedHistory:  claimedHistory,
+		remaining:       remaining,
+		original:        original,
+		metaBefore:      cloneMap(metaBefore),
+	}, true, nil
+}
+
+func rootSteeringOriginalJournalItems(value any, participantTurn int) ([]map[string]any, error) {
+	rawItems, ok := value.([]any)
+	if !ok {
+		return nil, rootRecipeDiagnostic(
+			diagnosticCodeRootSteeringStateInvalid,
+			contracts.DiagnosticPhasePolicy,
+			"/steering_claim/original_prompts",
+			"The durable root steering claim journal contains an invalid original queue.",
+			nil,
+		)
+	}
+	items := make([]map[string]any, 0, len(rawItems))
+	for _, raw := range rawItems {
+		item, ok := raw.(map[string]any)
+		if !ok || strings.TrimSpace(stringFromAny(item["id"])) == "" || strings.TrimSpace(stringFromAny(item["prompt"])) == "" || intFromAny(item["target_participant_turn"], 0) < participantTurn {
+			return nil, rootRecipeDiagnostic(
+				diagnosticCodeRootSteeringStateInvalid,
+				contracts.DiagnosticPhasePolicy,
+				"/steering_claim/original_prompts",
+				"The durable root steering claim journal contains an invalid original steering item.",
+				nil,
+			)
+		}
+		items = append(items, cloneMap(item))
+	}
+	return items, nil
+}
+
+func rootSteeringJournalItems(value any, participantTurn int, claimed bool) ([]map[string]any, error) {
+	rawItems, ok := value.([]any)
+	if !ok {
+		return nil, rootRecipeDiagnostic(
+			diagnosticCodeRootSteeringStateInvalid,
+			contracts.DiagnosticPhasePolicy,
+			"/steering_claim",
+			"The durable root steering claim journal contains an invalid item list.",
+			nil,
+		)
+	}
+	items := make([]map[string]any, 0, len(rawItems))
+	for _, raw := range rawItems {
+		item, ok := raw.(map[string]any)
+		if !ok || strings.TrimSpace(stringFromAny(item["id"])) == "" || strings.TrimSpace(stringFromAny(item["prompt"])) == "" {
+			return nil, rootRecipeDiagnostic(
+				diagnosticCodeRootSteeringStateInvalid,
+				contracts.DiagnosticPhasePolicy,
+				"/steering_claim",
+				"The durable root steering claim journal contains an invalid steering item.",
+				nil,
+			)
+		}
+		target := intFromAny(item["target_participant_turn"], 0)
+		if (claimed && target != participantTurn) || (!claimed && target <= participantTurn) {
+			return nil, rootRecipeDiagnostic(
+				diagnosticCodeRootSteeringStateInvalid,
+				contracts.DiagnosticPhasePolicy,
+				"/steering_claim",
+				"The durable root steering claim journal contains an invalid target turn.",
+				nil,
+			)
+		}
+		items = append(items, cloneMap(item))
+	}
+	return items, nil
 }
 
 func CleanSession(sessionDir string) (map[string]any, error) {
@@ -641,6 +1058,13 @@ func saveSteeringPrompts(sessionDir string, prompts []map[string]any) error {
 }
 
 func consumeSteeringPrompts(sessionDir string) ([]map[string]any, error) {
+	lock, err := lockSessionMutation(sessionDir)
+	if err != nil {
+		return nil, err
+	}
+	defer func() {
+		_ = lock.Unlock()
+	}()
 	prompts, err := loadSteeringPrompts(sessionDir)
 	if err != nil {
 		return nil, err
@@ -651,6 +1075,13 @@ func consumeSteeringPrompts(sessionDir string) ([]map[string]any, error) {
 		}
 	}
 	return prompts, nil
+}
+
+func emptyIntAsNil(value int) any {
+	if value <= 0 {
+		return nil
+	}
+	return value
 }
 
 func appendSteeringBlock(prompt string, steeringPrompts []map[string]any) string {

@@ -159,7 +159,7 @@ func TestPhase13MutatingCommandsDeclareOwnershipAndAreIdempotent(t *testing.T) {
 			t.Fatalf("queue steering: %v", err)
 		}
 		afterFirst := snapshotTree(t, sessionDir)
-		assertChangedFiles(t, before, afterFirst, []string{"steering.json"})
+		assertChangedFiles(t, before, afterFirst, []string{".mutation.lock", "steering.json"})
 		if _, err := runner.QueueSteeringPrompt(sessionDir, "second steer"); err != nil {
 			t.Fatalf("queue second steering: %v", err)
 		}
