@@ -1,8 +1,11 @@
 package integration
 
 import (
+	"crypto/sha256"
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
+	"hash"
 	"math"
 	"math/big"
 	"mime"
@@ -54,15 +57,29 @@ type assertionSourceBinder struct {
 }
 
 type keyedAssertionValue struct {
-	key   any
-	value any
-	index int
+	key         any
+	value       any
+	index       int
+	fingerprint semanticFingerprint
 }
 
 type normalizedAssertionNumber struct {
 	negative    bool
 	coefficient string
 	exponent    *big.Int
+}
+
+type semanticFingerprint [sha256.Size]byte
+
+type semanticIndexedValue struct {
+	value       any
+	index       int
+	fingerprint semanticFingerprint
+}
+
+type semanticValueIndex struct {
+	entries []semanticIndexedValue
+	buckets map[semanticFingerprint][]int
 }
 
 // PrepareAssertionEvaluator validates assertion pointers and sources during
@@ -413,22 +430,19 @@ func (e *AssertionEvaluator) evaluate(assertion compiledAssertion, result any) e
 	switch assertion.kind {
 	case "unique":
 		values := assertion.left.pointer.selectValues(e.source(assertion.left.source, result))
-		for right := 1; right < len(values); right++ {
-			for left := 0; left < right; left++ {
-				if semanticJSONEqual(values[left], values[right]) {
-					return assertionFailure(assertion, "Assertion selected duplicate values.", map[string]any{
-						"source":          assertion.left.source,
-						"pointer":         assertion.left.pointer.raw,
-						"first_index":     left,
-						"duplicate_index": right,
-					})
-				}
+		seen := newSemanticValueIndex(len(values))
+		for index, value := range values {
+			if existing, duplicate := seen.add(value, index); duplicate {
+				return assertionFailure(assertion, "Assertion selected duplicate values.", map[string]any{
+					"first_index":     existing.index,
+					"duplicate_index": index,
+				})
 			}
 		}
 		return nil
 	case "set_equal":
-		left := assertion.left.pointer.selectValues(e.source(assertion.left.source, result))
-		right := assertion.right.pointer.selectValues(e.source(assertion.right.source, result))
+		left := indexSemanticValues(assertion.left.pointer.selectValues(e.source(assertion.left.source, result)))
+		right := indexSemanticValues(assertion.right.pointer.selectValues(e.source(assertion.right.source, result)))
 		if missing, ok := firstSemanticSetDifference(left, right); ok {
 			return assertionFailure(assertion, "Assertion value sets are not equal.", map[string]any{
 				"missing_from": "right",
@@ -467,8 +481,12 @@ func (e *AssertionEvaluator) evaluate(assertion compiledAssertion, result any) e
 		if err != nil {
 			return err
 		}
+		rightByFingerprint := make(map[semanticFingerprint][]keyedAssertionValue, len(right))
+		for _, entry := range right {
+			rightByFingerprint[entry.fingerprint] = append(rightByFingerprint[entry.fingerprint], entry)
+		}
 		for _, leftEntry := range left {
-			for _, rightEntry := range right {
+			for _, rightEntry := range rightByFingerprint[leftEntry.fingerprint] {
 				if !semanticJSONEqual(leftEntry.key, rightEntry.key) {
 					continue
 				}
@@ -517,6 +535,7 @@ func (e *AssertionEvaluator) projectFields(assertion compiledAssertion, operand 
 	}
 
 	entries := make([]keyedAssertionValue, 0, len(items))
+	keysByValue := newSemanticValueIndex(len(items))
 	for index, item := range items {
 		keys := operand.keyPointer.selectValues(item)
 		if len(keys) != 1 {
@@ -536,16 +555,15 @@ func (e *AssertionEvaluator) projectFields(assertion compiledAssertion, operand 
 				"key_pointer": operand.keyPointer.raw,
 			})
 		}
-		for _, previous := range entries {
-			if semanticJSONEqual(previous.key, keys[0]) {
-				return nil, assertionFailure(assertion, "field_equal_by_key keys must be unique on each side.", map[string]any{
-					"side":            side,
-					"source":          operand.source,
-					"first_index":     previous.index,
-					"duplicate_index": index,
-					"key":             keys[0],
-				})
-			}
+		indexedKey, duplicate := keysByValue.add(keys[0], index)
+		if duplicate {
+			return nil, assertionFailure(assertion, "field_equal_by_key keys must be unique on each side.", map[string]any{
+				"side":            side,
+				"source":          operand.source,
+				"first_index":     indexedKey.index,
+				"duplicate_index": index,
+				"key":             keys[0],
+			})
 		}
 		values := operand.valuePointer.selectValues(item)
 		if len(values) != 1 {
@@ -557,7 +575,12 @@ func (e *AssertionEvaluator) projectFields(assertion compiledAssertion, operand 
 				"selection_count": len(values),
 			})
 		}
-		entries = append(entries, keyedAssertionValue{key: keys[0], value: values[0], index: index})
+		entries = append(entries, keyedAssertionValue{
+			key:         keys[0],
+			value:       values[0],
+			index:       index,
+			fingerprint: indexedKey.fingerprint,
+		})
 	}
 	return entries, nil
 }
@@ -566,6 +589,7 @@ func assertionFailure(assertion compiledAssertion, message string, details map[s
 	if details == nil {
 		details = map[string]any{}
 	}
+	addAssertionOperandContext(assertion, details)
 	details["assertion_type"] = assertion.kind
 	diagnostic := contracts.NewDiagnostic(
 		DiagnosticCodeAssertionFailed,
@@ -577,17 +601,76 @@ func assertionFailure(assertion compiledAssertion, message string, details map[s
 	return contracts.NewDiagnosticError(message, diagnostic)
 }
 
-func firstSemanticSetDifference(left []any, right []any) (any, bool) {
-	for _, candidate := range left {
-		found := false
-		for _, other := range right {
-			if semanticJSONEqual(candidate, other) {
-				found = true
-				break
-			}
+func addAssertionOperandContext(assertion compiledAssertion, details map[string]any) {
+	switch assertion.kind {
+	case "unique":
+		details["source"] = assertion.left.source
+		details["pointer"] = assertion.left.pointer.raw
+	case "set_equal", "value_equal":
+		details["left_source"] = assertion.left.source
+		details["left_pointer"] = assertion.left.pointer.raw
+		details["right_source"] = assertion.right.source
+		details["right_pointer"] = assertion.right.pointer.raw
+	case "field_equal_by_key":
+		details["left_source"] = assertion.left.source
+		details["left_items_pointer"] = assertion.left.itemsPointer.raw
+		details["left_key_pointer"] = assertion.left.keyPointer.raw
+		details["left_value_pointer"] = assertion.left.valuePointer.raw
+		details["right_source"] = assertion.right.source
+		details["right_items_pointer"] = assertion.right.itemsPointer.raw
+		details["right_key_pointer"] = assertion.right.keyPointer.raw
+		details["right_value_pointer"] = assertion.right.valuePointer.raw
+	}
+}
+
+func newSemanticValueIndex(capacity int) *semanticValueIndex {
+	return &semanticValueIndex{
+		entries: make([]semanticIndexedValue, 0, capacity),
+		buckets: make(map[semanticFingerprint][]int, capacity),
+	}
+}
+
+// add returns the first semantically equal entry when value is a duplicate.
+// Fingerprints make the normal path linear while equality checks preserve
+// correctness in the event of a hash collision.
+func (i *semanticValueIndex) add(value any, index int) (semanticIndexedValue, bool) {
+	entry := semanticIndexedValue{
+		value:       value,
+		index:       index,
+		fingerprint: semanticJSONFingerprint(value),
+	}
+	for _, entryIndex := range i.buckets[entry.fingerprint] {
+		existing := i.entries[entryIndex]
+		if semanticJSONEqual(existing.value, value) {
+			return existing, true
 		}
-		if !found {
-			return candidate, true
+	}
+	i.buckets[entry.fingerprint] = append(i.buckets[entry.fingerprint], len(i.entries))
+	i.entries = append(i.entries, entry)
+	return entry, false
+}
+
+func (i *semanticValueIndex) contains(candidate semanticIndexedValue) bool {
+	for _, entryIndex := range i.buckets[candidate.fingerprint] {
+		if semanticJSONEqual(i.entries[entryIndex].value, candidate.value) {
+			return true
+		}
+	}
+	return false
+}
+
+func indexSemanticValues(values []any) *semanticValueIndex {
+	index := newSemanticValueIndex(len(values))
+	for ordinal, value := range values {
+		index.add(value, ordinal)
+	}
+	return index
+}
+
+func firstSemanticSetDifference(left *semanticValueIndex, right *semanticValueIndex) (any, bool) {
+	for _, candidate := range left.entries {
+		if !right.contains(candidate) {
+			return candidate.value, true
 		}
 	}
 	return nil, false
@@ -636,6 +719,80 @@ func semanticJSONEqual(left any, right any) bool {
 	default:
 		return false
 	}
+}
+
+func semanticJSONFingerprint(value any) semanticFingerprint {
+	hasher := sha256.New()
+	writeSemanticJSONFingerprint(hasher, value)
+	var fingerprint semanticFingerprint
+	copy(fingerprint[:], hasher.Sum(nil))
+	return fingerprint
+}
+
+func writeSemanticJSONFingerprint(hasher hash.Hash, value any) {
+	if number, ok := assertionNumber(value); ok {
+		writeFingerprintByte(hasher, 'n')
+		if number.negative {
+			writeFingerprintByte(hasher, '-')
+		} else {
+			writeFingerprintByte(hasher, '+')
+		}
+		writeFingerprintText(hasher, number.coefficient)
+		writeFingerprintText(hasher, number.exponent.String())
+		return
+	}
+
+	switch typed := value.(type) {
+	case nil:
+		writeFingerprintByte(hasher, '0')
+	case bool:
+		if typed {
+			writeFingerprintByte(hasher, 't')
+		} else {
+			writeFingerprintByte(hasher, 'f')
+		}
+	case string:
+		writeFingerprintByte(hasher, 's')
+		writeFingerprintText(hasher, typed)
+	case []any:
+		writeFingerprintByte(hasher, 'a')
+		writeFingerprintSize(hasher, len(typed))
+		for _, item := range typed {
+			writeSemanticJSONFingerprint(hasher, item)
+		}
+	case map[string]any:
+		writeFingerprintByte(hasher, 'o')
+		writeFingerprintSize(hasher, len(typed))
+		keys := make([]string, 0, len(typed))
+		for key := range typed {
+			keys = append(keys, key)
+		}
+		sort.Strings(keys)
+		for _, key := range keys {
+			writeFingerprintText(hasher, key)
+			writeSemanticJSONFingerprint(hasher, typed[key])
+		}
+	default:
+		// Assertion values are validated before indexing, so this branch is a
+		// defensive discriminator rather than a supported JSON representation.
+		writeFingerprintByte(hasher, 'x')
+		writeFingerprintText(hasher, fmt.Sprintf("%T", value))
+	}
+}
+
+func writeFingerprintByte(hasher hash.Hash, value byte) {
+	_, _ = hasher.Write([]byte{value})
+}
+
+func writeFingerprintSize(hasher hash.Hash, value int) {
+	var encoded [8]byte
+	binary.BigEndian.PutUint64(encoded[:], uint64(value))
+	_, _ = hasher.Write(encoded[:])
+}
+
+func writeFingerprintText(hasher hash.Hash, value string) {
+	writeFingerprintSize(hasher, len(value))
+	_, _ = hasher.Write([]byte(value))
 }
 
 func assertionNumber(value any) (normalizedAssertionNumber, bool) {

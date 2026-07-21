@@ -84,6 +84,25 @@ func TestSemanticJSONEquality(t *testing.T) {
 	}
 }
 
+func TestSemanticValueIndexUsesNormalizedFingerprintsAndEqualityFallback(t *testing.T) {
+	index := newSemanticValueIndex(3)
+	first := map[string]any{"a": json.Number("1"), "b": []any{true, "x"}}
+	equivalent := map[string]any{"b": []any{true, "x"}, "a": json.Number("1.0")}
+	different := map[string]any{"a": json.Number("2"), "b": []any{true, "x"}}
+
+	inserted, duplicate := index.add(first, 7)
+	if duplicate || inserted.index != 7 {
+		t.Fatalf("first insertion = %#v, duplicate=%v", inserted, duplicate)
+	}
+	existing, duplicate := index.add(equivalent, 9)
+	if !duplicate || existing.index != 7 {
+		t.Fatalf("semantic duplicate = %#v, duplicate=%v", existing, duplicate)
+	}
+	if _, duplicate := index.add(different, 11); duplicate {
+		t.Fatal("different semantic value was treated as a duplicate")
+	}
+}
+
 func TestAssertionPreflightValidatesPointersAndSources(t *testing.T) {
 	tests := []struct {
 		name      string
@@ -399,6 +418,70 @@ func TestFieldEqualByKeyRejectsInvalidProjectionsAndMismatches(t *testing.T) {
 				t.Fatalf("prepare: %v", err)
 			}
 			assertDiagnostic(t, evaluator.Validate(test.result), DiagnosticCodeAssertionFailed, contracts.DiagnosticPhaseAssertion)
+		})
+	}
+}
+
+func TestAssertionDiagnosticsIncludeCompleteOperandContext(t *testing.T) {
+	tests := []struct {
+		name       string
+		assertion  map[string]any
+		result     any
+		wantDetail map[string]any
+	}{
+		{
+			name: "set equal",
+			assertion: map[string]any{
+				"type":  "set_equal",
+				"left":  map[string]any{"source": "result", "pointer": "/left/*"},
+				"right": map[string]any{"source": "result", "pointer": "/right/*"},
+			},
+			result: map[string]any{"left": []any{1}, "right": []any{2}},
+			wantDetail: map[string]any{
+				"left_source": "result", "left_pointer": "/left/*",
+				"right_source": "result", "right_pointer": "/right/*",
+			},
+		},
+		{
+			name: "value equal",
+			assertion: map[string]any{
+				"type":  "value_equal",
+				"left":  map[string]any{"source": "result", "pointer": "/left"},
+				"right": map[string]any{"source": "result", "pointer": "/right"},
+			},
+			result: map[string]any{"left": 1, "right": 2},
+			wantDetail: map[string]any{
+				"left_source": "result", "left_pointer": "/left",
+				"right_source": "result", "right_pointer": "/right",
+			},
+		},
+		{
+			name:      "field equal by key",
+			assertion: fieldEqualityAssertion("/left", "/id", "/value", "/right", "/key", "/field"),
+			result: map[string]any{
+				"left":  []any{map[string]any{"id": "a", "value": 1}},
+				"right": []any{map[string]any{"key": "a", "field": 2}},
+			},
+			wantDetail: map[string]any{
+				"left_source": "result", "left_items_pointer": "/left", "left_key_pointer": "/id", "left_value_pointer": "/value",
+				"right_source": "result", "right_items_pointer": "/right", "right_key_pointer": "/key", "right_value_pointer": "/field",
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			selected := selectedWithAssertions(t, []any{test.assertion}, nil)
+			evaluator, err := PrepareAssertionEvaluator(selected, nil)
+			if err != nil {
+				t.Fatalf("prepare: %v", err)
+			}
+			diagnostic := assertDiagnostic(t, evaluator.Validate(test.result), DiagnosticCodeAssertionFailed, contracts.DiagnosticPhaseAssertion)
+			for key, want := range test.wantDetail {
+				if got := diagnostic.Details[key]; !reflect.DeepEqual(got, want) {
+					t.Errorf("details[%q] = %#v, want %#v; details=%#v", key, got, want, diagnostic.Details)
+				}
+			}
 		})
 	}
 }
