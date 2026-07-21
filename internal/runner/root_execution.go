@@ -775,25 +775,33 @@ func sanitizedProviderResultMap(result ProviderResult) map[string]any {
 }
 
 func sanitizeDurableProviderValue(value any) any {
+	return sanitizeDurableProviderField("", value)
+}
+
+func sanitizeDurableProviderField(key string, value any) any {
+	if isProviderCredentialField(key) {
+		return "[redacted]"
+	}
 	switch typed := value.(type) {
 	case string:
 		return sanitizeProviderFailureDetail(typed)
 	case map[string]any:
 		result := make(map[string]any, len(typed))
 		for key, item := range typed {
-			result[key] = sanitizeDurableProviderValue(item)
+			result[key] = sanitizeDurableProviderField(key, item)
 		}
 		return result
 	case map[any]any:
 		result := make(map[string]any, len(typed))
 		for key, item := range typed {
-			result[fmt.Sprint(key)] = sanitizeDurableProviderValue(item)
+			field := fmt.Sprint(key)
+			result[field] = sanitizeDurableProviderField(field, item)
 		}
 		return result
 	case []any:
 		result := make([]any, len(typed))
 		for index, item := range typed {
-			result[index] = sanitizeDurableProviderValue(item)
+			result[index] = sanitizeDurableProviderField("", item)
 		}
 		return result
 	case []string:
@@ -806,6 +814,33 @@ func sanitizeDurableProviderValue(value any) any {
 		return result
 	default:
 		return typed
+	}
+}
+
+func isProviderCredentialField(key string) bool {
+	normalized := strings.NewReplacer("_", "", "-", "", " ", "", ".", "").Replace(strings.ToLower(strings.TrimSpace(key)))
+	switch normalized {
+	case "authorization",
+		"proxyauthorization",
+		"apikey",
+		"xapikey",
+		"token",
+		"accesstoken",
+		"refreshtoken",
+		"idtoken",
+		"bearertoken",
+		"authtoken",
+		"sessiontoken",
+		"clientsecret",
+		"secret",
+		"password",
+		"passwd",
+		"credential",
+		"credentials",
+		"privatekey":
+		return true
+	default:
+		return false
 	}
 }
 

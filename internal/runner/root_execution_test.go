@@ -702,6 +702,10 @@ func TestRunRecipeSanitizesDurableSuccessfulProviderResults(t *testing.T) {
 			"stderr":  `{"api_key":"` + secret + `"}`,
 			"nested":  []any{"Bearer " + secret},
 			"headers": map[string]string{"Authorization": "Bearer " + secret},
+			"metadata": map[string]any{
+				"api_key":       secret,
+				"Authorization": secret,
+			},
 		}
 		return result, nil
 	}
@@ -745,6 +749,30 @@ func TestRunRecipeSanitizesDurableSuccessfulProviderResults(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("scan successful session: %v", err)
 	}
+}
+
+func TestSanitizeDurableProviderValueRedactsNestedCredentialFields(t *testing.T) {
+	const secret = "story12-plain-nested-secret"
+	payload := sanitizeDurableProviderValue(map[string]any{
+		"metadata": map[string]any{
+			"api_key":       secret,
+			"Authorization": secret,
+			"safe_field":    "retained",
+		},
+	}).(map[string]any)
+
+	metadata := payload["metadata"].(map[string]any)
+	if metadata["api_key"] != "[redacted]" || metadata["Authorization"] != "[redacted]" {
+		t.Fatalf("nested credentials were not redacted: %#v", metadata)
+	}
+	if metadata["safe_field"] != "retained" {
+		t.Fatalf("non-credential field changed: %#v", metadata)
+	}
+	serialized, err := contracts.CanonicalJSONBytes(payload)
+	if err != nil {
+		t.Fatalf("marshal sanitized payload: %v", err)
+	}
+	assertNoRawProviderCredential(t, "nested provider metadata", serialized, secret)
 }
 
 func TestRootParticipantCompletionWriteFailuresBecomeConsistentTerminalFailures(t *testing.T) {
