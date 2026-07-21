@@ -342,12 +342,12 @@ func sanitizeProviderFailureDetail(detail string) string {
 	if cleaned == "" {
 		return ""
 	}
-	replacers := []*regexp.Regexp{
-		regexp.MustCompile(`(?i)(api[_ -]?key|token|authorization|bearer)\s*[:=]\s*['"]?[^'"\s]+`),
-	}
-	for _, replacer := range replacers {
-		cleaned = replacer.ReplaceAllString(cleaned, "$1=[redacted]")
-	}
+	authorization := regexp.MustCompile(`(?i)(["']?authorization["']?\s*[:=]\s*["']?)(?:bearer\s+)?[^'"\s,;}]+`)
+	cleaned = authorization.ReplaceAllString(cleaned, "${1}[redacted]")
+	credentialField := regexp.MustCompile(`(?i)(["']?(?:api[_ -]?key|token)["']?\s*[:=]\s*["']?)[^'"\s,;}]+`)
+	cleaned = credentialField.ReplaceAllString(cleaned, "${1}[redacted]")
+	standaloneBearer := regexp.MustCompile(`(?i)\bbearer\s+["']?[^'"\s,;}]+`)
+	cleaned = standaloneBearer.ReplaceAllString(cleaned, "Bearer [redacted]")
 	cleaned = regexp.MustCompile(`(?i)sk-[a-z0-9_-]{8,}`).ReplaceAllString(cleaned, "[redacted-key]")
 	return truncateString(cleaned, 500)
 }

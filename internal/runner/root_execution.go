@@ -20,6 +20,11 @@ const (
 	diagnosticCodeRootSteeringStateInvalid = "root_recipe_steering_state_invalid"
 )
 
+// rootParticipantCompletionAfterWrite is a test-only failpoint used to prove
+// that interruption after any participant-completion write is converted into
+// one consistent terminal failure. Production leaves it nil.
+var rootParticipantCompletionAfterWrite func(string) error
+
 type rootBackendFactory func(string, string, string, string, string, SlotConfig) (Backend, error)
 
 type rootProviderConstructionError struct {
@@ -288,7 +293,8 @@ func (s *rootExecutionState) persistParticipantResponse(
 			"steering_ids":        steeringIDs(steering),
 		},
 	}
-	if parsed, ok := model.ParseProviderResult(providerResultMap(providerResult)); ok {
+	providerResultPayload := sanitizedProviderResultMap(providerResult)
+	if parsed, ok := model.ParseProviderResult(providerResultPayload); ok {
 		entry.ProviderResult = &parsed
 	}
 	s.transcript = s.transcript.Append(entry)
@@ -308,7 +314,7 @@ func (s *rootExecutionState) persistParticipantResponse(
 			"participant_turn": ordinal,
 			"slot_id":          slot.SlotID(),
 			"speaker":          slot.Label(),
-			"provider_result":  providerResultMap(providerResult),
+			"provider_result":  providerResultPayload,
 			"steering_ids":     steeringIDs(steering),
 		},
 		store.EventOptions{},
@@ -334,11 +340,11 @@ func (s *rootExecutionState) persistFacilitatorAttempt(
 		"backend":          s.facilitator.Name(),
 		"profile_id":       s.facilitatorProfile["profile_id"],
 		"content":          result.Content,
-		"provider_result":  providerResultMap(providerResult),
+		"provider_result":  sanitizedProviderResultMap(providerResult),
 		"provider_state":   s.facilitator.SessionState(),
 	}
 	if runErr != nil {
-		payload["provider_result"] = sanitizedProviderResultMap(providerResult)
+		payload["content"] = sanitizeProviderFailureDetail(result.Content)
 		payload["provider_failure"] = cloneMap(failure)
 		payload["error"] = durableProviderFailureError(failure).Error()
 	} else {
@@ -378,7 +384,7 @@ func (s *rootExecutionState) persistFacilitatorSuccess(
 	if err := s.updateLastTranscriptEntry(func(entry *model.TranscriptEntry) {
 		delete(entry.Extra, "facilitator_pending")
 		entry.Extra["facilitator_output_ref"] = attemptRef
-		entry.Extra["facilitator_provider_result"] = providerResultMap(facilitatorResult)
+		entry.Extra["facilitator_provider_result"] = sanitizedProviderResultMap(facilitatorResult)
 		entry.Extra["facilitator_ledger_parse"] = ledgerParseReportMap(report)
 		entry.Ledger = ledger
 		entry.LedgerPresent = true
@@ -400,8 +406,8 @@ func (s *rootExecutionState) persistFacilitatorSuccess(
 			"speaker":                     slot.Label(),
 			"ledger_counts":               ledger.CountsMap(),
 			"parse_status":                string(report.Status),
-			"provider_result":             providerResultMap(participantResult),
-			"facilitator_provider_result": providerResultMap(facilitatorResult),
+			"provider_result":             sanitizedProviderResultMap(participantResult),
+			"facilitator_provider_result": sanitizedProviderResultMap(facilitatorResult),
 			"facilitator_output_ref":      attemptRef,
 		},
 		store.EventOptions{},
@@ -572,7 +578,10 @@ func (s *rootExecutionState) markParticipantsComplete() (map[string]any, error) 
 		With("root_checkpoint_refs", append(s.meta.Slice("root_checkpoint_refs"), checkpointRef)).
 		With("latest_root_checkpoint_ref", checkpointRef)
 	if err := s.saveProgress(); err != nil {
-		return nil, err
+		return s.markFailed("participant_completion_persistence", err)
+	}
+	if err := runRootParticipantCompletionFailpoint("metadata"); err != nil {
+		return s.markFailed("participant_completion_persistence", err)
 	}
 	if _, err := s.st.AppendSessionEventV1(
 		"root_participants_completed",
@@ -586,12 +595,25 @@ func (s *rootExecutionState) markParticipantsComplete() (map[string]any, error) 
 		},
 		store.EventOptions{},
 	); err != nil {
-		return nil, err
+		return s.markFailed("participant_completion_persistence", err)
+	}
+	if err := runRootParticipantCompletionFailpoint("event"); err != nil {
+		return s.markFailed("participant_completion_persistence", err)
 	}
 	if err := s.saveGraph(rootParticipantsCompleteStatus); err != nil {
-		return nil, err
+		return s.markFailed("participant_completion_persistence", err)
+	}
+	if err := runRootParticipantCompletionFailpoint("graph"); err != nil {
+		return s.markFailed("participant_completion_persistence", err)
 	}
 	return s.result(), nil
+}
+
+func runRootParticipantCompletionFailpoint(stage string) error {
+	if rootParticipantCompletionAfterWrite == nil {
+		return nil
+	}
+	return rootParticipantCompletionAfterWrite(stage)
 }
 
 func (s *rootExecutionState) markInterrupted(reason string) (map[string]any, error) {
@@ -644,7 +666,7 @@ func (s *rootExecutionState) markFailed(phase string, runErr error) (map[string]
 	effectiveErr := runErr
 	durableEventErr := durableErr
 	if terminalErr != nil {
-		effectiveErr = terminalErr
+		effectiveErr = errors.Join(runErr, terminalErr)
 		durableEventErr = terminalErr
 	}
 	if err := s.saveProgress(); err != nil {
@@ -692,7 +714,7 @@ func failRootExecutionSetup(
 	effectiveErr := runErr
 	durableEventErr := durableErr
 	if terminalErr != nil {
-		effectiveErr = terminalErr
+		effectiveErr = errors.Join(runErr, terminalErr)
 		durableEventErr = terminalErr
 	}
 	if saveErr := persisted.st.SaveMeta(meta); saveErr != nil {
@@ -733,32 +755,58 @@ func durableProviderFailureError(payload map[string]any) error {
 }
 
 func sanitizedProviderResultMap(result ProviderResult) map[string]any {
-	payload := map[string]any{
-		"backend":         result.Backend,
-		"timed_out":       result.TimedOut,
-		"stalled":         result.Stalled,
-		"recovered":       result.Recovered,
-		"recovery_source": result.RecoverySource,
-		"warnings":        []any{},
-	}
-	if result.ReturnCodeKnown {
-		payload["return_code"] = result.ReturnCode
-	} else {
-		payload["return_code"] = nil
-	}
-	if len(result.Warnings) > 0 {
-		warnings := make([]any, 0, len(result.Warnings))
-		for _, warning := range result.Warnings {
-			if sanitized := sanitizeProviderFailureDetail(warning); sanitized != "" {
-				warnings = append(warnings, sanitized)
-			}
+	raw := providerResultMap(result)
+	if encoded, err := contracts.CanonicalJSONBytes(raw); err == nil {
+		if materialized, decodeErr := contracts.DecodeJSONObjectBytes(encoded); decodeErr == nil {
+			raw = materialized
 		}
-		payload["warnings"] = warnings
+	} else {
+		// Unknown, non-JSON provider extensions are not safe to persist. Retain
+		// the documented result fields and fail closed by omitting Extra.
+		withoutExtra := result.Clone()
+		withoutExtra.Extra = nil
+		raw = providerResultMap(withoutExtra)
 	}
-	if strings.TrimSpace(result.RetryableError) != "" {
-		payload["retryable_error"] = sanitizeProviderFailureDetail(result.RetryableError)
+	payload, _ := sanitizeDurableProviderValue(raw).(map[string]any)
+	if payload == nil {
+		return map[string]any{}
 	}
 	return payload
+}
+
+func sanitizeDurableProviderValue(value any) any {
+	switch typed := value.(type) {
+	case string:
+		return sanitizeProviderFailureDetail(typed)
+	case map[string]any:
+		result := make(map[string]any, len(typed))
+		for key, item := range typed {
+			result[key] = sanitizeDurableProviderValue(item)
+		}
+		return result
+	case map[any]any:
+		result := make(map[string]any, len(typed))
+		for key, item := range typed {
+			result[fmt.Sprint(key)] = sanitizeDurableProviderValue(item)
+		}
+		return result
+	case []any:
+		result := make([]any, len(typed))
+		for index, item := range typed {
+			result[index] = sanitizeDurableProviderValue(item)
+		}
+		return result
+	case []string:
+		result := make([]any, 0, len(typed))
+		for _, item := range typed {
+			if sanitized := sanitizeProviderFailureDetail(item); sanitized != "" {
+				result = append(result, sanitized)
+			}
+		}
+		return result
+	default:
+		return typed
+	}
 }
 
 func (s *rootExecutionState) saveProgress() error {

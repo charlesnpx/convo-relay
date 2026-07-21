@@ -625,7 +625,7 @@ func TestRunRecipeProviderFailuresNeverPersistRawCredentials(t *testing.T) {
 				if (failingRole == "participant" && call.SlotID != "facilitator") ||
 					(failingRole == "facilitator" && call.SlotID == "facilitator") {
 					return TurnResult{
-						Content: "safe partial provider output",
+						Content: "partial provider output Authorization: Bearer " + rawCredential,
 						ProviderResult: ProviderResult{
 							Backend:         call.Backend,
 							ReturnCode:      9,
@@ -677,6 +677,156 @@ func TestRunRecipeProviderFailuresNeverPersistRawCredentials(t *testing.T) {
 				return nil
 			}); err != nil {
 				t.Fatalf("scan persisted session: %v", err)
+			}
+		})
+	}
+}
+
+func TestRunRecipeSanitizesDurableSuccessfulProviderResults(t *testing.T) {
+	const participantSecret = "story12-success-participant-secret"
+	const facilitatorSecret = "story12-success-facilitator-secret"
+	recorder := &rootBackendRecorder{}
+	recorder.handler = func(_ context.Context, call rootBackendCall) (TurnResult, error) {
+		content := "successful participant response"
+		secret := participantSecret
+		if call.SlotID == "facilitator" {
+			content = `{"settled":["complete"],"contested":[],"withdrawn":[]}`
+			secret = facilitatorSecret
+		}
+		result := successfulRootTurn(call.Backend, content)
+		result.ProviderResult.Recovered = true
+		result.ProviderResult.RecoverySource = "stdout"
+		result.ProviderResult.Warnings = []string{"Authorization: Bearer " + secret}
+		result.ProviderResult.RetryableError = `{"token":"` + secret + `"}`
+		result.ProviderResult.Extra = map[string]any{
+			"stderr":  `{"api_key":"` + secret + `"}`,
+			"nested":  []any{"Bearer " + secret},
+			"headers": map[string]string{"Authorization": "Bearer " + secret},
+		}
+		return result, nil
+	}
+	config := rootRecipeRuntimeConfig("")
+	config.RelayRecipes["neutral-root"]["participant_turns"] = 1
+	config.RelayRecipes["neutral-root"]["max_rounds"] = 1
+	sessionDir := filepath.Join(t.TempDir(), "session")
+	result, err := RunRecipe(context.Background(), RecipeOptions{
+		SessionDir:     sessionDir,
+		Task:           "Sanitize successful provider metadata",
+		RecipeID:       "neutral-root",
+		LaunchCWD:      t.TempDir(),
+		RuntimeConfig:  config,
+		ReadinessCheck: readyRootRecipeCheck,
+		backendFactory: recorder.factory(),
+	})
+	if err != nil {
+		t.Fatalf("RunRecipe: %v", err)
+	}
+	serialized, err := contracts.CanonicalJSONBytes(result)
+	if err != nil {
+		t.Fatalf("marshal result: %v", err)
+	}
+	assertNoRawProviderCredential(t, "returned successful session result", serialized, participantSecret, facilitatorSecret)
+	if !strings.Contains(string(serialized), "[redacted]") {
+		t.Fatalf("sanitized provider fields were dropped instead of retained: %s", serialized)
+	}
+	if err := filepath.WalkDir(sessionDir, func(path string, entry os.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if !entry.Type().IsRegular() {
+			return nil
+		}
+		data, readErr := os.ReadFile(path)
+		if readErr != nil {
+			return readErr
+		}
+		assertNoRawProviderCredential(t, path, data, participantSecret, facilitatorSecret)
+		return nil
+	}); err != nil {
+		t.Fatalf("scan successful session: %v", err)
+	}
+}
+
+func TestRootParticipantCompletionWriteFailuresBecomeConsistentTerminalFailures(t *testing.T) {
+	for _, stage := range []string{"metadata", "event", "graph"} {
+		t.Run(stage, func(t *testing.T) {
+			injected := fmt.Errorf("injected %s completion failure", stage)
+			rootParticipantCompletionAfterWrite = func(completedStage string) error {
+				if completedStage == stage {
+					return injected
+				}
+				return nil
+			}
+			t.Cleanup(func() { rootParticipantCompletionAfterWrite = nil })
+			config := rootRecipeRuntimeConfig("")
+			config.RelayRecipes["neutral-root"]["participant_turns"] = 1
+			config.RelayRecipes["neutral-root"]["max_rounds"] = 1
+			sessionDir := filepath.Join(t.TempDir(), "session")
+			result, err := RunRecipe(context.Background(), RecipeOptions{
+				SessionDir:     sessionDir,
+				Task:           "Fail one participant completion write",
+				RecipeID:       "neutral-root",
+				LaunchCWD:      t.TempDir(),
+				RuntimeConfig:  config,
+				ReadinessCheck: readyRootRecipeCheck,
+				backendFactory: successfulRootBackendFactory(),
+			})
+			if !errors.Is(err, injected) || result["status"] != "failed" || result["execution_phase"] != "participant_completion_persistence" {
+				t.Fatalf("completion failure = result %#v, err %v", result, err)
+			}
+			persisted := mustLoadMeta(t, sessionDir)
+			if persisted["status"] != "failed" || persisted["execution_phase"] != "participant_completion_persistence" {
+				t.Fatalf("persisted completion failure = %#v", persisted)
+			}
+			events, readErr := os.ReadFile(filepath.Join(sessionDir, "events.jsonl"))
+			if readErr != nil || !strings.Contains(string(events), `"event_type":"node_failed"`) {
+				t.Fatalf("completion failure events = %v\n%s", readErr, events)
+			}
+			graphPayload := store.New(sessionDir).LoadGraph()
+			nodes, _ := graphPayload["nodes"].(map[string]any)
+			root, _ := nodes[graph.RootNodeID].(map[string]any)
+			if root["status"] != "failed" {
+				t.Fatalf("completion failure graph = %#v", root)
+			}
+		})
+	}
+}
+
+func TestRootFailuresJoinOriginalAndWorkspaceFinalizationErrors(t *testing.T) {
+	for _, phase := range []string{"execution", "setup"} {
+		t.Run(phase, func(t *testing.T) {
+			fixture := newIsolatedSessionFixture(t, "running")
+			if err := os.WriteFile(filepath.Join(fixture.sourceRoot, "source.txt"), []byte("mutated before combined failure\n"), 0o644); err != nil {
+				t.Fatalf("mutate source: %v", err)
+			}
+			st := store.New(fixture.sessionDir)
+			meta, err := st.LoadMeta()
+			if err != nil {
+				t.Fatalf("load fixture meta: %v", err)
+			}
+			original := fmt.Errorf("original %s provider failure", phase)
+			var result map[string]any
+			if phase == "execution" {
+				state := &rootExecutionState{
+					st:         st,
+					preflight:  &recipePreflight{sessionDir: fixture.sessionDir},
+					meta:       meta,
+					transcript: model.EmptyTranscript(),
+					startedAt:  time.Now(),
+				}
+				result, err = state.markFailed("participant", original)
+			} else {
+				result, err = failRootExecutionSetup(
+					&recipePreflight{sessionDir: fixture.sessionDir},
+					&persistedRecipeRun{st: st},
+					meta,
+					model.EmptyTranscript(),
+					original,
+				)
+			}
+			var mutation *workspace.SourceMutatedError
+			if !errors.Is(err, original) || !errors.As(err, &mutation) || result["status"] != "failed" || result["stop_reason"] != workspace.StopReasonSourceMutated {
+				t.Fatalf("combined terminal failure = result %#v, err %v", result, err)
 			}
 		})
 	}
@@ -1120,9 +1270,9 @@ func TestRootSteeringEnqueueAndClaimRaceNeverLosesAcceptedItem(t *testing.T) {
 	}
 }
 
-func TestRootSteeringClaimJournalRecoversInterruptedAtomicMove(t *testing.T) {
+func TestRootSteeringClaimJournalRollsBackInterruptedMoveBeforePromptDelivery(t *testing.T) {
 	sessionDir := filepath.Join(t.TempDir(), "session")
-	if err := store.New(sessionDir).SaveMetaMap(map[string]any{
+	metaBefore := map[string]any{
 		"execution_kind":                 "recipe",
 		"status":                         "running",
 		"participant_turns":              2,
@@ -1130,7 +1280,8 @@ func TestRootSteeringClaimJournalRecoversInterruptedAtomicMove(t *testing.T) {
 		"sealed_participant_turns":       []any{},
 		"steering_history":               []any{},
 		"lifecycle":                      map[string]any{"steering": "allow"},
-	}); err != nil {
+	}
+	if err := store.New(sessionDir).SaveMetaMap(metaBefore); err != nil {
 		t.Fatalf("save journal fixture: %v", err)
 	}
 	queued := map[string]any{
@@ -1143,10 +1294,26 @@ func TestRootSteeringClaimJournalRecoversInterruptedAtomicMove(t *testing.T) {
 	if err := saveSteeringPrompts(sessionDir, []map[string]any{queued}); err != nil {
 		t.Fatalf("save journal queue: %v", err)
 	}
+	sealedAt := utcNow()
+	historyItem := cloneMap(queued)
+	historyItem["consumed_at"] = sealedAt
+	historyItem["status"] = "consumed"
+	journal := rootSteeringClaimJournal{
+		participantTurn: 1,
+		sealedAt:        sealedAt,
+		nextTurn:        2,
+		claimedHistory:  []map[string]any{historyItem},
+		remaining:       []map[string]any{},
+		original:        []map[string]any{queued},
+		metaBefore:      cloneMap(metaBefore),
+	}
+	if err := saveRootSteeringClaimJournal(sessionDir, journal); err != nil {
+		t.Fatalf("save durable claim journal: %v", err)
+	}
 	interrupted := errors.New("simulated exit between steering replacements")
 	rootSteeringClaimAfterQueueWrite = func() error { return interrupted }
 	t.Cleanup(func() { rootSteeringClaimAfterQueueWrite = nil })
-	if _, _, err := claimRootParticipantSteering(sessionDir, 1); !errors.Is(err, interrupted) {
+	if _, err := applyRootSteeringClaimJournalLocked(sessionDir, journal, true); !errors.Is(err, interrupted) {
 		t.Fatalf("interrupted claim error = %v", err)
 	}
 	if _, err := os.Stat(filepath.Join(sessionDir, rootSteeringClaimJournalName)); err != nil {
@@ -1162,20 +1329,29 @@ func TestRootSteeringClaimJournalRecoversInterruptedAtomicMove(t *testing.T) {
 	}
 
 	rootSteeringClaimAfterQueueWrite = nil
-	lock, err := lockSessionMutation(sessionDir)
-	if err != nil {
-		t.Fatalf("lock recovery: %v", err)
+	second, err := QueueSteeringPrompt(sessionDir, "queued while recovering")
+	if err != nil || intFromAny(second["target_participant_turn"], 0) != 1 {
+		t.Fatalf("queue after interrupted claim recovery = %#v, %v", second, err)
 	}
-	recovered, recoverErr := recoverRootSteeringClaimLocked(sessionDir)
-	unlockErr := lock.Unlock()
-	if recoverErr != nil || unlockErr != nil {
-		t.Fatalf("recover durable claim: %v / unlock %v", recoverErr, unlockErr)
+	claimed, recovered, err := claimRootParticipantSteering(sessionDir, 1)
+	if err != nil {
+		t.Fatalf("retry recovered claim: %v", err)
+	}
+	if len(claimed) != 2 || claimed[0]["id"] != queued["id"] || claimed[1]["id"] != second["id"] {
+		t.Fatalf("recovered steering delivery batch = %#v", claimed)
+	}
+	prompt := appendRootSteeringBlock("authoritative prompt", 1, claimed)
+	if strings.Count(prompt, "deliver exactly once") != 1 || strings.Count(prompt, "queued while recovering") != 1 {
+		t.Fatalf("recovered prompt delivery = %q", prompt)
 	}
 	history := recovered.Slice("steering_history")
-	if len(history) != 1 || history[0].(map[string]any)["id"] != queued["id"] ||
+	if len(history) != 2 || history[0].(map[string]any)["id"] != queued["id"] ||
 		recovered.Int("participant_prompt_sealed_through", 0) != 1 ||
 		recovered.Int("next_unsealed_participant_turn", 0) != 2 {
 		t.Fatalf("recovered claim metadata = %#v", recovered.ToMap())
+	}
+	if history[1].(map[string]any)["id"] != second["id"] {
+		t.Fatalf("recovered claim history = %#v", history)
 	}
 	remaining, err = loadSteeringPrompts(sessionDir)
 	if err != nil || len(remaining) != 0 {

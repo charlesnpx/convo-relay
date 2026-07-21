@@ -30,6 +30,8 @@ type rootSteeringClaimJournal struct {
 	nextTurn        any
 	claimedHistory  []map[string]any
 	remaining       []map[string]any
+	original        []map[string]any
+	metaBefore      map[string]any
 }
 
 func ResolveSessionDir(home string, sessionDir string, sessionIDPrefix string) (string, error) {
@@ -255,13 +257,16 @@ func claimRootParticipantSteering(sessionDir string, ordinal int) ([]map[string]
 		nextTurn:        nextTurn,
 		claimedHistory:  claimedHistory,
 		remaining:       remaining,
+		original:        prompts,
+		metaBefore:      meta.ToMap(),
 	}
 	if err := saveRootSteeringClaimJournal(sessionDir, journal); err != nil {
 		return nil, model.EmptySessionMeta(), err
 	}
 	updatedMeta, err := applyRootSteeringClaimJournalLocked(sessionDir, journal, true)
 	if err != nil {
-		return nil, model.EmptySessionMeta(), err
+		_, rollbackErr := rollbackRootSteeringClaimJournalLocked(sessionDir, journal)
+		return nil, model.EmptySessionMeta(), errors.Join(err, rollbackErr)
 	}
 	return claimed, updatedMeta, nil
 }
@@ -274,7 +279,26 @@ func recoverRootSteeringClaimLocked(sessionDir string) (model.SessionMeta, error
 	if !exists {
 		return model.EmptySessionMeta(), nil
 	}
-	return applyRootSteeringClaimJournalLocked(sessionDir, journal, false)
+	return rollbackRootSteeringClaimJournalLocked(sessionDir, journal)
+}
+
+// rollbackRootSteeringClaimJournalLocked restores the exact queue and metadata
+// snapshot that preceded an unacknowledged claim. The journal remains in place
+// until both replacements succeed, so recovery is itself idempotent across
+// interruption. A claim is consumed only after apply removes the journal and
+// returns its batch to the prompt-building caller.
+func rollbackRootSteeringClaimJournalLocked(sessionDir string, journal rootSteeringClaimJournal) (model.SessionMeta, error) {
+	if err := saveSteeringPrompts(sessionDir, journal.original); err != nil {
+		return model.EmptySessionMeta(), err
+	}
+	restoredMeta := model.NewSessionMeta(journal.metaBefore)
+	if err := store.New(sessionDir).SaveMeta(restoredMeta); err != nil {
+		return model.EmptySessionMeta(), err
+	}
+	if err := os.Remove(filepath.Join(sessionDir, rootSteeringClaimJournalName)); err != nil && !os.IsNotExist(err) {
+		return model.EmptySessionMeta(), err
+	}
+	return restoredMeta, nil
 }
 
 func applyRootSteeringClaimJournalLocked(sessionDir string, journal rootSteeringClaimJournal, useFailpoint bool) (model.SessionMeta, error) {
@@ -355,6 +379,10 @@ func saveRootSteeringClaimJournal(sessionDir string, journal rootSteeringClaimJo
 	for _, item := range journal.remaining {
 		remaining = append(remaining, cloneMap(item))
 	}
+	original := make([]any, 0, len(journal.original))
+	for _, item := range journal.original {
+		original = append(original, cloneMap(item))
+	}
 	payload := map[string]any{
 		"schema_version":                 1,
 		"participant_turn":               journal.participantTurn,
@@ -362,6 +390,8 @@ func saveRootSteeringClaimJournal(sessionDir string, journal rootSteeringClaimJo
 		"next_unsealed_participant_turn": journal.nextTurn,
 		"claimed_history":                claimed,
 		"remaining_prompts":              remaining,
+		"original_prompts":               original,
+		"meta_before":                    cloneMap(journal.metaBefore),
 	}
 	body, err := contracts.CanonicalJSONBytes(payload)
 	if err != nil {
@@ -415,13 +445,57 @@ func loadRootSteeringClaimJournal(sessionDir string) (rootSteeringClaimJournal, 
 	if err != nil {
 		return rootSteeringClaimJournal{}, false, err
 	}
+	original, err := rootSteeringOriginalJournalItems(payload["original_prompts"], participantTurn)
+	if err != nil {
+		return rootSteeringClaimJournal{}, false, err
+	}
+	metaBefore, ok := payload["meta_before"].(map[string]any)
+	if !ok || stringFromAny(metaBefore["execution_kind"]) != "recipe" || intFromAny(metaBefore["next_unsealed_participant_turn"], 0) != participantTurn {
+		return rootSteeringClaimJournal{}, false, rootRecipeDiagnostic(
+			diagnosticCodeRootSteeringStateInvalid,
+			contracts.DiagnosticPhasePolicy,
+			"/steering_claim/meta_before",
+			"The durable root steering claim journal has an invalid rollback snapshot.",
+			nil,
+		)
+	}
 	return rootSteeringClaimJournal{
 		participantTurn: participantTurn,
 		sealedAt:        sealedAt,
 		nextTurn:        nextTurn,
 		claimedHistory:  claimedHistory,
 		remaining:       remaining,
+		original:        original,
+		metaBefore:      cloneMap(metaBefore),
 	}, true, nil
+}
+
+func rootSteeringOriginalJournalItems(value any, participantTurn int) ([]map[string]any, error) {
+	rawItems, ok := value.([]any)
+	if !ok {
+		return nil, rootRecipeDiagnostic(
+			diagnosticCodeRootSteeringStateInvalid,
+			contracts.DiagnosticPhasePolicy,
+			"/steering_claim/original_prompts",
+			"The durable root steering claim journal contains an invalid original queue.",
+			nil,
+		)
+	}
+	items := make([]map[string]any, 0, len(rawItems))
+	for _, raw := range rawItems {
+		item, ok := raw.(map[string]any)
+		if !ok || strings.TrimSpace(stringFromAny(item["id"])) == "" || strings.TrimSpace(stringFromAny(item["prompt"])) == "" || intFromAny(item["target_participant_turn"], 0) < participantTurn {
+			return nil, rootRecipeDiagnostic(
+				diagnosticCodeRootSteeringStateInvalid,
+				contracts.DiagnosticPhasePolicy,
+				"/steering_claim/original_prompts",
+				"The durable root steering claim journal contains an invalid original steering item.",
+				nil,
+			)
+		}
+		items = append(items, cloneMap(item))
+	}
+	return items, nil
 }
 
 func rootSteeringJournalItems(value any, participantTurn int, claimed bool) ([]map[string]any, error) {
