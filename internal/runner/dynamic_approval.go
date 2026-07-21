@@ -171,6 +171,7 @@ func ApproveProposal(ctx context.Context, sessionDir string, opts ApproveOptions
 		Recipe:             admitted.Recipe,
 		Profiles:           admitted.Profiles,
 		Recipes:            admitted.Recipes,
+		RuntimeConfig:      runtimeConfig,
 		AdmittedRounds:     admitted.AdmittedRounds,
 		Origin:             "dynamic-proposal",
 		RunContext:         admitted.RunContext,

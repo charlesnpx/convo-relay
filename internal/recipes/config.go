@@ -23,6 +23,7 @@ const (
 type RuntimeConfig struct {
 	BackendProfiles map[string]map[string]any `json:"backend_profiles"`
 	RelayRecipes    map[string]map[string]any `json:"relay_recipes"`
+	Limits          RuntimeLimits             `json:"limits"`
 	SettingsPath    string                    `json:"settings_path,omitempty"`
 }
 
@@ -63,6 +64,10 @@ func LoadRuntimeConfigWithTransientSources(settingsPath string, sources []Transi
 	}
 	rawProfiles := asObject(settings["backend_profiles"])
 	rawRecipes := asObject(settings["relay_recipes"])
+	limits, err := ParseRuntimeLimits(settings["limits"])
+	if err != nil {
+		return RuntimeConfig{}, nil, err
+	}
 	transientFiles, err := loadTransientRecipeSources(sources, rawProfiles, rawRecipes)
 	if err != nil {
 		return RuntimeConfig{}, nil, err
@@ -75,11 +80,15 @@ func LoadRuntimeConfigWithTransientSources(settingsPath string, sources []Transi
 	return RuntimeConfig{
 		BackendProfiles: normalizedProfiles,
 		RelayRecipes:    normalizedRecipes,
+		Limits:          limits,
 		SettingsPath:    path,
 	}, transientFiles, nil
 }
 
 func ApplyTransientRecipeSources(base RuntimeConfig, sources []TransientRecipeSource) (RuntimeConfig, []TransientRecipeSource, error) {
+	if err := ValidateRuntimeLimits(base.EffectiveLimits()); err != nil {
+		return RuntimeConfig{}, nil, err
+	}
 	rawProfiles := runtimeMapAsRaw(base.BackendProfiles)
 	rawRecipes := runtimeMapAsRaw(base.RelayRecipes)
 	transientFiles, err := loadTransientRecipeSources(sources, rawProfiles, rawRecipes)
@@ -94,6 +103,7 @@ func ApplyTransientRecipeSources(base RuntimeConfig, sources []TransientRecipeSo
 	return RuntimeConfig{
 		BackendProfiles: normalizedProfiles,
 		RelayRecipes:    normalizedRecipes,
+		Limits:          base.EffectiveLimits(),
 		SettingsPath:    strings.TrimSpace(base.SettingsPath),
 	}, transientFiles, nil
 }
