@@ -190,6 +190,39 @@ func TestCleanupRemovesWorktreeAndPrunesStaleMetadata(t *testing.T) {
 	}
 }
 
+func TestCleanupPrunesMissingManagedWorktreeRegistration(t *testing.T) {
+	root := newCommittedRepo(t)
+	sessionDir := filepath.Join(t.TempDir(), "session")
+	snapshot := mustPreflight(t, Options{LaunchCWD: root, SessionDir: sessionDir, MinimumPolicy: PolicyEphemeral})
+	st := store.New(sessionDir)
+	materialized, err := Materialize(context.Background(), st, snapshot)
+	if err != nil {
+		t.Fatalf("Materialize: %v", err)
+	}
+	registerWorktreeCleanup(t, root, materialized.WorktreePath)
+	if err := os.RemoveAll(materialized.WorktreePath); err != nil {
+		t.Fatalf("remove managed worktree directory: %v", err)
+	}
+	record, registered, err := repositoryWorktreeRegistration(context.Background(), snapshot.repository, materialized.WorktreePath)
+	if err != nil || !registered || !record.Prunable {
+		t.Fatalf("missing managed worktree registration = %#v, %v, %v", record, registered, err)
+	}
+
+	result, err := Cleanup(context.Background(), st)
+	if err != nil {
+		t.Fatalf("Cleanup: %v", err)
+	}
+	if !result.Managed || !result.RegistrationFound || result.WorktreeRemoved || !result.MetadataPruned {
+		t.Fatalf("cleanup result = %#v", result)
+	}
+	if registered, err := repositoryWorktreeRegistered(context.Background(), snapshot.repository, materialized.WorktreePath); err != nil || registered {
+		t.Fatalf("prunable managed registration = %v, %v", registered, err)
+	}
+	if _, err := os.Stat(sessionDir); err != nil {
+		t.Fatalf("workspace cleanup deleted session evidence: %v", err)
+	}
+}
+
 func TestCleanupFailureRetainsRegistrationForIdempotentRetry(t *testing.T) {
 	root := newCommittedRepo(t)
 	sessionDir := filepath.Join(t.TempDir(), "session")

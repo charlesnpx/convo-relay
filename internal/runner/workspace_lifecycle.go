@@ -12,6 +12,7 @@ import (
 const stopReasonWorkspaceIntegrityFailed = "workspace_integrity_failed"
 
 func finalizeTerminalWorkspace(ctx context.Context, st *store.Store, meta model.SessionMeta) (model.SessionMeta, *workspace.Finalization, error) {
+	wasSourceMutated := meta.Bool("source_mutated")
 	finalized, err := workspace.Finalize(ctx, st)
 	if err != nil {
 		return meta, nil, err
@@ -34,8 +35,10 @@ func finalizeTerminalWorkspace(ctx context.Context, st *store.Store, meta model.
 	if mutationErr == nil {
 		return meta, finalized, nil
 	}
-	meta = meta.With("terminal_status_before_source_check", meta.String("status")).
-		WithStatus("failed").
+	if !wasSourceMutated || meta.String("terminal_status_before_source_check") == "" {
+		meta = meta.With("terminal_status_before_source_check", meta.String("status"))
+	}
+	meta = meta.WithStatus("failed").
 		With("stop_reason", workspace.StopReasonSourceMutated).
 		With("error", mutationErr.Error()).
 		With("failed_at", utcNow())

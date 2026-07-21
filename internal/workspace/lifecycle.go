@@ -174,10 +174,12 @@ func Cleanup(ctx context.Context, st *store.Store) (*CleanupResult, error) {
 		if record.Bare {
 			return nil, contracts.NewValidationError("execution workspace registration unexpectedly identifies a bare worktree")
 		}
-		if _, err := runGit(ctx, repository.gitBinary, repository.root, "worktree", "remove", "--force", paths.worktreePath); err != nil {
-			return nil, fmt.Errorf("remove execution worktree: %w", err)
+		if !record.Prunable {
+			if _, err := runGit(ctx, repository.gitBinary, repository.root, "worktree", "remove", "--force", paths.worktreePath); err != nil {
+				return nil, fmt.Errorf("remove execution worktree: %w", err)
+			}
+			result.WorktreeRemoved = true
 		}
-		result.WorktreeRemoved = true
 	}
 	if _, err := runGit(ctx, repository.gitBinary, repository.root, "worktree", "prune", "--expire", "now"); err != nil {
 		return nil, fmt.Errorf("prune execution worktree metadata: %w", err)

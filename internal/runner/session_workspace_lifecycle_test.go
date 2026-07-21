@@ -61,6 +61,15 @@ func TestCleanSessionPersistsSourceMutationAndRetryCheckpoints(t *testing.T) {
 		t.Fatalf("result not preserved: %#v, %v", result, err)
 	}
 
+	retryDeleteErr := errors.New("injected retry deletion failure")
+	if report, err := cleanSessionWithRemover(fixture.sessionDir, func(string) error { return retryDeleteErr }); report != nil || !errors.Is(err, retryDeleteErr) {
+		t.Fatalf("failed cleanup retry = %#v, %v", report, err)
+	}
+	retriedMeta := mustLoadMeta(t, fixture.sessionDir)
+	if retriedMeta["terminal_status_before_source_check"] != "completed" {
+		t.Fatalf("cleanup retry replaced original terminal status: %#v", retriedMeta)
+	}
+
 	report, err := CleanSession(fixture.sessionDir)
 	if err != nil || report["status"] != "deleted" {
 		t.Fatalf("cleanup retry = %#v, %v", report, err)
@@ -241,6 +250,59 @@ func TestCleanSessionProviderFailureRetainsWorktreeAndSessionForRetry(t *testing
 	report, err := CleanSession(fixture.sessionDir)
 	if err != nil || report["status"] != "deleted" {
 		t.Fatalf("provider cleanup retry = %#v, %v", report, err)
+	}
+}
+
+func TestCleanSessionRejectsUnsafeClaudeSessionIDsForEveryProviderRole(t *testing.T) {
+	for _, role := range []string{"participant", "facilitator", "reducer"} {
+		t.Run(role, func(t *testing.T) {
+			providerHome := t.TempDir()
+			t.Setenv("HOME", providerHome)
+			fixture := newIsolatedSessionFixture(t, "crashed")
+			st := store.New(fixture.sessionDir)
+			projectDir := claudeProjectDir(fixture.executionCWD)
+			outsideDir := filepath.Join(filepath.Dir(projectDir), "outside-"+role)
+			outsideMarker := filepath.Join(outsideDir, "preserve")
+			if err := os.MkdirAll(outsideDir, 0o755); err != nil {
+				t.Fatalf("create outside directory: %v", err)
+			}
+			if err := os.WriteFile(outsideMarker, []byte("preserve outside data\n"), 0o644); err != nil {
+				t.Fatalf("write outside marker: %v", err)
+			}
+
+			envelope := claudeCleanupEnvelope(filepath.Join("..", filepath.Base(outsideDir)), role, fixture.executionCWD)
+			meta := mustLoadMeta(t, fixture.sessionDir)
+			switch role {
+			case "participant":
+				meta["slots"] = []any{envelope}
+			case "facilitator":
+				meta["facilitator_provider_state"] = envelope
+			case "reducer":
+				meta["reducer_provider_state"] = envelope
+			}
+			if err := st.SaveMetaMap(meta); err != nil {
+				t.Fatalf("save adversarial %s state: %v", role, err)
+			}
+
+			report, err := CleanSession(fixture.sessionDir)
+			if report != nil || err == nil || !strings.Contains(err.Error(), "safe path component") {
+				t.Fatalf("adversarial %s cleanup = %#v, %v", role, report, err)
+			}
+			if data, err := os.ReadFile(outsideMarker); err != nil || string(data) != "preserve outside data\n" {
+				t.Fatalf("outside marker changed: %q, %v", data, err)
+			}
+			persisted := mustLoadMeta(t, fixture.sessionDir)
+			checkpoint := persisted["workspace_cleanup"].(map[string]any)
+			if checkpoint["status"] != "failed" || checkpoint["stage"] != "provider_artifacts" {
+				t.Fatalf("adversarial cleanup checkpoint = %#v", checkpoint)
+			}
+			if _, err := os.Stat(fixture.worktreePath); err != nil {
+				t.Fatalf("adversarial cleanup removed retryable worktree: %v", err)
+			}
+			if _, err := os.Stat(fixture.sessionDir); err != nil {
+				t.Fatalf("adversarial cleanup removed session evidence: %v", err)
+			}
+		})
 	}
 }
 

@@ -188,6 +188,9 @@ func (b *claudeBackend) RestoreState(state map[string]any, override SlotConfig) 
 	if !ok || sessionID == "" {
 		return fmt.Errorf("session_id must be a non-empty string")
 	}
+	if err := validateClaudeSessionID(sessionID); err != nil {
+		return err
+	}
 	started, ok := state["started"].(bool)
 	if state["started"] != nil && !ok {
 		return fmt.Errorf("started must be a bool")
@@ -232,12 +235,13 @@ func (b *claudeBackend) RestoreState(state map[string]any, override SlotConfig) 
 }
 
 func (b *claudeBackend) Cleanup() error {
-	jsonlPath := b.jsonlPath()
-	projectDir := filepath.Dir(jsonlPath)
+	projectDir, jsonlPath, sessionDir, err := claudeCleanupPaths(b.cwd, b.sessionID)
+	if err != nil {
+		return err
+	}
 	if err := os.Remove(jsonlPath); err != nil && !os.IsNotExist(err) {
 		return err
 	}
-	sessionDir := filepath.Join(projectDir, b.sessionID)
 	if err := os.RemoveAll(sessionDir); err != nil {
 		return err
 	}
@@ -248,6 +252,35 @@ func (b *claudeBackend) Cleanup() error {
 		return err
 	}
 	return nil
+}
+
+func validateClaudeSessionID(sessionID string) error {
+	if sessionID == "" {
+		return fmt.Errorf("session_id must be a non-empty string")
+	}
+	if sessionID == "." || sessionID == ".." {
+		return fmt.Errorf("session_id must be a safe path component")
+	}
+	for _, ch := range sessionID {
+		if (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9') || ch == '-' || ch == '_' || ch == '.' {
+			continue
+		}
+		return fmt.Errorf("session_id must be a safe path component")
+	}
+	return nil
+}
+
+func claudeCleanupPaths(cwd string, sessionID string) (string, string, string, error) {
+	if err := validateClaudeSessionID(sessionID); err != nil {
+		return "", "", "", err
+	}
+	projectDir := filepath.Clean(claudeProjectDir(cwd))
+	jsonlPath := filepath.Join(projectDir, sessionID+".jsonl")
+	sessionDir := filepath.Join(projectDir, sessionID)
+	if filepath.Clean(filepath.Dir(jsonlPath)) != projectDir || filepath.Clean(filepath.Dir(sessionDir)) != projectDir {
+		return "", "", "", fmt.Errorf("session_id resolves outside the Claude project directory")
+	}
+	return projectDir, jsonlPath, sessionDir, nil
 }
 
 func (b *claudeBackend) attemptTurn(ctx context.Context, prompt string, timeoutSeconds int, stallTimeoutSeconds int) (claudeProcessResult, string, error) {
