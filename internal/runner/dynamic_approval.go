@@ -266,9 +266,6 @@ func admitDynamicChild(st *store.Store, meta map[string]any, proposal map[string
 	admittedPlanID := store.NewGraphID("plan")
 	parentNodeID := firstNonEmpty(stringFromAny(proposal["parent_node_id"]), graph.RootNodeID)
 	decision := makeAdmissionDecision(proposal, "admit", []string{"operator approved"}, admittedRounds, stringFromAny(recipe["id"]), admittedPlanID, nil)
-	if err := st.RecordAdmissionDecisionMap(decision); err != nil {
-		return dynamicAdmittedChild{}, proposal, err
-	}
 	childTask := buildProposalChildTask(stringFromAny(meta["task"]), proposal, recipe)
 	node := map[string]any{
 		"node_id":          childNodeID,
@@ -311,6 +308,9 @@ func admitDynamicChild(st *store.Store, meta map[string]any, proposal map[string
 		intFromAny(depthPolicy["max_relay_backend_depth"], 1),
 	)
 	if err != nil {
+		return dynamicAdmittedChild{}, proposal, err
+	}
+	if err := st.RecordAdmissionDecisionMap(decision); err != nil {
 		return dynamicAdmittedChild{}, proposal, err
 	}
 	compiledPlanRef, err := refForPayload("compiled_plan", compiledPlan)

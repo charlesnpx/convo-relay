@@ -258,6 +258,71 @@ max_depth = 1
 	}
 }
 
+func TestRecipeCatalogIgnoresUnusedRootReducers(t *testing.T) {
+	settingsPath := writeSettings(t, `
+[backend_profiles.unused-relay-reducer]
+backend = "relay"
+model = "unused-child"
+effort = 1
+
+[relay_recipes.unknown-unused-reducer]
+participants = ["codex", "codex"]
+facilitator = "codex"
+reducer = "does-not-exist"
+participant_turns = 2
+result_source = "last_turn"
+max_depth = 1
+
+[relay_recipes.relay-unused-reducer]
+participants = ["codex", "codex"]
+facilitator = "codex"
+reducer = "unused-relay-reducer"
+participant_turns = 2
+result_source = "last_turn"
+max_depth = 1
+
+[relay_recipes.unused-child]
+participants = ["codex", "codex"]
+facilitator = "codex"
+reducer = "codex"
+max_depth = 1
+`)
+	report, err := BuildRecipeCatalogReportWithOptions(settingsPath, RecipeCatalogOptions{
+		ReadinessCheck: catalogReadinessCheck(nil),
+	})
+	if err != nil {
+		t.Fatalf("catalog: %v", err)
+	}
+	config, err := LoadRuntimeConfig(settingsPath)
+	if err != nil {
+		t.Fatalf("load runtime config: %v", err)
+	}
+	for _, recipeID := range []string{"unknown-unused-reducer", "relay-unused-reducer"} {
+		record, ok := FindRecipeRecord(report.Recipes, recipeID)
+		if !ok || record.Status != RecipeStatusUsable || len(record.Diagnostics) != 0 {
+			t.Fatalf("%s catalog record = %#v, want usable", recipeID, record)
+		}
+		for _, backend := range record.BackendReadiness {
+			if backend.Backend == "relay" {
+				t.Fatalf("%s checked unused reducer backend: %#v", recipeID, record.BackendReadiness)
+			}
+		}
+		plan, err := CompileRecipe(
+			config.RelayRecipes[recipeID],
+			config.BackendProfiles,
+			config.RelayRecipes,
+			CompileTargetRoot,
+			CompileOptions{ValidateExecutable: true},
+		)
+		if err != nil {
+			t.Fatalf("compile %s as root: %v", recipeID, err)
+		}
+		if _, exists := plan["reducer"]; exists {
+			t.Fatalf("%s root plan resolved unused reducer: %#v", recipeID, plan)
+		}
+	}
+}
+
 func TestRecipeCatalogSharesRootParticipantTurnAllocationBound(t *testing.T) {
 	settingsPath := writeSettings(t, `
 [relay_recipes.boundary-contractless]

@@ -1,17 +1,20 @@
 package runner
 
 import (
+	"context"
 	"errors"
 	"go/ast"
 	"go/parser"
 	"go/token"
 	"io/fs"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"strings"
 	"testing"
 
 	"github.com/charlesnpx/convo-relay/internal/recipes"
+	"github.com/charlesnpx/convo-relay/internal/store"
 )
 
 func TestNestedAndDynamicChildRoutesRejectIntegrationBoundRecipes(t *testing.T) {
@@ -66,6 +69,91 @@ func TestNestedAndDynamicChildRoutesRejectIntegrationBoundRecipes(t *testing.T) 
 				t.Fatalf("root-only error = %#v", rootOnly)
 			}
 		})
+	}
+}
+
+func TestApproveProposalRejectsRootOnlyRecipeWithoutDurableAdmission(t *testing.T) {
+	sessionDir := filepath.Join(t.TempDir(), "sessions", "root-only-proposal")
+	st := store.New(sessionDir)
+	config, err := recipes.LoadRuntimeConfig(filepath.Join(t.TempDir(), "missing-settings.toml"))
+	if err != nil {
+		t.Fatalf("load runtime config: %v", err)
+	}
+	recipe := map[string]any{
+		"id":                   "consumer-owned-arbitrary-root-recipe",
+		"participants":         []any{"codex", "codex"},
+		"facilitator":          "codex",
+		"reducer":              "codex",
+		"max_rounds":           1,
+		"participant_turns":    2,
+		"result_source":        "reducer",
+		"integration_contract": "consumer/opaque-contract-v1",
+		"max_depth":            2,
+	}
+	config.RelayRecipes[stringFromAny(recipe["id"])] = recipe
+	runtimeConfigRef, err := persistRuntimeConfigSnapshot(st, config)
+	if err != nil {
+		t.Fatalf("persist runtime config: %v", err)
+	}
+	if err := st.SaveMetaMap(map[string]any{
+		"status":             "completed",
+		"task":               "Reject root-only dynamic child",
+		"runtime_config_ref": runtimeConfigRef,
+	}); err != nil {
+		t.Fatalf("save meta: %v", err)
+	}
+	if err := st.SaveTranscriptItems([]any{}); err != nil {
+		t.Fatalf("save transcript: %v", err)
+	}
+	proposalID := "sp_root_only"
+	if err := st.SaveProposalMap(map[string]any{
+		"proposal_id":          proposalID,
+		"parent_node_id":       "root",
+		"contested_lineage_id": "ln_root_only",
+		"delegated_question":   "Attempt a root-only child",
+		"selected_recipe_id":   recipe["id"],
+		"requested_rounds":     1,
+		"status":               "proposed",
+		"created_at":           utcNow(),
+		"updated_at":           utcNow(),
+	}); err != nil {
+		t.Fatalf("save proposal: %v", err)
+	}
+	beforeProposal, err := st.LoadProposalMap(proposalID)
+	if err != nil {
+		t.Fatalf("load proposal before approval: %v", err)
+	}
+	beforeGraph := st.LoadGraph()
+	beforeEvents, err := st.ReadEvents()
+	if err != nil {
+		t.Fatalf("read events before approval: %v", err)
+	}
+
+	_, err = ApproveProposal(context.Background(), sessionDir, ApproveOptions{
+		ProposalID:     proposalID,
+		Rounds:         1,
+		TimeoutSeconds: 5,
+	})
+	var rootOnly *recipes.RootOnlyRecipeError
+	if !errors.As(err, &rootOnly) {
+		t.Fatalf("approval error = %T %[1]v, want *recipes.RootOnlyRecipeError", err)
+	}
+	afterProposal, loadErr := st.LoadProposalMap(proposalID)
+	if loadErr != nil {
+		t.Fatalf("load proposal after approval: %v", loadErr)
+	}
+	if !reflect.DeepEqual(afterProposal, beforeProposal) {
+		t.Fatalf("rejected approval mutated proposal:\nbefore=%#v\nafter=%#v", beforeProposal, afterProposal)
+	}
+	if afterGraph := st.LoadGraph(); !reflect.DeepEqual(afterGraph, beforeGraph) {
+		t.Fatalf("rejected approval mutated graph:\nbefore=%#v\nafter=%#v", beforeGraph, afterGraph)
+	}
+	afterEvents, readErr := st.ReadEvents()
+	if readErr != nil {
+		t.Fatalf("read events after approval: %v", readErr)
+	}
+	if !reflect.DeepEqual(afterEvents, beforeEvents) {
+		t.Fatalf("rejected approval appended events:\nbefore=%#v\nafter=%#v", beforeEvents, afterEvents)
 	}
 }
 

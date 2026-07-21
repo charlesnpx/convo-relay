@@ -171,7 +171,7 @@ func BuildRecipeCatalogReportWithOptions(settingsPath string, options RecipeCata
 			records = append(records, record)
 			continue
 		}
-		issues := ExecutableIssues(recipe, normalizedProfiles, normalizedRecipes, DepthPolicy{}, "root")
+		issues := rootExecutableIssues(recipe, normalizedProfiles, normalizedRecipes, DepthPolicy{}, "root")
 		issues = annotateProfileReferenceIssues(issues, profileIssues)
 		record.Diagnostics = issues
 		record.Resolved = resolveRecipeView(recipe, normalizedProfiles, normalizedRecipes)
