@@ -124,6 +124,41 @@ func PersistAndMaterialize(st *store.Store, prepared *Prepared, executionInputDi
 	return persisted, projection, nil
 }
 
+// LoadAssertionInputs reconstructs assertion JSON values exclusively from the
+// persisted manifest and content envelopes. It verifies every artifact ref,
+// raw-byte digest, media type, and manifest cross-record before decoding, and
+// never reads the original source paths recorded for operator inspection.
+func LoadAssertionInputs(st *store.Store, manifestRef map[string]any, expectedContractID string) (map[string][]any, error) {
+	manifest, entries, err := loadManifest(st, manifestRef)
+	if err != nil {
+		return nil, err
+	}
+	contractID, _ := manifest["contract_id"].(string)
+	contractID = strings.TrimSpace(contractID)
+	if expected := strings.TrimSpace(expectedContractID); expected == "" || contractID != expected {
+		return nil, integrityError(nil, "Named input manifest contract does not match the selected integration contract.", map[string]any{
+			"expected_contract_id": strings.TrimSpace(expectedContractID),
+			"manifest_contract_id": contractID,
+		})
+	}
+	result := map[string][]any{}
+	for _, entry := range entries {
+		mediaType, err := parseNamedInputMediaType(entry.mediaType)
+		if err != nil {
+			return nil, integrityError(err, "Named input media type is invalid during recovery.", map[string]any{"ordinal": entry.ordinal})
+		}
+		if mediaType != "application/json" && !strings.HasSuffix(mediaType, "+json") {
+			continue
+		}
+		value, err := contracts.DecodeStrictJSONBytes(entry.data)
+		if err != nil {
+			return nil, integrityError(err, "Persisted named input JSON is invalid during recovery.", map[string]any{"ordinal": entry.ordinal})
+		}
+		result[entry.name] = append(result[entry.name], contracts.Materialize(value))
+	}
+	return result, nil
+}
+
 // Materialize verifies the manifest, every artifact ref, base64 envelope, raw
 // digest, and cross-record metadata before writing read-only ordinal files.
 func Materialize(st *store.Store, manifestRef map[string]any, executionInputDir string) (map[string]any, error) {

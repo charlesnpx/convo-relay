@@ -9,7 +9,9 @@ import (
 	"github.com/charlesnpx/convo-relay/internal/contracts"
 	"github.com/charlesnpx/convo-relay/internal/graph"
 	"github.com/charlesnpx/convo-relay/internal/integration"
+	"github.com/charlesnpx/convo-relay/internal/model"
 	"github.com/charlesnpx/convo-relay/internal/store"
+	"github.com/charlesnpx/convo-relay/internal/workspace"
 )
 
 const (
@@ -22,9 +24,13 @@ const (
 )
 
 // rootResultCompletionAfterWrite is a test-only failpoint used to prove that
-// interruption after any result-completion write becomes one consistent
-// terminal failure. Production leaves it nil.
+// interruption after any result-completion write remains recoverable from the
+// cleanup checkpoint. Production leaves it nil.
 var rootResultCompletionAfterWrite func(string) error
+
+// rootReducerAfterAttempt is a test-only interruption seam after a successful
+// reducer attempt is durable but before a raw candidate can be persisted.
+var rootReducerAfterAttempt func() error
 
 type rootCandidate struct {
 	content         string
@@ -59,10 +65,10 @@ func (s *rootExecutionState) runRootResultPhases(ctx context.Context) (map[strin
 		if errors.As(err, &reducerErr) {
 			return s.markReducerFailed(reducerErr.cause)
 		}
-		return s.markFailed("result_candidate_persistence", err)
+		return s.markRootRecoveryPending("result_candidate_persistence", err)
 	}
 	if err := s.persistRootCandidate(&candidate); err != nil {
-		return s.markFailed("result_candidate_persistence", err)
+		return s.markRootRecoveryPending("result_candidate_persistence", err)
 	}
 	return s.validateAndCompleteRootCandidate(candidate)
 }
@@ -161,6 +167,11 @@ func (s *rootExecutionState) runFreshRootReducer(ctx context.Context) (rootCandi
 		}
 		return rootCandidate{}, rootReducerExecutionError{cause: runErr}
 	}
+	if rootReducerAfterAttempt != nil {
+		if err := rootReducerAfterAttempt(); err != nil {
+			return rootCandidate{}, err
+		}
+	}
 	if _, err := s.st.AppendSessionEventV1(
 		"root_reducer_completed",
 		graph.RootNodeID,
@@ -188,6 +199,7 @@ func (s *rootExecutionState) persistRootReducerAttempt(
 	failure map[string]any,
 	runErr error,
 ) (map[string]any, error) {
+	ordinal := nextRootReducerAttemptOrdinal(s.meta)
 	status := "completed"
 	content := result.Content
 	if runErr != nil {
@@ -195,7 +207,7 @@ func (s *rootExecutionState) persistRootReducerAttempt(
 		content = sanitizeProviderFailureDetail(content)
 	}
 	payload, err := contracts.NormalizeRootArtifact(contracts.RootArtifactKindReducerAttempt, map[string]any{
-		"ordinal":         1,
+		"ordinal":         ordinal,
 		"status":          status,
 		"backend":         reducer.Name(),
 		"profile_id":      profile["profile_id"],
@@ -213,7 +225,7 @@ func (s *rootExecutionState) persistRootReducerAttempt(
 		payload["provider_failure"] = cloneMap(failure)
 		payload["error"] = durableProviderFailureError(failure).Error()
 	}
-	ref, err := saveRootArtifact(s.st, contracts.RootArtifactKindReducerAttempt, 1, payload)
+	ref, err := saveRootArtifact(s.st, contracts.RootArtifactKindReducerAttempt, ordinal, payload)
 	if err != nil {
 		return nil, err
 	}
@@ -229,6 +241,20 @@ func (s *rootExecutionState) persistRootReducerAttempt(
 		return nil, err
 	}
 	return ref, nil
+}
+
+func nextRootReducerAttemptOrdinal(meta model.SessionMeta) int {
+	maximum := 0
+	for _, raw := range meta.Slice("reducer_attempt_refs") {
+		ref, _ := raw.(map[string]any)
+		refID := strings.TrimSpace(stringFromAny(ref["id"]))
+		artifactID := strings.TrimPrefix(refID, contracts.RootArtifactKindReducerAttempt+":")
+		ordinal, err := contracts.RootArtifactOrdinalFromID(contracts.RootArtifactKindReducerAttempt, artifactID)
+		if err == nil && ordinal > maximum {
+			maximum = ordinal
+		}
+	}
+	return maximum + 1
 }
 
 func (s *rootExecutionState) rootReducerPrompt() (string, error) {
@@ -300,6 +326,13 @@ func (s *rootExecutionState) persistRootCandidate(candidate *rootCandidate) erro
 	if err != nil {
 		return err
 	}
+	return s.recordRootCandidateCheckpoint(candidate)
+}
+
+func (s *rootExecutionState) recordRootCandidateCheckpoint(candidate *rootCandidate) error {
+	if candidate == nil || candidate.rawResultRef == nil {
+		return persistenceIntegrityError("Root result candidate artifact ref is required.", nil)
+	}
 	phase := rootCandidateCompleteStatus
 	if candidate.source == integration.ResultSourceReducer {
 		phase = rootReducerCompleteStatus
@@ -310,15 +343,17 @@ func (s *rootExecutionState) persistRootCandidate(candidate *rootCandidate) erro
 		"reducer_attempt_ref": candidate.reducerAttempt,
 	})
 	if err != nil {
+		if checkpointRef != nil {
+			s.meta = withRootCheckpointRef(s.meta, checkpointRef)
+		}
 		return err
 	}
 	s.meta = s.meta.
 		WithStatus(phase).
 		With("execution_phase", phase).
 		With("raw_result_ref", candidate.rawResultRef).
-		With("candidate_completed_at", utcNow()).
-		With("root_checkpoint_refs", append(s.meta.Slice("root_checkpoint_refs"), checkpointRef)).
-		With("latest_root_checkpoint_ref", checkpointRef)
+		With("candidate_completed_at", utcNow())
+	s.meta = withRootCheckpointRef(s.meta, checkpointRef)
 	if err := s.saveProgress(); err != nil {
 		return err
 	}
@@ -349,14 +384,14 @@ func positiveIntOrNil(value int) any {
 func (s *rootExecutionState) validateAndCompleteRootCandidate(candidate rootCandidate) (map[string]any, error) {
 	if s.preflight.selectedContract == nil {
 		if err := s.persistRootValidation("not_required", candidate.rawResultRef, nil, nil); err != nil {
-			return s.markFailed("result_validation_persistence", err)
+			return s.markRootRecoveryPending("result_validation_persistence", err)
 		}
 		return s.markRootResultCompleted()
 	}
 
 	contract := s.preflight.selectedContract.Contract()
 	if contract == nil || contract.Result.Transport != integration.ResultTransportJSON || contract.Result.Schema == nil {
-		return s.markFailed("result_validation", persistenceIntegrityError("Selected integration contract result declaration is invalid.", nil))
+		return s.markRootRecoveryPending("result_validation", persistenceIntegrityError("Selected integration contract result declaration is invalid.", nil))
 	}
 	value, validationErr := contracts.DecodeStrictJSONBytes([]byte(candidate.content))
 	if validationErr == nil {
@@ -372,7 +407,7 @@ func (s *rootExecutionState) validateAndCompleteRootCandidate(candidate rootCand
 	if validationErr != nil {
 		validationErr = typedRootResultValidationError(validationErr)
 		if err := s.persistRootValidation("failed", candidate.rawResultRef, nil, validationErr); err != nil {
-			return s.markFailed("result_validation_persistence", errors.Join(validationErr, err))
+			return s.markRootRecoveryPending("result_validation_persistence", errors.Join(validationErr, err))
 		}
 		return s.markInvalidRootResult(validationErr)
 	}
@@ -381,7 +416,7 @@ func (s *rootExecutionState) validateAndCompleteRootCandidate(candidate rootCand
 	if err != nil {
 		validationErr = typedRootResultValidationError(err)
 		if persistErr := s.persistRootValidation("failed", candidate.rawResultRef, nil, validationErr); persistErr != nil {
-			return s.markFailed("result_validation_persistence", errors.Join(validationErr, persistErr))
+			return s.markRootRecoveryPending("result_validation_persistence", errors.Join(validationErr, persistErr))
 		}
 		return s.markInvalidRootResult(validationErr)
 	}
@@ -393,14 +428,14 @@ func (s *rootExecutionState) validateAndCompleteRootCandidate(candidate rootCand
 		"created_at":     utcNow(),
 	})
 	if err != nil {
-		return s.markFailed("result_validation_persistence", err)
+		return s.markRootRecoveryPending("result_validation_persistence", err)
 	}
 	canonicalRef, err := saveRootArtifact(s.st, contracts.RootArtifactKindCanonicalResult, 0, canonicalPayload)
 	if err != nil {
-		return s.markFailed("result_validation_persistence", err)
+		return s.markRootRecoveryPending("result_validation_persistence", err)
 	}
 	if err := s.persistRootValidation("validated", candidate.rawResultRef, canonicalRef, nil); err != nil {
-		return s.markFailed("result_validation_persistence", err)
+		return s.markRootRecoveryPending("result_validation_persistence", err)
 	}
 	return s.markRootResultCompleted()
 }
@@ -468,6 +503,19 @@ func (s *rootExecutionState) persistRootValidation(
 	if err != nil {
 		return err
 	}
+	return s.recordRootValidationCheckpoint(status, rawResultRef, canonicalResultRef, validationRef, fields["diagnostics"])
+}
+
+func (s *rootExecutionState) recordRootValidationCheckpoint(
+	status string,
+	rawResultRef map[string]any,
+	canonicalResultRef map[string]any,
+	validationRef map[string]any,
+	diagnostics any,
+) error {
+	if validationRef == nil {
+		return persistenceIntegrityError("Root result validation artifact ref is required.", nil)
+	}
 	checkpointStatus := "completed"
 	if status == "failed" {
 		checkpointStatus = "failed"
@@ -479,14 +527,16 @@ func (s *rootExecutionState) persistRootValidation(
 		"canonical_result_ref":  canonicalResultRef,
 	})
 	if err != nil {
+		if checkpointRef != nil {
+			s.meta = withRootCheckpointRef(s.meta, checkpointRef)
+		}
 		return err
 	}
 	s.meta = s.meta.
 		With("validation_status", status).
 		With("result_validation_ref", validationRef).
-		With("result_validation_failed", status == "failed").
-		With("root_checkpoint_refs", append(s.meta.Slice("root_checkpoint_refs"), checkpointRef)).
-		With("latest_root_checkpoint_ref", checkpointRef)
+		With("result_validation_failed", status == "failed")
+	s.meta = withRootCheckpointRef(s.meta, checkpointRef)
 	if canonicalResultRef != nil {
 		s.meta = s.meta.With("canonical_result_ref", canonicalResultRef)
 	} else {
@@ -516,7 +566,7 @@ func (s *rootExecutionState) persistRootValidation(
 			"result_validation_ref": validationRef,
 			"canonical_result_ref":  canonicalResultRef,
 			"root_checkpoint_ref":   checkpointRef,
-			"diagnostics":           fields["diagnostics"],
+			"diagnostics":           diagnostics,
 		},
 		store.EventOptions{},
 	); err != nil {
@@ -559,46 +609,107 @@ func (s *rootExecutionState) markRootResultCompleted() (map[string]any, error) {
 		With("actual_participant_turns", s.transcript.Len()).
 		With("participant_turns_completed", s.transcript.Len()).
 		With("execution_phase", "result_complete")
-	var terminalErr error
-	s.meta, _, terminalErr = finalizeTerminalWorkspace(context.Background(), s.st, s.meta)
+	terminalErr := s.finalizeRootResultWorkspace()
 	if terminalErr != nil && !isSourceMutationError(terminalErr) {
-		s.meta = workspaceIntegrityFailureMeta(s.meta, terminalErr)
+		return s.markRootRecoveryPending("result_cleanup_persistence", terminalErr)
 	}
+	return s.finishRootResultCompleted(terminalErr)
+}
+
+func (s *rootExecutionState) finishRootResultCompleted(terminalErr error) (map[string]any, error) {
 	if err := s.saveProgress(); err != nil {
-		return s.markFailed("result_completion_persistence", errors.Join(terminalErr, err))
+		return s.markRootRecoveryPending("result_completion_persistence", errors.Join(terminalErr, err))
 	}
 	if err := runRootResultCompletionFailpoint("metadata"); err != nil {
-		return s.markFailed("result_completion_persistence", errors.Join(terminalErr, err))
+		return s.markRootRecoveryPending("result_completion_persistence", errors.Join(terminalErr, err))
 	}
 	if terminalErr != nil {
-		_, _ = s.st.AppendSessionEventV1("node_failed", graph.RootNodeID, "Root recipe result finalization failed: "+terminalErr.Error(), map[string]any{
+		if err := s.appendRootTerminalEventOnce("node_failed", "Root recipe result finalization failed: "+terminalErr.Error(), map[string]any{
 			"actual_participant_turns": s.transcript.Len(),
 			"error":                    terminalErr.Error(),
 			"stop_reason":              s.meta.String("stop_reason"),
-		}, store.EventOptions{})
-		_ = s.saveGraph("failed")
+			"root_checkpoint_ref":      s.meta.Get("latest_root_checkpoint_ref"),
+		}); err != nil {
+			return s.markRootRecoveryPending("result_completion_persistence", errors.Join(terminalErr, err))
+		}
+		if err := runRootResultCompletionFailpoint("event"); err != nil {
+			return s.markRootRecoveryPending("result_completion_persistence", errors.Join(terminalErr, err))
+		}
+		if err := s.saveGraph("failed"); err != nil {
+			return s.markRootRecoveryPending("result_completion_persistence", errors.Join(terminalErr, err))
+		}
+		if err := runRootResultCompletionFailpoint("graph"); err != nil {
+			return s.markRootRecoveryPending("result_completion_persistence", errors.Join(terminalErr, err))
+		}
 		return s.result(), terminalErr
 	}
-	if _, err := s.st.AppendSessionEventV1("node_completed", graph.RootNodeID, "Root recipe result completed", map[string]any{
+	if err := s.appendRootTerminalEventOnce("node_completed", "Root recipe result completed", map[string]any{
 		"actual_participant_turns": s.transcript.Len(),
 		"result_source":            s.meta.String("result_source"),
 		"validation_status":        s.meta.String("validation_status"),
 		"raw_result_ref":           s.meta.Get("raw_result_ref"),
 		"result_validation_ref":    s.meta.Get("result_validation_ref"),
 		"canonical_result_ref":     s.meta.Get("canonical_result_ref"),
-	}, store.EventOptions{}); err != nil {
-		return s.markFailed("result_completion_persistence", err)
+		"root_checkpoint_ref":      s.meta.Get("latest_root_checkpoint_ref"),
+	}); err != nil {
+		return s.markRootRecoveryPending("result_completion_persistence", err)
 	}
 	if err := runRootResultCompletionFailpoint("event"); err != nil {
-		return s.markFailed("result_completion_persistence", err)
+		return s.markRootRecoveryPending("result_completion_persistence", err)
 	}
 	if err := s.saveGraph("completed"); err != nil {
-		return s.markFailed("result_completion_persistence", err)
+		return s.markRootRecoveryPending("result_completion_persistence", err)
 	}
 	if err := runRootResultCompletionFailpoint("graph"); err != nil {
-		return s.markFailed("result_completion_persistence", err)
+		return s.markRootRecoveryPending("result_completion_persistence", err)
 	}
 	return s.result(), nil
+}
+
+func (s *rootExecutionState) appendRootTerminalEventOnce(eventType string, summary string, payload map[string]any) error {
+	wantRef, _ := payload["root_checkpoint_ref"].(map[string]any)
+	events, err := s.st.ReadEvents()
+	if err != nil {
+		return err
+	}
+	for _, event := range events {
+		if strings.TrimSpace(stringFromAny(event["event_type"])) != eventType {
+			continue
+		}
+		existingPayload, _ := event["payload"].(map[string]any)
+		existingRef, _ := existingPayload["root_checkpoint_ref"].(map[string]any)
+		if wantRef != nil && existingRef != nil && requireMatchingArtifactRef(wantRef, existingRef, "terminal root checkpoint") == nil {
+			return nil
+		}
+	}
+	_, err = s.st.AppendSessionEventV1(eventType, graph.RootNodeID, summary, payload, store.EventOptions{})
+	return err
+}
+
+func (s *rootExecutionState) finalizeRootResultWorkspace() error {
+	var terminalErr error
+	var finalized *workspace.Finalization
+	s.meta, finalized, terminalErr = finalizeTerminalWorkspace(context.Background(), s.st, s.meta)
+	if terminalErr != nil && !isSourceMutationError(terminalErr) {
+		s.meta = workspaceIntegrityFailureMeta(s.meta, terminalErr)
+		return terminalErr
+	}
+	if finalized != nil && finalized.Managed {
+		s.persisted.workspaceRef = cloneMap(finalized.ArtifactRef)
+		s.persisted.executionCWD = s.meta.String("execution_cwd")
+	}
+	checkpointRef, checkpointErr := s.saveRootResultCheckpoint(5, "cleanup_complete", "completed", map[string]any{
+		"cleanup_status":          "completed",
+		"source_changed":          s.meta.Bool("source_changed"),
+		"source_mutated":          s.meta.Bool("source_mutated"),
+		"execution_workspace_ref": s.meta.Get("execution_workspace_ref"),
+	})
+	if checkpointRef != nil {
+		s.meta = withRootCheckpointRef(s.meta, checkpointRef).
+			With("cleanup_status", "completed").
+			With("cleanup_completed_at", utcNow())
+	}
+	return errors.Join(terminalErr, checkpointErr)
 }
 
 func runRootResultCompletionFailpoint(stage string) error {
@@ -622,33 +733,19 @@ func (s *rootExecutionState) markReducerFailed(runErr error) (map[string]any, er
 		With("stop_reason", rootReducerFailedStatus).
 		With("actual_participant_turns", s.transcript.Len()).
 		With("participant_turns_completed", s.transcript.Len())
-	var terminalErr error
-	s.meta, _, terminalErr = finalizeTerminalWorkspace(context.Background(), s.st, s.meta)
-	if terminalErr != nil && !isSourceMutationError(terminalErr) {
-		s.meta = workspaceIntegrityFailureMeta(s.meta, terminalErr)
-	}
-	effectiveErr := runErr
-	durableEventErr := durableErr
-	if terminalErr != nil {
-		effectiveErr = errors.Join(runErr, terminalErr)
-		durableEventErr = terminalErr
-	}
+	s.meta = s.meta.With("root_recovery_pending", true)
 	if err := s.saveProgress(); err != nil {
-		return s.result(), errors.Join(effectiveErr, err)
+		return s.result(), errors.Join(runErr, err)
 	}
-	_, _ = s.st.AppendSessionEventV1("node_failed", graph.RootNodeID, "Root recipe reducer failed: "+durableEventErr.Error(), map[string]any{
+	_, _ = s.st.AppendSessionEventV1("node_failed", graph.RootNodeID, "Root recipe reducer failed: "+durableErr.Error(), map[string]any{
 		"actual_participant_turns": s.transcript.Len(),
 		"phase":                    rootReducerFailedStatus,
-		"error":                    durableEventErr.Error(),
+		"error":                    durableErr.Error(),
 		"provider_failure":         providerFailure,
 		"reducer_attempt_ref":      s.meta.Get("latest_reducer_attempt_ref"),
 	}, store.EventOptions{})
-	graphStatus := rootReducerFailedStatus
-	if terminalErr != nil {
-		graphStatus = "failed"
-	}
-	_ = s.saveGraph(graphStatus)
-	return s.result(), effectiveErr
+	_ = s.saveGraph(rootReducerFailedStatus)
+	return s.result(), runErr
 }
 
 func (s *rootExecutionState) markInvalidRootResult(validationErr error) (map[string]any, error) {
@@ -661,11 +758,14 @@ func (s *rootExecutionState) markInvalidRootResult(validationErr error) (map[str
 		With("stop_reason", rootValidationFailedPhase).
 		With("actual_participant_turns", s.transcript.Len()).
 		With("participant_turns_completed", s.transcript.Len())
-	var terminalErr error
-	s.meta, _, terminalErr = finalizeTerminalWorkspace(context.Background(), s.st, s.meta)
+	terminalErr := s.finalizeRootResultWorkspace()
 	if terminalErr != nil && !isSourceMutationError(terminalErr) {
-		s.meta = workspaceIntegrityFailureMeta(s.meta, terminalErr)
+		return s.markRootRecoveryPending("result_cleanup_persistence", errors.Join(validationErr, terminalErr))
 	}
+	return s.finishRootInvalidResult(validationErr, terminalErr)
+}
+
+func (s *rootExecutionState) finishRootInvalidResult(validationErr error, terminalErr error) (map[string]any, error) {
 	effectiveErr := validationErr
 	durableEventErr := validationErr
 	if terminalErr != nil {
@@ -673,21 +773,35 @@ func (s *rootExecutionState) markInvalidRootResult(validationErr error) (map[str
 		durableEventErr = terminalErr
 	}
 	if err := s.saveProgress(); err != nil {
-		return s.result(), errors.Join(effectiveErr, err)
+		return s.markRootRecoveryPending("result_completion_persistence", errors.Join(effectiveErr, err))
 	}
-	_, _ = s.st.AppendSessionEventV1("node_failed", graph.RootNodeID, "Root recipe result is invalid: "+durableEventErr.Error(), map[string]any{
+	if err := runRootResultCompletionFailpoint("metadata"); err != nil {
+		return s.markRootRecoveryPending("result_completion_persistence", errors.Join(effectiveErr, err))
+	}
+	if err := s.appendRootTerminalEventOnce("node_failed", "Root recipe result is invalid: "+durableEventErr.Error(), map[string]any{
 		"actual_participant_turns": s.transcript.Len(),
 		"phase":                    rootValidationFailedPhase,
 		"error":                    durableEventErr.Error(),
 		"diagnostics":              rootResultDiagnosticMaps(validationErr),
 		"raw_result_ref":           s.meta.Get("raw_result_ref"),
 		"result_validation_ref":    s.meta.Get("result_validation_ref"),
-	}, store.EventOptions{})
+		"root_checkpoint_ref":      s.meta.Get("latest_root_checkpoint_ref"),
+	}); err != nil {
+		return s.markRootRecoveryPending("result_completion_persistence", errors.Join(effectiveErr, err))
+	}
+	if err := runRootResultCompletionFailpoint("event"); err != nil {
+		return s.markRootRecoveryPending("result_completion_persistence", errors.Join(effectiveErr, err))
+	}
 	graphStatus := rootInvalidResultStatus
 	if terminalErr != nil {
 		graphStatus = "failed"
 	}
-	_ = s.saveGraph(graphStatus)
+	if err := s.saveGraph(graphStatus); err != nil {
+		return s.markRootRecoveryPending("result_completion_persistence", errors.Join(effectiveErr, err))
+	}
+	if err := runRootResultCompletionFailpoint("graph"); err != nil {
+		return s.markRootRecoveryPending("result_completion_persistence", errors.Join(effectiveErr, err))
+	}
 	return s.result(), effectiveErr
 }
 
@@ -696,22 +810,10 @@ func (s *rootExecutionState) markRootPostParticipantInterrupted(phase string, re
 		WithInterrupted(s.transcript.Len(), utcNow(), reason).
 		With("actual_participant_turns", s.transcript.Len()).
 		With("participant_turns_completed", s.transcript.Len()).
-		With("execution_phase", phase+"_interrupted")
-	var terminalErr error
-	s.meta, _, terminalErr = finalizeTerminalWorkspace(context.Background(), s.st, s.meta)
-	if terminalErr != nil && !isSourceMutationError(terminalErr) {
-		s.meta = workspaceIntegrityFailureMeta(s.meta, terminalErr)
-	}
+		With("execution_phase", phase+"_interrupted").
+		With("root_recovery_pending", true)
 	if err := s.saveProgress(); err != nil {
-		return s.result(), errors.Join(context.Canceled, terminalErr, err)
-	}
-	if terminalErr != nil {
-		_, _ = s.st.AppendSessionEventV1("node_failed", graph.RootNodeID, "Root recipe post-participant execution failed: "+terminalErr.Error(), map[string]any{
-			"phase": phase,
-			"error": terminalErr.Error(),
-		}, store.EventOptions{})
-		_ = s.saveGraph("failed")
-		return s.result(), terminalErr
+		return s.result(), errors.Join(context.Canceled, err)
 	}
 	_, _ = s.st.AppendSessionEventV1("node_interrupted", graph.RootNodeID, "Root recipe post-participant execution interrupted", map[string]any{
 		"phase":  phase,

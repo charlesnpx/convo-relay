@@ -75,6 +75,16 @@ type ResumeOptions struct {
 	FacilitatorEffort   string
 	RelayBackendDepth   int
 	MaxRelayDepth       int
+
+	// ExplicitFields identifies CLI/API fields that the caller deliberately
+	// supplied. Root-recipe recovery uses it to distinguish flag defaults from
+	// forbidden structural overrides. Direct API callers may omit it; non-zero
+	// structural values are then treated as explicit.
+	ExplicitFields map[string]bool
+
+	// backendFactory is a test seam for root recovery. Ordinary resume keeps
+	// using the established slot restoration path.
+	backendFactory rootBackendFactory
 }
 
 type StopOptions struct {
@@ -306,11 +316,14 @@ func Resume(ctx context.Context, sessionDir string, opts ResumeOptions) (map[str
 	if strings.TrimSpace(sessionDir) == "" {
 		return nil, fmt.Errorf("--session-dir is required")
 	}
-	opts = normalizeResumeOptions(opts)
 	meta, err := loadSessionMeta(sessionDir)
 	if err != nil {
 		return nil, err
 	}
+	if meta.String("execution_kind") == "recipe" {
+		return resumeRootRecipe(ctx, sessionDir, opts, meta)
+	}
+	opts = normalizeResumeOptions(opts)
 	transcript, err := loadSessionTranscript(sessionDir)
 	if err != nil {
 		return nil, err

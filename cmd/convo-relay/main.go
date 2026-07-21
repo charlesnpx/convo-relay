@@ -1079,6 +1079,13 @@ func runResume(args []string) {
 	if err := parseFlags(flags, cleanedArgs); err != nil {
 		os.Exit(2)
 	}
+	visited := visitedFlagNames(flags)
+	if len(extracted["context"]) > 0 {
+		visited["context"] = true
+	}
+	if len(extracted["skill"]) > 0 {
+		visited["skill"] = true
+	}
 	remaining := flags.Args()
 	if *sessionID == "" && *sessionDir == "" && len(remaining) > 0 {
 		*sessionID = remaining[0]
@@ -1086,6 +1093,7 @@ func runResume(args []string) {
 	}
 	if *prompt == "" && len(remaining) > 0 {
 		*prompt = strings.Join(remaining, " ")
+		visited["prompt"] = true
 	}
 	resolvedSessionDir := resolveSessionDirOrExit(*sessionDir, *sessionID, *relayHome)
 	effectiveRounds := *rounds
@@ -1109,6 +1117,7 @@ func runResume(args []string) {
 		SettingsPath:        *settingsPath,
 		FacilitatorModel:    *facilitatorModel,
 		FacilitatorEffort:   *facilitatorEffort,
+		ExplicitFields:      visited,
 	})
 	writeRunnerResult(result, err, *jsonOutput, output)
 }
