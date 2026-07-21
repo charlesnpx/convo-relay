@@ -8,10 +8,16 @@ import (
 	"github.com/charlesnpx/convo-relay/internal/store"
 )
 
-const RuntimeConfigSnapshotVersion = "runtime-config/v1"
+const (
+	RuntimeConfigSnapshotVersion   = "runtime-config/v2"
+	RuntimeConfigSnapshotVersionV1 = "runtime-config/v1"
+)
 
 func loadEffectiveRuntimeConfig(settingsPath string, provided recipes.RuntimeConfig, recipeFiles []string, generatedRecipeFiles []string, transientSources []recipes.TransientRecipeSource) (recipes.RuntimeConfig, []recipes.TransientRecipeFile, error) {
 	if runtimeConfigProvided(provided) {
+		if err := recipes.ValidateRuntimeLimits(provided.EffectiveLimits()); err != nil {
+			return recipes.RuntimeConfig{}, nil, err
+		}
 		config := cloneRuntimeConfig(provided)
 		if strings.TrimSpace(config.SettingsPath) == "" {
 			config.SettingsPath = strings.TrimSpace(settingsPath)
@@ -37,6 +43,7 @@ func cloneRuntimeConfig(config recipes.RuntimeConfig) recipes.RuntimeConfig {
 	return recipes.RuntimeConfig{
 		BackendProfiles: mapStringObjectMap(config.BackendProfiles),
 		RelayRecipes:    mapStringObjectMap(config.RelayRecipes),
+		Limits:          config.EffectiveLimits(),
 		SettingsPath:    strings.TrimSpace(config.SettingsPath),
 	}
 }
@@ -47,6 +54,7 @@ func runtimeConfigSnapshotPayload(config recipes.RuntimeConfig) map[string]any {
 		"settings_path":    strings.TrimSpace(config.SettingsPath),
 		"backend_profiles": mapStringObjectMap(config.BackendProfiles),
 		"relay_recipes":    mapStringObjectMap(config.RelayRecipes),
+		"limits":           recipes.RuntimeLimitsMap(config.EffectiveLimits()),
 	}
 }
 
@@ -64,12 +72,26 @@ func loadRuntimeConfigFromSnapshot(st *store.Store, ref any) (recipes.RuntimeCon
 		return recipes.RuntimeConfig{}, err
 	}
 	version := strings.TrimSpace(stringFromAny(payload["version"]))
-	if version != RuntimeConfigSnapshotVersion {
+	if version != RuntimeConfigSnapshotVersion && version != RuntimeConfigSnapshotVersionV1 {
 		return recipes.RuntimeConfig{}, fmt.Errorf("runtime config snapshot version %q is unsupported", version)
+	}
+	limits := recipes.DefaultRuntimeLimits()
+	if version == RuntimeConfigSnapshotVersion {
+		var exists bool
+		var err error
+		rawLimits, exists := payload["limits"]
+		if !exists {
+			return recipes.RuntimeConfig{}, fmt.Errorf("runtime config v2 snapshot is missing limits")
+		}
+		limits, err = recipes.ParseRuntimeLimits(rawLimits)
+		if err != nil {
+			return recipes.RuntimeConfig{}, fmt.Errorf("runtime config v2 snapshot: %w", err)
+		}
 	}
 	config := recipes.RuntimeConfig{
 		BackendProfiles: mapStringObjectMap(payload["backend_profiles"]),
 		RelayRecipes:    mapStringObjectMap(payload["relay_recipes"]),
+		Limits:          limits,
 		SettingsPath:    strings.TrimSpace(stringFromAny(payload["settings_path"])),
 	}
 	if !runtimeConfigProvided(config) {
@@ -86,7 +108,10 @@ func effectiveRuntimeConfigForSession(st *store.Store, meta map[string]any, sett
 		}
 		return config, config.SettingsPath, nil
 	}
-	graphConfig := runtimeConfigFromGraph(st.LoadGraph(), stringFromAny(meta["settings_path"]))
+	graphConfig, err := runtimeConfigFromGraph(st.LoadGraph(), stringFromAny(meta["settings_path"]))
+	if err != nil {
+		return recipes.RuntimeConfig{}, "", err
+	}
 	if runtimeConfigProvided(graphConfig) {
 		return graphConfig, graphConfig.SettingsPath, nil
 	}
@@ -120,12 +145,17 @@ func effectiveRuntimeConfigForResume(st *store.Store, meta map[string]any, opts 
 	return config, resolvedPath, nil
 }
 
-func runtimeConfigFromGraph(graphPayload map[string]any, settingsPath string) recipes.RuntimeConfig {
+func runtimeConfigFromGraph(graphPayload map[string]any, settingsPath string) (recipes.RuntimeConfig, error) {
+	limits, err := recipes.ParseRuntimeLimits(graphPayload["runtime_limits"])
+	if err != nil {
+		return recipes.RuntimeConfig{}, fmt.Errorf("graph runtime limits: %w", err)
+	}
 	return recipes.RuntimeConfig{
 		BackendProfiles: mapStringObjectMap(graphPayload["backend_profiles"]),
 		RelayRecipes:    mapStringObjectMap(graphPayload["relay_recipes"]),
+		Limits:          limits,
 		SettingsPath:    strings.TrimSpace(settingsPath),
-	}
+	}, nil
 }
 
 func mutateSessionRuntimeConfig(sessionDir string, sources []recipes.TransientRecipeSource) (map[string]any, error) {
@@ -164,6 +194,7 @@ func mutateSessionRuntimeConfig(sessionDir string, sources []recipes.TransientRe
 	graphPayload := st.LoadGraph()
 	graphPayload["backend_profiles"] = nextConfig.BackendProfiles
 	graphPayload["relay_recipes"] = nextConfig.RelayRecipes
+	graphPayload["runtime_limits"] = recipes.RuntimeLimitsMap(nextConfig.EffectiveLimits())
 	graphPayload["runtime_config_ref"] = runtimeConfigRef
 	if err := st.SaveGraph(graphPayload); err != nil {
 		return nil, err

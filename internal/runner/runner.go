@@ -785,6 +785,7 @@ func (s *runState) saveGraph() error {
 	}
 	repaired["backend_profiles"] = s.runtimeConfig.BackendProfiles
 	repaired["relay_recipes"] = s.runtimeConfig.RelayRecipes
+	repaired["runtime_limits"] = recipes.RuntimeLimitsMap(s.runtimeConfig.EffectiveLimits())
 	repaired["runtime_config_ref"] = s.meta.Get("runtime_config_ref")
 	nodes, _ := repaired["nodes"].(map[string]any)
 	if root, ok := nodes[graph.RootNodeID].(map[string]any); ok {

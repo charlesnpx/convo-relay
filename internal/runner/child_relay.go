@@ -157,6 +157,7 @@ func runtimeConfigForChildSpec(spec childRelaySpec) recipes.RuntimeConfig {
 	return recipes.RuntimeConfig{
 		BackendProfiles: mapStringObjectMap(spec.Profiles),
 		RelayRecipes:    mapStringObjectMap(spec.Recipes),
+		Limits:          recipes.DefaultRuntimeLimits(),
 		SettingsPath:    spec.SettingsPath,
 	}
 }

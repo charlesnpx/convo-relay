@@ -137,6 +137,14 @@ func TestRunBuildsSlotsFromBackendProfiles(t *testing.T) {
 func TestRunPersistsRuntimeConfigSnapshot(t *testing.T) {
 	env := setupFakeCodex(t)
 	settingsPath := writeNestedRelaySettings(t, env)
+	settings, err := os.ReadFile(settingsPath)
+	if err != nil {
+		t.Fatalf("read settings: %v", err)
+	}
+	settings = append(settings, []byte("\n[limits]\nintegration_bundle_max_bytes = 2097152\n")...)
+	if err := os.WriteFile(settingsPath, settings, 0o644); err != nil {
+		t.Fatalf("write settings with limits: %v", err)
+	}
 	sessionDir := filepath.Join(env.relayHome, "sessions", "runtime-snapshot")
 
 	if _, err := Run(context.Background(), Options{
@@ -159,7 +167,8 @@ func TestRunPersistsRuntimeConfigSnapshot(t *testing.T) {
 	if meta["runtime_config_version"] != RuntimeConfigSnapshotVersion {
 		t.Fatalf("runtime_config_version = %v", meta["runtime_config_version"])
 	}
-	artifact, err := store.New(sessionDir).LoadArtifact(ref)
+	st := store.New(sessionDir)
+	artifact, err := st.LoadArtifact(ref)
 	if err != nil {
 		t.Fatalf("load runtime snapshot: %v", err)
 	}
@@ -167,6 +176,14 @@ func TestRunPersistsRuntimeConfigSnapshot(t *testing.T) {
 	relayRecipes := artifact["relay_recipes"].(map[string]any)
 	if profiles["codex-fast"] == nil || relayRecipes["outer-review"] == nil {
 		t.Fatalf("runtime snapshot missing resolved defaults/settings: %#v", artifact)
+	}
+	limits := artifact["limits"].(map[string]any)
+	if fmt.Sprint(limits["integration_bundle_max_bytes"]) != "2097152" {
+		t.Fatalf("runtime snapshot limits = %#v", limits)
+	}
+	graphLimits := st.LoadGraph()["runtime_limits"].(map[string]any)
+	if fmt.Sprint(graphLimits["integration_bundle_max_bytes"]) != "2097152" {
+		t.Fatalf("graph runtime limits = %#v", graphLimits)
 	}
 	report, err := inspect.BuildContractsReport(sessionDir, false, "", "")
 	if err != nil {
