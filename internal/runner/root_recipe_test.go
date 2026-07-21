@@ -3,6 +3,7 @@ package runner
 import (
 	"context"
 	"errors"
+	"fmt"
 	"math"
 	"os"
 	"path/filepath"
@@ -414,6 +415,73 @@ max_depth = 1
 		assertRootRecipeDiagnostic(t, err, diagnosticCodeArtifactIDInvalid)
 		assertNoUnsafeRootRecipePersistence(t, sessionDir, filepath.Join(parent, "outside-transient.json"))
 	})
+}
+
+func TestRunRecipeRejectsInvalidTransientRecipeRefsBeforeSessionCreation(t *testing.T) {
+	tests := []struct {
+		name     string
+		recipeID string
+	}{
+		{name: "unsupported character", recipeID: "bad id"},
+		{name: "overlength", recipeID: strings.Repeat("a", 300)},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			sessionDir := filepath.Join(t.TempDir(), "session")
+			source := recipes.TransientRecipeSource{
+				SourceType:  recipes.TransientRecipeSourceOrdinary,
+				Path:        "invalid-ref.toml",
+				DisplayName: "invalid-ref.toml",
+				RawTOML: []byte(fmt.Sprintf(`
+[relay_recipes.%q]
+purpose = "Must be rejected before persistence."
+participants = ["codex-deep", "codex-fast"]
+facilitator = "codex-fast"
+reducer = "codex-deep"
+mode = "cooperative"
+max_rounds = 1
+max_depth = 1
+`, test.recipeID)),
+			}
+
+			_, err := RunRecipe(context.Background(), RecipeOptions{
+				SessionDir:       sessionDir,
+				Task:             "Reject invalid transient recipe ref",
+				RecipeID:         "review-panel",
+				LaunchCWD:        t.TempDir(),
+				SettingsPath:     filepath.Join(t.TempDir(), "missing-settings.toml"),
+				TransientSources: []recipes.TransientRecipeSource{source},
+				ReadinessCheck:   readyRootRecipeCheck,
+			})
+			assertRootRecipeDiagnostic(t, err, diagnosticCodeArtifactIDInvalid)
+			if _, statErr := os.Stat(sessionDir); !os.IsNotExist(statErr) {
+				t.Fatalf("invalid transient recipe ref created session, err = %v", statErr)
+			}
+		})
+	}
+}
+
+func TestRunRecipeRejectsUnpersistableRuntimeConfigBeforeSessionCreation(t *testing.T) {
+	sessionDir := filepath.Join(t.TempDir(), "session")
+	config := rootRecipeRuntimeConfig("")
+	config.BackendProfiles["unused-invalid-profile"] = map[string]any{
+		"id":      "unused-invalid-profile",
+		"backend": "codex",
+		"ignored": make(chan int),
+	}
+
+	_, err := RunRecipe(context.Background(), RecipeOptions{
+		SessionDir:     sessionDir,
+		Task:           "Reject an unpersistable runtime snapshot",
+		RecipeID:       "neutral-root",
+		LaunchCWD:      t.TempDir(),
+		RuntimeConfig:  config,
+		ReadinessCheck: readyRootRecipeCheck,
+	})
+	assertRootRecipeDiagnostic(t, err, diagnosticCodeRuntimeConfigInvalid)
+	if _, statErr := os.Stat(sessionDir); !os.IsNotExist(statErr) {
+		t.Fatalf("unpersistable runtime config created session, err = %v", statErr)
+	}
 }
 
 func assertNoUnsafeRootRecipePersistence(t *testing.T, sessionDir string, outsidePath string) {

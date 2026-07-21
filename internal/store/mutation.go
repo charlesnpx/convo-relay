@@ -315,11 +315,19 @@ func (s *Store) saveIndexedArtifact(category string, artifactID string, payload 
 }
 
 func stableArtifactRelativePath(category string, artifactID string) (string, error) {
-	if strings.TrimSpace(category) == "" {
+	trimmedCategory := strings.TrimSpace(category)
+	if trimmedCategory == "" {
 		return "", contracts.NewValidationError("artifact category must not be empty")
 	}
-	if filepath.IsAbs(category) || filepath.VolumeName(category) != "" {
-		return "", contracts.NewValidationError("artifact category %q must be relative", category)
+	invalidCategory := category != trimmedCategory ||
+		category == "." ||
+		category == ".." ||
+		filepath.IsAbs(category) ||
+		filepath.VolumeName(category) != "" ||
+		strings.ContainsAny(category, `/\\`) ||
+		filepath.Clean(category) != category
+	if invalidCategory {
+		return "", contracts.NewValidationError("artifact category %q must be a clean, non-dot path component", category)
 	}
 	artifactsRoot := filepath.Clean("artifacts")
 	categoryPath := filepath.Clean(filepath.Join(artifactsRoot, category))

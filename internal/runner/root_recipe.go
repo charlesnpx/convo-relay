@@ -30,6 +30,7 @@ const (
 	diagnosticCodePersistenceIntegrity = "root_recipe_persistence_integrity"
 	diagnosticCodeArtifactIDInvalid    = "root_recipe_artifact_id_invalid"
 	diagnosticCodeTaskPlanInvalid      = "root_recipe_task_plan_invalid"
+	diagnosticCodeRuntimeConfigInvalid = "root_recipe_runtime_config_invalid"
 )
 
 // RecipeOptions describes a direct root-recipe run. Unlike Options, it does
@@ -73,7 +74,9 @@ type recipePreflight struct {
 	sessionPathSource string
 	launchCWD         string
 	runtimeConfig     recipes.RuntimeConfig
+	runtimeSnapshot   map[string]any
 	transientFiles    []recipes.TransientRecipeFile
+	transientRecipes  []preparedTransientRecipe
 	recipe            map[string]any
 	rootPlan          map[string]any
 	bundle            *integration.Bundle
@@ -84,6 +87,13 @@ type recipePreflight struct {
 	promptPolicy      PromptPolicy
 	backendReadiness  []readiness.Record
 	workspace         *workspace.Snapshot
+}
+
+type preparedTransientRecipe struct {
+	recipeID    string
+	payload     map[string]any
+	expectedRef map[string]any
+	selected    bool
 }
 
 type persistedRecipeRun struct {
@@ -156,6 +166,16 @@ func preflightRecipe(ctx context.Context, opts RecipeOptions) (*recipePreflight,
 	if err != nil {
 		return nil, err
 	}
+	runtimeSnapshot, err := prepareRuntimeConfigSnapshot(runtimeConfig)
+	if err != nil {
+		return nil, rootRecipeDiagnostic(
+			diagnosticCodeRuntimeConfigInvalid,
+			contracts.DiagnosticPhasePreflight,
+			"/runtime_config",
+			"The effective runtime configuration must be persistable JSON.",
+			map[string]any{"cause": err.Error()},
+		)
+	}
 	recipeID := strings.TrimSpace(opts.RecipeID)
 	recipe, exists := runtimeConfig.RelayRecipes[recipeID]
 	if !exists || recipe == nil {
@@ -192,6 +212,10 @@ func preflightRecipe(ctx context.Context, opts RecipeOptions) (*recipePreflight,
 		return nil, err
 	}
 	if _, err := contracts.ValidateRootArtifact(rootPlan, contracts.RootArtifactKindRootRecipePlan); err != nil {
+		return nil, err
+	}
+	transientRecipes, err := prepareRootTransientRecipes(transientFiles, runtimeConfig, recipeID, rootPlan)
+	if err != nil {
 		return nil, err
 	}
 
@@ -275,7 +299,9 @@ func preflightRecipe(ctx context.Context, opts RecipeOptions) (*recipePreflight,
 		sessionPathSource: sessionPathSource,
 		launchCWD:         launchCWD,
 		runtimeConfig:     runtimeConfig,
+		runtimeSnapshot:   runtimeSnapshot,
 		transientFiles:    transientFiles,
+		transientRecipes:  transientRecipes,
 		recipe:            contracts.Materialize(recipe).(map[string]any),
 		rootPlan:          contracts.Materialize(rootPlan).(map[string]any),
 		bundle:            bundle,
@@ -362,7 +388,7 @@ func startRecipeRun(ctx context.Context, preflight *recipePreflight) (map[string
 
 func persistRecipePreflight(ctx context.Context, preflight *recipePreflight) (*persistedRecipeRun, error) {
 	st := store.New(preflight.sessionDir)
-	runtimeConfigRef, err := persistRuntimeConfigSnapshot(st, preflight.runtimeConfig)
+	runtimeConfigRef, err := persistPreparedRuntimeConfigSnapshot(st, preflight.runtimeSnapshot)
 	if err != nil {
 		return nil, err
 	}
@@ -383,7 +409,7 @@ func persistRecipePreflight(ctx context.Context, preflight *recipePreflight) (*p
 	if err := requireMatchingArtifactRef(expectedRecipeRef, recipeRef, "recipe"); err != nil {
 		return nil, err
 	}
-	transientContractRefs, err := persistRootTransientRecipeContractArtifacts(st, preflight.transientFiles, preflight.runtimeConfig, preflight.options.RecipeID, recipeRef)
+	transientContractRefs, err := persistRootTransientRecipeContractArtifacts(st, preflight.transientRecipes, recipeRef)
 	if err != nil {
 		return nil, err
 	}
@@ -749,26 +775,60 @@ func saveRootArtifact(st *store.Store, kind string, ordinal int, payload map[str
 	return ref, nil
 }
 
-func persistRootTransientRecipeContractArtifacts(st *store.Store, files []recipes.TransientRecipeFile, runtimeConfig recipes.RuntimeConfig, rootRecipeID string, rootRecipeRef map[string]any) ([]any, error) {
+func prepareRootTransientRecipes(files []recipes.TransientRecipeFile, runtimeConfig recipes.RuntimeConfig, rootRecipeID string, rootPlan map[string]any) ([]preparedTransientRecipe, error) {
 	ids := effectiveTransientRecipeIDs(files)
-	refs := make([]any, 0, len(ids))
+	prepared := make([]preparedTransientRecipe, 0, len(ids))
 	for _, recipeID := range ids {
 		recipe := runtimeConfig.RelayRecipes[recipeID]
 		if recipe == nil {
 			return nil, fmt.Errorf("transient recipe %q is missing from effective runtime config", recipeID)
 		}
-		var ref map[string]any
-		if recipeID == strings.TrimSpace(rootRecipeID) {
-			ref = rootRecipeRef
-		} else {
+		selected := recipeID == strings.TrimSpace(rootRecipeID)
+		payload := recipes.ChildRecipeContractPayload(recipe)
+		if selected {
+			payload = recipes.RecipeContractPayload(recipe)
+		}
+		expectedRef, err := contracts.ArtifactRefForPayload("recipe:"+recipeID, payload)
+		if err != nil {
+			return nil, rootRecipeDiagnostic(
+				diagnosticCodeArtifactIDInvalid,
+				contracts.DiagnosticPhasePreflight,
+				"/recipe",
+				"Transient recipe IDs must form valid recipe artifact references.",
+				map[string]any{"recipe_id": recipeID, "cause": err.Error()},
+			)
+		}
+		if selected {
+			if err := requireMatchingArtifactRef(mapFromAny(rootPlan["recipe_ref"]), expectedRef, "recipe"); err != nil {
+				return nil, err
+			}
+		}
+		prepared = append(prepared, preparedTransientRecipe{
+			recipeID:    recipeID,
+			payload:     payload,
+			expectedRef: expectedRef,
+			selected:    selected,
+		})
+	}
+	return prepared, nil
+}
+
+func persistRootTransientRecipeContractArtifacts(st *store.Store, prepared []preparedTransientRecipe, rootRecipeRef map[string]any) ([]any, error) {
+	refs := make([]any, 0, len(prepared))
+	for _, recipe := range prepared {
+		ref := rootRecipeRef
+		if !recipe.selected {
 			var err error
-			ref, err = st.SaveContractArtifact("recipes", recipeID, recipes.ChildRecipeContractPayload(recipe), "recipe:"+recipeID)
+			ref, err = st.SaveContractArtifact("recipes", recipe.recipeID, recipe.payload, stringFromAny(recipe.expectedRef["id"]))
 			if err != nil {
 				return nil, err
 			}
 		}
+		if err := requireMatchingArtifactRef(recipe.expectedRef, ref, "transient recipe"); err != nil {
+			return nil, err
+		}
 		refs = append(refs, map[string]any{
-			"recipe_id":     recipeID,
+			"recipe_id":     recipe.recipeID,
 			"recipe_ref":    ref,
 			"recipe_digest": ref["digest"],
 		})

@@ -76,6 +76,20 @@ func TestArtifactPersistenceRejectsEscapingLocationsBeforeCreatingSession(t *tes
 				return err
 			},
 		},
+		{
+			name: "dot category targeting artifact index",
+			save: func(st *Store) error {
+				_, err := st.SaveArtifact(".", "index", map[string]any{"message": "unsafe"})
+				return err
+			},
+		},
+		{
+			name: "normalized category targeting artifact index",
+			save: func(st *Store) error {
+				_, err := st.SaveArtifact("foo/..", "index", map[string]any{"message": "unsafe"})
+				return err
+			},
+		},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
