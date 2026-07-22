@@ -134,7 +134,7 @@ func TestRunRecipeUsesExplicitRootTargetAndPersistsDirectContractlessSession(t *
 	}
 	assertRootRecipeArtifact(t, st, meta.Get("root_recipe_plan_ref"), contracts.RootArtifactKindRootRecipePlan, 0)
 	checkpointRefs := meta.Slice("root_checkpoint_refs")
-	if len(checkpointRefs) != 4 {
+	if len(checkpointRefs) != 5 {
 		t.Fatalf("root checkpoint refs = %#v", checkpointRefs)
 	}
 	workspaceCheckpoint := assertRootRecipeArtifact(t, st, checkpointRefs[0], contracts.RootArtifactKindRootCheckpoint, 1)
@@ -144,6 +144,10 @@ func TestRunRecipeUsesExplicitRootTargetAndPersistsDirectContractlessSession(t *
 	participantCheckpoint := assertRootRecipeArtifact(t, st, checkpointRefs[1], contracts.RootArtifactKindRootCheckpoint, 2)
 	if participantCheckpoint["phase"] != "participant_turns_complete" || intFromAny(participantCheckpoint["participant_turns_completed"], 0) != 2 {
 		t.Fatalf("participant checkpoint = %#v", participantCheckpoint)
+	}
+	cleanupCheckpoint := assertRootRecipeArtifact(t, st, checkpointRefs[4], contracts.RootArtifactKindRootCheckpoint, 5)
+	if cleanupCheckpoint["phase"] != "cleanup_complete" || cleanupCheckpoint["status"] != "completed" {
+		t.Fatalf("cleanup checkpoint = %#v", cleanupCheckpoint)
 	}
 	assertRootRecipeArtifact(t, st, meta.Get("raw_result_ref"), contracts.RootArtifactKindRawResult, 0)
 	assertRootRecipeArtifact(t, st, meta.Get("result_validation_ref"), contracts.RootArtifactKindResultValidation, 0)

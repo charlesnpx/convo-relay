@@ -59,7 +59,24 @@ func Proposals(sessionDir string) (map[string]any, error) {
 }
 
 func RejectProposal(sessionDir string, opts RejectOptions) (map[string]any, error) {
+	if err := guardRootLifecycleSession(sessionDir, rootLifecycleActionProposalReject); err != nil {
+		return nil, err
+	}
+	lock, err := lockSessionMutation(sessionDir)
+	if err != nil {
+		return nil, err
+	}
+	defer func() {
+		_ = lock.Unlock()
+	}()
 	st := store.New(sessionDir)
+	meta, err := loadSessionMeta(sessionDir)
+	if err != nil {
+		return nil, err
+	}
+	if err := guardRootLifecycleMeta(meta, rootLifecycleActionProposalReject); err != nil {
+		return nil, err
+	}
 	proposal, err := st.LoadProposalMap(opts.ProposalID)
 	if err != nil {
 		return nil, err
@@ -93,6 +110,9 @@ func ApproveProposal(ctx context.Context, sessionDir string, opts ApproveOptions
 	if opts.StallTimeoutSeconds < 0 {
 		opts.StallTimeoutSeconds = 0
 	}
+	if err := guardRootLifecycleSession(sessionDir, rootLifecycleActionProposalApprove); err != nil {
+		return nil, err
+	}
 	lock, err := lockSessionMutation(sessionDir)
 	if err != nil {
 		return nil, err
@@ -103,6 +123,9 @@ func ApproveProposal(ctx context.Context, sessionDir string, opts ApproveOptions
 	st := store.New(sessionDir)
 	meta, err := loadMeta(sessionDir)
 	if err != nil {
+		return nil, err
+	}
+	if err := guardRootLifecycleMap(meta, rootLifecycleActionProposalApprove); err != nil {
 		return nil, err
 	}
 	if err := ensureSessionNotRunning(sessionDir, "approving proposals"); err != nil {

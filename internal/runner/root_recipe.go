@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 
 	"github.com/charlesnpx/convo-relay/internal/contracts"
@@ -32,6 +33,10 @@ const (
 	diagnosticCodeTaskPlanInvalid      = "root_recipe_task_plan_invalid"
 	diagnosticCodeRuntimeConfigInvalid = "root_recipe_runtime_config_invalid"
 )
+
+// rootCheckpointAfterSave is a test-only interruption seam. The checkpoint
+// artifact and its index/graph entry are already durable when it is invoked.
+var rootCheckpointAfterSave func(int) error
 
 // RecipeOptions describes a direct root-recipe run. Unlike Options, it does
 // not accept caller-selected participant, facilitator, mode, round, or dynamic
@@ -788,7 +793,37 @@ func saveRootArtifact(st *store.Store, kind string, ordinal int, payload map[str
 	if _, err := contracts.ValidateRootArtifactRef(ref, kind, ordinal, persisted); err != nil {
 		return nil, err
 	}
+	if kind == contracts.RootArtifactKindRootCheckpoint && rootCheckpointAfterSave != nil {
+		if err := rootCheckpointAfterSave(ordinal); err != nil {
+			return ref, err
+		}
+	}
 	return ref, nil
+}
+
+func withRootCheckpointRef(meta model.SessionMeta, ref map[string]any) model.SessionMeta {
+	if ref == nil {
+		return meta
+	}
+	wantID := strings.TrimSpace(stringFromAny(ref["id"]))
+	refs := append([]any{}, meta.Slice("root_checkpoint_refs")...)
+	replaced := false
+	for index, raw := range refs {
+		candidate, _ := raw.(map[string]any)
+		if strings.TrimSpace(stringFromAny(candidate["id"])) == wantID {
+			refs[index] = cloneMap(ref)
+			replaced = true
+		}
+	}
+	if !replaced {
+		refs = append(refs, cloneMap(ref))
+	}
+	sort.SliceStable(refs, func(left int, right int) bool {
+		leftRef, _ := refs[left].(map[string]any)
+		rightRef, _ := refs[right].(map[string]any)
+		return stringFromAny(leftRef["id"]) < stringFromAny(rightRef["id"])
+	})
+	return meta.With("root_checkpoint_refs", refs).With("latest_root_checkpoint_ref", cloneMap(ref))
 }
 
 func prepareRootTransientRecipes(files []recipes.TransientRecipeFile, runtimeConfig recipes.RuntimeConfig, rootRecipeID string, rootPlan map[string]any) ([]preparedTransientRecipe, error) {

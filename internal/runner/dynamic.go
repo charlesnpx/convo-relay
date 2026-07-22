@@ -105,8 +105,16 @@ func updateContestedLineages(rawLineages any, previousLedger any, currentLedger 
 }
 
 func maybeCreateSpawnProposals(st *store.Store, dynamicMode string, lineages map[string]any, previousLedger any, currentLedger any, roundNum int, triggerEventID string, profiles map[string]map[string]any, relayRecipes map[string]map[string]any) ([]map[string]any, error) {
-	if normalizeDynamicMode(dynamicMode) == defaultDynamicMode {
+	mode := normalizeDynamicMode(dynamicMode)
+	if mode == defaultDynamicMode {
 		return nil, nil
+	}
+	action := rootLifecycleActionProposalCreate
+	if mode == "auto-safe" {
+		action = rootLifecycleActionAutomaticExpansion
+	}
+	if err := guardRootLifecycleSession(st.Root, action); err != nil {
+		return nil, err
 	}
 	previous := normalizeLedger(previousLedger)
 	current := normalizeLedger(currentLedger)

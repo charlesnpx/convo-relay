@@ -112,12 +112,13 @@ func TestRunRecipeContractlessReducerUsesFreshContextAndRawProse(t *testing.T) {
 		t.Fatalf("contractless validation record = %#v", validation)
 	}
 	checkpoints := result["root_checkpoint_refs"].([]any)
-	if len(checkpoints) != 4 {
+	if len(checkpoints) != 5 {
 		t.Fatalf("root checkpoints = %#v", checkpoints)
 	}
 	reducerCheckpoint := assertRootRecipeArtifact(t, st, checkpoints[2], contracts.RootArtifactKindRootCheckpoint, 3)
 	validationCheckpoint := assertRootRecipeArtifact(t, st, checkpoints[3], contracts.RootArtifactKindRootCheckpoint, 4)
-	if reducerCheckpoint["phase"] != rootReducerCompleteStatus || validationCheckpoint["phase"] != rootValidationCompletePhase {
+	cleanupCheckpoint := assertRootRecipeArtifact(t, st, checkpoints[4], contracts.RootArtifactKindRootCheckpoint, 5)
+	if reducerCheckpoint["phase"] != rootReducerCompleteStatus || validationCheckpoint["phase"] != rootValidationCompletePhase || cleanupCheckpoint["phase"] != "cleanup_complete" {
 		t.Fatalf("post-participant checkpoints = %#v / %#v", reducerCheckpoint, validationCheckpoint)
 	}
 }

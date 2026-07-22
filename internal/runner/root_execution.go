@@ -568,6 +568,10 @@ func (s *rootExecutionState) markParticipantsComplete() (map[string]any, error) 
 	}
 	checkpointRef, err := saveRootArtifact(s.st, contracts.RootArtifactKindRootCheckpoint, 2, checkpoint)
 	if err != nil {
+		if checkpointRef != nil {
+			s.meta = withRootCheckpointRef(s.meta, checkpointRef)
+			return s.markRootRecoveryPending("participant_completion_persistence", err)
+		}
 		return s.markFailed("participant_checkpoint", err)
 	}
 	s.meta = s.meta.
@@ -578,14 +582,13 @@ func (s *rootExecutionState) markParticipantsComplete() (map[string]any, error) 
 		WithActualRounds(s.transcript.Len()).
 		With("participant_completed_at", utcNow()).
 		With("elapsed_seconds", roundElapsed(s.startedAt)).
-		With("stop_reason", "participant_turns_complete").
-		With("root_checkpoint_refs", append(s.meta.Slice("root_checkpoint_refs"), checkpointRef)).
-		With("latest_root_checkpoint_ref", checkpointRef)
+		With("stop_reason", "participant_turns_complete")
+	s.meta = withRootCheckpointRef(s.meta, checkpointRef)
 	if err := s.saveProgress(); err != nil {
-		return s.markFailed("participant_completion_persistence", err)
+		return s.markRootRecoveryPending("participant_completion_persistence", err)
 	}
 	if err := runRootParticipantCompletionFailpoint("metadata"); err != nil {
-		return s.markFailed("participant_completion_persistence", err)
+		return s.markRootRecoveryPending("participant_completion_persistence", err)
 	}
 	if _, err := s.st.AppendSessionEventV1(
 		"root_participants_completed",
@@ -599,16 +602,16 @@ func (s *rootExecutionState) markParticipantsComplete() (map[string]any, error) 
 		},
 		store.EventOptions{},
 	); err != nil {
-		return s.markFailed("participant_completion_persistence", err)
+		return s.markRootRecoveryPending("participant_completion_persistence", err)
 	}
 	if err := runRootParticipantCompletionFailpoint("event"); err != nil {
-		return s.markFailed("participant_completion_persistence", err)
+		return s.markRootRecoveryPending("participant_completion_persistence", err)
 	}
 	if err := s.saveGraph(rootParticipantsCompleteStatus); err != nil {
-		return s.markFailed("participant_completion_persistence", err)
+		return s.markRootRecoveryPending("participant_completion_persistence", err)
 	}
 	if err := runRootParticipantCompletionFailpoint("graph"); err != nil {
-		return s.markFailed("participant_completion_persistence", err)
+		return s.markRootRecoveryPending("participant_completion_persistence", err)
 	}
 	return s.result(), nil
 }
@@ -687,6 +690,36 @@ func (s *rootExecutionState) markFailed(phase string, runErr error) (map[string]
 	_, _ = s.st.AppendSessionEventV1("node_failed", graph.RootNodeID, "Root recipe participant execution failed: "+durableEventErr.Error(), eventPayload, store.EventOptions{})
 	_ = s.saveGraph("failed")
 	return s.result(), effectiveErr
+}
+
+func (s *rootExecutionState) markRootRecoveryPending(phase string, runErr error) (map[string]any, error) {
+	durableErr := runErr
+	providerFailure := cloneMap(s.lastProviderFailure)
+	if len(providerFailure) > 0 {
+		durableErr = durableProviderFailureError(providerFailure)
+	}
+	s.meta = s.meta.
+		WithFailed(s.transcript.Len(), utcNow(), durableErr).
+		With("actual_participant_turns", s.transcript.Len()).
+		With("participant_turns_completed", s.transcript.Len()).
+		With("execution_phase", phase).
+		With("stop_reason", phase).
+		With("root_recovery_pending", true)
+	if err := s.saveProgress(); err != nil {
+		return s.result(), errors.Join(runErr, err)
+	}
+	payload := map[string]any{
+		"actual_participant_turns": s.transcript.Len(),
+		"phase":                    phase,
+		"error":                    durableErr.Error(),
+		"recovery_pending":         true,
+	}
+	if len(providerFailure) > 0 {
+		payload["provider_failure"] = providerFailure
+	}
+	_, _ = s.st.AppendSessionEventV1("node_failed", graph.RootNodeID, "Root recipe post-participant phase is recoverable: "+durableErr.Error(), payload, store.EventOptions{})
+	_ = s.saveGraph("failed")
+	return s.result(), runErr
 }
 
 func failRootExecutionSetup(
@@ -849,7 +882,9 @@ func isProviderCredentialField(key string) bool {
 }
 
 func (s *rootExecutionState) saveProgress() error {
-	s.meta = s.meta.WithSlots(slotEnvelopes(s.slots))
+	if s.slots != nil {
+		s.meta = s.meta.WithSlots(slotEnvelopes(s.slots))
+	}
 	if s.facilitator != nil {
 		s.meta = s.meta.With("facilitator_provider_state", rootProviderEnvelope(s.facilitator))
 	}

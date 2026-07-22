@@ -62,6 +62,107 @@ type CleanupResult struct {
 	MetadataPruned    bool
 }
 
+// Recover validates the persisted workspace boundary without changing it.
+// Isolated execution requires the exact detached worktree captured at launch;
+// inherited execution requires its recorded launch directory. The returned
+// Materialized value is reconstructed only from digest-checked session state.
+func Recover(ctx context.Context, st *store.Store) (*Materialized, error) {
+	artifact, ref, found, err := loadExecutionWorkspace(st)
+	if err != nil {
+		return nil, err
+	}
+	if !found {
+		return nil, contracts.NewValidationError("root recovery requires an execution_workspace artifact")
+	}
+	paths, err := validatePersistedWorkspace(st, artifact)
+	if err != nil {
+		return nil, err
+	}
+	policy, err := workspacePolicy(artifact)
+	if err != nil {
+		return nil, err
+	}
+	identity, _ := artifact["identity"].(map[string]any)
+	recordedExecutionCWD := strings.TrimSpace(stringValue(identity["execution_cwd"]))
+	if recordedExecutionCWD == "" {
+		return nil, contracts.NewValidationError("execution_workspace identity is missing execution_cwd")
+	}
+
+	if policy.achieved == PolicyInherited {
+		if paths.worktreePath != "" {
+			return nil, contracts.NewValidationError("inherited execution_workspace unexpectedly records a worktree path")
+		}
+		executionCWD, err := canonicalExistingDirectory(recordedExecutionCWD)
+		if err != nil {
+			return nil, fmt.Errorf("resolve inherited recovery directory: %w", err)
+		}
+		if paths.sourceLaunchCWD != "" && !pathsEquivalent(executionCWD, paths.sourceLaunchCWD) {
+			return nil, contracts.NewValidationError("inherited execution_workspace recovery directory changed")
+		}
+		return &Materialized{
+			ExecutionCWD: executionCWD,
+			Artifact:     cloneMap(artifact),
+			ArtifactRef:  cloneMap(ref),
+		}, nil
+	}
+
+	if paths.sourceGitRoot == "" || paths.worktreePath == "" {
+		return nil, contracts.NewValidationError("isolated root recovery requires its retained worktree")
+	}
+	info, err := os.Lstat(paths.worktreePath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, contracts.NewValidationError("required retained execution worktree is absent")
+		}
+		return nil, fmt.Errorf("inspect retained execution worktree: %w", err)
+	}
+	if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
+		return nil, contracts.NewValidationError("required retained execution worktree must be a real directory")
+	}
+	expectedHead, err := persistedDetachedWorktreeHead(artifact)
+	if err != nil {
+		return nil, err
+	}
+	repository, err := repositoryForCleanup(ctx, paths.sourceGitRoot)
+	if err != nil {
+		return nil, err
+	}
+	record, registered, err := repositoryWorktreeRegistration(ctx, repository, paths.worktreePath)
+	if err != nil {
+		return nil, fmt.Errorf("inspect retained execution worktree registration: %w", err)
+	}
+	if !registered || record.Prunable || record.Bare || !record.Detached || record.Branch != "" || strings.TrimSpace(record.Head) != expectedHead {
+		return nil, contracts.NewValidationError("required retained execution worktree registration no longer matches the persisted workspace")
+	}
+	worktreeRoot, err := canonicalExistingDirectory(paths.worktreePath)
+	if err != nil || !pathsEquivalent(worktreeRoot, paths.worktreePath) {
+		return nil, contracts.NewValidationError("required retained execution worktree path changed")
+	}
+	headOutput, err := runGit(ctx, repository.gitBinary, worktreeRoot, "rev-parse", "--verify", "HEAD^{commit}")
+	if err != nil || strings.TrimSpace(string(headOutput)) != expectedHead {
+		return nil, contracts.NewValidationError("required retained execution worktree HEAD changed")
+	}
+	if base, ok := artifact["base"].(map[string]any); ok {
+		expectedTree := strings.TrimSpace(stringValue(base["head_tree"]))
+		if expectedTree != "" {
+			treeOutput, treeErr := runGit(ctx, repository.gitBinary, worktreeRoot, "rev-parse", "--verify", "HEAD^{tree}")
+			if treeErr != nil || strings.TrimSpace(string(treeOutput)) != expectedTree {
+				return nil, contracts.NewValidationError("required retained execution worktree tree changed")
+			}
+		}
+	}
+	executionCWD, err := canonicalExistingDirectory(recordedExecutionCWD)
+	if err != nil || !pathContains(worktreeRoot, executionCWD) {
+		return nil, contracts.NewValidationError("root recovery execution directory is not inside the retained worktree")
+	}
+	return &Materialized{
+		ExecutionCWD: executionCWD,
+		WorktreePath: worktreeRoot,
+		Artifact:     cloneMap(artifact),
+		ArtifactRef:  cloneMap(ref),
+	}, nil
+}
+
 // Finalize recomputes the original source inventory once and persists the
 // source-after digest in a new execution_workspace artifact revision. A
 // changed digest only becomes source_mutated for isolated execution;

@@ -116,6 +116,9 @@ func QueueSteeringPrompt(sessionDir string, prompt string) (map[string]any, erro
 	if text == "" {
 		return nil, fmt.Errorf("steering prompt cannot be empty")
 	}
+	if err := guardRootLifecycleSession(sessionDir, rootLifecycleActionSteer); err != nil {
+		return nil, err
+	}
 	lock, err := lockSessionMutation(sessionDir)
 	if err != nil {
 		return nil, err
@@ -130,6 +133,9 @@ func QueueSteeringPrompt(sessionDir string, prompt string) (map[string]any, erro
 	if err != nil {
 		return nil, err
 	}
+	if err := guardRootLifecycleMeta(meta, rootLifecycleActionSteer); err != nil {
+		return nil, err
+	}
 	item := map[string]any{
 		"id":         steeringID(),
 		"prompt":     text,
@@ -137,16 +143,6 @@ func QueueSteeringPrompt(sessionDir string, prompt string) (map[string]any, erro
 		"created_at": utcNow(),
 	}
 	if meta.String("execution_kind") == "recipe" {
-		lifecycle, _ := meta.Get("lifecycle").(map[string]any)
-		if strings.TrimSpace(stringFromAny(lifecycle["steering"])) == "forbid" {
-			return nil, rootRecipeDiagnostic(
-				diagnosticCodeRootSteeringForbidden,
-				contracts.DiagnosticPhasePolicy,
-				"/lifecycle/steering",
-				"Steering is forbidden by the root recipe lifecycle policy.",
-				nil,
-			)
-		}
 		nextOrdinal := meta.Int("next_unsealed_participant_turn", 0)
 		totalTurns := meta.Int("participant_turns", 0)
 		status := meta.String("status")

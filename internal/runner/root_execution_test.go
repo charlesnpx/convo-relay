@@ -243,7 +243,7 @@ func TestRunRecipeExecutesExactAlternatingParticipantsAndFacilitator(t *testing.
 		}
 	}
 	checkpointRefs := result["root_checkpoint_refs"].([]any)
-	if len(checkpointRefs) != 4 {
+	if len(checkpointRefs) != 5 {
 		t.Fatalf("root checkpoint refs = %#v", checkpointRefs)
 	}
 	checkpoint := assertRootRecipeArtifact(t, st, checkpointRefs[1], contracts.RootArtifactKindRootCheckpoint, 2)
@@ -785,7 +785,7 @@ func TestSanitizeDurableProviderValueRedactsNestedCredentialFields(t *testing.T)
 	assertNoRawProviderCredential(t, "nested provider metadata", serialized, secret)
 }
 
-func TestRootParticipantCompletionWriteFailuresBecomeConsistentTerminalFailures(t *testing.T) {
+func TestRootParticipantCompletionWriteFailuresRemainRecoverable(t *testing.T) {
 	for _, stage := range []string{"metadata", "event", "graph"} {
 		t.Run(stage, func(t *testing.T) {
 			injected := fmt.Errorf("injected %s completion failure", stage)
@@ -816,6 +816,9 @@ func TestRootParticipantCompletionWriteFailuresBecomeConsistentTerminalFailures(
 			if persisted["status"] != "failed" || persisted["execution_phase"] != "participant_completion_persistence" {
 				t.Fatalf("persisted completion failure = %#v", persisted)
 			}
+			if persisted["root_recovery_pending"] != true || persisted["source_after_digest"] != nil {
+				t.Fatalf("participant completion failure finalized recoverable state = %#v", persisted)
+			}
 			events, readErr := os.ReadFile(filepath.Join(sessionDir, "events.jsonl"))
 			if readErr != nil || !strings.Contains(string(events), `"event_type":"node_failed"`) {
 				t.Fatalf("completion failure events = %v\n%s", readErr, events)
@@ -825,6 +828,11 @@ func TestRootParticipantCompletionWriteFailuresBecomeConsistentTerminalFailures(
 			root, _ := nodes[graph.RootNodeID].(map[string]any)
 			if root["status"] != "failed" {
 				t.Fatalf("completion failure graph = %#v", root)
+			}
+			rootParticipantCompletionAfterWrite = nil
+			recovered, resumeErr := Resume(context.Background(), sessionDir, ResumeOptions{})
+			if resumeErr != nil || recovered["status"] != "completed" || intFromAny(recovered["actual_participant_turns"], 0) != 1 {
+				t.Fatalf("participant completion recovery = %#v, %v", recovered, resumeErr)
 			}
 		})
 	}
