@@ -189,7 +189,14 @@ func validateRootResumeOverrides(opts ResumeOptions) error {
 		mark(fmt.Sprintf("model-%c", 'a'+rune(index)), strings.TrimSpace(config.Model) != "")
 		mark(fmt.Sprintf("effort-%c", 'a'+rune(index)), strings.TrimSpace(config.Effort) != "")
 		mark(fmt.Sprintf("agent-%c", 'a'+rune(index)), strings.TrimSpace(config.ProfileID) != "")
+		mark(fmt.Sprintf("settings-%c", 'a'+rune(index)), strings.TrimSpace(config.SettingsPath) != "")
+		mark(fmt.Sprintf("composition-path-%c", 'a'+rune(index)), strings.TrimSpace(config.CompositionPath) != "")
+		mark(fmt.Sprintf("runtime-config-%c", 'a'+rune(index)), rootResumeRuntimeConfigProvided(config.RuntimeConfig))
+		mark(fmt.Sprintf("relay-depth-%c", 'a'+rune(index)), config.Depth != 0)
+		mark(fmt.Sprintf("max-relay-depth-%c", 'a'+rune(index)), config.MaxDepth != 0)
 	}
+	mark("relay-backend-depth", opts.RelayBackendDepth != 0)
+	mark("max-relay-backend-depth", opts.MaxRelayDepth != 0)
 	if len(forbidden) == 0 {
 		return nil
 	}
@@ -209,6 +216,13 @@ func validateRootResumeOverrides(opts ResumeOptions) error {
 		"Root recipe recovery rejects structural resume overrides; start a new root run instead.",
 		map[string]any{"overrides": items},
 	)
+}
+
+func rootResumeRuntimeConfigProvided(config recipes.RuntimeConfig) bool {
+	return len(config.BackendProfiles) > 0 ||
+		len(config.RelayRecipes) > 0 ||
+		config.Limits.IntegrationBundleMaxBytes != 0 ||
+		strings.TrimSpace(config.SettingsPath) != ""
 }
 
 func prepareRootRecovery(ctx context.Context, sessionDir string, opts ResumeOptions) (*preparedRootRecovery, error) {
@@ -332,6 +346,9 @@ func prepareRootRecovery(ctx context.Context, sessionDir string, opts ResumeOpti
 		return nil, persistenceIntegrityError("Persisted root execution workspace is not recoverable: "+err.Error(), map[string]any{"cause": err.Error()})
 	}
 	if _, err := loadRootRecoveryArtifactRef(st, baseRefs["execution_workspace_ref"], contracts.RootArtifactKindExecutionWorkspace, 0); err != nil {
+		return nil, err
+	}
+	if err := validateRecoveredCheckpointPrerequisiteRefs(checkpoints, baseRefs, workspaceState.ArtifactRef); err != nil {
 		return nil, err
 	}
 
@@ -1019,6 +1036,20 @@ func validateRecoveredResultArtifacts(
 		if err := requireMatchingArtifactRef(mapFromAny(checkpoint.payload["raw_result_ref"]), candidate.rawResultRef, "raw result"); err != nil {
 			return err
 		}
+		if strings.TrimSpace(stringFromAny(checkpoint.payload["result_source"])) != candidate.source {
+			return persistenceIntegrityError("Persisted root candidate checkpoint result source is invalid.", nil)
+		}
+		if err := requireOptionalArtifactRefValueMatch(
+			checkpoint.payload["reducer_attempt_ref"],
+			candidate.reducerAttempt,
+			"reducer_attempt_ref",
+			"root candidate reducer attempt",
+		); err != nil {
+			return err
+		}
+		if err := requireMatchingArtifactRef(mapFromAny(checkpoint.payload["previous_checkpoint_ref"]), checkpoints[2].ref, "participant checkpoint prerequisite"); err != nil {
+			return err
+		}
 	}
 	if validation == nil {
 		if checkpoints[4] != nil {
@@ -1050,13 +1081,32 @@ func validateRecoveredResultArtifacts(
 		if err := requireMatchingArtifactRef(mapFromAny(checkpoint.payload["result_validation_ref"]), validation.ref, "result validation"); err != nil {
 			return err
 		}
+		if strings.TrimSpace(stringFromAny(checkpoint.payload["validation_status"])) != status {
+			return persistenceIntegrityError("Persisted root validation checkpoint validation status is invalid.", nil)
+		}
+		if err := requireMatchingArtifactRef(mapFromAny(checkpoint.payload["raw_result_ref"]), candidate.rawResultRef, "validation checkpoint raw result"); err != nil {
+			return err
+		}
+		if err := requireOptionalArtifactRefValueMatch(
+			checkpoint.payload["canonical_result_ref"],
+			artifactRefOrNil(canonical),
+			"canonical_result_ref",
+			"validation checkpoint canonical result",
+		); err != nil {
+			return err
+		}
+		if err := requireMatchingArtifactRef(mapFromAny(checkpoint.payload["previous_checkpoint_ref"]), checkpoints[3].ref, "candidate checkpoint prerequisite"); err != nil {
+			return err
+		}
 	}
 	switch status {
 	case "validated":
 		if selected == nil || canonical == nil {
 			return persistenceIntegrityError("Validated root result is missing its integration contract or canonical result.", nil)
 		}
-		return validateRecoveredCanonical(candidate, canonical, selected, evaluator)
+		if err := validateRecoveredCanonical(candidate, canonical, selected, evaluator); err != nil {
+			return err
+		}
 	case "not_required":
 		if selected != nil || canonical != nil {
 			return persistenceIntegrityError("Contractless result validation unexpectedly has a canonical result or contract.", nil)
@@ -1070,8 +1120,80 @@ func validateRecoveredResultArtifacts(
 		if strings.TrimSpace(stringFromAny(checkpoint.payload["phase"])) != "cleanup_complete" || strings.TrimSpace(stringFromAny(checkpoint.payload["status"])) != "completed" || strings.TrimSpace(stringFromAny(checkpoint.payload["cleanup_status"])) != "completed" {
 			return persistenceIntegrityError("Persisted root cleanup checkpoint phase or status is invalid.", nil)
 		}
+		if strings.TrimSpace(stringFromAny(checkpoint.payload["validation_status"])) != status {
+			return persistenceIntegrityError("Persisted root cleanup checkpoint validation status is invalid.", nil)
+		}
+		for field, expected := range map[string]map[string]any{
+			"raw_result_ref":        candidate.rawResultRef,
+			"result_validation_ref": validation.ref,
+		} {
+			if err := requireMatchingArtifactRef(mapFromAny(checkpoint.payload[field]), expected, "cleanup checkpoint "+strings.ReplaceAll(field, "_", " ")); err != nil {
+				return err
+			}
+		}
+		if err := requireOptionalArtifactRefValueMatch(
+			checkpoint.payload["canonical_result_ref"],
+			artifactRefOrNil(canonical),
+			"canonical_result_ref",
+			"cleanup checkpoint canonical result",
+		); err != nil {
+			return err
+		}
+		if err := requireMatchingArtifactRef(mapFromAny(checkpoint.payload["previous_checkpoint_ref"]), checkpoints[4].ref, "validation checkpoint prerequisite"); err != nil {
+			return err
+		}
 	}
 	return nil
+}
+
+func validateRecoveredCheckpointPrerequisiteRefs(
+	checkpoints map[int]*persistedRootRecoveryArtifact,
+	baseRefs map[string]map[string]any,
+	finalWorkspaceRef map[string]any,
+) error {
+	baseFields := []string{
+		"recipe_ref", "root_recipe_plan_ref", "runtime_config_ref", "integration_bundle_ref",
+		"integration_contract_ref", "named_input_manifest_ref",
+	}
+	for _, ordinal := range []int{3, 4, 5} {
+		checkpoint := checkpoints[ordinal]
+		if checkpoint == nil {
+			continue
+		}
+		for _, field := range baseFields {
+			actual, err := optionalArtifactRef(checkpoint.payload[field], field)
+			if err != nil {
+				return err
+			}
+			if err := requireOptionalMatchingArtifactRef(actual, baseRefs[field], fmt.Sprintf("checkpoint %d %s", ordinal, strings.ReplaceAll(field, "_", " "))); err != nil {
+				return err
+			}
+		}
+		expectedWorkspace := baseRefs["execution_workspace_ref"]
+		if ordinal == 5 {
+			expectedWorkspace = finalWorkspaceRef
+		}
+		actualWorkspace, err := optionalArtifactRef(checkpoint.payload["execution_workspace_ref"], "execution_workspace_ref")
+		if err != nil {
+			return err
+		}
+		if err := requireOptionalMatchingArtifactRef(actualWorkspace, expectedWorkspace, fmt.Sprintf("checkpoint %d execution workspace", ordinal)); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func requireOptionalArtifactRefValueMatch(actual any, expected any, field string, label string) error {
+	actualRef, err := optionalArtifactRef(actual, field)
+	if err != nil {
+		return err
+	}
+	expectedRef, err := optionalArtifactRef(expected, field)
+	if err != nil {
+		return err
+	}
+	return requireOptionalMatchingArtifactRef(actualRef, expectedRef, label)
 }
 
 func validateRecoveredCanonical(candidate *rootCandidate, canonical *persistedRootRecoveryArtifact, selected *integration.SelectedContract, evaluator *integration.AssertionEvaluator) error {

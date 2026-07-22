@@ -590,6 +590,7 @@ func (s *rootExecutionState) saveRootResultCheckpoint(ordinal int, phase string,
 		"integration_contract_ref":    s.persisted.contractRef,
 		"named_input_manifest_ref":    s.persisted.inputManifestRef,
 		"execution_workspace_ref":     s.persisted.workspaceRef,
+		"previous_checkpoint_ref":     s.meta.Get("latest_root_checkpoint_ref"),
 		"ledger":                      s.meta.Ledger().ToMap(),
 		"created_at":                  utcNow(),
 	}
@@ -703,6 +704,10 @@ func (s *rootExecutionState) finalizeRootResultWorkspace() error {
 		"source_changed":          s.meta.Bool("source_changed"),
 		"source_mutated":          s.meta.Bool("source_mutated"),
 		"execution_workspace_ref": s.meta.Get("execution_workspace_ref"),
+		"validation_status":       s.meta.String("validation_status"),
+		"raw_result_ref":          s.meta.Get("raw_result_ref"),
+		"result_validation_ref":   s.meta.Get("result_validation_ref"),
+		"canonical_result_ref":    s.meta.Get("canonical_result_ref"),
 	})
 	if checkpointRef != nil {
 		s.meta = withRootCheckpointRef(s.meta, checkpointRef).

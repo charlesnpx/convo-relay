@@ -391,19 +391,89 @@ func TestRootRecoveryUsesPersistedBundleContractAndNamedInputSnapshots(t *testin
 	}
 }
 
+func TestRootRecoveryRejectsInconsistentValidatedCleanupCheckpointBeforeMutation(t *testing.T) {
+	tests := []struct {
+		name   string
+		mutate func(map[string]any, map[string]any)
+	}{
+		{name: "phase", mutate: func(payload map[string]any, _ map[string]any) { payload["phase"] = "wrong" }},
+		{name: "status", mutate: func(payload map[string]any, _ map[string]any) { payload["status"] = "failed" }},
+		{name: "cleanup_status", mutate: func(payload map[string]any, _ map[string]any) { payload["cleanup_status"] = "pending" }},
+		{name: "validation_status", mutate: func(payload map[string]any, _ map[string]any) { payload["validation_status"] = "failed" }},
+		{name: "raw_result_ref", mutate: func(payload map[string]any, ref map[string]any) { payload["raw_result_ref"] = ref }},
+		{name: "result_validation_ref", mutate: func(payload map[string]any, ref map[string]any) { payload["result_validation_ref"] = ref }},
+		{name: "canonical_result_ref", mutate: func(payload map[string]any, ref map[string]any) { payload["canonical_result_ref"] = ref }},
+		{name: "execution_workspace_ref", mutate: func(payload map[string]any, ref map[string]any) { payload["execution_workspace_ref"] = ref }},
+		{name: "previous_checkpoint_ref", mutate: func(payload map[string]any, ref map[string]any) { payload["previous_checkpoint_ref"] = ref }},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			config := rootRecipeRuntimeConfig("neutral/result-contract-v1")
+			recorder := &rootBackendRecorder{}
+			recorder.handler = func(_ context.Context, call rootBackendCall) (TurnResult, error) {
+				if call.SlotID == "facilitator" {
+					return successfulRootTurn(call.Backend, `{"settled":[],"contested":[],"withdrawn":[]}`), nil
+				}
+				return successfulRootTurn(call.Backend, `{"items":["durable"]}`), nil
+			}
+			sessionDir := filepath.Join(t.TempDir(), "session")
+			result, err := RunRecipe(context.Background(), RecipeOptions{
+				SessionDir:        sessionDir,
+				Task:              "Reject an inconsistent cleanup checkpoint",
+				RecipeID:          "neutral-root",
+				LaunchCWD:         t.TempDir(),
+				RuntimeConfig:     config,
+				IntegrationBundle: decodeRootRecipeTestBundle(t, rootResultTestBundle),
+				ReadinessCheck:    readyRootRecipeCheck,
+				backendFactory:    recorder.factory(),
+			})
+			if err != nil || result["validation_status"] != "validated" {
+				t.Fatalf("complete integration fixture = %#v, %v", result, err)
+			}
+			st := store.New(sessionDir)
+			checkpointRefs := result["root_checkpoint_refs"].([]any)
+			cleanup := assertRootRecipeArtifact(t, st, checkpointRefs[4], contracts.RootArtifactKindRootCheckpoint, 5)
+			wrongRef, err := contracts.ArtifactRefForPayload("wrong:selected", map[string]any{"test": test.name})
+			if err != nil {
+				t.Fatalf("create wrong ref: %v", err)
+			}
+			test.mutate(cleanup, wrongRef)
+			if _, err := saveRootArtifact(st, contracts.RootArtifactKindRootCheckpoint, 5, cleanup); err != nil {
+				t.Fatalf("persist inconsistent cleanup checkpoint: %v", err)
+			}
+
+			before := snapshotRootRecoverySession(t, sessionDir)
+			_, err = Resume(context.Background(), sessionDir, ResumeOptions{})
+			assertRootRecipeDiagnostic(t, err, diagnosticCodePersistenceIntegrity)
+			after := snapshotRootRecoverySession(t, sessionDir)
+			if !equalRootRecoverySnapshots(before, after) {
+				t.Fatal("cleanup checkpoint integrity rejection mutated the session")
+			}
+		})
+	}
+}
+
 func TestRootRecoveryDirectAPIRejectsStructuralOverrides(t *testing.T) {
 	for name, options := range map[string]ResumeOptions{
-		"prompt":      {Prompt: "new prompt"},
-		"context":     {ContextFiles: []string{"changed.txt"}},
-		"skill":       {SkillFiles: []string{"changed.md"}},
-		"mode":        {Mode: "steelman"},
-		"rounds":      {Rounds: 2},
-		"max_rounds":  {MaxRounds: 5},
-		"replacement": {ReplaceAgents: []string{"codex"}},
-		"model":       {SlotConfigs: []SlotConfig{{Model: "changed"}}},
-		"effort":      {SlotConfigs: []SlotConfig{{Effort: "high"}}},
-		"settings":    {SettingsPath: "changed.toml"},
-		"facilitator": {FacilitatorModel: "changed"},
+		"prompt":              {Prompt: "new prompt"},
+		"context":             {ContextFiles: []string{"changed.txt"}},
+		"skill":               {SkillFiles: []string{"changed.md"}},
+		"mode":                {Mode: "steelman"},
+		"rounds":              {Rounds: 2},
+		"max_rounds":          {MaxRounds: 5},
+		"replacement":         {ReplaceAgents: []string{"codex"}},
+		"model":               {SlotConfigs: []SlotConfig{{Model: "changed"}}},
+		"effort":              {SlotConfigs: []SlotConfig{{Effort: "high"}}},
+		"profile":             {SlotConfigs: []SlotConfig{{ProfileID: "changed"}}},
+		"slot_settings":       {SlotConfigs: []SlotConfig{{SettingsPath: "changed.toml"}}},
+		"composition_path":    {SlotConfigs: []SlotConfig{{CompositionPath: "changed"}}},
+		"runtime_config":      {SlotConfigs: []SlotConfig{{RuntimeConfig: rootRecipeRuntimeConfig("")}}},
+		"slot_depth":          {SlotConfigs: []SlotConfig{{Depth: 2}}},
+		"slot_max_depth":      {SlotConfigs: []SlotConfig{{MaxDepth: 3}}},
+		"settings":            {SettingsPath: "changed.toml"},
+		"facilitator":         {FacilitatorModel: "changed"},
+		"relay_backend_depth": {RelayBackendDepth: 2},
+		"max_relay_depth":     {MaxRelayDepth: 3},
 	} {
 		t.Run(name, func(t *testing.T) {
 			err := validateRootResumeOverrides(options)
