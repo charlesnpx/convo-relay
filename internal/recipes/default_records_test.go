@@ -12,8 +12,8 @@ import (
 )
 
 func TestEveryDefaultRecipeRecordPassesGenericRegistryChecks(t *testing.T) {
-	rawDefaults := make(map[string]any, len(defaultRelayRecipes))
-	for recipeID, record := range defaultRelayRecipes {
+	rawDefaults := make(map[string]any, len(defaultRelayRecipeRecords))
+	for recipeID, record := range defaultRelayRecipeRecords {
 		rawDefaults[recipeID] = cloneObject(record)
 	}
 	if err := ValidateRawRelayRecipes(rawDefaults); err != nil {
@@ -24,9 +24,10 @@ func TestEveryDefaultRecipeRecordPassesGenericRegistryChecks(t *testing.T) {
 	if err != nil {
 		t.Fatalf("load default registry: %v", err)
 	}
+	allRecipes := normalizeRelayRecipesWithDefaults(nil, defaultRelayRecipeRecords)
 	integrationBound := make(map[string]map[string]any)
 	variantGroups := make(map[string]map[string]bool)
-	for recipeID, rawRecord := range defaultRelayRecipes {
+	for recipeID, rawRecord := range defaultRelayRecipeRecords {
 		contractID := stringValue(rawRecord["integration_contract"])
 		if contractID == "" {
 			continue
@@ -34,6 +35,9 @@ func TestEveryDefaultRecipeRecordPassesGenericRegistryChecks(t *testing.T) {
 		integrationBound[recipeID] = rawRecord
 
 		recipe := config.RelayRecipes[recipeID]
+		if !includeOptionalRelayRecipeDefaults {
+			recipe = allRecipes[recipeID]
+		}
 		if recipe == nil {
 			t.Fatalf("default recipe %q was not normalized", recipeID)
 		}
@@ -46,7 +50,7 @@ func TestEveryDefaultRecipeRecordPassesGenericRegistryChecks(t *testing.T) {
 		}
 
 		bundle := defaultRecordBundle(t, contractID, intFromAny(recipe["participant_turns"], 0))
-		rootPlan, err := CompileRecipe(recipe, config.BackendProfiles, config.RelayRecipes, CompileTargetRoot, CompileOptions{
+		rootPlan, err := CompileRecipe(recipe, config.BackendProfiles, allRecipes, CompileTargetRoot, CompileOptions{
 			IntegrationBundle:  bundle,
 			ValidateExecutable: true,
 		})
@@ -57,7 +61,7 @@ func TestEveryDefaultRecipeRecordPassesGenericRegistryChecks(t *testing.T) {
 			t.Fatalf("default recipe %q root plan = %#v", recipeID, rootPlan)
 		}
 
-		_, err = CompileRecipe(recipe, config.BackendProfiles, config.RelayRecipes, CompileTargetChild, CompileOptions{})
+		_, err = CompileRecipe(recipe, config.BackendProfiles, allRecipes, CompileTargetChild, CompileOptions{})
 		var rootOnly *RootOnlyRecipeError
 		if !errors.As(err, &rootOnly) || rootOnly.RecipeID != recipeID || rootOnly.IntegrationContract != contractID {
 			t.Fatalf("default recipe %q child error = %T %#v", recipeID, err, err)
@@ -94,44 +98,6 @@ func TestEveryDefaultRecipeRecordPassesGenericRegistryChecks(t *testing.T) {
 	for shape, assignments := range variantGroups {
 		if len(assignments) != 3 {
 			t.Fatalf("default protocol shape %s has %d backend assignments, want 3", shape, len(assignments))
-		}
-	}
-}
-
-func TestGenericRecipeExecutionWorksWithoutIntegrationBoundDefaults(t *testing.T) {
-	baseDefaults := make(map[string]map[string]any)
-	for recipeID, record := range defaultRelayRecipes {
-		if stringValue(record["integration_contract"]) == "" {
-			baseDefaults[recipeID] = cloneObject(record)
-		}
-	}
-	rawRecipes := map[string]any{
-		"neutral-root": map[string]any{
-			"participants":      []any{"codex-deep", "codex-fast"},
-			"facilitator":       "codex-fast",
-			"reducer":           "codex-deep",
-			"participant_turns": 2,
-			"result_source":     "last_turn",
-			"max_depth":         1,
-		},
-	}
-	if err := ValidateRawRelayRecipes(rawRecipes); err != nil {
-		t.Fatalf("validate neutral recipe: %v", err)
-	}
-	recipes := normalizeRelayRecipesWithDefaults(rawRecipes, baseDefaults)
-	for recipeID, recipe := range recipes {
-		if stringValue(recipe["integration_contract"]) != "" {
-			t.Fatalf("registry without optional defaults retained integration-bound recipe %q", recipeID)
-		}
-	}
-	profiles := NormalizeBackendProfiles(nil)
-	for _, target := range []CompileTarget{CompileTargetRoot, CompileTargetChild} {
-		plan, err := CompileRecipe(recipes["neutral-root"], profiles, recipes, target, CompileOptions{ValidateExecutable: true})
-		if err != nil {
-			t.Fatalf("compile neutral recipe for %s without optional defaults: %v", target, err)
-		}
-		if plan == nil {
-			t.Fatalf("compile neutral recipe for %s returned no plan", target)
 		}
 	}
 }

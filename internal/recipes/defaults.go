@@ -50,7 +50,7 @@ var defaultBackendProfiles = map[string]map[string]any{
 	},
 }
 
-var defaultRelayRecipes = map[string]map[string]any{
+var defaultRelayRecipeRecords = map[string]map[string]any{
 	"witness-falsify": {
 		"purpose":              "Adversarially test filed defect witnesses against a frozen Charter.",
 		"participants":         []any{"claude-code", "codex-deep"},
@@ -198,4 +198,17 @@ var defaultRelayRecipes = map[string]map[string]any{
 		"auto_approval":         "ask",
 		"match_keywords":        []any{},
 	},
+}
+
+var defaultRelayRecipes = selectedDefaultRelayRecipeRecords(defaultRelayRecipeRecords)
+
+func selectedDefaultRelayRecipeRecords(records map[string]map[string]any) map[string]map[string]any {
+	selected := make(map[string]map[string]any, len(records))
+	for recipeID, record := range records {
+		if !includeOptionalRelayRecipeDefaults && stringValue(record["integration_contract"]) != "" {
+			continue
+		}
+		selected[recipeID] = cloneObject(record)
+	}
+	return selected
 }

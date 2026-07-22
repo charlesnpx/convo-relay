@@ -6,7 +6,7 @@ BINARY := bin/convo-relay
 VERSION ?= $(shell git describe --tags --exact-match 2>/dev/null || echo 1.0.0-dev)
 LDFLAGS ?= -X main.cliVersion=$(VERSION)
 
-.PHONY: build install install-assets install-skills test smoke-fake-providers package clean
+.PHONY: build install install-assets install-skills test test-without-optional-defaults smoke-fake-providers package clean
 
 build:
 	mkdir -p "$(dir $(BINARY))"
@@ -29,6 +29,10 @@ install-skills:
 test:
 	go vet ./...
 	go test ./... -count=1
+	$(MAKE) test-without-optional-defaults
+
+test-without-optional-defaults:
+	go test -tags=convo_relay_acceptance_no_optional_defaults ./... -count=1
 
 smoke-fake-providers:
 	CONVO_RELAY_RUN_SMOKE_MATRIX=1 go test ./cmd/convo-relay -run TestGoOnlySmokeMatrix -count=1 -v

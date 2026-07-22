@@ -113,6 +113,8 @@ make package
 
 `make smoke-fake-providers` is the Go-only release smoke gate. It builds the CLI, shadows `codex`, `claude`, and `gemini` with deterministic fake provider binaries in `PATH`, writes sessions into a temp relay home, and checks the required provider matrix plus `resume`, `cleanup`, `clean`, `contracts --json`, `show --graph --json`, and `display --html-only`. Live Codex, Claude, and Gemini runs are useful local release evidence, but they are optional and are not required for CI.
 
+`make test` also reruns the complete generic Go suite with integration-bound optional recipe defaults disabled. Run that configuration alone with `make test-without-optional-defaults`.
+
 ### Manual skill install from a checkout
 
 If you are running directly from a source checkout and do not want to install the CLI first, the wrapper script runs the Go command:
