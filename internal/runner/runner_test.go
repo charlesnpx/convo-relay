@@ -1683,6 +1683,7 @@ func TestSessionAdminResolvesListsCleansAndCleansUp(t *testing.T) {
 	liveDir := filepath.Join(env.relayHome, "sessions", "phase7-live")
 	cleanDir := filepath.Join(env.relayHome, "sessions", "phase7-clean")
 	liveCleanDir := filepath.Join(env.relayHome, "sessions", "phase7-clean-live")
+	rootDir := filepath.Join(env.relayHome, "sessions", "phase7-root")
 	saveAdminSession(t, deadDir, map[string]any{
 		"session_id":    "phase7-dead",
 		"title":         "Dead running session",
@@ -1715,6 +1716,21 @@ func TestSessionAdminResolvesListsCleansAndCleansUp(t *testing.T) {
 		"actual_rounds": 0,
 		"created_at":    "2026-05-19T00:04:00.000000+00:00",
 	})
+	saveAdminSession(t, rootDir, map[string]any{
+		"session_id":                  "phase7-root",
+		"title":                       "Root inspection session",
+		"status":                      "completed",
+		"mode":                        "cooperative",
+		"execution_kind":              "recipe",
+		"recipe_id":                   "neutral-root",
+		"participant_turns":           2,
+		"participant_turns_completed": 2,
+		"actual_participant_turns":    2,
+		"result_source":               "reducer",
+		"validation_status":           "not_required",
+		"facilitator_provider_state":  map[string]any{"backend": "codex", "state": map[string]any{"secret": "do-not-list"}},
+		"created_at":                  "2026-05-19T00:00:00.000000+00:00",
+	})
 	if err := os.WriteFile(filepath.Join(deadDir, "relay.pid"), []byte("99999999"), 0o644); err != nil {
 		t.Fatalf("write dead pid: %v", err)
 	}
@@ -1740,6 +1756,17 @@ func TestSessionAdminResolvesListsCleansAndCleansUp(t *testing.T) {
 	deadSummary := findSessionSummary(sessions, "phase7-dead")
 	if deadSummary["status"] != "orphaned" {
 		t.Fatalf("dead summary status = %#v", deadSummary)
+	}
+	rootSummary := findSessionSummary(sessions, "phase7-root")
+	if rootSummary["root"] == nil {
+		t.Fatalf("root list summary = %#v", rootSummary)
+	}
+	encodedRootSummary, err := json.Marshal(rootSummary)
+	if err != nil {
+		t.Fatalf("marshal root list summary: %v", err)
+	}
+	if strings.Contains(string(encodedRootSummary), "do-not-list") {
+		t.Fatalf("root list exposed provider state: %s", encodedRootSummary)
 	}
 
 	cleanup, err := CleanupSessions(env.relayHome, 10, false)

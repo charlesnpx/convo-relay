@@ -72,16 +72,20 @@ func BuildShowTranscriptReport(sessionDir string, fromRound int, roundsSpec stri
 	if eventsErr != nil {
 		diagnostics["events_error"] = eventsErr.Error()
 	}
-	return model.NewShowReport(map[string]any{
+	report := map[string]any{
 		"session_id":   filepath.Base(filepath.Clean(sessionDir)),
 		"session_dir":  sessionDir,
-		"meta":         meta,
+		"meta":         SanitizeMetaForInspection(meta),
 		"transcript":   transcriptAny(filtered),
 		"summary":      summary,
 		"diagnostics":  diagnostics,
 		"incomplete":   sessionIncomplete(meta),
 		"export_ready": true,
-	}).ToMap(), nil
+	}
+	if root := BuildRootInspectionReport(sessionDir, meta, false); root != nil {
+		report["root"] = root
+	}
+	return model.NewShowReport(report).ToMap(), nil
 }
 
 func BuildExportReport(sessionDir string, jsonMode bool) (map[string]any, error) {
@@ -128,6 +132,12 @@ func FormatTranscriptMarkdown(report map[string]any) string {
 	if rejection := lastModeControlRejectionForMarkdown(diagnostics); rejection != "" {
 		lines = append(lines, fmt.Sprintf("**Last mode control rejection**: %s", rejection))
 	}
+	if root, ok := report["root"].(map[string]any); ok {
+		lines = append(lines, "", "## Root Execution", "")
+		for _, line := range strings.Split(FormatRootSummary(root), "\n") {
+			lines = append(lines, "- "+line)
+		}
+	}
 	lines = append(lines, "", "## Final Ledger")
 	lines = append(lines, ledgerSummaryLines(meta["ledger"])...)
 	lines = append(lines, slotReplacementMarkdownLines(meta["slot_replacement_history"])...)
@@ -166,6 +176,14 @@ func FormatExportMarkdown(report map[string]any) string {
 		fmt.Sprintf("**Ledger**: settled %d | contested %d | withdrawn %d", settled, contested, withdrawn),
 		"",
 		"## Final Ledger",
+	}
+	if root, ok := report["root"].(map[string]any); ok {
+		rootLines := []string{"", "## Root Execution", ""}
+		for _, line := range strings.Split(FormatRootSummary(root), "\n") {
+			rootLines = append(rootLines, "- "+line)
+		}
+		rootLines = append(rootLines, "", "## Final Ledger")
+		lines = append(lines[:len(lines)-1], rootLines...)
 	}
 	lines = append(lines, ledgerSummaryLines(meta["ledger"])...)
 	lines = append(lines, slotReplacementMarkdownLines(meta["slot_replacement_history"])...)
@@ -210,7 +228,7 @@ func BuildSessionHealthReport(sessionDir string) (map[string]any, error) {
 	if attention, _ := diagnostics["attention_required"].(bool); attention {
 		status = "attention_required"
 	}
-	return model.NewHealthReport(map[string]any{
+	report := map[string]any{
 		"scope":       "session",
 		"status":      status,
 		"session_id":  filepath.Base(filepath.Clean(sessionDir)),
@@ -221,7 +239,21 @@ func BuildSessionHealthReport(sessionDir string) (map[string]any, error) {
 			"max_rounds":     meta["max_rounds"],
 		},
 		"diagnostics": diagnostics,
-	}).ToMap(), nil
+	}
+	if root := BuildRootInspectionReport(sessionDir, meta, false); root != nil {
+		checks := BuildRootHealthChecks(sessionDir, meta, root)
+		report["root"] = root
+		report["checks"] = checks
+		for _, raw := range checks {
+			check, _ := raw.(map[string]any)
+			if strings.TrimSpace(stringFromAny(check["status"])) != "ok" {
+				status = "attention_required"
+				diagnostics["root_attention_required"] = true
+			}
+		}
+		report["status"] = status
+	}
+	return model.NewHealthReport(report).ToMap(), nil
 }
 
 func BuildGlobalHealthReport(settingsPath string) map[string]any {
@@ -295,6 +327,9 @@ func FormatHealthReport(report map[string]any) string {
 			check, _ := rawCheck.(map[string]any)
 			lines = append(lines, fmt.Sprintf("- %v: %v", check["name"], check["status"]))
 		}
+	}
+	if root, ok := report["root"].(map[string]any); ok {
+		lines = append(lines, strings.Split(FormatRootSummary(root), "\n")...)
 	}
 	return strings.Join(lines, "\n")
 }
@@ -624,16 +659,46 @@ func BuildDisplayHTML(sessionDir string) (string, error) {
 	planBlock := buildLaunchPlanBlock(meta)
 	ledgerBlock := buildLedgerHTMLBlock(meta["ledger"])
 	replacementBlock := buildSlotReplacementHTMLBlock(meta["slot_replacement_history"])
+	rootResultBlock, err := buildRootResultHTMLBlock(sessionDir, meta)
+	if err != nil {
+		return "", err
+	}
 	return "<!doctype html>\n<html><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">" +
 		"<title>" + html.EscapeString(title) + " - convo-relay</title>" +
-		"<style>body{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;background:#111827;color:#e5e7eb;margin:0;padding:32px}.container{max-width:920px;margin:0 auto}.meta,.ledger-mini{color:#9ca3af}.ledger-mini{font-size:13px;margin:0 0 12px}.turn,.prompt-terminal,.plan-terminal,.ledger-terminal,.replacement-terminal{background:#1f2937;border:1px solid #374151;border-radius:8px;margin:18px 0;padding:18px}h1{margin:0 0 8px}h2{font-size:16px;color:#f9fafb;margin:0 0 12px}pre{white-space:pre-wrap;line-height:1.55;margin:0}.ledger-list,.replacement-list{display:grid;gap:8px;margin:0;padding-left:20px}.plan-steps{display:grid;gap:10px;margin:0;padding:0;list-style:none}.plan-step{display:flex;gap:10px}.plan-status{min-width:92px;text-transform:uppercase;font-size:12px}.status-completed{color:#86efac}.status-in_progress{color:#fde68a}.status-pending{color:#cbd5e1}.status-other{color:#93c5fd}</style>" +
+		"<style>body{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;background:#111827;color:#e5e7eb;margin:0;padding:32px}.container{max-width:920px;margin:0 auto}.meta,.ledger-mini{color:#9ca3af}.ledger-mini{font-size:13px;margin:0 0 12px}.turn,.prompt-terminal,.plan-terminal,.ledger-terminal,.replacement-terminal,.result-terminal{background:#1f2937;border:1px solid #374151;border-radius:8px;margin:18px 0;padding:18px}h1{margin:0 0 8px}h2{font-size:16px;color:#f9fafb;margin:0 0 12px}pre{white-space:pre-wrap;line-height:1.55;margin:0}.ledger-list,.replacement-list{display:grid;gap:8px;margin:0;padding-left:20px}.plan-steps{display:grid;gap:10px;margin:0;padding:0;list-style:none}.plan-step{display:flex;gap:10px}.plan-status{min-width:92px;text-transform:uppercase;font-size:12px}.status-completed{color:#86efac}.status-in_progress{color:#fde68a}.status-pending{color:#cbd5e1}.status-other{color:#93c5fd}</style>" +
 		"</head><body><main class=\"container\"><h1>" + html.EscapeString(title) + "</h1><div class=\"meta\">convo-relay transcript &middot; " +
 		html.EscapeString(fmt.Sprint(valueOr(meta["actual_rounds"], len(transcript)))) + " rounds</div>" +
 		promptBlock +
 		planBlock +
 		ledgerBlock +
 		replacementBlock +
-		strings.Join(blocks, "") + "</main></body></html>", nil
+		strings.Join(blocks, "") +
+		rootResultBlock + "</main></body></html>", nil
+}
+
+func buildRootResultHTMLBlock(sessionDir string, meta map[string]any) (string, error) {
+	results, err := LoadDisplayRootResults(sessionDir, meta)
+	if err != nil || len(results) == 0 {
+		return "", err
+	}
+	var body strings.Builder
+	if raw, ok := results["raw"]; ok {
+		label := "Result Output"
+		if strings.TrimSpace(stringFromAny(meta["result_source"])) == "reducer" {
+			label = "Reducer Output"
+		}
+		body.WriteString(`<section class="result-terminal"><h2>`)
+		body.WriteString(html.EscapeString(label))
+		body.WriteString(`</h2><pre>`)
+		body.WriteString(html.EscapeString(raw))
+		body.WriteString(`</pre></section>`)
+	}
+	if canonical, ok := results["canonical"]; ok {
+		body.WriteString(`<section class="result-terminal"><h2>Canonical Result</h2><pre>`)
+		body.WriteString(html.EscapeString(canonical))
+		body.WriteString(`</pre></section>`)
+	}
+	return body.String(), nil
 }
 
 func ledgerSummaryLines(ledger any) []string {

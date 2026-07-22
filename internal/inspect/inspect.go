@@ -152,6 +152,9 @@ func BuildContractsReport(sessionDir string, includeRaw bool, refID string, dige
 		report["runtime_config_ref"] = InspectContractRef(st, "runtime_config_ref", meta["runtime_config_ref"], includeRaw)
 		report["transient_recipe_refs"] = inspectRefList(st, "transient_recipe_ref", asSlice(meta["transient_recipe_refs"]), includeRaw)
 		report["slot_replacement_history"] = asSlice(meta["slot_replacement_history"])
+		if root := BuildRootInspectionReport(sessionDir, meta, includeRaw); root != nil {
+			report["root"] = root
+		}
 	}
 	if eventsError != "" {
 		report["events_error"] = eventsError
@@ -211,6 +214,9 @@ func FormatContractsReport(report map[string]any) string {
 		if object, ok := bundle.(map[string]any); ok {
 			lines = append(lines, formatBundleLine(object))
 		}
+	}
+	if root, ok := report["root"].(map[string]any); ok {
+		lines = append(lines, FormatRootSummary(root))
 	}
 	return strings.Join(lines, "\n")
 }

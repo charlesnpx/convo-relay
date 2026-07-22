@@ -11,6 +11,7 @@ import (
 
 	"github.com/charlesnpx/convo-relay/internal/contracts"
 	"github.com/charlesnpx/convo-relay/internal/graph"
+	"github.com/charlesnpx/convo-relay/internal/inspect"
 	"github.com/charlesnpx/convo-relay/internal/integration"
 	"github.com/charlesnpx/convo-relay/internal/recipes"
 	"github.com/charlesnpx/convo-relay/internal/store"
@@ -171,6 +172,16 @@ func TestRunRecipeStructuredResultsValidateAndCanonicalize(t *testing.T) {
 			if validation["status"] != "validated" || validation["canonical_result_ref"] == nil || len(validation["diagnostics"].([]any)) != 0 {
 				t.Fatalf("structured validation = %#v", validation)
 			}
+			inspection, err := inspect.BuildShowTranscriptReport(sessionDir, 0, "")
+			if err != nil {
+				t.Fatalf("structured inspection: %v", err)
+			}
+			rootInspection := inspection["root"].(map[string]any)
+			resultInspection := rootInspection["result"].(map[string]any)
+			canonicalInspection := resultInspection["canonical_result_ref"].(map[string]any)
+			if resultInspection["validation_status"] != "validated" || canonicalInspection["ok"] != true || canonicalInspection["payload"] != nil {
+				t.Fatalf("structured result inspection = %#v", resultInspection)
+			}
 			calls := recorder.snapshotCalls()
 			reducerCalls := 0
 			for _, call := range calls {
@@ -185,6 +196,17 @@ func TestRunRecipeStructuredResultsValidateAndCanonicalize(t *testing.T) {
 			if (source == integration.ResultSourceReducer && reducerCalls != 1) ||
 				(source == integration.ResultSourceLastTurn && reducerCalls != 0) {
 				t.Fatalf("reducer calls for %s = %d: %#v", source, reducerCalls, calls)
+			}
+			if source == integration.ResultSourceReducer {
+				displayHTML, err := inspect.BuildDisplayHTML(sessionDir)
+				if err != nil {
+					t.Fatalf("root display HTML: %v", err)
+				}
+				for _, label := range []string{"Reducer Output", "Canonical Result", "alpha", "beta"} {
+					if !strings.Contains(displayHTML, label) {
+						t.Fatalf("root display missing %q:\n%s", label, displayHTML)
+					}
+				}
 			}
 		})
 	}
