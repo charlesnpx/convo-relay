@@ -230,7 +230,11 @@ func NormalizeBackendProfiles(rawProfiles map[string]any) map[string]map[string]
 }
 
 func NormalizeRelayRecipes(rawRecipes map[string]any) map[string]map[string]any {
-	recipes := mergeNamedRecords(defaultRelayRecipes, rawRecipes)
+	return normalizeRelayRecipesWithDefaults(rawRecipes, defaultRelayRecipes)
+}
+
+func normalizeRelayRecipesWithDefaults(rawRecipes map[string]any, defaults map[string]map[string]any) map[string]map[string]any {
+	recipes := mergeNamedRecords(defaults, rawRecipes)
 	normalized := map[string]map[string]any{}
 	for _, recipeID := range sortedObjectKeys(recipes) {
 		recipe := recipes[recipeID]

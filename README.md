@@ -313,6 +313,20 @@ convo-relay compile-recipe --recipe review-panel --target root
 
 `compile-recipe` defaults `--target` to `child` for compatibility. Child compilation emits `compiled_plan/v1` and rejects integration-bound recipes as root-only. Explicit `--target root` emits `root_recipe_plan/v1` and binds a matching integration bundle when the recipe declares a contract.
 
+Run a configured recipe directly as the root session:
+
+```bash
+convo-relay run "Evaluate the supplied records" \
+  --recipe bounded-procedure \
+  --settings ./settings.toml \
+  --integration-bundle ./integration.json \
+  --input source=./source.json \
+  --workspace-isolation ephemeral \
+  --json -o ./session-result.json
+```
+
+Root recipe mode uses the recipe's exact participant-turn schedule, optional fresh reducer, lifecycle minimum, named inputs, and declarative result contract. It has no compile-target flag because it always selects the root target. Ordinary runs and nested relay execution continue to use their existing paths. See [Root recipe and integration contracts](docs/root-recipe-integration.md) for the unified compiler API, bundle and schema subset, assertions, recovery, persistence, inspection, and cleanup contracts.
+
 When a top-level slot uses the `relay` backend, `--model-a` or `--model-b` selects the relay backend recipe for that slot. Nested relay profiles do not read those top-level model flags; their recipe and profile selection comes from the settings file.
 
 Limit a run to 3 rounds:
@@ -517,6 +531,9 @@ Then read /tmp/auth-review.md and summarize what each agent found.
 | `--context FILE [FILE ...]` | run, resume | Attach UTF-8 context files and persist labeled input-bundle artifacts. Limits: 1 MiB per file, 2 MiB total |
 | `--skill FILE [FILE ...]` | run, resume | Attach UTF-8 capability files and persist labeled input-bundle artifacts |
 | `--recipe-file FILE` | run | Attach session-scoped transient relay recipes from TOML and persist the source artifact |
+| `--recipe ID` | run | Execute a configured recipe directly as the root session |
+| `--input NAME=PATH` | run --recipe | Bind one named contract input; repeat for many-valued inputs |
+| `--workspace-isolation {inherited,read_only,ephemeral}` | run --recipe | Request a root workspace policy that does not weaken the recipe minimum |
 | `--task-plan FILE` | run | Attach the launch task plan from a JSON or markdown/text file so display exports can show it |
 | `--investigation {auto,normal,context_only}` | run | Prompt policy for evidence behavior. Default `auto` cites inspected files/context; `normal` is conceptual; `context_only` requires `--context` and avoids repo exploration |
 | `--dynamic {off,ask,auto-safe}` | run | Enable dynamic spawn proposal handling. Default is `off` |
@@ -530,7 +547,7 @@ Then read /tmp/auth-review.md and summarize what each agent found.
 | `--status {usable,requires_integration,unavailable,invalid,skipped,all}` | recipes list | Filter recipes by catalog status |
 | `--view {all,declared,resolved}` | recipes show | Select declared and/or resolved recipe details |
 | `--target {root,child}` | compile-recipe | Select a recipe compile target; defaults to `child` |
-| `--integration-bundle FILE` | recipes list/show/doctor, compile-recipe | Bind catalog records or an explicitly root-targeted compile to a strict integration bundle |
+| `--integration-bundle FILE` | run --recipe, recipes list/show/doctor, compile-recipe | Bind a root run, catalog records, or an explicitly root-targeted compile to a strict integration bundle |
 | `--raw` | contracts | Include full loaded artifact payloads |
 | `--ref REF_ID`, `--digest DIGEST` | contracts | Resolve one artifact ref from the index, using digest when ref ids are ambiguous |
 | `--html-only` | display | Generate HTML only, skip PDF rendering |

@@ -50,9 +50,16 @@ func TestRecipeCatalogAndCompileTargetCLIContracts(t *testing.T) {
 	filtered := env.run(t, "recipes", "list", "--settings", env.settingsPath, "--status", "requires_integration", "--json")
 	filtered.requireExit(t, 0)
 	filteredReport := decodeCLIJSON(t, filtered.stdout)
-	recipes := filteredReport["recipes"].([]any)
-	if len(recipes) != 1 || recipes[0].(map[string]any)["id"] != "bound-review" {
-		t.Fatalf("requires_integration filter = %#v", recipes)
+	filteredRecipes := filteredReport["recipes"].([]any)
+	foundBoundReview := false
+	for _, raw := range filteredRecipes {
+		if raw.(map[string]any)["id"] == "bound-review" {
+			foundBoundReview = true
+			break
+		}
+	}
+	if !foundBoundReview {
+		t.Fatalf("requires_integration filter omitted settings recipe: %#v", filteredRecipes)
 	}
 
 	show := env.run(t, "recipes", "show", "bound-review", "--settings", env.settingsPath, "--integration-bundle", env.bundlePath, "--json")
