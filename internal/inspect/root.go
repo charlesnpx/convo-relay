@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"github.com/charlesnpx/convo-relay/internal/contracts"
+	"github.com/charlesnpx/convo-relay/internal/graph"
 	"github.com/charlesnpx/convo-relay/internal/namedinputs"
 	"github.com/charlesnpx/convo-relay/internal/store"
 	"github.com/charlesnpx/convo-relay/internal/workspace"
@@ -98,7 +99,7 @@ func BuildRootInspectionReport(sessionDir string, meta map[string]any, includeRa
 	rootPlanRef := addRoot("root_recipe_plan_ref", meta["root_recipe_plan_ref"], contracts.RootArtifactKindRootRecipePlan, 0, true)
 	bundleRef := addRoot("integration_bundle_ref", meta["integration_bundle_ref"], contracts.RootArtifactKindIntegrationBundle, 0, contractID != "")
 	contractRef := addRoot("integration_contract_ref", meta["integration_contract_ref"], contracts.RootArtifactKindIntegrationContract, 0, contractID != "")
-	manifestRef := addRoot("named_input_manifest_ref", meta["named_input_manifest_ref"], contracts.RootArtifactKindNamedInputManifest, 0, false)
+	manifestRef := addRoot("named_input_manifest_ref", meta["named_input_manifest_ref"], contracts.RootArtifactKindNamedInputManifest, 0, contractID != "")
 	workspaceRef := addRoot("execution_workspace_ref", meta["execution_workspace_ref"], contracts.RootArtifactKindExecutionWorkspace, 0, true)
 	rawResultRef := addRoot("raw_result_ref", meta["raw_result_ref"], contracts.RootArtifactKindRawResult, 0, false)
 	validationRef := addRoot("result_validation_ref", meta["result_validation_ref"], contracts.RootArtifactKindResultValidation, 0, validationStatus != "")
@@ -121,12 +122,13 @@ func BuildRootInspectionReport(sessionDir string, meta map[string]any, includeRa
 	workspaceSummary := rootWorkspaceSummary(meta, workspaceRef)
 	providers := rootProviderSummaries(meta)
 	cleanup := rootCleanupSummary(meta)
+	recovery := rootRecoverySummary(st, meta)
 
 	result := map[string]any{
 		"execution_kind": rootExecutionKind,
 		"status":         valueOr(meta["status"], "unknown"),
 		"phase":          meta["execution_phase"],
-		"recovered":      meta["recovered_at"] != nil,
+		"recovered":      recovery["resumed"] == true,
 		"recipe": map[string]any{
 			"id":                   meta["recipe_id"],
 			"recipe_ref":           recipeRef.status,
@@ -155,6 +157,7 @@ func BuildRootInspectionReport(sessionDir string, meta map[string]any, includeRa
 		"checkpoints":         checkpoints,
 		"reducer_attempts":    map[string]any{"count": len(reducerAttemptItems), "refs": reducerAttemptItems, "latest_ref": latestReducerAttempt.status},
 		"cleanup":             cleanup,
+		"recovery":            recovery,
 		"named_inputs":        inputs,
 		"artifact_refs":       refs,
 		"artifact_validation": rootArtifactValidationSummary(inspected, len(checkpointItems) > 0),
@@ -215,6 +218,13 @@ func BuildRootHealthChecks(sessionDir string, meta map[string]any, root map[stri
 		cleanupStatus = "error"
 	}
 	checks = append(checks, map[string]any{"name": "root_cleanup_state", "status": cleanupStatus, "detail": cleanup})
+
+	recovery, _ := root["recovery"].(map[string]any)
+	recoveryStatus := "ok"
+	if boolFromAny(recovery["pending"]) || strings.TrimSpace(stringFromAny(recovery["events_status"])) == "error" {
+		recoveryStatus = "error"
+	}
+	checks = append(checks, map[string]any{"name": "root_recovery_state", "status": recoveryStatus, "detail": recovery})
 	return checks
 }
 
@@ -371,6 +381,9 @@ func rootArtifactValidationSummary(items []inspectedRootRef, hasCheckpoint bool)
 
 func namedInputIntegrity(st *store.Store, manifest inspectedRootRef, contractID string) map[string]any {
 	if !boolFromAny(manifest.status["present"]) {
+		if boolFromAny(manifest.status["required"]) {
+			return map[string]any{"status": "error", "ok": false, "input_count": 0, "error": "integration-bound root session is missing its named input manifest"}
+		}
 		return map[string]any{"status": "not_applicable", "ok": true, "input_count": 0}
 	}
 	if !boolFromAny(manifest.status["ok"]) {
@@ -493,6 +506,39 @@ func rootCleanupSummary(meta map[string]any) map[string]any {
 	return result
 }
 
+func rootRecoverySummary(st *store.Store, meta map[string]any) map[string]any {
+	result := map[string]any{
+		"resumed":         meta["recovered_at"] != nil,
+		"resume_count":    0,
+		"pending":         valueOr(meta["root_recovery_pending"], false),
+		"last_resumed_at": meta["recovered_at"],
+	}
+	events, err := st.ReadEvents()
+	if err != nil {
+		result["events_status"] = "error"
+		result["events_error"] = err.Error()
+		return result
+	}
+	count := 0
+	for _, event := range events {
+		if strings.TrimSpace(stringFromAny(event["event_type"])) != "node_resumed" ||
+			strings.TrimSpace(stringFromAny(event["node_id"])) != graph.RootNodeID {
+			continue
+		}
+		payload, _ := event["payload"].(map[string]any)
+		if payload != nil && payload["recovery_only"] != true {
+			continue
+		}
+		count++
+		result["last_resumed_at"] = event["timestamp"]
+		result["last_resume_event_id"] = event["event_id"]
+	}
+	result["resume_count"] = count
+	result["resumed"] = count > 0 || result["resumed"] == true
+	result["events_status"] = "ok"
+	return result
+}
+
 func summarizeRootArtifact(payload map[string]any) map[string]any {
 	if payload == nil {
 		return nil
@@ -550,6 +596,7 @@ func FormatRootSummary(root map[string]any) string {
 	providers := mapFromAny(root["providers"])
 	checkpoints := mapFromAny(root["checkpoints"])
 	cleanup := mapFromAny(root["cleanup"])
+	recovery := mapFromAny(root["recovery"])
 	artifacts := mapFromAny(root["artifact_validation"])
 	contract := firstNonEmpty(integration["contract_id"], "none")
 	providerCount := len(asSlice(providers["participants"]))
@@ -569,6 +616,7 @@ func FormatRootSummary(root map[string]any) string {
 		fmt.Sprintf("Providers: %d sanitized summaries", providerCount),
 		fmt.Sprintf("Checkpoints: %v (%v valid, chain=%v)", valueOr(checkpoints["count"], 0), valueOr(checkpoints["valid_count"], 0), valueOr(checkpoints["chain_valid"], false)),
 		fmt.Sprintf("Cleanup: result=%v, administrative=%v", valueOr(cleanup["result_cleanup_status"], "pending"), valueOr(cleanup["administrative_status"], "not_started")),
+		fmt.Sprintf("Recovery: resumed=%v, count=%v, pending=%v", valueOr(recovery["resumed"], false), valueOr(recovery["resume_count"], 0), valueOr(recovery["pending"], false)),
 		fmt.Sprintf("Root artifact refs: %v/%v valid", valueOr(artifacts["valid"], 0), valueOr(artifacts["checked"], 0)),
 	}, "\n")
 }

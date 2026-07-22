@@ -71,6 +71,7 @@ func BuildShowTranscriptReport(sessionDir string, fromRound int, roundsSpec stri
 	diagnostics := sessionDiagnostics(meta, transcript, events)
 	if eventsErr != nil {
 		diagnostics["events_error"] = eventsErr.Error()
+		diagnostics["attention_required"] = true
 	}
 	report := map[string]any{
 		"session_id":   filepath.Base(filepath.Clean(sessionDir)),
@@ -223,6 +224,7 @@ func BuildSessionHealthReport(sessionDir string) (map[string]any, error) {
 	diagnostics := sessionDiagnostics(meta, transcript, events)
 	if eventsErr != nil {
 		diagnostics["events_error"] = eventsErr.Error()
+		diagnostics["attention_required"] = true
 	}
 	status := "ok"
 	if attention, _ := diagnostics["attention_required"].(bool); attention {

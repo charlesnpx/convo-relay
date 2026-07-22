@@ -273,6 +273,26 @@ func TestRunRecipeBindsContractInputsAndPersistsExactArtifacts(t *testing.T) {
 	if strings.Contains(string(rootJSON), `"value":"stable"`) || strings.Contains(string(rootJSON), materializedPath) {
 		t.Fatalf("ordinary inspection exposed named input content or provider path: %s", rootJSON)
 	}
+	missingManifestMeta := cloneMap(result)
+	missingManifestMeta["named_input_manifest_ref"] = nil
+	missingManifestInspection := inspect.BuildRootInspectionReport(sessionDir, missingManifestMeta, false)
+	missingManifestArtifacts := missingManifestInspection["artifact_validation"].(map[string]any)
+	missingManifestInputs := missingManifestInspection["named_inputs"].(map[string]any)
+	if missingManifestArtifacts["ok"] != false || intFromAny(missingManifestArtifacts["required_missing"], 0) < 1 ||
+		missingManifestInputs["status"] != "error" || missingManifestInputs["ok"] != false {
+		t.Fatalf("missing manifest inspection = %#v / %#v", missingManifestArtifacts, missingManifestInputs)
+	}
+	missingManifestChecks := inspect.BuildRootHealthChecks(sessionDir, missingManifestMeta, missingManifestInspection)
+	foundInputFailure := false
+	for _, rawCheck := range missingManifestChecks {
+		check := rawCheck.(map[string]any)
+		if check["name"] == "root_named_input_digests" && check["status"] == "error" {
+			foundInputFailure = true
+		}
+	}
+	if !foundInputFailure {
+		t.Fatalf("missing manifest health checks = %#v", missingManifestChecks)
+	}
 }
 
 func TestRunRecipeContractPoliciesRejectBeforeSessionCreation(t *testing.T) {

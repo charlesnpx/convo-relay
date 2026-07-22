@@ -150,7 +150,15 @@ func TestRootInspectionLifecycleStateProjection(t *testing.T) {
 			meta["status"] = test.status
 			meta["execution_phase"] = test.phase
 			if test.recovered {
-				meta["recovered_at"] = "2026-07-21T00:00:00Z"
+				if _, err := store.New(sessionDir).AppendSessionEventV1(
+					"node_resumed",
+					"root",
+					"Root recipe resumed for post-participant recovery",
+					map[string]any{"recovery_only": true},
+					store.EventOptions{},
+				); err != nil {
+					t.Fatalf("append recovery event: %v", err)
+				}
 			}
 			if test.cleanup != nil {
 				meta["workspace_cleanup"] = test.cleanup
