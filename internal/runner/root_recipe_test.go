@@ -11,6 +11,7 @@ import (
 	"testing"
 
 	"github.com/charlesnpx/convo-relay/internal/contracts"
+	"github.com/charlesnpx/convo-relay/internal/inspect"
 	"github.com/charlesnpx/convo-relay/internal/integration"
 	"github.com/charlesnpx/convo-relay/internal/readiness"
 	"github.com/charlesnpx/convo-relay/internal/recipes"
@@ -156,6 +157,30 @@ func TestRunRecipeUsesExplicitRootTargetAndPersistsDirectContractlessSession(t *
 	}
 	assertRootRecipeArtifact(t, st, meta.Get("execution_workspace_ref"), contracts.RootArtifactKindExecutionWorkspace, 0)
 
+	showReport, err := inspect.BuildShowTranscriptReport(sessionDir, 0, "")
+	if err != nil {
+		t.Fatalf("inspect root session: %v", err)
+	}
+	rootReport, _ := showReport["root"].(map[string]any)
+	artifactValidation, _ := rootReport["artifact_validation"].(map[string]any)
+	checkpointInspection, _ := rootReport["checkpoints"].(map[string]any)
+	if artifactValidation["ok"] != true || checkpointInspection["ok"] != true {
+		t.Fatalf("root inspection integrity = %#v / %#v", artifactValidation, checkpointInspection)
+	}
+	healthReport, err := inspect.BuildSessionHealthReport(sessionDir)
+	if err != nil {
+		t.Fatalf("inspect root health: %v", err)
+	}
+	if healthReport["status"] != "ok" || healthReport["root"] == nil {
+		t.Fatalf("root health report = %#v", healthReport)
+	}
+	for _, rawCheck := range healthReport["checks"].([]any) {
+		check := rawCheck.(map[string]any)
+		if check["status"] != "ok" {
+			t.Fatalf("root health check = %#v", check)
+		}
+	}
+
 	graphPayload := st.LoadGraph()
 	nodes := graphPayload["nodes"].(map[string]any)
 	if len(nodes) != 1 || nodes["root"] == nil || len(graphPayload["edges"].([]any)) != 0 {
@@ -229,6 +254,44 @@ func TestRunRecipeBindsContractInputsAndPersistsExactArtifacts(t *testing.T) {
 	}
 	if info, err := os.Stat(materializedPath); err != nil || info.Mode().Perm()&0o222 != 0 {
 		t.Fatalf("materialized input mode = %v, %v", info, err)
+	}
+	inspection, err := inspect.BuildShowTranscriptReport(sessionDir, 0, "")
+	if err != nil {
+		t.Fatalf("inspect integration-bound session: %v", err)
+	}
+	rootInspection := inspection["root"].(map[string]any)
+	integrationInspection := rootInspection["integration"].(map[string]any)
+	inputInspection := rootInspection["named_inputs"].(map[string]any)
+	if integrationInspection["bound"] != true || integrationInspection["contract_id"] != "neutral/contract-v1" ||
+		inputInspection["status"] != "ok" || intFromAny(inputInspection["input_count"], 0) != 1 {
+		t.Fatalf("integration/input inspection = %#v / %#v", integrationInspection, inputInspection)
+	}
+	rootJSON, err := contracts.CanonicalJSONBytes(rootInspection)
+	if err != nil {
+		t.Fatalf("encode root inspection: %v", err)
+	}
+	if strings.Contains(string(rootJSON), `"value":"stable"`) || strings.Contains(string(rootJSON), materializedPath) {
+		t.Fatalf("ordinary inspection exposed named input content or provider path: %s", rootJSON)
+	}
+	missingManifestMeta := cloneMap(result)
+	missingManifestMeta["named_input_manifest_ref"] = nil
+	missingManifestInspection := inspect.BuildRootInspectionReport(sessionDir, missingManifestMeta, false)
+	missingManifestArtifacts := missingManifestInspection["artifact_validation"].(map[string]any)
+	missingManifestInputs := missingManifestInspection["named_inputs"].(map[string]any)
+	if missingManifestArtifacts["ok"] != false || intFromAny(missingManifestArtifacts["required_missing"], 0) < 1 ||
+		missingManifestInputs["status"] != "error" || missingManifestInputs["ok"] != false {
+		t.Fatalf("missing manifest inspection = %#v / %#v", missingManifestArtifacts, missingManifestInputs)
+	}
+	missingManifestChecks := inspect.BuildRootHealthChecks(sessionDir, missingManifestMeta, missingManifestInspection)
+	foundInputFailure := false
+	for _, rawCheck := range missingManifestChecks {
+		check := rawCheck.(map[string]any)
+		if check["name"] == "root_named_input_digests" && check["status"] == "error" {
+			foundInputFailure = true
+		}
+	}
+	if !foundInputFailure {
+		t.Fatalf("missing manifest health checks = %#v", missingManifestChecks)
 	}
 }
 

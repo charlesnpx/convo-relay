@@ -12,6 +12,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/charlesnpx/convo-relay/internal/contracts"
 	"github.com/charlesnpx/convo-relay/internal/recipes"
 	"github.com/charlesnpx/convo-relay/internal/store"
 )
@@ -938,6 +939,64 @@ func TestEmitRunnerResultStillWritesStdoutWhenOutputSaveFails(t *testing.T) {
 				t.Fatalf("plain stdout result = %q", stdout.String())
 			}
 		})
+	}
+}
+
+func TestEmitRunnerResultWithRunErrorPersistsSelectedOutputRepresentation(t *testing.T) {
+	sessionDir := filepath.Join(t.TempDir(), "root-session")
+	if err := os.MkdirAll(sessionDir, 0o755); err != nil {
+		t.Fatalf("mkdir root session: %v", err)
+	}
+	meta := `{"execution_kind":"recipe","recipe_id":"neutral-root","task":"Output task","title":"Output title","status":"invalid_result","mode":"cooperative","participant_turns":2,"participant_turns_completed":2,"actual_participant_turns":2,"actual_rounds":2,"max_rounds":2,"result_source":"reducer","validation_status":"failed","ledger":{"settled":[],"contested":[],"withdrawn":[]},"slots":[{"backend":"codex"},{"backend":"codex"}]}`
+	transcript := `[{"round":1,"from":"Participant A","content":"First participant body","ledger":{"settled":[],"contested":[],"withdrawn":[]}},{"round":2,"from":"Participant B","content":"Second participant body","ledger":{"settled":[],"contested":[],"withdrawn":[]}}]`
+	if err := os.WriteFile(filepath.Join(sessionDir, "meta.json"), []byte(meta), 0o644); err != nil {
+		t.Fatalf("write root meta: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(sessionDir, "transcript.json"), []byte(transcript), 0o644); err != nil {
+		t.Fatalf("write root transcript: %v", err)
+	}
+	canonicalRef := map[string]any{
+		"kind": "artifact_ref", "schema_version": 1, "id": "canonical_result:selected",
+		"digest": contracts.DigestPrefix + strings.Repeat("0", 64),
+	}
+	result := map[string]any{
+		"execution_kind": "recipe", "session_id": "invalid123", "session_dir": sessionDir,
+		"status": "invalid_result", "actual_participant_turns": 2, "participant_turns": 2,
+		"canonical_result_ref": canonicalRef, "transcript": []any{map[string]any{"content": "machine envelope body"}},
+	}
+	runErr := errors.New("invalid root result")
+
+	markdownPath := filepath.Join(t.TempDir(), "result.md")
+	var plainStdout bytes.Buffer
+	if err := emitRunnerResult(&plainStdout, result, runErr, false, markdownPath); !errors.Is(err, runErr) {
+		t.Fatalf("plain emit error = %v", err)
+	}
+	markdown, err := os.ReadFile(markdownPath)
+	if err != nil {
+		t.Fatalf("read markdown output: %v", err)
+	}
+	if !strings.Contains(string(markdown), "# Relay Dialogue") || !strings.Contains(string(markdown), "Second participant body") || strings.Contains(string(markdown), `"canonical_result_ref"`) {
+		t.Fatalf("plain run output =\n%s", markdown)
+	}
+	if !strings.Contains(plainStdout.String(), "invalid_result") || !strings.Contains(plainStdout.String(), markdownPath) {
+		t.Fatalf("plain stdout = %q", plainStdout.String())
+	}
+
+	jsonPath := filepath.Join(t.TempDir(), "result.json")
+	var jsonStdout bytes.Buffer
+	if err := emitRunnerResult(&jsonStdout, result, runErr, true, jsonPath); !errors.Is(err, runErr) {
+		t.Fatalf("JSON emit error = %v", err)
+	}
+	jsonBody, err := os.ReadFile(jsonPath)
+	if err != nil {
+		t.Fatalf("read JSON output: %v", err)
+	}
+	jsonFile := decodeJSONObject(t, string(jsonBody))
+	jsonConsole := decodeJSONObject(t, jsonStdout.String())
+	for label, payload := range map[string]map[string]any{"file": jsonFile, "stdout": jsonConsole} {
+		if payload["status"] != "invalid_result" || payload["canonical_result_ref"] == nil || payload["transcript"] == nil {
+			t.Fatalf("JSON %s envelope = %#v", label, payload)
+		}
 	}
 }
 

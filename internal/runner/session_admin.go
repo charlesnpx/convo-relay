@@ -12,6 +12,7 @@ import (
 	"strings"
 
 	"github.com/charlesnpx/convo-relay/internal/contracts"
+	"github.com/charlesnpx/convo-relay/internal/inspect"
 	"github.com/charlesnpx/convo-relay/internal/model"
 	"github.com/charlesnpx/convo-relay/internal/store"
 	"github.com/charlesnpx/convo-relay/internal/workspace"
@@ -99,6 +100,11 @@ func ListSessions(home string, limit int) ([]map[string]any, error) {
 			if err == nil && !processAlive(pid) {
 				meta["status"] = "orphaned"
 			}
+		}
+		if inspect.IsRootSession(meta) {
+			root := inspect.BuildRootInspectionReport(sessionDir, meta, false)
+			meta = inspect.SanitizeMetaForInspection(meta)
+			meta["root"] = root
 		}
 		sessions = append(sessions, meta)
 	}

@@ -544,6 +544,11 @@ func runList(args []string) {
 			stringValue(session["created_at"]),
 			title,
 		)
+		if root, ok := session["root"].(map[string]any); ok {
+			for _, line := range strings.Split(inspect.FormatRootSummary(root), "\n") {
+				fmt.Printf("             %s\n", line)
+			}
+		}
 	}
 }
 
