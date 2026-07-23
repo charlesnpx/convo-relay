@@ -560,6 +560,24 @@ func cleanSessionWithRemover(sessionDir string, removeSession func(string) error
 	if err != nil {
 		return nil, err
 	}
+	if status := strings.TrimSpace(stringFromAny(meta["status"])); status == RootInitializationStateInitializing || status == RootInitializationStateFailed {
+		transaction, err := loadRootInitializationTransaction(sessionDir, meta)
+		if err != nil {
+			return nil, err
+		}
+		report := map[string]any{
+			"session_id":           sessionIDFromDir(sessionDir),
+			"session_dir":          sessionDir,
+			"title":                firstNonEmpty(stringFromAny(meta["title"]), stringFromAny(meta["task"])),
+			"initialization_state": status,
+		}
+		if err := transaction.compensate(); err != nil {
+			return nil, err
+		}
+		report["status"] = "deleted"
+		report["initialization_cleanup"] = "complete"
+		return report, nil
+	}
 	st := store.New(sessionDir)
 	report := map[string]any{
 		"session_id":  sessionIDFromDir(sessionDir),

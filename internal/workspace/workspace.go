@@ -14,6 +14,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/charlesnpx/convo-relay/internal/contracts"
+	"github.com/charlesnpx/convo-relay/internal/recipes"
 )
 
 const (
@@ -34,6 +35,8 @@ const (
 	DiagnosticCodeLaunchNotCommitted = "workspace_launch_path_not_committed"
 	DiagnosticCodeCreationFailed     = "workspace_creation_failed"
 	DiagnosticCodeIntegrity          = "workspace_integrity_failed"
+	DiagnosticCodeDirtySource        = "workspace_dirty_source"
+	DiagnosticCodeDirtyInapplicable  = "workspace_allow_dirty_inapplicable"
 )
 
 // Options describes workspace preflight without creating a session or Git
@@ -46,7 +49,10 @@ type Options struct {
 	MinimumPolicy     string
 	RequestedPolicy   string
 	RequestedExplicit bool
+	AllowDirtySource  bool
 	GitBinary         string
+	InventoryMaxFiles int64
+	InventoryMaxBytes int64
 }
 
 // PolicyResolution records the recipe minimum, caller request, effective
@@ -68,9 +74,23 @@ type Snapshot struct {
 	sessionPathSource string
 	gitBinary         string
 	policy            PolicyResolution
+	inventoryLimits   repositoryInventoryLimits
+	allowDirtySource  bool
+	sourceChanges     SourceChanges
 	repository        *repositorySnapshot
 	sourceReport      map[string]any
 	exclusions        map[string]any
+}
+
+// SourceChanges contains only counts from the captured stable inventory.
+type SourceChanges struct {
+	Staged    int64
+	Unstaged  int64
+	Untracked int64
+}
+
+func (c SourceChanges) Dirty() bool {
+	return c.Staged > 0 || c.Unstaged > 0 || c.Untracked > 0
 }
 
 func ResolvePolicy(minimum string, requested string, requestedExplicit bool) (PolicyResolution, error) {
@@ -146,6 +166,29 @@ func Preflight(ctx context.Context, options Options) (*Snapshot, error) {
 	if gitBinary == "" {
 		gitBinary = "git"
 	}
+	inventoryLimits := repositoryInventoryLimits{
+		maxFiles: options.InventoryMaxFiles,
+		maxBytes: options.InventoryMaxBytes,
+	}
+	if inventoryLimits.maxFiles == 0 {
+		inventoryLimits.maxFiles = recipes.DefaultRepositoryInventoryMaxFiles
+	}
+	if inventoryLimits.maxBytes == 0 {
+		inventoryLimits.maxBytes = recipes.DefaultRepositoryInventoryMaxBytes
+	}
+	if inventoryLimits.maxFiles < 0 || inventoryLimits.maxBytes < 0 {
+		return nil, workspaceError(
+			nil,
+			DiagnosticCodeInventoryFailed,
+			contracts.DiagnosticPhasePreflight,
+			"/runtime_config/limits",
+			"Repository inventory limits must be positive integers.",
+			map[string]any{
+				"repository_inventory_max_files": inventoryLimits.maxFiles,
+				"repository_inventory_max_bytes": inventoryLimits.maxBytes,
+			},
+		)
+	}
 
 	snapshot := &Snapshot{
 		launchCWD:         launchCWD,
@@ -153,10 +196,23 @@ func Preflight(ctx context.Context, options Options) (*Snapshot, error) {
 		sessionPathSource: sessionPathSource,
 		gitBinary:         gitBinary,
 		policy:            policy,
+		inventoryLimits:   inventoryLimits,
+		allowDirtySource:  options.AllowDirtySource,
 		exclusions:        emptyExclusions(),
 	}
-	repository, err := inspectRepository(ctx, gitBinary, launchCWD)
+	repository, err := inspectRepositoryWithLimits(ctx, gitBinary, launchCWD, inventoryLimits)
 	if err != nil {
+		var limitErr *contracts.ResourceLimitError
+		if errors.As(err, &limitErr) {
+			return nil, workspaceError(
+				err,
+				limitErr.Code,
+				contracts.DiagnosticPhasePreflight,
+				"/runtime_config/limits",
+				"The source repository exceeds its configured inventory budget.",
+				resourceLimitDetails(limitErr),
+			)
+		}
 		notGit := errors.Is(err, errNotGitRepository)
 		unborn := errors.Is(err, errUnbornRepository)
 		if policy.Effective != PolicyInherited && (notGit || unborn) {
@@ -175,11 +231,33 @@ func Preflight(ctx context.Context, options Options) (*Snapshot, error) {
 			"repository_state": repositoryStateForError(err),
 			"launch_cwd":       launchCWD,
 		}
+		if options.AllowDirtySource {
+			return nil, workspaceError(
+				nil,
+				DiagnosticCodeDirtyInapplicable,
+				contracts.DiagnosticPhasePolicy,
+				"/allow_dirty_source",
+				"Dirty-source override applies only to isolated Git execution.",
+				map[string]any{"repository_state": repositoryStateForError(err), "effective_policy": policy.Effective},
+			)
+		}
 		return snapshot, nil
 	}
 	snapshot.repository = repository
 	snapshot.sourceReport = cloneMap(repository.sourceReport)
 	snapshot.exclusions = cloneMap(repository.exclusions)
+	snapshot.sourceChanges = sourceChangeCounts(repository.exclusions)
+
+	if policy.Effective == PolicyInherited && options.AllowDirtySource {
+		return nil, workspaceError(
+			nil,
+			DiagnosticCodeDirtyInapplicable,
+			contracts.DiagnosticPhasePolicy,
+			"/allow_dirty_source",
+			"Dirty-source override is inapplicable to inherited execution.",
+			map[string]any{"effective_policy": policy.Effective},
+		)
+	}
 
 	if policy.Effective != PolicyInherited {
 		if pathsOverlap(repository.root, sessionDir) {
@@ -195,6 +273,20 @@ func Preflight(ctx context.Context, options Options) (*Snapshot, error) {
 		if err := verifyCommittedLaunchSubpath(ctx, repository); err != nil {
 			return nil, workspaceError(err, DiagnosticCodeLaunchNotCommitted, contracts.DiagnosticPhasePreflight, "/launch_cwd", "The launch directory is not present as a directory in committed HEAD.", map[string]any{"launch_subpath": repository.launchSubpath})
 		}
+		if snapshot.sourceChanges.Dirty() && !options.AllowDirtySource {
+			return nil, workspaceError(
+				nil,
+				DiagnosticCodeDirtySource,
+				contracts.DiagnosticPhasePolicy,
+				"/allow_dirty_source",
+				"Isolated execution requires a clean source or an explicit dirty-source override.",
+				map[string]any{
+					"staged_changes":    snapshot.sourceChanges.Staged,
+					"unstaged_changes":  snapshot.sourceChanges.Unstaged,
+					"untracked_changes": snapshot.sourceChanges.Untracked,
+				},
+			)
+		}
 		worktreePath := filepath.Join(sessionDir, "execution", "worktree")
 		if registered, err := repositoryWorktreeRegistered(ctx, repository, worktreePath); err != nil {
 			return nil, workspaceError(err, DiagnosticCodeInventoryFailed, contracts.DiagnosticPhasePreflight, "/session_dir", "Git worktree registration could not be inspected.", nil)
@@ -203,6 +295,30 @@ func Preflight(ctx context.Context, options Options) (*Snapshot, error) {
 		}
 	}
 	return snapshot, nil
+}
+
+func (s *Snapshot) SourceChanges() SourceChanges {
+	if s == nil {
+		return SourceChanges{}
+	}
+	return s.sourceChanges
+}
+
+func (s *Snapshot) AllowDirtySource() bool {
+	return s != nil && s.allowDirtySource
+}
+
+func sourceChangeCounts(exclusions map[string]any) SourceChanges {
+	return SourceChanges{
+		Staged:    int64(len(anySlice(exclusions["staged"]))),
+		Unstaged:  int64(len(anySlice(exclusions["unstaged"]))),
+		Untracked: int64(len(anySlice(exclusions["untracked"]))),
+	}
+}
+
+func anySlice(value any) []any {
+	items, _ := value.([]any)
+	return items
 }
 
 func (s *Snapshot) Policy() PolicyResolution {
@@ -238,6 +354,20 @@ func (s *Snapshot) HeadCommit() string {
 		return ""
 	}
 	return s.repository.headCommit
+}
+
+func (s *Snapshot) HeadTree() string {
+	if s == nil || s.repository == nil {
+		return ""
+	}
+	return s.repository.headTree
+}
+
+func (s *Snapshot) ObjectFormat() string {
+	if s == nil || s.repository == nil {
+		return ""
+	}
+	return s.repository.objectFormat
 }
 
 func (s *Snapshot) SourceDigest() string {
@@ -424,4 +554,17 @@ func cloneMap(value map[string]any) map[string]any {
 func workspaceError(cause error, code string, phase string, path string, message string, details map[string]any) error {
 	diagnostic := contracts.NewDiagnostic(code, phase, path, message, details)
 	return contracts.WrapDiagnosticError(cause, message, diagnostic)
+}
+
+func resourceLimitDetails(limitErr *contracts.ResourceLimitError) map[string]any {
+	if limitErr == nil {
+		return map[string]any{}
+	}
+	return map[string]any{
+		"resource":  limitErr.Resource,
+		"limit":     limitErr.Limit,
+		"observed":  limitErr.Observed,
+		"current":   limitErr.Current,
+		"increment": limitErr.Increment,
+	}
 }

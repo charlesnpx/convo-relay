@@ -29,6 +29,7 @@ func TestMaterializeRequiredPoliciesCreateVerifiedDetachedWorktreeAndArtifact(t 
 				SessionDir:        sessionDir,
 				SessionPathSource: SessionPathExplicit,
 				MinimumPolicy:     policy,
+				AllowDirtySource:  true,
 			})
 			if snapshot.HeadCommit() != originalHead {
 				t.Fatalf("snapshot HEAD = %s, want %s", snapshot.HeadCommit(), originalHead)

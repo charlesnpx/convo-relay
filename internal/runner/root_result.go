@@ -261,6 +261,7 @@ func (s *rootExecutionState) rootReducerPrompt() (string, error) {
 	var builder strings.Builder
 	builder.WriteString("Root recipe reducer\n\n")
 	fmt.Fprintf(&builder, "--- Task ---\n%s\n", s.meta.String("task"))
+	fmt.Fprintf(&builder, "\n--- Execution Workspace Provenance ---\n%s\n", mustJSON(s.workspaceProvenancePrompt()))
 
 	providerInputItems, _ := s.persisted.providerInputs["inputs"].([]any)
 	if len(providerInputItems) > 0 {

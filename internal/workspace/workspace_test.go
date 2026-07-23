@@ -13,6 +13,7 @@ import (
 	"testing"
 
 	"github.com/charlesnpx/convo-relay/internal/contracts"
+	"github.com/charlesnpx/convo-relay/internal/store"
 )
 
 func TestResolvePolicyOrderingAndExplicitOverrides(t *testing.T) {
@@ -238,12 +239,87 @@ func TestPreflightInventoriesInitializedDirtyAndDeinitializedSubmodules(t *testi
 	if cleanEntry["submodule_head"] != testGit(t, submoduleRoot, "rev-parse", "HEAD") || cleanEntry["submodule_source_digest"] == "" {
 		t.Fatalf("initialized submodule identity = %#v", cleanEntry)
 	}
+	cleanInventory := clean.sourceReport["inventory"].(map[string]any)
+	totalFiles := intFromWorkspaceAny(cleanInventory["file_count"])
+	totalBytes := intFromWorkspaceAny(cleanInventory["byte_count"])
+	submoduleFiles := intFromWorkspaceAny(cleanEntry["submodule_inventory_files"])
+	submoduleBytes := intFromWorkspaceAny(cleanEntry["submodule_inventory_bytes"])
+	directFiles := int64(len(inventoryEntries(t, clean.sourceReport, "tracked_worktree")) + len(inventoryEntries(t, clean.sourceReport, "untracked_worktree")))
+	directBytes := inventoryEntryBytes(inventoryEntries(t, clean.sourceReport, "tracked_worktree")) +
+		inventoryEntryBytes(inventoryEntries(t, clean.sourceReport, "untracked_worktree"))
+	if submoduleFiles < 1 || submoduleBytes < 1 ||
+		totalFiles != directFiles+submoduleFiles ||
+		totalBytes != directBytes+submoduleBytes {
+		t.Fatalf(
+			"shared submodule accounting total=(%d,%d) direct=(%d,%d) nested=(%d,%d)",
+			totalFiles,
+			totalBytes,
+			directFiles,
+			directBytes,
+			submoduleFiles,
+			submoduleBytes,
+		)
+	}
+	if _, err := Preflight(context.Background(), Options{
+		LaunchCWD:         root,
+		SessionDir:        filepath.Join(t.TempDir(), "exact-budget"),
+		InventoryMaxFiles: totalFiles,
+		InventoryMaxBytes: totalBytes,
+	}); err != nil {
+		t.Fatalf("exact shared submodule budget rejected: %v", err)
+	}
+	_, err := Preflight(context.Background(), Options{
+		LaunchCWD:         root,
+		SessionDir:        filepath.Join(t.TempDir(), "file-budget"),
+		InventoryMaxFiles: totalFiles - 1,
+		InventoryMaxBytes: totalBytes,
+	})
+	requireDiagnosticCode(t, err, contracts.DiagnosticCodeRepositoryInventoryMaxFiles)
+	_, err = Preflight(context.Background(), Options{
+		LaunchCWD:         root,
+		SessionDir:        filepath.Join(t.TempDir(), "byte-budget"),
+		InventoryMaxFiles: totalFiles,
+		InventoryMaxBytes: totalBytes - 1,
+	})
+	requireDiagnosticCode(t, err, contracts.DiagnosticCodeRepositoryInventoryMaxBytes)
 
-	writeTestFile(t, filepath.Join(root, "vendor", "module", "committed.txt"), []byte("dirty submodule\n"), 0o644)
-	dirty := mustPreflight(t, Options{LaunchCWD: root, SessionDir: filepath.Join(t.TempDir(), "dirty-session")})
+	moduleWorktree := filepath.Join(root, "vendor", "module")
+	writeTestFile(t, filepath.Join(moduleWorktree, "committed.txt"), []byte("staged submodule\n"), 0o644)
+	testGit(t, moduleWorktree, "add", "--", "committed.txt")
+	writeTestFile(t, filepath.Join(moduleWorktree, "committed.txt"), []byte("unstaged submodule\n"), 0o644)
+	writeTestFile(t, filepath.Join(moduleWorktree, "untracked.txt"), []byte("untracked submodule\n"), 0o644)
+	dirtySession := filepath.Join(t.TempDir(), "dirty-session")
+	dirty := mustPreflight(t, Options{LaunchCWD: root, SessionDir: dirtySession})
 	dirtyEntry := inventoryEntries(t, dirty.sourceReport, "tracked_worktree")["vendor/module"]
 	if dirty.SourceDigest() == clean.SourceDigest() || dirtyEntry["submodule_source_digest"] == cleanEntry["submodule_source_digest"] {
 		t.Fatalf("dirty submodule did not change inventory: clean=%#v dirty=%#v", cleanEntry, dirtyEntry)
+	}
+	if changes := dirty.SourceChanges(); changes.Unstaged != 1 {
+		t.Fatalf("parent dirtiness did not include initialized submodule: %#v", changes)
+	}
+	dirtySubmoduleSource, ok := dirtyEntry["submodule_source"].(map[string]any)
+	if !ok {
+		t.Fatalf("dirty submodule source report = %#v", dirtyEntry["submodule_source"])
+	}
+	dirtySubmoduleExclusions, ok := dirtySubmoduleSource["exclusions"].(map[string]any)
+	if !ok ||
+		len(exclusionPaths(t, dirtySubmoduleExclusions, "staged")) != 1 ||
+		len(exclusionPaths(t, dirtySubmoduleExclusions, "unstaged")) != 1 ||
+		len(exclusionPaths(t, dirtySubmoduleExclusions, "untracked")) != 1 {
+		t.Fatalf("dirty submodule exclusions = %#v", dirtySubmoduleSource["exclusions"])
+	}
+	materialized, err := Materialize(context.Background(), store.New(dirtySession), dirty)
+	if err != nil {
+		t.Fatalf("persist dirty initialized-submodule inventory: %v", err)
+	}
+	persistedSource, ok := materialized.Artifact["source"].(map[string]any)
+	if !ok {
+		t.Fatalf("persisted source report = %#v", materialized.Artifact["source"])
+	}
+	persistedEntry := inventoryEntries(t, persistedSource, "tracked_worktree")["vendor/module"]
+	persistedSubmoduleSource, ok := persistedEntry["submodule_source"].(map[string]any)
+	if !ok || persistedSubmoduleSource["exclusions"] == nil {
+		t.Fatalf("persisted submodule dirtiness = %#v", persistedEntry)
 	}
 
 	testGit(t, root, "submodule", "deinit", "-q", "-f", "--", "vendor/module")
@@ -254,6 +330,65 @@ func TestPreflightInventoriesInitializedDirtyAndDeinitializedSubmodules(t *testi
 	}
 	if _, exists := deinitializedEntry["submodule_head"]; exists {
 		t.Fatalf("deinitialized submodule claimed a HEAD: %#v", deinitializedEntry)
+	}
+}
+
+func TestRepositoryInventoryRejectsInitializedSubmoduleCycles(t *testing.T) {
+	root := t.TempDir()
+	testGit(t, root, "init", "-q")
+	testGit(t, root, "config", "user.name", "Workspace Test")
+	testGit(t, root, "config", "user.email", "workspace@example.invalid")
+	testGit(t, root, "commit", "--allow-empty", "-q", "-m", "initial")
+	head := testGit(t, root, "rev-parse", "HEAD")
+	testGit(t, root, "update-index", "--add", "--cacheinfo", "160000", head, "loop")
+	testGit(t, root, "commit", "-q", "-m", "add repository cycle")
+	loopWorktree := filepath.Join(root, "loop")
+	testGit(t, root, "worktree", "add", "--detach", "--no-checkout", loopWorktree, "HEAD")
+	t.Cleanup(func() {
+		command := exec.Command("git", "-C", root, "worktree", "remove", "--force", loopWorktree)
+		_ = command.Run()
+	})
+	testGit(t, loopWorktree, "read-tree", "--reset", "HEAD")
+	canonicalRoot, err := canonicalExistingDirectory(root)
+	if err != nil {
+		t.Fatalf("canonical cycle root: %v", err)
+	}
+
+	_, err = inspectRepositoryWithLimits(
+		context.Background(),
+		"git",
+		canonicalRoot,
+		repositoryInventoryLimits{maxFiles: 1_000, maxBytes: 1_000_000},
+	)
+	if err == nil || !strings.Contains(err.Error(), "repository inventory cycle detected") {
+		t.Fatalf("repository cycle error = %v", err)
+	}
+}
+
+func TestRepositoryInventoryAllowsDepthEightAndRejectsDepthNine(t *testing.T) {
+	root := newInitializedSubmoduleChain(t, 9)
+	canonicalRoot, err := canonicalExistingDirectory(root)
+	if err != nil {
+		t.Fatalf("canonical submodule-chain root: %v", err)
+	}
+	root = canonicalRoot
+	depthEightRoot := filepath.Join(root, "nested")
+	if _, err := inspectRepositoryWithLimits(
+		context.Background(),
+		"git",
+		depthEightRoot,
+		repositoryInventoryLimits{maxFiles: 10_000, maxBytes: 1_000_000_000},
+	); err != nil {
+		t.Fatalf("depth-eight initialized submodule chain rejected: %v", err)
+	}
+	_, err = inspectRepositoryWithLimits(
+		context.Background(),
+		"git",
+		root,
+		repositoryInventoryLimits{maxFiles: 10_000, maxBytes: 1_000_000_000},
+	)
+	if err == nil || !strings.Contains(err.Error(), "repository inventory depth exceeds 8") {
+		t.Fatalf("depth-nine initialized submodule chain error = %v", err)
 	}
 }
 
@@ -527,4 +662,25 @@ func inventoryEntries(t *testing.T, source map[string]any, category string) map[
 		}
 	}
 	return result
+}
+
+func inventoryEntryBytes(entries map[string]map[string]any) int64 {
+	var total int64
+	for _, entry := range entries {
+		total += intFromWorkspaceAny(entry["size_bytes"])
+	}
+	return total
+}
+
+func newInitializedSubmoduleChain(t *testing.T, depth int) string {
+	t.Helper()
+	child := newCommittedRepo(t)
+	for level := 0; level < depth; level++ {
+		parent := newCommittedRepo(t)
+		testGit(t, parent, "-c", "protocol.file.allow=always", "submodule", "add", "-q", child, "nested")
+		testGit(t, parent, "commit", "-q", "-m", "add nested submodule")
+		child = parent
+	}
+	testGit(t, child, "-c", "protocol.file.allow=always", "submodule", "update", "--init", "--recursive")
+	return child
 }

@@ -678,6 +678,7 @@ func runRelay(args []string) {
 	recipeID := flags.String("recipe", "", "Run a configured recipe as the direct root execution")
 	integrationBundlePath := flags.String("integration-bundle", "", "Integration bundle JSON for an integration-bound root recipe")
 	workspaceIsolation := flags.String("workspace-isolation", "inherited", "Root recipe workspace isolation: inherited, read_only, or ephemeral")
+	allowDirtySource := flags.Bool("allow-dirty-source", false, "Use committed HEAD for isolated root execution when the source is dirty")
 	var inputBindings repeatableFlagValue
 	flags.Var(&inputBindings, "input", "Bind a named root recipe input as name=path; may be repeated")
 	sessionDir := flags.String("session-dir", "", "Optional explicit session directory")
@@ -728,7 +729,7 @@ func runRelay(args []string) {
 		*task = strings.Join(flags.Args(), " ")
 	}
 	visited := visitedFlagNames(flags)
-	recipeRequested := strings.TrimSpace(*recipeID) != "" || visited["recipe"] || visited["integration-bundle"] || visited["workspace-isolation"] || visited["input"]
+	recipeRequested := strings.TrimSpace(*recipeID) != "" || visited["recipe"] || visited["integration-bundle"] || visited["workspace-isolation"] || visited["allow-dirty-source"] || visited["input"]
 	if recipeRequested {
 		if strings.TrimSpace(*recipeID) == "" {
 			fmt.Fprintln(os.Stderr, "error: --recipe is required when root recipe run options are used")
@@ -770,14 +771,25 @@ func runRelay(args []string) {
 			InputBindings:         append([]string{}, inputBindings...),
 			WorkspaceIsolation:    *workspaceIsolation,
 			WorkspaceExplicit:     visited["workspace-isolation"],
-			SettingsPath:          anchorRecipeCLIPath(sourceAnchor, *settingsPath),
-			LaunchCWD:             sourceAnchor,
-			TimeoutSeconds:        *timeout,
-			StallTimeoutSeconds:   *stallTimeout,
-			InvestigationMode:     *investigationMode,
-			LaunchPlan:            launchPlan,
-			TaskPlanExplicit:      visited["task-plan"],
-			SkillExplicit:         len(extracted["skill"]) > 0,
+			AllowDirtySource:      *allowDirtySource,
+			WarningCallback: func(warning runner.RecipeWarning) {
+				fmt.Fprintf(
+					os.Stderr,
+					"warning: %s (staged=%d unstaged=%d untracked=%d)\n",
+					warning.Message,
+					warning.StagedChanges,
+					warning.UnstagedChanges,
+					warning.UntrackedChanges,
+				)
+			},
+			SettingsPath:        anchorRecipeCLIPath(sourceAnchor, *settingsPath),
+			LaunchCWD:           sourceAnchor,
+			TimeoutSeconds:      *timeout,
+			StallTimeoutSeconds: *stallTimeout,
+			InvestigationMode:   *investigationMode,
+			LaunchPlan:          launchPlan,
+			TaskPlanExplicit:    visited["task-plan"],
+			SkillExplicit:       len(extracted["skill"]) > 0,
 		})
 		writeRunnerResult(result, err, *jsonOutput, output)
 		return

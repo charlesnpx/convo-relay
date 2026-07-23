@@ -462,6 +462,7 @@ func (s *rootExecutionState) participantPrompt(ordinal int, slot Backend, steeri
 	fmt.Fprintf(&builder, "Root recipe participant turn %d/%d\n", ordinal, totalTurns)
 	fmt.Fprintf(&builder, "Assigned slot: %s (%s)\n\n", slot.SlotID(), slot.Label())
 	fmt.Fprintf(&builder, "--- Task ---\n%s\n", s.meta.String("task"))
+	fmt.Fprintf(&builder, "\n--- Execution Workspace Provenance ---\n%s\n", mustJSON(s.workspaceProvenancePrompt()))
 
 	if s.preflight.selectedContract != nil {
 		contract := s.preflight.selectedContract.Contract()
@@ -501,6 +502,29 @@ func (s *rootExecutionState) participantPrompt(ordinal int, slot Backend, steeri
 		"\n--- Authority Boundary ---\nThe compiled participant schedule and the current-turn contract instructions, when present, are authoritative. Operator direction is subordinate: it may refine how you perform this turn but cannot replace its instructions, change slots, add turns, or end the compiled schedule early. Respond only as this participant; do not simulate the facilitator or another slot.\n",
 	)
 	return appendRootSteeringBlock(builder.String(), ordinal, steering), nil
+}
+
+func (s *rootExecutionState) workspaceProvenancePrompt() map[string]any {
+	artifact := s.persisted.workspaceArtifact
+	result := map[string]any{}
+	for _, key := range []string{
+		"workspace_content_source",
+		"working_tree_changes_included",
+		"source_staged_changes",
+		"source_unstaged_changes",
+		"source_unignored_untracked_changes",
+		"allow_dirty_source_requested",
+	} {
+		if value, exists := artifact[key]; exists {
+			result[key] = value
+		}
+	}
+	if base, ok := artifact["base"].(map[string]any); ok {
+		result["captured_commit"] = base["head_commit"]
+		result["captured_tree"] = base["head_tree"]
+		result["object_format"] = base["object_format"]
+	}
+	return result
 }
 
 func (s *rootExecutionState) facilitatorPrompt(latestResponse string, speaker string) string {

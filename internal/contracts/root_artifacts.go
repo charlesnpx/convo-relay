@@ -13,6 +13,7 @@ const (
 	RootArtifactKindIntegrationContract = "integration_contract"
 	RootArtifactKindNamedInputManifest  = "named_input_manifest"
 	RootArtifactKindNamedInputContent   = "named_input_content"
+	RootArtifactKindRetainedInputs      = "retained_input_materialization"
 	RootArtifactKindExecutionWorkspace  = "execution_workspace"
 	RootArtifactKindRootCheckpoint      = "root_checkpoint"
 	RootArtifactKindReducerAttempt      = "reducer_attempt"
@@ -37,6 +38,7 @@ var rootArtifactSpecs = []rootArtifactSpec{
 	{kind: RootArtifactKindIntegrationContract},
 	{kind: RootArtifactKindNamedInputManifest},
 	{kind: RootArtifactKindNamedInputContent, ordinal: true},
+	{kind: RootArtifactKindRetainedInputs},
 	{kind: RootArtifactKindExecutionWorkspace},
 	{kind: RootArtifactKindRootCheckpoint, ordinal: true},
 	{kind: RootArtifactKindReducerAttempt, ordinal: true},

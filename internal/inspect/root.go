@@ -100,6 +100,13 @@ func BuildRootInspectionReport(sessionDir string, meta map[string]any, includeRa
 	bundleRef := addRoot("integration_bundle_ref", meta["integration_bundle_ref"], contracts.RootArtifactKindIntegrationBundle, 0, contractID != "")
 	contractRef := addRoot("integration_contract_ref", meta["integration_contract_ref"], contracts.RootArtifactKindIntegrationContract, 0, contractID != "")
 	manifestRef := addRoot("named_input_manifest_ref", meta["named_input_manifest_ref"], contracts.RootArtifactKindNamedInputManifest, 0, contractID != "")
+	retainedInputRef := addRoot(
+		"retained_input_materialization_ref",
+		meta["retained_input_materialization_ref"],
+		contracts.RootArtifactKindRetainedInputs,
+		0,
+		contractID != "",
+	)
 	workspaceRef := addRoot("execution_workspace_ref", meta["execution_workspace_ref"], contracts.RootArtifactKindExecutionWorkspace, 0, true)
 	rawResultRef := addRoot("raw_result_ref", meta["raw_result_ref"], contracts.RootArtifactKindRawResult, 0, false)
 	validationRef := addRoot("result_validation_ref", meta["result_validation_ref"], contracts.RootArtifactKindResultValidation, 0, validationStatus != "")
@@ -119,6 +126,7 @@ func BuildRootInspectionReport(sessionDir string, meta map[string]any, includeRa
 
 	checkpoints := rootCheckpointSummary(checkpointItems, checkpointInspected, latestCheckpoint)
 	inputs := namedInputIntegrity(st, manifestRef, contractID)
+	inputs["retained_materialization_ref"] = retainedInputRef.status
 	workspaceSummary := rootWorkspaceSummary(meta, workspaceRef)
 	providers := rootProviderSummaries(meta)
 	cleanup := rootCleanupSummary(meta)
@@ -177,11 +185,20 @@ func BuildRootHealthChecks(sessionDir string, meta map[string]any, root map[stri
 
 	inputs, _ := root["named_inputs"].(map[string]any)
 	inputStatus := strings.TrimSpace(stringFromAny(inputs["status"]))
-	checks = append(checks, map[string]any{
+	inputCheck := map[string]any{
 		"name":   "root_named_input_digests",
 		"status": map[bool]string{true: "ok", false: "error"}[inputStatus == "ok" || inputStatus == "not_applicable"],
 		"detail": inputs,
-	})
+	}
+	if retainedRef, ok := meta["retained_input_materialization_ref"].(map[string]any); ok {
+		if err := namedinputs.VerifyRetained(context.Background(), store.New(sessionDir), retainedRef, "inspection", "health"); err != nil {
+			inputCheck["status"] = "error"
+			inputCheck["retained_error"] = err.Error()
+		} else {
+			inputCheck["retained_status"] = "ok"
+		}
+	}
+	checks = append(checks, inputCheck)
 
 	workspaceCheck := map[string]any{"name": "root_workspace_registration", "status": "ok"}
 	recovered, err := workspace.Recover(context.Background(), store.New(sessionDir))
@@ -433,6 +450,19 @@ func rootWorkspaceSummary(meta map[string]any, ref inspectedRootRef) map[string]
 			ref.status["root_contract_valid"] = false
 			ref.status["error_type"] = errorType(provenanceErr)
 			ref.status["error"] = provenanceErr.Error()
+		}
+		launchFacts, launchFactsErr := workspace.ValidateLaunchFactsProjection(meta, ref.payload)
+		for key, value := range launchFacts.Projection() {
+			summary[key] = value
+		}
+		summary["dirty_source_projection_valid"] = launchFactsErr == nil
+		if launchFactsErr != nil {
+			summary["dirty_source_projection_error"] = launchFactsErr.Error()
+			ref.status["ok"] = false
+			ref.status["status"] = "invalid"
+			ref.status["root_contract_valid"] = false
+			ref.status["error_type"] = errorType(launchFactsErr)
+			ref.status["error"] = launchFactsErr.Error()
 		}
 		if policy, ok := ref.payload["policy"].(map[string]any); ok {
 			summary["configured_policy"] = valueOr(summary["configured_policy"], policy["requested"])

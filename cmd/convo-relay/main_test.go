@@ -745,6 +745,48 @@ esac
 		t.Fatalf("unexpected provider invocation log after compatible run:\n%s", logData)
 	}
 
+	runCLITestGit(t, launchCWD, "init", "-q")
+	runCLITestGit(t, launchCWD, "config", "user.name", "CLI Test")
+	runCLITestGit(t, launchCWD, "config", "user.email", "cli@example.invalid")
+	runCLITestGit(t, launchCWD, "add", "--all")
+	runCLITestGit(t, launchCWD, "commit", "-q", "-m", "committed CLI fixture")
+	if err := os.WriteFile(filepath.Join(launchCWD, "context.md"), []byte("dirty compatibility context\n"), 0o644); err != nil {
+		t.Fatalf("dirty committed CLI source: %v", err)
+	}
+	dirtySessionDir := filepath.Join(tempDir, "dirty-source-session")
+	dirtyCommand := exec.Command(binary,
+		"run", "Dirty source JSON stream",
+		"--recipe", "neutral-root",
+		"--settings", "settings.toml",
+		"--recipe-file", "root-recipes.toml",
+		"--session-dir", dirtySessionDir,
+		"--launch-cwd", launchCWD,
+		"--workspace-isolation", "ephemeral",
+		"--allow-dirty-source",
+		"--json",
+	)
+	dirtyCommand.Env = command.Env
+	var dirtyStdout strings.Builder
+	var dirtyStderr strings.Builder
+	dirtyCommand.Stdout = &dirtyStdout
+	dirtyCommand.Stderr = &dirtyStderr
+	if err := dirtyCommand.Run(); err != nil {
+		t.Fatalf("dirty-source CLI run: %v\nstdout:\n%s\nstderr:\n%s", err, dirtyStdout.String(), dirtyStderr.String())
+	}
+	dirtyResult := decodeJSONObject(t, dirtyStdout.String())
+	if dirtyResult["status"] != "completed" || dirtyResult["session_id"] == nil {
+		t.Fatalf("dirty-source JSON stdout = %#v", dirtyResult)
+	}
+	if strings.Contains(dirtyStdout.String(), "warning:") {
+		t.Fatalf("dirty-source warning contaminated JSON stdout:\n%s", dirtyStdout.String())
+	}
+	if warning := dirtyStderr.String(); !strings.Contains(warning, "warning:") ||
+		!strings.Contains(warning, "staged=0") ||
+		!strings.Contains(warning, "unstaged=1") ||
+		!strings.Contains(warning, "untracked=0") {
+		t.Fatalf("dirty-source stderr warning = %q", warning)
+	}
+
 	for _, mode := range []struct {
 		name       string
 		jsonOutput bool
@@ -1226,6 +1268,17 @@ func decodeJSONObject(t *testing.T, body string) map[string]any {
 		t.Fatalf("decode JSON output %q: %v", body, err)
 	}
 	return result
+}
+
+func runCLITestGit(t *testing.T, root string, args ...string) string {
+	t.Helper()
+	command := exec.Command("git", append([]string{"-C", root}, args...)...)
+	command.Env = append(os.Environ(), "LC_ALL=C", "GIT_TERMINAL_PROMPT=0")
+	output, err := command.CombinedOutput()
+	if err != nil {
+		t.Fatalf("git %s: %v\n%s", strings.Join(args, " "), err, output)
+	}
+	return strings.TrimSpace(string(output))
 }
 
 func TestDelegatedInstallSkillsPlanUsesInstallRoot(t *testing.T) {
