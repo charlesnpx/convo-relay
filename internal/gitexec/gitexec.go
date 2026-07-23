@@ -1,6 +1,7 @@
 package gitexec
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -125,6 +126,33 @@ func Run(
 	if err != nil {
 		return nil, err
 	}
+	output, runErr := prepared.Command.CombinedOutput()
+	closeErr := prepared.Close()
+	if runErr != nil {
+		runErr = &CommandError{
+			Args:   append([]string(nil), args...),
+			Detail: boundedDetail(output),
+			Cause:  runErr,
+		}
+	}
+	return output, errors.Join(runErr, closeErr)
+}
+
+// RunWithInput executes one sanitized Git command with orchestration-owned
+// standard input and captures combined output.
+func RunWithInput(
+	ctx context.Context,
+	binary string,
+	cwd string,
+	extraEnvironment map[string]string,
+	input []byte,
+	args ...string,
+) ([]byte, error) {
+	prepared, err := Prepare(ctx, binary, cwd, extraEnvironment, args...)
+	if err != nil {
+		return nil, err
+	}
+	prepared.Command.Stdin = bytes.NewReader(input)
 	output, runErr := prepared.Command.CombinedOutput()
 	closeErr := prepared.Close()
 	if runErr != nil {

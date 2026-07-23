@@ -87,17 +87,12 @@ func CleanupInitializationWorktree(
 		return err
 	}
 	if registered {
-		if record.Bare || (!record.Prunable && (!record.Detached || record.Branch != "" || strings.TrimSpace(record.Head) != strings.TrimSpace(expectedHead))) {
+		if record.Bare || !record.Detached || record.Branch != "" || strings.TrimSpace(record.Head) != strings.TrimSpace(expectedHead) {
 			return contracts.NewValidationError("initialization worktree registration does not match its journal")
 		}
-		if !record.Prunable {
-			if _, err := runGit(ctx, repository.gitBinary, repository.root, "worktree", "remove", "--force", target); err != nil {
-				return err
-			}
+		if _, err := runGit(ctx, repository.gitBinary, repository.root, "worktree", "remove", "--force", target); err != nil {
+			return err
 		}
-	}
-	if _, err := runGit(ctx, repository.gitBinary, repository.root, "worktree", "prune", "--expire", "now"); err != nil {
-		return err
 	}
 	if stillRegistered, err := repositoryWorktreeRegistered(ctx, repository, target); err != nil {
 		return err

@@ -1,6 +1,7 @@
 package workspace
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"os"
@@ -8,6 +9,7 @@ import (
 	"runtime"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/charlesnpx/convo-relay/internal/contracts"
 	"github.com/charlesnpx/convo-relay/internal/store"
@@ -126,6 +128,40 @@ func TestMaterializePreservesRawExportRepositoryBudgetDiagnostic(t *testing.T) {
 	}
 }
 
+func TestMaterializeRejectsOversizedCommittedBlobWithoutBlockingBatchClose(t *testing.T) {
+	root := t.TempDir()
+	testGit(t, root, "init", "-q")
+	testGit(t, root, "config", "user.name", "Workspace Test")
+	testGit(t, root, "config", "user.email", "workspace@example.invalid")
+	writeTestFile(t, filepath.Join(root, "large.bin"), bytes.Repeat([]byte("x"), 2*1024*1024), 0o644)
+	testGit(t, root, "add", "--", "large.bin")
+	testGit(t, root, "commit", "-q", "-m", "large blob")
+	if err := os.Remove(filepath.Join(root, "large.bin")); err != nil {
+		t.Fatalf("remove tracked large blob: %v", err)
+	}
+
+	sessionDir := filepath.Join(t.TempDir(), "session")
+	snapshot := mustPreflight(t, Options{
+		LaunchCWD:         root,
+		SessionDir:        sessionDir,
+		MinimumPolicy:     PolicyEphemeral,
+		AllowDirtySource:  true,
+		InventoryMaxFiles: 1,
+		InventoryMaxBytes: 1,
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	started := time.Now()
+	_, err := Materialize(ctx, store.New(sessionDir), snapshot)
+	requireDiagnosticCode(t, err, contracts.DiagnosticCodeRepositoryInventoryMaxBytes)
+	if elapsed := time.Since(started); elapsed >= 2*time.Second {
+		t.Fatalf("oversized raw export waited for cat-file batch shutdown: %s", elapsed)
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("oversized raw export required context cancellation: %v", err)
+	}
+}
+
 func TestRepositoryInventoryAndFinalizationObserveCancellation(t *testing.T) {
 	root := newCommittedRepo(t)
 	canceledPreflight, cancelPreflight := context.WithCancel(context.Background())
@@ -221,6 +257,54 @@ func TestDirtyIsolatedLaunchRequiresExplicitCommittedHeadOverride(t *testing.T) 
 	projection[SourceUnstagedChangesKey] = int64(2)
 	if _, err := ValidateLaunchFactsProjection(projection, materialized.Artifact); err == nil {
 		t.Fatal("disagreeing dirty-source projection was accepted")
+	}
+}
+
+func TestDirtyIsolatedLaunchDoesNotHonorIndexWorktreeHints(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		flag string
+	}{
+		{name: "skip worktree", flag: "--skip-worktree"},
+		{name: "assume unchanged", flag: "--assume-unchanged"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			root := newCommittedRepo(t)
+			writeTestFile(t, filepath.Join(root, ".gitattributes"), []byte("committed.txt filter=danger\n"), 0o644)
+			testGit(t, root, "add", "--", ".gitattributes")
+			testGit(t, root, "commit", "-q", "-m", "add filter attribute")
+			filterMarker := filepath.Join(t.TempDir(), "filter-ran")
+			filterScript := filepath.Join(t.TempDir(), "filter")
+			writeExecutableTestScript(t, filterScript, filterMarker)
+			testGit(t, root, "update-index", test.flag, "--", "committed.txt")
+			testGit(t, root, "config", "filter.danger.process", filterScript)
+			testGit(t, root, "config", "filter.danger.required", "true")
+			writeTestFile(t, filepath.Join(root, "committed.txt"), []byte("hint-hidden change\n"), 0o644)
+			sessionDir := filepath.Join(t.TempDir(), "session")
+
+			_, err := Preflight(context.Background(), Options{
+				LaunchCWD:     root,
+				SessionDir:    sessionDir,
+				MinimumPolicy: PolicyEphemeral,
+			})
+			requireDiagnosticCode(t, err, DiagnosticCodeDirtySource)
+			if _, statErr := os.Stat(sessionDir); !os.IsNotExist(statErr) {
+				t.Fatalf("hint-hidden dirty rejection claimed a session: %v", statErr)
+			}
+
+			snapshot := mustPreflight(t, Options{
+				LaunchCWD:        root,
+				SessionDir:       sessionDir,
+				MinimumPolicy:    PolicyEphemeral,
+				AllowDirtySource: true,
+			})
+			if changes := snapshot.SourceChanges(); changes.Staged != 0 || changes.Unstaged != 1 || changes.Untracked != 0 {
+				t.Fatalf("hint-hidden dirty source counts = %#v", changes)
+			}
+			if _, err := os.Stat(filterMarker); !os.IsNotExist(err) {
+				t.Fatalf("hint-resistant dirtiness executed process filter: %v", err)
+			}
+		})
 	}
 }
 

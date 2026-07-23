@@ -279,6 +279,23 @@ func inspectRepositoryPass(
 	if err != nil {
 		return nil, err
 	}
+	hintOutput, err := runGit(ctx, gitBinary, root, "ls-files", "-v", "-z", "--")
+	if err != nil {
+		return nil, err
+	}
+	if hasIndexWorktreeHints(hintOutput) {
+		unhintedOutput, err := diffFilesWithUnhintedIndex(
+			ctx,
+			gitBinary,
+			root,
+			indexOutput,
+			filterOverrides,
+		)
+		if err != nil {
+			return nil, err
+		}
+		unstagedOutput = append(unstagedOutput, unhintedOutput...)
+	}
 	stagedPaths := uniqueSorted(parseNULPaths(stagedOutput))
 	unstagedPaths := uniqueSorted(parseNULPaths(unstagedOutput))
 
@@ -352,6 +369,82 @@ func verifyCommittedLaunchSubpath(ctx context.Context, repository *repositorySna
 
 func runGit(ctx context.Context, gitBinary string, cwd string, args ...string) ([]byte, error) {
 	return gitexec.Run(ctx, gitBinary, cwd, nil, args...)
+}
+
+func hasIndexWorktreeHints(data []byte) bool {
+	for _, record := range splitNUL(data) {
+		if len(record) < 3 || record[1] != ' ' {
+			continue
+		}
+		tag := record[0]
+		if tag == 'S' || (tag >= 'a' && tag <= 'z') {
+			return true
+		}
+	}
+	return false
+}
+
+func diffFilesWithUnhintedIndex(
+	ctx context.Context,
+	gitBinary string,
+	root string,
+	indexEntries []byte,
+	filterOverrides []string,
+) (output []byte, err error) {
+	tempRoot, err := os.MkdirTemp("", "convo-relay-index-")
+	if err != nil {
+		return nil, fmt.Errorf("create temporary Git index directory: %w", err)
+	}
+	defer func() {
+		err = errors.Join(err, os.RemoveAll(tempRoot))
+	}()
+	indexPath := filepath.Join(tempRoot, "index")
+	environment := map[string]string{"GIT_INDEX_FILE": indexPath}
+	if _, err := gitexec.Run(
+		ctx,
+		gitBinary,
+		root,
+		environment,
+		"read-tree",
+		"--empty",
+	); err != nil {
+		return nil, fmt.Errorf("initialize temporary Git index: %w", err)
+	}
+	if len(indexEntries) > 0 {
+		if _, err := gitexec.RunWithInput(
+			ctx,
+			gitBinary,
+			root,
+			environment,
+			indexEntries,
+			"update-index",
+			"-z",
+			"--index-info",
+		); err != nil {
+			return nil, fmt.Errorf("populate temporary Git index: %w", err)
+		}
+	}
+	refreshArgs := append(append([]string{}, filterOverrides...), "update-index", "--refresh")
+	if _, err := gitexec.Run(ctx, gitBinary, root, environment, refreshArgs...); err != nil && !gitCommandExitedWith(err, 1) {
+		return nil, fmt.Errorf("refresh temporary Git index: %w", err)
+	}
+	args := append(append([]string{}, filterOverrides...),
+		"diff-files", "--name-only", "-z", "--no-ext-diff", "--no-textconv", "--ignore-submodules=none", "--",
+	)
+	output, err = gitexec.Run(ctx, gitBinary, root, environment, args...)
+	if err != nil {
+		return nil, fmt.Errorf("inspect worktree with temporary Git index: %w", err)
+	}
+	return output, nil
+}
+
+func gitCommandExitedWith(err error, code int) bool {
+	var commandError *gitexec.CommandError
+	if !errors.As(err, &commandError) {
+		return false
+	}
+	var exitError *exec.ExitError
+	return errors.As(commandError.Cause, &exitError) && exitError.ExitCode() == code
 }
 
 func repositoryInventoryIdentity(ctx context.Context, gitBinary string, root string) (string, error) {

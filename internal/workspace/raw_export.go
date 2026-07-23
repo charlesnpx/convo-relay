@@ -668,19 +668,27 @@ func (b *catFileBatch) Close() error {
 	}
 	b.closed = true
 	var failures []error
-	if b.pending {
+	aborted := b.pending
+	if aborted {
 		failures = append(failures, errors.New("cat-file batch closed with an unread object"))
+		if b.prepared != nil && b.prepared.Command.Process != nil {
+			if err := b.prepared.Command.Process.Kill(); err != nil && !errors.Is(err, os.ErrProcessDone) {
+				failures = append(failures, fmt.Errorf("abort cat-file batch: %w", err))
+			}
+		}
 	}
 	if b.stdin != nil {
 		failures = append(failures, b.stdin.Close())
 	}
 	if b.prepared != nil && b.prepared.Command.Process != nil {
 		if err := b.prepared.Command.Wait(); err != nil {
-			detail := strings.TrimSpace(b.stderr.String())
-			if detail != "" {
-				err = fmt.Errorf("git cat-file --batch: %s: %w", detail, err)
+			if !aborted {
+				detail := strings.TrimSpace(b.stderr.String())
+				if detail != "" {
+					err = fmt.Errorf("git cat-file --batch: %s: %w", detail, err)
+				}
+				failures = append(failures, err)
 			}
-			failures = append(failures, err)
 		}
 		failures = append(failures, b.prepared.Close())
 	}

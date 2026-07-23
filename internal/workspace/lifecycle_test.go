@@ -290,6 +290,35 @@ func TestCleanupPrunesMissingManagedWorktreeRegistration(t *testing.T) {
 	}
 }
 
+func TestCleanupInitializationWorktreePreservesUnrelatedPrunableRegistration(t *testing.T) {
+	root := newCommittedRepo(t)
+	head := testGit(t, root, "rev-parse", "HEAD")
+	target := filepath.Join(t.TempDir(), "target")
+	unrelated := filepath.Join(t.TempDir(), "unrelated")
+	testGit(t, root, "worktree", "add", "--detach", target, head)
+	testGit(t, root, "worktree", "add", "--detach", unrelated, head)
+	if err := os.RemoveAll(target); err != nil {
+		t.Fatalf("remove target worktree path: %v", err)
+	}
+	if err := os.RemoveAll(unrelated); err != nil {
+		t.Fatalf("remove unrelated worktree path: %v", err)
+	}
+	repository, err := inspectRepository(context.Background(), "git", root)
+	if err != nil {
+		t.Fatalf("inspect cleanup repository: %v", err)
+	}
+	if err := CleanupInitializationWorktree(context.Background(), root, target, head); err != nil {
+		t.Fatalf("cleanup exact initialization worktree: %v", err)
+	}
+	if registered, err := repositoryWorktreeRegistered(context.Background(), repository, target); err != nil || registered {
+		t.Fatalf("target registration survived exact cleanup: registered=%v err=%v", registered, err)
+	}
+	record, registered, err := repositoryWorktreeRegistration(context.Background(), repository, unrelated)
+	if err != nil || !registered || !record.Prunable {
+		t.Fatalf("unrelated prunable registration changed: record=%#v registered=%v err=%v", record, registered, err)
+	}
+}
+
 func TestCleanupRejectsDirtyReplacementWorktree(t *testing.T) {
 	root := newCommittedRepo(t)
 	writeTestFile(t, filepath.Join(root, "second.txt"), []byte("second commit\n"), 0o644)
