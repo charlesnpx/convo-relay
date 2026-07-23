@@ -298,6 +298,9 @@ func workspaceArtifact(snapshot *Snapshot, sessionDir string, worktreePath strin
 		"source":       cloneMap(snapshot.sourceReport),
 		"exclusions":   cloneMap(snapshot.exclusions),
 	}
+	provenance := provenanceForAchievedPolicy(achievedPolicy)
+	fields[WorkspaceContentSourceKey] = provenance.WorkspaceContentSource
+	fields[WorkingTreeChangesIncludedKey] = provenance.WorkingTreeChangesIncluded
 	if snapshot.repository != nil {
 		fields["source_before_digest"] = snapshot.repository.sourceDigest
 	}

@@ -221,7 +221,7 @@ func validateRootResumeOverrides(opts ResumeOptions) error {
 func rootResumeRuntimeConfigProvided(config recipes.RuntimeConfig) bool {
 	return len(config.BackendProfiles) > 0 ||
 		len(config.RelayRecipes) > 0 ||
-		config.Limits.IntegrationBundleMaxBytes != 0 ||
+		recipes.RuntimeLimitsProvided(config.Limits) ||
 		strings.TrimSpace(config.SettingsPath) != ""
 }
 

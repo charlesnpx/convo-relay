@@ -420,6 +420,20 @@ func rootWorkspaceSummary(meta map[string]any, ref inspectedRootRef) map[string]
 		"source_after_digest":  meta["source_after_digest"],
 	}
 	if ref.payload != nil {
+		provenance, provenanceErr := workspace.ValidateProvenanceProjection(meta, ref.payload)
+		projection := provenance.Projection()
+		for key, value := range projection {
+			summary[key] = value
+		}
+		summary["provenance_projection_valid"] = provenanceErr == nil
+		if provenanceErr != nil {
+			summary["provenance_projection_error"] = provenanceErr.Error()
+			ref.status["ok"] = false
+			ref.status["status"] = "invalid"
+			ref.status["root_contract_valid"] = false
+			ref.status["error_type"] = errorType(provenanceErr)
+			ref.status["error"] = provenanceErr.Error()
+		}
 		if policy, ok := ref.payload["policy"].(map[string]any); ok {
 			summary["configured_policy"] = valueOr(summary["configured_policy"], policy["requested"])
 			summary["effective_policy"] = valueOr(summary["effective_policy"], policy["effective"])
