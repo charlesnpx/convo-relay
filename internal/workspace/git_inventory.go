@@ -272,29 +272,19 @@ func inspectRepositoryPass(
 	if err != nil {
 		return nil, err
 	}
-	unstagedArgs := append(append([]string{}, filterOverrides...),
-		"diff-files", "--name-only", "-z", "--no-ext-diff", "--no-textconv", "--ignore-submodules=none", "--",
+	// Always compare through a freshly constructed index. Its entries have no
+	// reusable filesystem stat cache, so repository-local trustctime/checkStat
+	// settings and skip-worktree/assume-unchanged hints cannot hide changed
+	// bytes from the dirty-source decision.
+	unstagedOutput, err := diffFilesWithUnhintedIndex(
+		ctx,
+		gitBinary,
+		root,
+		indexOutput,
+		filterOverrides,
 	)
-	unstagedOutput, err := runGit(ctx, gitBinary, root, unstagedArgs...)
 	if err != nil {
 		return nil, err
-	}
-	hintOutput, err := runGit(ctx, gitBinary, root, "ls-files", "-v", "-z", "--")
-	if err != nil {
-		return nil, err
-	}
-	if hasIndexWorktreeHints(hintOutput) {
-		unhintedOutput, err := diffFilesWithUnhintedIndex(
-			ctx,
-			gitBinary,
-			root,
-			indexOutput,
-			filterOverrides,
-		)
-		if err != nil {
-			return nil, err
-		}
-		unstagedOutput = append(unstagedOutput, unhintedOutput...)
 	}
 	stagedPaths := uniqueSorted(parseNULPaths(stagedOutput))
 	unstagedPaths := uniqueSorted(parseNULPaths(unstagedOutput))
@@ -371,19 +361,6 @@ func runGit(ctx context.Context, gitBinary string, cwd string, args ...string) (
 	return gitexec.Run(ctx, gitBinary, cwd, nil, args...)
 }
 
-func hasIndexWorktreeHints(data []byte) bool {
-	for _, record := range splitNUL(data) {
-		if len(record) < 3 || record[1] != ' ' {
-			continue
-		}
-		tag := record[0]
-		if tag == 'S' || (tag >= 'a' && tag <= 'z') {
-			return true
-		}
-	}
-	return false
-}
-
 func diffFilesWithUnhintedIndex(
 	ctx context.Context,
 	gitBinary string,
@@ -424,11 +401,16 @@ func diffFilesWithUnhintedIndex(
 			return nil, fmt.Errorf("populate temporary Git index: %w", err)
 		}
 	}
-	refreshArgs := append(append([]string{}, filterOverrides...), "update-index", "--refresh")
+	statOverrides := []string{
+		"-c", "core.trustctime=true",
+		"-c", "core.checkStat=default",
+		"-c", "core.ignoreStat=false",
+	}
+	refreshArgs := append(append(append([]string{}, filterOverrides...), statOverrides...), "update-index", "--really-refresh")
 	if _, err := gitexec.Run(ctx, gitBinary, root, environment, refreshArgs...); err != nil && !gitCommandExitedWith(err, 1) {
 		return nil, fmt.Errorf("refresh temporary Git index: %w", err)
 	}
-	args := append(append([]string{}, filterOverrides...),
+	args := append(append(append([]string{}, filterOverrides...), statOverrides...),
 		"diff-files", "--name-only", "-z", "--no-ext-diff", "--no-textconv", "--ignore-submodules=none", "--",
 	)
 	output, err = gitexec.Run(ctx, gitBinary, root, environment, args...)

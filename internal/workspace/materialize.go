@@ -379,10 +379,28 @@ func repositoryWorktreeRegistered(ctx context.Context, repository *repositorySna
 }
 
 func repositoryWorktreeRegistration(ctx context.Context, repository *repositorySnapshot, path string) (worktreeRegistration, bool, error) {
+	return repositoryWorktreeRegistrationMatching(ctx, repository, path, false)
+}
+
+func repositoryWorktreeRegisteredExact(ctx context.Context, repository *repositorySnapshot, path string) (bool, error) {
+	_, found, err := repositoryWorktreeRegistrationExact(ctx, repository, path)
+	return found, err
+}
+
+func repositoryWorktreeRegistrationExact(ctx context.Context, repository *repositorySnapshot, path string) (worktreeRegistration, bool, error) {
+	return repositoryWorktreeRegistrationMatching(ctx, repository, path, true)
+}
+
+func repositoryWorktreeRegistrationMatching(
+	ctx context.Context,
+	repository *repositorySnapshot,
+	path string,
+	exact bool,
+) (worktreeRegistration, bool, error) {
 	if repository == nil {
 		return worktreeRegistration{}, false, errors.New("repository snapshot is required")
 	}
-	target, err := canonicalPathAllowMissing(path)
+	target, err := lexicalAbsolutePath(path)
 	if err != nil {
 		return worktreeRegistration{}, false, err
 	}
@@ -395,11 +413,21 @@ func repositoryWorktreeRegistration(ctx context.Context, repository *repositoryS
 		return worktreeRegistration{}, false, err
 	}
 	for _, record := range records {
-		candidate, err := canonicalPathAllowMissing(record.Path)
+		candidate, err := lexicalAbsolutePath(record.Path)
 		if err != nil {
 			return worktreeRegistration{}, false, err
 		}
-		if pathsEquivalent(candidate, target) {
+		matches := candidate == target
+		if !exact && !matches {
+			candidateInfo, candidateErr := os.Lstat(candidate)
+			targetInfo, targetErr := os.Lstat(target)
+			matches = candidateErr == nil &&
+				targetErr == nil &&
+				candidateInfo.Mode()&os.ModeSymlink == 0 &&
+				targetInfo.Mode()&os.ModeSymlink == 0 &&
+				os.SameFile(candidateInfo, targetInfo)
+		}
+		if matches {
 			record.Path = candidate
 			return record, true, nil
 		}

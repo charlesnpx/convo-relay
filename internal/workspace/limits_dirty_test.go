@@ -308,6 +308,47 @@ func TestDirtyIsolatedLaunchDoesNotHonorIndexWorktreeHints(t *testing.T) {
 	}
 }
 
+func TestDirtyIsolatedLaunchDoesNotTrustRepositoryStatCache(t *testing.T) {
+	root := newCommittedRepo(t)
+	path := filepath.Join(root, "committed.txt")
+	testGit(t, root, "update-index", "--refresh")
+	before, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat committed file: %v", err)
+	}
+	testGit(t, root, "config", "core.trustctime", "false")
+	testGit(t, root, "config", "core.checkStat", "minimal")
+	writeTestFile(t, path, []byte("tampered!\n"), 0o644)
+	if err := os.Chtimes(path, before.ModTime(), before.ModTime()); err != nil {
+		t.Fatalf("restore committed file mtime: %v", err)
+	}
+	after, err := os.Stat(path)
+	if err != nil || after.Size() != before.Size() || !after.ModTime().Equal(before.ModTime()) {
+		t.Fatalf("adversarial stat-cache fixture changed metadata: before=%v after=%v err=%v", before, after, err)
+	}
+	sessionDir := filepath.Join(t.TempDir(), "session")
+
+	_, err = Preflight(context.Background(), Options{
+		LaunchCWD:     root,
+		SessionDir:    sessionDir,
+		MinimumPolicy: PolicyEphemeral,
+	})
+	requireDiagnosticCode(t, err, DiagnosticCodeDirtySource)
+	if _, statErr := os.Stat(sessionDir); !os.IsNotExist(statErr) {
+		t.Fatalf("stat-cache-hidden dirty rejection claimed a session: %v", statErr)
+	}
+
+	snapshot := mustPreflight(t, Options{
+		LaunchCWD:        root,
+		SessionDir:       sessionDir,
+		MinimumPolicy:    PolicyEphemeral,
+		AllowDirtySource: true,
+	})
+	if changes := snapshot.SourceChanges(); changes.Staged != 0 || changes.Unstaged != 1 || changes.Untracked != 0 {
+		t.Fatalf("stat-cache-resistant dirty source counts = %#v", changes)
+	}
+}
+
 func TestDirtySourceOverrideRejectsInheritedAndNonGitExecution(t *testing.T) {
 	root := newCommittedRepo(t)
 	_, err := Preflight(context.Background(), Options{

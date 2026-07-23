@@ -188,6 +188,9 @@ func TestCleanCompletesStaleInitializingTransactionAndRejectsForeignEntries(t *t
 		if _, err := workspace.Materialize(context.Background(), transaction.st, preflight.workspace); err != nil {
 			t.Fatalf("materialize interrupted worktree: %v", err)
 		}
+		if err := transaction.advance("workspace_materialized"); err != nil {
+			t.Fatalf("record materialized ownership: %v", err)
+		}
 
 		report, err := CleanSession(sessionDir)
 		if err != nil || report["status"] != "deleted" {
@@ -215,6 +218,9 @@ func TestCleanCompletesStaleInitializingTransactionAndRejectsForeignEntries(t *t
 		if _, err := workspace.Materialize(context.Background(), transaction.st, preflight.workspace); err != nil {
 			t.Fatalf("materialize interrupted worktree: %v", err)
 		}
+		if err := transaction.advance("workspace_materialized"); err != nil {
+			t.Fatalf("record materialized ownership: %v", err)
+		}
 		foreignPath := filepath.Join(sessionDir, "foreign.txt")
 		if err := os.WriteFile(foreignPath, []byte("foreign"), 0o644); err != nil {
 			t.Fatalf("write foreign entry: %v", err)
@@ -232,6 +238,135 @@ func TestCleanCompletesStaleInitializingTransactionAndRejectsForeignEntries(t *t
 			t.Fatalf("cleanup after removing foreign entry: %v", err)
 		}
 	})
+}
+
+func TestCleanRejectsNestedForeignInitializationEntriesBeforeWorktreeRemoval(t *testing.T) {
+	tests := []struct {
+		name         string
+		relativePath string
+	}{
+		{name: "inside execution directory", relativePath: filepath.Join("execution", "foreign.db")},
+		{name: "inside registered worktree", relativePath: filepath.Join("execution", "worktree", "foreign.db")},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			launchRoot := newRootInitializationRepository(t)
+			sessionDir := filepath.Join(t.TempDir(), "session")
+			if err := os.MkdirAll(sessionDir, 0o755); err != nil {
+				t.Fatalf("create explicit empty session root: %v", err)
+			}
+			preflight, err := preflightRecipe(context.Background(), rootInitializationOptions(launchRoot, sessionDir))
+			if err != nil {
+				t.Fatalf("preflight: %v", err)
+			}
+			transaction, err := beginRootInitialization(preflight)
+			if err != nil {
+				t.Fatalf("begin initialization: %v", err)
+			}
+			if _, err := workspace.Materialize(context.Background(), transaction.st, preflight.workspace); err != nil {
+				t.Fatalf("materialize interrupted worktree: %v", err)
+			}
+			if err := transaction.advance("workspace_materialized"); err != nil {
+				t.Fatalf("record materialized ownership: %v", err)
+			}
+			foreignPath := filepath.Join(sessionDir, test.relativePath)
+			if err := os.WriteFile(foreignPath, []byte("foreign"), 0o644); err != nil {
+				t.Fatalf("write nested foreign entry: %v", err)
+			}
+
+			if report, err := CleanSession(sessionDir); err == nil || report != nil || !strings.Contains(err.Error(), "foreign") {
+				t.Fatalf("nested-foreign clean = %#v, %v", report, err)
+			}
+			if _, err := os.Stat(foreignPath); err != nil {
+				t.Fatalf("nested foreign entry was removed: %v", err)
+			}
+			worktreePath := filepath.Join(sessionDir, "execution", "worktree")
+			if info, err := os.Stat(worktreePath); err != nil || !info.IsDir() {
+				t.Fatalf("foreign-entry rejection removed worktree: %v", err)
+			}
+			if output := rootInitializationGit(t, launchRoot, "worktree", "list", "--porcelain"); !strings.Contains(output, worktreePath) {
+				t.Fatalf("foreign-entry rejection removed worktree registration:\n%s", output)
+			}
+
+			if err := os.Remove(foreignPath); err != nil {
+				t.Fatalf("remove nested foreign entry: %v", err)
+			}
+			if err := transaction.compensate(); err != nil {
+				t.Fatalf("cleanup after removing nested foreign entry: %v", err)
+			}
+		})
+	}
+}
+
+func TestRootInitializationDestinationClaimIsExclusive(t *testing.T) {
+	for _, preExisting := range []bool{false, true} {
+		name := "new destination"
+		if preExisting {
+			name = "pre-existing empty destination"
+		}
+		t.Run(name, func(t *testing.T) {
+			launchRoot := newRootInitializationRepository(t)
+			sessionDir := filepath.Join(t.TempDir(), "session")
+			if preExisting {
+				if err := os.MkdirAll(sessionDir, 0o755); err != nil {
+					t.Fatalf("create explicit empty session root: %v", err)
+				}
+			}
+			first, err := preflightRecipe(context.Background(), rootInitializationOptions(launchRoot, sessionDir))
+			if err != nil {
+				t.Fatalf("first preflight: %v", err)
+			}
+			second, err := preflightRecipe(context.Background(), rootInitializationOptions(launchRoot, sessionDir))
+			if err != nil {
+				t.Fatalf("second preflight: %v", err)
+			}
+			type result struct {
+				transaction *rootInitializationTransaction
+				err         error
+			}
+			start := make(chan struct{})
+			results := make(chan result, 2)
+			for _, candidate := range []*recipePreflight{first, second} {
+				candidate := candidate
+				go func() {
+					<-start
+					transaction, err := beginRootInitialization(candidate)
+					results <- result{transaction: transaction, err: err}
+				}()
+			}
+			close(start)
+			observed := []result{<-results, <-results}
+			var winner *rootInitializationTransaction
+			failures := 0
+			for _, item := range observed {
+				if item.err != nil {
+					failures++
+					continue
+				}
+				if winner != nil {
+					t.Fatal("two initializers acquired the same session destination")
+				}
+				winner = item.transaction
+			}
+			if winner == nil || failures != 1 {
+				t.Fatalf("exclusive initialization results = %#v", observed)
+			}
+			if err := validateRootInitializationClaim(winner.sessionRoot, winner.token); err != nil {
+				t.Fatalf("winner claim is not durable: %v", err)
+			}
+			if err := winner.compensate(); err != nil {
+				t.Fatalf("compensate winning initialization: %v", err)
+			}
+			if preExisting {
+				entries, err := os.ReadDir(sessionDir)
+				if err != nil || len(entries) != 0 {
+					t.Fatalf("pre-existing destination cleanup = %#v, %v", entries, err)
+				}
+			} else if _, err := os.Lstat(sessionDir); !os.IsNotExist(err) {
+				t.Fatalf("new destination remained after compensation: %v", err)
+			}
+		})
+	}
 }
 
 func TestCleanRejectsTamperedInitializationJournalIdentities(t *testing.T) {
@@ -290,6 +425,9 @@ func TestCleanRejectsTamperedInitializationJournalIdentities(t *testing.T) {
 			}
 			if _, err := workspace.Materialize(context.Background(), transaction.st, preflight.workspace); err != nil {
 				t.Fatalf("materialize interrupted worktree: %v", err)
+			}
+			if err := transaction.advance("workspace_materialized"); err != nil {
+				t.Fatalf("record materialized ownership: %v", err)
 			}
 
 			outsidePath := filepath.Join(t.TempDir(), "outside-target")

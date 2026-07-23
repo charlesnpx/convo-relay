@@ -64,7 +64,8 @@ type CleanupResult struct {
 
 // CleanupInitializationWorktree removes only the exact detached registration
 // captured by an initialization journal. A mismatched live registration is
-// never removed.
+// never removed, and an unregistered filesystem entry is left for the
+// transaction-owned session cleanup that has independent ownership evidence.
 func CleanupInitializationWorktree(
 	ctx context.Context,
 	sourceGitRoot string,
@@ -74,15 +75,25 @@ func CleanupInitializationWorktree(
 	if strings.TrimSpace(sourceGitRoot) == "" || strings.TrimSpace(worktreePath) == "" {
 		return nil
 	}
-	repository, err := repositoryForCleanup(ctx, sourceGitRoot)
+	sourceRoot, err := lexicalAbsolutePath(sourceGitRoot)
 	if err != nil {
 		return err
 	}
-	target, err := canonicalPathAllowMissing(worktreePath)
+	target, err := lexicalAbsolutePath(worktreePath)
 	if err != nil {
 		return err
 	}
-	record, registered, err := repositoryWorktreeRegistration(ctx, repository, target)
+	if err := rejectSymlinkPathComponents(sourceRoot); err != nil {
+		return contracts.NewValidationError("initialization source repository path is unsafe: %v", err)
+	}
+	if err := rejectSymlinkPathComponents(target); err != nil {
+		return contracts.NewValidationError("initialization worktree path is unsafe: %v", err)
+	}
+	repository, err := repositoryForCleanup(ctx, sourceRoot)
+	if err != nil {
+		return err
+	}
+	record, registered, err := repositoryWorktreeRegistrationExact(ctx, repository, target)
 	if err != nil {
 		return err
 	}
@@ -90,23 +101,24 @@ func CleanupInitializationWorktree(
 		if record.Bare || !record.Detached || record.Branch != "" || strings.TrimSpace(record.Head) != strings.TrimSpace(expectedHead) {
 			return contracts.NewValidationError("initialization worktree registration does not match its journal")
 		}
+		if err := rejectSymlinkPathComponents(target); err != nil {
+			return contracts.NewValidationError("initialization worktree path changed before Git cleanup: %v", err)
+		}
 		if _, err := runGit(ctx, repository.gitBinary, repository.root, "worktree", "remove", "--force", target); err != nil {
 			return err
 		}
 	}
-	if stillRegistered, err := repositoryWorktreeRegistered(ctx, repository, target); err != nil {
+	if stillRegistered, err := repositoryWorktreeRegisteredExact(ctx, repository, target); err != nil {
 		return err
 	} else if stillRegistered {
 		return contracts.NewValidationError("initialization worktree registration remained after cleanup")
 	}
-	if info, err := os.Lstat(target); err == nil {
-		if info.Mode()&os.ModeSymlink != 0 {
-			return contracts.NewValidationError("initialization worktree path became a symlink")
-		}
-		if err := os.RemoveAll(target); err != nil {
-			return err
-		}
-	} else if !os.IsNotExist(err) {
+	if err := rejectSymlinkPathComponents(target); err != nil {
+		return contracts.NewValidationError("initialization worktree path changed after Git cleanup: %v", err)
+	}
+	if _, err := os.Lstat(target); err == nil && registered {
+		return contracts.NewValidationError("initialization worktree path remained after its Git registration was removed")
+	} else if err != nil && !os.IsNotExist(err) {
 		return err
 	}
 	return nil

@@ -484,6 +484,54 @@ func canonicalPathAllowMissing(value string) (string, error) {
 	return filepath.Clean(resolved), nil
 }
 
+func lexicalAbsolutePath(value string) (string, error) {
+	if strings.TrimSpace(value) == "" {
+		return "", fmt.Errorf("path is required")
+	}
+	absolute, err := filepath.Abs(value)
+	if err != nil {
+		return "", err
+	}
+	return filepath.Clean(absolute), nil
+}
+
+// rejectSymlinkPathComponents validates a lexical absolute path without
+// resolving it. Missing suffixes are allowed, but every existing component
+// must be a real directory except for an existing leaf.
+func rejectSymlinkPathComponents(value string) error {
+	target, err := lexicalAbsolutePath(value)
+	if err != nil {
+		return err
+	}
+	root := filepath.VolumeName(target) + string(filepath.Separator)
+	if filepath.VolumeName(target) == "" {
+		root = string(filepath.Separator)
+	}
+	relative := strings.TrimPrefix(target, root)
+	current := filepath.Clean(root)
+	components := strings.Split(relative, string(filepath.Separator))
+	for index, component := range components {
+		if component == "" || component == "." {
+			continue
+		}
+		current = filepath.Join(current, component)
+		info, err := os.Lstat(current)
+		if os.IsNotExist(err) {
+			return nil
+		}
+		if err != nil {
+			return fmt.Errorf("inspect path component %s: %w", current, err)
+		}
+		if info.Mode()&os.ModeSymlink != 0 {
+			return fmt.Errorf("path component %s is a symlink", current)
+		}
+		if index < len(components)-1 && !info.IsDir() {
+			return fmt.Errorf("path ancestor %s is not a directory", current)
+		}
+	}
+	return nil
+}
+
 func pathsOverlap(left string, right string) bool {
 	return pathContains(left, right) || pathContains(right, left)
 }

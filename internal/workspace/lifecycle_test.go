@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -297,6 +298,14 @@ func TestCleanupInitializationWorktreePreservesUnrelatedPrunableRegistration(t *
 	unrelated := filepath.Join(t.TempDir(), "unrelated")
 	testGit(t, root, "worktree", "add", "--detach", target, head)
 	testGit(t, root, "worktree", "add", "--detach", unrelated, head)
+	target, err := canonicalExistingDirectory(target)
+	if err != nil {
+		t.Fatalf("canonicalize target worktree: %v", err)
+	}
+	unrelated, err = canonicalExistingDirectory(unrelated)
+	if err != nil {
+		t.Fatalf("canonicalize unrelated worktree: %v", err)
+	}
 	if err := os.RemoveAll(target); err != nil {
 		t.Fatalf("remove target worktree path: %v", err)
 	}
@@ -316,6 +325,91 @@ func TestCleanupInitializationWorktreePreservesUnrelatedPrunableRegistration(t *
 	record, registered, err := repositoryWorktreeRegistration(context.Background(), repository, unrelated)
 	if err != nil || !registered || !record.Prunable {
 		t.Fatalf("unrelated prunable registration changed: record=%#v registered=%v err=%v", record, registered, err)
+	}
+}
+
+func TestCleanupInitializationWorktreeRejectsReplacementSymlinksWithoutFollowingThem(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("symlink creation requires additional Windows privileges")
+	}
+	root := newCommittedRepo(t)
+	head := testGit(t, root, "rev-parse", "HEAD")
+
+	t.Run("leaf symlink to registered worktree", func(t *testing.T) {
+		outside := filepath.Join(t.TempDir(), "outside-worktree")
+		testGit(t, root, "worktree", "add", "--detach", outside, head)
+		outside, err := canonicalExistingDirectory(outside)
+		if err != nil {
+			t.Fatalf("canonicalize outside worktree: %v", err)
+		}
+		t.Cleanup(func() {
+			testGit(t, root, "worktree", "remove", "--force", outside)
+		})
+		sentinel := filepath.Join(outside, "sentinel.txt")
+		writeTestFile(t, sentinel, []byte("preserve outside worktree\n"), 0o644)
+
+		target := filepath.Join(t.TempDir(), "session", "execution", "worktree")
+		if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+			t.Fatalf("create target parent: %v", err)
+		}
+		if err := os.Symlink(outside, target); err != nil {
+			t.Fatalf("substitute leaf symlink: %v", err)
+		}
+
+		if err := CleanupInitializationWorktree(context.Background(), root, target, head); err == nil || !strings.Contains(err.Error(), "symlink") {
+			t.Fatalf("leaf-symlink cleanup error = %v", err)
+		}
+		if _, err := os.Stat(sentinel); err != nil {
+			t.Fatalf("leaf-symlink cleanup deleted outside sentinel: %v", err)
+		}
+		repository, err := inspectRepository(context.Background(), "git", root)
+		if err != nil {
+			t.Fatalf("inspect source repository: %v", err)
+		}
+		if registered, err := repositoryWorktreeRegistered(context.Background(), repository, outside); err != nil || !registered {
+			t.Fatalf("outside registration changed: registered=%v err=%v", registered, err)
+		}
+	})
+
+	t.Run("ancestor symlink", func(t *testing.T) {
+		outside := filepath.Join(t.TempDir(), "outside-execution")
+		sentinel := filepath.Join(outside, "worktree", "sentinel.txt")
+		writeTestFile(t, sentinel, []byte("preserve outside directory\n"), 0o644)
+
+		session := filepath.Join(t.TempDir(), "session")
+		if err := os.MkdirAll(session, 0o755); err != nil {
+			t.Fatalf("create session root: %v", err)
+		}
+		if err := os.Symlink(outside, filepath.Join(session, "execution")); err != nil {
+			t.Fatalf("substitute ancestor symlink: %v", err)
+		}
+		target := filepath.Join(session, "execution", "worktree")
+
+		if err := CleanupInitializationWorktree(context.Background(), root, target, head); err == nil || !strings.Contains(err.Error(), "symlink") {
+			t.Fatalf("ancestor-symlink cleanup error = %v", err)
+		}
+		if _, err := os.Stat(sentinel); err != nil {
+			t.Fatalf("ancestor-symlink cleanup deleted outside sentinel: %v", err)
+		}
+	})
+}
+
+func TestCleanupInitializationWorktreeLeavesUnregisteredDirectoryForTransactionOwner(t *testing.T) {
+	root := newCommittedRepo(t)
+	head := testGit(t, root, "rev-parse", "HEAD")
+	target := filepath.Join(root, "..", "unregistered-worktree")
+	target, err := filepath.Abs(target)
+	if err != nil {
+		t.Fatalf("resolve unregistered worktree path: %v", err)
+	}
+	sentinel := filepath.Join(target, "sentinel.txt")
+	writeTestFile(t, sentinel, []byte("requires transaction ownership\n"), 0o644)
+
+	if err := CleanupInitializationWorktree(context.Background(), root, target, head); err != nil {
+		t.Fatalf("inspect unregistered initialization worktree: %v", err)
+	}
+	if _, err := os.Stat(sentinel); err != nil {
+		t.Fatalf("registration-only cleanup removed unowned directory: %v", err)
 	}
 }
 
