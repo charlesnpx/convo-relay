@@ -72,6 +72,10 @@ func TestMaterializeRequiredPoliciesCreateVerifiedDetachedWorktreeAndArtifact(t 
 			if policyRecord["minimum"] != policy || policyRecord["effective"] != policy || policyRecord["achieved"] != PolicyEphemeral {
 				t.Fatalf("artifact policy = %#v", policyRecord)
 			}
+			if materialized.Artifact[WorkspaceContentSourceKey] != WorkspaceContentSourceCommittedHead ||
+				materialized.Artifact[WorkingTreeChangesIncludedKey] != false {
+				t.Fatalf("isolated workspace provenance = %#v", materialized.Artifact)
+			}
 			registration := requireObjectField(t, materialized.Artifact, "registration")
 			if registration["mode"] != "detached_worktree" || registration["registered"] != true || registration["detached"] != true || registration["writable"] != true {
 				t.Fatalf("artifact registration = %#v", registration)
@@ -161,6 +165,10 @@ func TestMaterializeInheritedPersistsOrdinaryWorkspaceWithoutWorktree(t *testing
 	policy := requireObjectField(t, materialized.Artifact, "policy")
 	if policy["effective"] != PolicyInherited || policy["achieved"] != PolicyInherited {
 		t.Fatalf("inherited artifact policy = %#v", policy)
+	}
+	if materialized.Artifact[WorkspaceContentSourceKey] != WorkspaceContentSourceWorkingTree ||
+		materialized.Artifact[WorkingTreeChangesIncludedKey] != true {
+		t.Fatalf("inherited workspace provenance = %#v", materialized.Artifact)
 	}
 	registration := requireObjectField(t, materialized.Artifact, "registration")
 	if registration["mode"] != PolicyInherited || registration["registered"] != false || registration["writable"] != false {

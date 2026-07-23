@@ -10,6 +10,7 @@ import (
 
 	"github.com/charlesnpx/convo-relay/internal/contracts"
 	"github.com/charlesnpx/convo-relay/internal/integration"
+	"github.com/charlesnpx/convo-relay/internal/recipes"
 	"github.com/charlesnpx/convo-relay/internal/store"
 )
 
@@ -468,6 +469,7 @@ func TestRootRecoveryDirectAPIRejectsStructuralOverrides(t *testing.T) {
 		"slot_settings":       {SlotConfigs: []SlotConfig{{SettingsPath: "changed.toml"}}},
 		"composition_path":    {SlotConfigs: []SlotConfig{{CompositionPath: "changed"}}},
 		"runtime_config":      {SlotConfigs: []SlotConfig{{RuntimeConfig: rootRecipeRuntimeConfig("")}}},
+		"runtime_limit_only":  {SlotConfigs: []SlotConfig{{RuntimeConfig: recipes.RuntimeConfig{Limits: recipes.RuntimeLimits{NamedInputMaxBytes: 1}}}}},
 		"slot_depth":          {SlotConfigs: []SlotConfig{{Depth: 2}}},
 		"slot_max_depth":      {SlotConfigs: []SlotConfig{{MaxDepth: 3}}},
 		"settings":            {SettingsPath: "changed.toml"},
@@ -499,6 +501,43 @@ func TestRootRecoveryDirectAPIRejectsStructuralOverrides(t *testing.T) {
 	cliDefaults.ExplicitFields["max-rounds"] = true
 	if err := validateRootResumeOverrides(cliDefaults); err == nil {
 		t.Fatal("explicit CLI max-rounds override was accepted")
+	}
+}
+
+func TestRootRecoveryDirectAPIRecognizesLimitOnlyRuntimeOverrideBeforeMutation(t *testing.T) {
+	sessionDir := t.TempDir()
+	st := store.New(sessionDir)
+	if err := st.SaveMetaMap(map[string]any{
+		"execution_kind": "recipe",
+		"status":         "failed",
+	}); err != nil {
+		t.Fatalf("save root recovery metadata: %v", err)
+	}
+	metaPath := filepath.Join(sessionDir, "meta.json")
+	before, err := os.ReadFile(metaPath)
+	if err != nil {
+		t.Fatalf("read root recovery metadata: %v", err)
+	}
+
+	result, err := Resume(context.Background(), sessionDir, ResumeOptions{
+		SlotConfigs: []SlotConfig{{
+			RuntimeConfig: recipes.RuntimeConfig{
+				Limits: recipes.RuntimeLimits{RepositoryInventoryMaxBytes: 1},
+			},
+		}},
+	})
+	var diagnosticErr *contracts.DiagnosticError
+	if err == nil || result != nil || !strings.Contains(err.Error(), "structural resume overrides") ||
+		!errors.As(err, &diagnosticErr) || len(diagnosticErr.Diagnostics) != 1 {
+		t.Fatalf("limit-only recovery override = result %#v error %v", result, err)
+	}
+	overrides, _ := diagnosticErr.Diagnostics[0].Details["overrides"].([]any)
+	if len(overrides) != 1 || overrides[0] != "--runtime-config-a" {
+		t.Fatalf("limit-only recovery override details = %#v", diagnosticErr.Diagnostics[0].Details)
+	}
+	after, readErr := os.ReadFile(metaPath)
+	if readErr != nil || string(after) != string(before) {
+		t.Fatalf("limit-only recovery override mutated metadata: read=%v equal=%v", readErr, string(after) == string(before))
 	}
 }
 

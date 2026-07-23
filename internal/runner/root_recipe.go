@@ -55,6 +55,8 @@ type RecipeOptions struct {
 	InputBindings         []string
 	WorkspaceIsolation    string
 	WorkspaceExplicit     bool
+	AllowDirtySource      bool
+	WarningCallback       RecipeWarningCallback
 	SettingsPath          string
 	LaunchCWD             string
 	TimeoutSeconds        int
@@ -119,6 +121,7 @@ type persistedRecipeRun struct {
 	launchSkillRefs       []any
 	inputManifestRef      map[string]any
 	providerInputs        map[string]any
+	workspaceArtifact     map[string]any
 	workspaceRef          map[string]any
 	executionCWD          string
 	checkpointRef         map[string]any
@@ -387,7 +390,10 @@ func startRecipeRun(ctx context.Context, preflight *recipePreflight) (map[string
 	if err != nil {
 		return nil, err
 	}
-	meta := rootRecipeMeta(preflight, persisted)
+	meta, err := rootRecipeMeta(preflight, persisted)
+	if err != nil {
+		return nil, err
+	}
 	transcript := model.EmptyTranscript()
 	if err := persisted.st.SaveMeta(meta); err != nil {
 		return nil, err
@@ -513,6 +519,7 @@ func persistRecipePreflight(ctx context.Context, preflight *recipePreflight) (*p
 		launchSkillRefs:       launchSkillRefs,
 		inputManifestRef:      inputManifestRef,
 		providerInputs:        providerInputs,
+		workspaceArtifact:     cloneMap(materializedWorkspace.Artifact),
 		workspaceRef:          materializedWorkspace.ArtifactRef,
 		executionCWD:          materializedWorkspace.ExecutionCWD,
 	}
@@ -527,8 +534,12 @@ func persistRecipePreflight(ctx context.Context, preflight *recipePreflight) (*p
 	return persisted, nil
 }
 
-func rootRecipeMeta(preflight *recipePreflight, persisted *persistedRecipeRun) model.SessionMeta {
+func rootRecipeMeta(preflight *recipePreflight, persisted *persistedRecipeRun) (model.SessionMeta, error) {
 	participantTurns := intFromAny(preflight.rootPlan["participant_turns"], 0)
+	provenance, err := workspace.ProvenanceProjection(persisted.workspaceArtifact)
+	if err != nil {
+		return model.EmptySessionMeta(), fmt.Errorf("project execution workspace provenance: %w", err)
+	}
 	meta := map[string]any{
 		"session_id":                      preflight.sessionID,
 		"execution_kind":                  "recipe",
@@ -583,6 +594,9 @@ func rootRecipeMeta(preflight *recipePreflight, persisted *persistedRecipeRun) m
 		"stall_timeout_seconds":           preflight.options.StallTimeoutSeconds,
 		"created_at":                      utcNow(),
 	}
+	for key, value := range provenance {
+		meta[key] = value
+	}
 	if strings.TrimSpace(preflight.runtimeConfig.SettingsPath) != "" {
 		meta["settings_path"] = preflight.runtimeConfig.SettingsPath
 	}
@@ -597,7 +611,7 @@ func rootRecipeMeta(preflight *recipePreflight, persisted *persistedRecipeRun) m
 		meta["named_input_manifest_ref"] = persisted.inputManifestRef
 		meta["provider_inputs"] = persisted.providerInputs
 	}
-	return model.NewSessionMeta(meta)
+	return model.NewSessionMeta(meta), nil
 }
 
 func rootRecipeStartEvent(preflight *recipePreflight, persisted *persistedRecipeRun) map[string]any {
