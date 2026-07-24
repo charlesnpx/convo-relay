@@ -38,8 +38,12 @@ func TestRawExportBypassesHooksFiltersReplacementSparseAndCheckoutConversion(t *
 		}
 		writeTestFile(t, filepath.Join(root, "line\nbreak\tname.txt"), []byte("hostile filename\n"), 0o644)
 	}
-	testGit(t, root, "add", "--all")
-	testGit(t, root, "commit", "-q", "-m", "raw export fixtures")
+	testSanitizedGit(t, root, "add", "--all")
+	testSanitizedGit(t, root, "commit", "-q", "-m", "raw export fixtures")
+	testSanitizedGit(t, root, "reset", "--hard", "HEAD")
+	if status := testSanitizedGit(t, root, "status", "--short", "--untracked-files=all"); status != "" {
+		t.Fatalf("raw export fixture is dirty after checkout refresh:\n%s", status)
+	}
 	encodedBlob := gitBlobBytes(t, root, "HEAD:encoded.txt")
 	if !bytes.Equal(encodedBlob, []byte("encoded\n")) || bytes.Equal(encodedBlob, utf16WorkingTree) {
 		t.Fatalf("working-tree encoding fixture committed unexpected blob bytes: %x", encodedBlob)
@@ -194,6 +198,15 @@ func writeExecutableTestScript(t *testing.T, path string, marker string) {
 	t.Helper()
 	body := "#!/bin/sh\n: > " + shellSingleQuote(marker) + "\nexit 1\n"
 	writeTestFile(t, path, []byte(body), 0o755)
+}
+
+func testSanitizedGit(t *testing.T, root string, args ...string) string {
+	t.Helper()
+	output, err := runGit(context.Background(), "git", root, args...)
+	if err != nil {
+		t.Fatalf("sanitized git %s: %v", strings.Join(args, " "), err)
+	}
+	return strings.TrimSpace(string(output))
 }
 
 func shellSingleQuote(value string) string {

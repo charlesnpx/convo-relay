@@ -17,7 +17,6 @@ import (
 	"runtime"
 	"sort"
 	"strings"
-	"syscall"
 
 	"github.com/charlesnpx/convo-relay/internal/contracts"
 	"github.com/charlesnpx/convo-relay/internal/graph"
@@ -756,7 +755,7 @@ func runRelay(args []string) {
 		transientRecipeSources := readTransientRecipeSourcesOrExit(recipeFiles, generatedRecipeFiles)
 		_ = verbose
 		_ = stream
-		ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+		ctx, stop := signal.NotifyContext(context.Background(), commandInterruptSignals()...)
 		defer stop()
 		result, err := runner.RunRecipe(ctx, runner.RecipeOptions{
 			SessionDir:            *sessionDir,
@@ -818,7 +817,7 @@ func runRelay(args []string) {
 	}
 	_ = verbose
 	_ = stream
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	ctx, stop := signal.NotifyContext(context.Background(), commandInterruptSignals()...)
 	defer stop()
 	result, err := runner.Run(ctx, runner.Options{
 		SessionDir:             *sessionDir,
@@ -999,7 +998,7 @@ func runApprove(args []string) {
 		fmt.Fprintln(os.Stderr, "error: approve requires a session and proposal id")
 		os.Exit(2)
 	}
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	ctx, stop := signal.NotifyContext(context.Background(), commandInterruptSignals()...)
 	defer stop()
 	report, err := runner.ApproveProposal(ctx, resolvedSessionDir, runner.ApproveOptions{
 		ProposalID:          *proposalID,
@@ -1118,7 +1117,7 @@ func runResume(args []string) {
 		effectiveRounds = 3
 	}
 	_ = verbose
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	ctx, stop := signal.NotifyContext(context.Background(), commandInterruptSignals()...)
 	defer stop()
 	result, err := runner.Resume(ctx, resolvedSessionDir, runner.ResumeOptions{
 		Prompt:              *prompt,
@@ -1144,7 +1143,7 @@ func runStop(args []string, forceKill bool) {
 	sessionDir := flags.String("session-dir", "", "Session directory to stop")
 	sessionID := flags.String("session-id", "", "Session id under --home when --session-dir is omitted")
 	relayHome := flags.String("home", "", "Optional relay home; defaults to CODEX_CLAUDE_HOME or ~/.codex-claude")
-	killFlag := flags.Bool("kill", forceKill, "Send SIGKILL and mark killed instead of SIGTERM")
+	killFlag := flags.Bool("kill", forceKill, "Force-kill and mark killed instead of requesting graceful stop")
 	jsonOutput := flags.Bool("json", false, "Emit machine-readable stop JSON")
 	if err := parseFlags(flags, args); err != nil {
 		os.Exit(2)
