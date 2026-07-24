@@ -208,6 +208,97 @@ func TestRunRecipeUsesExplicitRootTargetAndPersistsDirectContractlessSession(t *
 	}
 }
 
+func TestRootRecipeHealthCanonicalizesSessionPathAlias(t *testing.T) {
+	fixtureRoot := t.TempDir()
+	realParent := filepath.Join(fixtureRoot, "real")
+	if err := os.Mkdir(realParent, 0o755); err != nil {
+		t.Fatalf("create real parent: %v", err)
+	}
+	aliasParent := filepath.Join(fixtureRoot, "alias")
+	if err := os.Symlink(realParent, aliasParent); err != nil {
+		t.Skipf("create session parent symlink: %v", err)
+	}
+
+	realLaunchCWD := filepath.Join(realParent, "launch")
+	if err := os.Mkdir(realLaunchCWD, 0o755); err != nil {
+		t.Fatalf("create launch CWD: %v", err)
+	}
+	writeRootRecipeTestFile(t, filepath.Join(realLaunchCWD, "payload.json"), `{"value":"stable"}`)
+	aliasLaunchCWD := filepath.Join(aliasParent, "launch")
+	aliasSessionDir := filepath.Join(aliasParent, "sessions", "alias-health-session")
+
+	recorder := &rootBackendRecorder{}
+	recorder.handler = func(_ context.Context, call rootBackendCall) (TurnResult, error) {
+		if call.SlotID == "facilitator" {
+			return successfulRootTurn(call.Backend, `{"settled":[],"contested":[],"withdrawn":[]}`), nil
+		}
+		return successfulRootTurn(call.Backend, `{"value":"stable"}`), nil
+	}
+	if _, err := RunRecipe(context.Background(), RecipeOptions{
+		SessionDir:        aliasSessionDir,
+		Task:              "Verify health through a session path alias",
+		RecipeID:          "neutral-root",
+		InputBindings:     []string{"payload=payload.json"},
+		LaunchCWD:         aliasLaunchCWD,
+		RuntimeConfig:     rootRecipeRuntimeConfig("neutral/contract-v1"),
+		IntegrationBundle: decodeRootRecipeTestBundle(t, rootRecipeTestBundle),
+		ReadinessCheck:    readyRootRecipeCheck,
+		backendFactory:    recorder.factory(),
+	}); err != nil {
+		t.Fatalf("RunRecipe through alias: %v", err)
+	}
+
+	canonicalSessionDir, err := filepath.EvalSymlinks(aliasSessionDir)
+	if err != nil {
+		t.Fatalf("canonicalize session path: %v", err)
+	}
+	assertHealthy := func(requestedPath string) map[string]any {
+		t.Helper()
+		report, err := inspect.BuildSessionHealthReport(requestedPath)
+		if err != nil {
+			t.Fatalf("health report for %s: %v", requestedPath, err)
+		}
+		if report["status"] != "ok" || report["root"] == nil {
+			t.Fatalf("health report for %s = %#v", requestedPath, report)
+		}
+		var namedInputCheck map[string]any
+		for _, rawCheck := range report["checks"].([]any) {
+			check := rawCheck.(map[string]any)
+			if check["name"] == "root_named_input_digests" {
+				namedInputCheck = check
+				break
+			}
+		}
+		if namedInputCheck == nil {
+			t.Fatalf("health report for %s is missing root_named_input_digests: %#v", requestedPath, report)
+		}
+		if namedInputCheck["status"] != "ok" || namedInputCheck["retained_status"] != "ok" {
+			t.Fatalf("named input health for %s = %#v", requestedPath, namedInputCheck)
+		}
+		return report
+	}
+
+	aliasReport := assertHealthy(aliasSessionDir)
+	canonicalReport := assertHealthy(canonicalSessionDir)
+	if aliasReport["session_dir"] != aliasSessionDir {
+		t.Fatalf("alias report session_dir = %v, want %s", aliasReport["session_dir"], aliasSessionDir)
+	}
+	if canonicalReport["session_dir"] != canonicalSessionDir {
+		t.Fatalf("canonical report session_dir = %v, want %s", canonicalReport["session_dir"], canonicalSessionDir)
+	}
+	aliasInfo, err := os.Stat(aliasSessionDir)
+	if err != nil {
+		t.Fatalf("stat alias session path: %v", err)
+	}
+	canonicalInfo, err := os.Stat(canonicalSessionDir)
+	if err != nil {
+		t.Fatalf("stat canonical session path: %v", err)
+	}
+	if !os.SameFile(aliasInfo, canonicalInfo) {
+		t.Fatalf("session paths do not resolve to the same directory: alias=%s canonical=%s", aliasSessionDir, canonicalSessionDir)
+	}
+}
+
 func TestRunRecipeBindsContractInputsAndPersistsExactArtifacts(t *testing.T) {
 	launchCWD := t.TempDir()
 	writeRootRecipeTestFile(t, filepath.Join(launchCWD, "payload.json"), `{"value":"stable"}`)
