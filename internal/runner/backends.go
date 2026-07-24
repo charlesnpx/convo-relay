@@ -509,7 +509,7 @@ func resolveBackendCWD(launchCWD string, sessionRoot string, backendName string)
 	if err != nil || !info.IsDir() {
 		return sessionRoot
 	}
-	if backendName == "codex" && !pathHasGitRepo(launchCWD) {
+	if backendName == "codex" && !pathWithinGitRepo(launchCWD) {
 		return sessionRoot
 	}
 	return launchCWD

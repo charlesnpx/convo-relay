@@ -10,6 +10,7 @@ import (
 	"github.com/charlesnpx/convo-relay/internal/contracts"
 	"github.com/charlesnpx/convo-relay/internal/model"
 	"github.com/charlesnpx/convo-relay/internal/store"
+	"github.com/charlesnpx/convo-relay/internal/workspace"
 )
 
 func TestRootInspectionProjectionIsSharedDigestCheckedAndPayloadRedacted(t *testing.T) {
@@ -98,6 +99,71 @@ func TestRootDisplaySeparatesReducerAndCanonicalResultsThroughValidatedRefs(t *t
 	}
 	if _, err := BuildDisplayHTML(sessionDir); err == nil || !strings.Contains(err.Error(), "resolve root result output") {
 		t.Fatalf("tampered display error = %v", err)
+	}
+}
+
+func TestRootInspectionDerivesLegacyWorkspaceProvenanceWithoutRewritingEvidence(t *testing.T) {
+	sessionDir, meta := writeRootInspectionFixture(t)
+	st := store.New(sessionDir)
+	ref := mapFromAny(meta["execution_workspace_ref"])
+	path, err := st.ArtifactPathForRef(ref)
+	if err != nil {
+		t.Fatalf("workspace artifact path: %v", err)
+	}
+	if !filepath.IsAbs(path) {
+		path = filepath.Join(sessionDir, path)
+	}
+	before, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read legacy workspace artifact: %v", err)
+	}
+	beforeDigest := stringFromAny(ref["digest"])
+
+	report := BuildRootInspectionReport(sessionDir, meta, false)
+	workspaceState := mapFromAny(report["workspace"])
+	if workspaceState[workspace.WorkspaceContentSourceKey] != workspace.WorkspaceContentSourceCommittedHead ||
+		workspaceState[workspace.WorkingTreeChangesIncludedKey] != false ||
+		workspaceState[workspace.WorkspaceProvenanceInferredKey] != true ||
+		workspaceState["provenance_projection_valid"] != true {
+		t.Fatalf("legacy workspace provenance = %#v", workspaceState)
+	}
+	after, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("reread legacy workspace artifact: %v", err)
+	}
+	resolved, err := st.ResolveArtifactRef("execution_workspace:selected", beforeDigest)
+	if err != nil || string(after) != string(before) || stringFromAny(resolved["digest"]) != beforeDigest {
+		t.Fatalf("legacy workspace evidence changed: ref=%#v err=%v bytes_equal=%v", resolved, err, string(after) == string(before))
+	}
+}
+
+func TestRootInspectionRejectsWorkspaceProvenanceProjectionDisagreement(t *testing.T) {
+	sessionDir, meta := writeRootInspectionFixture(t)
+	st := store.New(sessionDir)
+	workspaceRef := saveInspectionRootArtifact(t, st, contracts.RootArtifactKindExecutionWorkspace, 0, map[string]any{
+		"policy": map[string]any{
+			"requested": "read_only",
+			"effective": "read_only",
+			"achieved":  "ephemeral",
+		},
+		workspace.WorkspaceContentSourceKey:     workspace.WorkspaceContentSourceCommittedHead,
+		workspace.WorkingTreeChangesIncludedKey: false,
+	})
+	meta["execution_workspace_ref"] = workspaceRef
+	meta[workspace.WorkspaceContentSourceKey] = workspace.WorkspaceContentSourceWorkingTree
+	meta[workspace.WorkingTreeChangesIncludedKey] = true
+	meta[workspace.WorkspaceProvenanceInferredKey] = false
+
+	report := BuildRootInspectionReport(sessionDir, meta, false)
+	workspaceState := mapFromAny(report["workspace"])
+	validation := mapFromAny(report["artifact_validation"])
+	refStatus := mapFromAny(mapFromAny(report["artifact_refs"])["execution_workspace_ref"])
+	if workspaceState["provenance_projection_valid"] != false ||
+		validation["ok"] != false ||
+		intFromAny(validation["invalid"], 0) < 1 ||
+		refStatus["status"] != "invalid" ||
+		!strings.Contains(stringFromAny(refStatus["error"]), "disagrees") {
+		t.Fatalf("provenance disagreement report = workspace=%#v validation=%#v ref=%#v", workspaceState, validation, refStatus)
 	}
 }
 

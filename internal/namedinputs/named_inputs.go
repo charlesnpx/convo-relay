@@ -1,10 +1,14 @@
 package namedinputs
 
 import (
+	"bytes"
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
+	"math"
 	"mime"
 	"os"
 	"path/filepath"
@@ -25,6 +29,7 @@ const (
 	DiagnosticCodeFileUnavailable  = "named_input_file_unavailable"
 	DiagnosticCodeFileNotRegular   = "named_input_file_not_regular"
 	DiagnosticCodeFileTooLarge     = "named_input_file_too_large"
+	DiagnosticCodeTotalTooLarge    = "named_input_total_too_large"
 	DiagnosticCodeInvalidMediaType = "invalid_named_input_media_type"
 	DiagnosticCodeIntegrity        = "named_input_integrity_failed"
 	SchemaStatusValidated          = "validated"
@@ -35,10 +40,13 @@ const (
 // Options describes the pure named-input preflight. Binding values use the
 // repeatable name=path CLI contract and are resolved relative to SourceAnchor.
 type Options struct {
-	Contract               *integration.SelectedContract
-	Bindings               []string
-	SourceAnchor           string
-	PositionalContextCount int
+	Contract                *integration.SelectedContract
+	Bindings                []string
+	SourceAnchor            string
+	PositionalContextCount  int
+	Context                 context.Context
+	NamedInputMaxBytes      int64
+	NamedInputTotalMaxBytes int64
 }
 
 // Binding preserves the exact opaque input name and everything after the first
@@ -144,6 +152,13 @@ func ParseBinding(raw string) (Binding, error) {
 // Prepare performs all binding, file, encoding, media, and schema validation
 // without creating a session or writing any artifacts.
 func Prepare(options Options) (*Prepared, error) {
+	ctx := options.Context
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := retainedContextError(ctx); err != nil {
+		return nil, err
+	}
 	if options.PositionalContextCount < 0 {
 		return nil, diagnosticError(nil, DiagnosticCodeContextConflict, contracts.DiagnosticPhasePolicy, "", "Positional context count cannot be negative.", nil)
 	}
@@ -196,18 +211,65 @@ func Prepare(options Options) (*Prepared, error) {
 		return nil, err
 	}
 
+	runtimeMaxBytes, totalMaxBytes, err := effectiveRuntimeLimits(options)
+	if err != nil {
+		return nil, err
+	}
 	prepared := &Prepared{contractID: options.Contract.ID(), items: make([]preparedItem, 0, len(bindings))}
 	nameOrdinals := map[string]int{}
+	var totalBytes int64
 	for index, binding := range bindings {
+		if err := retainedContextError(ctx); err != nil {
+			return nil, err
+		}
 		declaration := contract.Inputs[binding.Name]
 		nameOrdinals[binding.Name]++
-		item, err := prepareFile(binding, declaration, options.SourceAnchor, index+1, nameOrdinals[binding.Name])
+		item, nextTotal, err := prepareFile(
+			ctx,
+			binding,
+			declaration,
+			options.SourceAnchor,
+			index+1,
+			nameOrdinals[binding.Name],
+			runtimeMaxBytes,
+			totalBytes,
+			totalMaxBytes,
+		)
 		if err != nil {
 			return nil, err
 		}
 		prepared.items = append(prepared.items, item)
+		totalBytes = nextTotal
 	}
 	return prepared, nil
+}
+
+func effectiveRuntimeLimits(options Options) (int64, int64, error) {
+	runtimeMaxBytes := options.NamedInputMaxBytes
+	totalMaxBytes := options.NamedInputTotalMaxBytes
+	if runtimeMaxBytes < 0 || totalMaxBytes < 0 {
+		return 0, 0, diagnosticError(
+			nil,
+			contracts.DiagnosticCodeResourceAccountingOverflow,
+			contracts.DiagnosticPhasePreflight,
+			"/runtime_config/limits",
+			"Named input runtime limits must be positive integers.",
+			map[string]any{
+				"named_input_max_bytes":       runtimeMaxBytes,
+				"named_input_total_max_bytes": totalMaxBytes,
+			},
+		)
+	}
+	// Zero preserves the package-level API for callers that do not own runtime
+	// configuration. Root execution always supplies its positive effective
+	// limits.
+	if runtimeMaxBytes == 0 {
+		runtimeMaxBytes = math.MaxInt64
+	}
+	if totalMaxBytes == 0 {
+		totalMaxBytes = math.MaxInt64
+	}
+	return runtimeMaxBytes, totalMaxBytes, nil
 }
 
 func validateCardinalities(declarations map[string]*integration.InputDeclaration, counts map[string]int) error {
@@ -255,14 +317,49 @@ func cardinalityError(name string, declaration *integration.InputDeclaration, co
 	)
 }
 
-func prepareFile(binding Binding, declaration *integration.InputDeclaration, sourceAnchor string, ordinal int, nameOrdinal int) (preparedItem, error) {
-	sourcePath, data, err := readRegularFile(binding.Path, sourceAnchor, declaration.MaxBytes)
+func prepareFile(
+	ctx context.Context,
+	binding Binding,
+	declaration *integration.InputDeclaration,
+	sourceAnchor string,
+	ordinal int,
+	nameOrdinal int,
+	runtimeMaxBytes int64,
+	totalBytes int64,
+	totalMaxBytes int64,
+) (preparedItem, int64, error) {
+	effectiveMaxBytes := declaration.MaxBytes
+	if runtimeMaxBytes < effectiveMaxBytes {
+		effectiveMaxBytes = runtimeMaxBytes
+	}
+	sourcePath, data, digest, nextTotal, err := readRegularFile(
+		ctx,
+		binding.Path,
+		sourceAnchor,
+		effectiveMaxBytes,
+		totalBytes,
+		totalMaxBytes,
+	)
 	if err != nil {
-		return preparedItem{}, prefixFileError(err, binding.Name, nameOrdinal, binding.Path, declaration.MaxBytes)
+		return preparedItem{}, totalBytes, prefixFileError(
+			err,
+			binding.Name,
+			nameOrdinal,
+			binding.Path,
+			declaration.MaxBytes,
+			runtimeMaxBytes,
+			effectiveMaxBytes,
+		)
+	}
+	if err := retainedContextError(ctx); err != nil {
+		return preparedItem{}, totalBytes, err
 	}
 	jsonValue, isJSON, schemaStatus, err := validateContent(binding.Name, nameOrdinal, data, declaration)
 	if err != nil {
-		return preparedItem{}, err
+		return preparedItem{}, totalBytes, err
+	}
+	if err := retainedContextError(ctx); err != nil {
+		return preparedItem{}, totalBytes, err
 	}
 	return preparedItem{
 		Item: Item{
@@ -272,19 +369,26 @@ func prepareFile(binding Binding, declaration *integration.InputDeclaration, sou
 			SourcePath:   sourcePath,
 			DisplayName:  filepath.Base(sourcePath),
 			SizeBytes:    int64(len(data)),
-			RawDigest:    rawDigest(data),
+			RawDigest:    digest,
 			MediaType:    declaration.MediaType,
 			SchemaStatus: schemaStatus,
 		},
 		data:      append([]byte(nil), data...),
 		jsonValue: contracts.Materialize(jsonValue),
 		isJSON:    isJSON,
-	}, nil
+	}, nextTotal, nil
 }
 
-func readRegularFile(rawPath string, sourceAnchor string, maxBytes int64) (string, []byte, error) {
+func readRegularFile(
+	ctx context.Context,
+	rawPath string,
+	sourceAnchor string,
+	maxBytes int64,
+	totalBytes int64,
+	totalMaxBytes int64,
+) (string, []byte, string, int64, error) {
 	if maxBytes <= 0 {
-		return "", nil, fmt.Errorf("maximum byte limit must be positive")
+		return "", nil, "", totalBytes, fmt.Errorf("maximum byte limit must be positive")
 	}
 	resolved := rawPath
 	if !filepath.IsAbs(resolved) {
@@ -293,44 +397,110 @@ func readRegularFile(rawPath string, sourceAnchor string, maxBytes int64) (strin
 			var err error
 			anchor, err = os.Getwd()
 			if err != nil {
-				return "", nil, err
+				return "", nil, "", totalBytes, err
 			}
 		}
 		resolved = filepath.Join(anchor, resolved)
 	}
 	absolutePath, err := filepath.Abs(resolved)
 	if err != nil {
-		return "", nil, err
+		return "", nil, "", totalBytes, err
+	}
+	if err := retainedContextError(ctx); err != nil {
+		return "", nil, "", totalBytes, err
 	}
 	info, err := os.Lstat(absolutePath)
 	if err != nil {
-		return "", nil, err
+		return "", nil, "", totalBytes, err
 	}
 	if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
-		return "", nil, errNotRegular
+		return "", nil, "", totalBytes, errNotRegular
 	}
-	if info.Size() > maxBytes {
-		return "", nil, errTooLarge
+	if err := contracts.CheckResourceLimit(
+		contracts.DiagnosticCodeNamedInputMaxBytes,
+		"named input bytes",
+		info.Size(),
+		maxBytes,
+	); err != nil {
+		return "", nil, "", totalBytes, err
 	}
 	handle, openedInfo, err := openNamedInputFile(absolutePath)
 	if err != nil {
-		return "", nil, err
+		return "", nil, "", totalBytes, err
 	}
 	defer handle.Close()
 	if !os.SameFile(info, openedInfo) {
-		return "", nil, errNotRegular
+		return "", nil, "", totalBytes, errNotRegular
 	}
-	if openedInfo.Size() > maxBytes {
-		return "", nil, errTooLarge
+	if err := contracts.CheckResourceLimit(
+		contracts.DiagnosticCodeNamedInputMaxBytes,
+		"named input bytes",
+		openedInfo.Size(),
+		maxBytes,
+	); err != nil {
+		return "", nil, "", totalBytes, err
 	}
-	data, err := contracts.ReadBytesLimited(handle, maxBytes)
+	nextTotal, err := contracts.CheckedAddResource(
+		totalBytes,
+		openedInfo.Size(),
+		totalMaxBytes,
+		contracts.DiagnosticCodeNamedInputTotalMaxBytes,
+		"aggregate named input bytes",
+	)
 	if err != nil {
-		if strings.Contains(err.Error(), "exceeds") {
-			return "", nil, errTooLarge
-		}
-		return "", nil, err
+		return "", nil, "", totalBytes, err
 	}
-	return filepath.Clean(absolutePath), data, nil
+	data, digest, err := readNamedInputBytes(ctx, handle, maxBytes)
+	if err != nil {
+		return "", nil, "", totalBytes, err
+	}
+	openedAfter, statErr := handle.Stat()
+	pathAfter, pathErr := os.Lstat(absolutePath)
+	if statErr != nil || pathErr != nil ||
+		!openedAfter.Mode().IsRegular() ||
+		!os.SameFile(openedInfo, openedAfter) ||
+		!os.SameFile(openedInfo, pathAfter) ||
+		openedAfter.Size() != openedInfo.Size() ||
+		pathAfter.Size() != openedInfo.Size() ||
+		openedAfter.Mode() != openedInfo.Mode() ||
+		pathAfter.Mode() != openedInfo.Mode() ||
+		!openedAfter.ModTime().Equal(openedInfo.ModTime()) ||
+		!pathAfter.ModTime().Equal(openedInfo.ModTime()) {
+		return "", nil, "", totalBytes, errors.Join(statErr, pathErr, errFileChanged)
+	}
+	if int64(len(data)) != openedInfo.Size() {
+		return "", nil, "", totalBytes, errFileChanged
+	}
+	if err := retainedContextError(ctx); err != nil {
+		return "", nil, "", totalBytes, err
+	}
+	return filepath.Clean(absolutePath), data, digest, nextTotal, nil
+}
+
+func readNamedInputBytes(ctx context.Context, reader io.Reader, maxBytes int64) ([]byte, string, error) {
+	contextReader := &retainedContextReader{ctx: ctx, reader: reader}
+	var source io.Reader = contextReader
+	if maxBytes < math.MaxInt64 {
+		source = &io.LimitedReader{R: contextReader, N: maxBytes + 1}
+	}
+	var buffer bytes.Buffer
+	hasher := sha256.New()
+	size, err := io.Copy(io.MultiWriter(&buffer, hasher), source)
+	if err != nil {
+		return nil, "", err
+	}
+	if err := contracts.CheckResourceLimit(
+		contracts.DiagnosticCodeNamedInputMaxBytes,
+		"named input bytes",
+		size,
+		maxBytes,
+	); err != nil {
+		return nil, "", err
+	}
+	if err := retainedContextError(ctx); err != nil {
+		return nil, "", err
+	}
+	return buffer.Bytes(), contracts.DigestPrefix + hex.EncodeToString(hasher.Sum(nil)), nil
 }
 
 func openNamedInputFile(path string) (*os.File, os.FileInfo, error) {
@@ -351,8 +521,8 @@ func openNamedInputFile(path string) (*os.File, os.FileInfo, error) {
 }
 
 var (
-	errNotRegular = errors.New("not a regular file")
-	errTooLarge   = errors.New("file exceeds declared byte limit")
+	errNotRegular  = errors.New("not a regular file")
+	errFileChanged = errors.New("named input file changed while it was read")
 )
 
 func validateContent(name string, nameOrdinal int, data []byte, declaration *integration.InputDeclaration) (any, bool, string, error) {
@@ -456,25 +626,65 @@ func prefixBindingError(err error, index int) error {
 	return contracts.WrapDiagnosticError(err, structured.Error(), diagnostics...)
 }
 
-func prefixFileError(err error, name string, ordinal int, rawPath string, maxBytes int64) error {
+func prefixFileError(
+	err error,
+	name string,
+	ordinal int,
+	rawPath string,
+	contractMaxBytes int64,
+	runtimeMaxBytes int64,
+	effectiveMaxBytes int64,
+) error {
 	code := DiagnosticCodeFileUnavailable
 	message := "Named input file could not be read."
+	path := inputValuePointer(name, ordinal)
+	details := map[string]any{
+		"name":                name,
+		"source_path":         rawPath,
+		"contract_max_bytes":  contractMaxBytes,
+		"runtime_max_bytes":   runtimeMaxBytes,
+		"effective_max_bytes": effectiveMaxBytes,
+	}
+	var limitErr *contracts.ResourceLimitError
 	switch {
 	case errors.Is(err, errNotRegular):
 		code = DiagnosticCodeFileNotRegular
 		message = "Named input path must identify a regular file and must not be a symlink."
-	case errors.Is(err, errTooLarge):
-		code = DiagnosticCodeFileTooLarge
-		message = "Named input file exceeds its declared byte limit."
+	case errors.As(err, &limitErr):
+		if limitErr.Code == contracts.DiagnosticCodeNamedInputTotalMaxBytes ||
+			limitErr.Code == contracts.DiagnosticCodeResourceAccountingOverflow {
+			code = DiagnosticCodeTotalTooLarge
+			path = "/runtime_config/limits/named_input_total_max_bytes"
+			message = "Named inputs exceed the configured aggregate raw-byte budget."
+		} else {
+			code = DiagnosticCodeFileTooLarge
+			message = "Named input file exceeds its effective raw-byte budget."
+		}
+		for key, value := range resourceLimitDetails(limitErr) {
+			details[key] = value
+		}
 	}
 	return diagnosticError(
 		err,
 		code,
 		contracts.DiagnosticPhasePreflight,
-		inputValuePointer(name, ordinal),
+		path,
 		message,
-		map[string]any{"name": name, "source_path": rawPath, "max_bytes": maxBytes},
+		details,
 	)
+}
+
+func resourceLimitDetails(limitErr *contracts.ResourceLimitError) map[string]any {
+	if limitErr == nil {
+		return map[string]any{}
+	}
+	return map[string]any{
+		"resource":  limitErr.Resource,
+		"limit":     limitErr.Limit,
+		"observed":  limitErr.Observed,
+		"current":   limitErr.Current,
+		"increment": limitErr.Increment,
+	}
 }
 
 func diagnosticError(cause error, code string, phase string, path string, message string, details map[string]any) error {

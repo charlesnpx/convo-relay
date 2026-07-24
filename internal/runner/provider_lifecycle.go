@@ -48,6 +48,10 @@ type RetryableProviderError struct {
 	Detail string
 }
 
+type providerRetrySuppressed interface {
+	suppressProviderRetry()
+}
+
 func (e RetryableProviderError) Error() string {
 	detail := strings.TrimSpace(e.Detail)
 	if detail == "" {
@@ -187,6 +191,10 @@ func runWithRetryableProviderErrors[T any](ctx context.Context, label string, op
 		result, err := operation()
 		if err == nil {
 			return result, nil
+		}
+		var suppressed providerRetrySuppressed
+		if errors.As(err, &suppressed) {
+			return result, err
 		}
 		var retryable RetryableProviderError
 		if !errors.As(err, &retryable) {

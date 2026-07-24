@@ -16,6 +16,10 @@ import (
 
 const executionWorkspaceCategory = contracts.RootArtifactKindExecutionWorkspace
 
+// materializationBeforeFailureRollback is a test-only failpoint used to prove
+// that failure cleanup never follows a replacement path component.
+var materializationBeforeFailureRollback func(string) error
+
 // Materialized is the verified workspace boundary consumed by execution.
 // Artifact and ArtifactRef are cloned so callers cannot mutate persisted state.
 type Materialized struct {
@@ -62,6 +66,8 @@ func Materialize(ctx context.Context, st *store.Store, snapshot *Snapshot) (*Mat
 	worktreePath := ""
 	registration := inheritedRegistration()
 	createdWorktree := false
+	var createdWorktreeRoot os.FileInfo
+	var rawDescriptor *rawExportDescriptor
 
 	if snapshot.policy.Effective != PolicyInherited {
 		if snapshot.repository == nil {
@@ -100,52 +106,82 @@ func Materialize(ctx context.Context, st *store.Store, snapshot *Snapshot) (*Mat
 			return nil, workspaceError(err, DiagnosticCodeSessionConflict, contracts.DiagnosticPhasePolicy, "/session_dir", "The session execution directory changed after preflight.", map[string]any{"execution_root": executionRoot, "resolved_execution_root": canonicalExecutionRoot})
 		}
 
-		if _, err := runGit(ctx, snapshot.gitBinary, snapshot.repository.root, "worktree", "add", "--detach", worktreePath, snapshot.repository.headCommit); err != nil {
-			if rollbackErr := rollbackMaterializedWorktreeAfterFailure(snapshot.repository, worktreePath); rollbackErr != nil {
+		if _, err := runGit(
+			ctx,
+			snapshot.gitBinary,
+			snapshot.repository.root,
+			"worktree", "add", "--detach", "--no-checkout", worktreePath, snapshot.repository.headCommit,
+		); err != nil {
+			if rollbackErr := rollbackMaterializedWorktreeAfterFailure(snapshot.repository, worktreePath, nil); rollbackErr != nil {
 				err = errors.Join(err, fmt.Errorf("partial worktree rollback failed: %w", rollbackErr))
 			}
 			return nil, workspaceError(err, DiagnosticCodeCreationFailed, contracts.DiagnosticPhasePreflight, "/session_dir", "The detached execution worktree could not be created.", map[string]any{"worktree_path": worktreePath, "head_commit": snapshot.repository.headCommit})
 		}
 		createdWorktree = true
+		createdWorktreeRoot, err = os.Lstat(worktreePath)
+		if err != nil ||
+			createdWorktreeRoot.Mode()&os.ModeSymlink != 0 ||
+			!createdWorktreeRoot.IsDir() {
+			return nil, materializationFailure(
+				snapshot.repository,
+				worktreePath,
+				createdWorktree,
+				nil,
+				errors.Join(err, errors.New("created worktree root identity is unavailable")),
+				"The detached execution worktree root could not be identified.",
+			)
+		}
 
-		executionCWD, registration, err = verifyMaterializedWorktree(ctx, snapshot.repository, worktreePath)
+		if _, err := runGit(
+			ctx,
+			snapshot.gitBinary,
+			worktreePath,
+			"read-tree", "--reset", snapshot.repository.headTree,
+		); err != nil {
+			return nil, materializationFailure(snapshot.repository, worktreePath, createdWorktree, createdWorktreeRoot, err, "The detached execution worktree index could not be initialized.")
+		}
+		rawDescriptor, err = exportCapturedTree(ctx, snapshot.repository, worktreePath, snapshot.inventoryLimits)
 		if err != nil {
-			return nil, materializationFailure(snapshot.repository, worktreePath, createdWorktree, err, "The detached execution worktree failed its integrity checks.")
+			return nil, materializationFailure(snapshot.repository, worktreePath, createdWorktree, createdWorktreeRoot, err, "The captured Git tree could not be exported from raw objects.")
+		}
+		executionCWD, registration, err = verifyMaterializedWorktree(ctx, snapshot.repository, worktreePath, rawDescriptor)
+		if err != nil {
+			return nil, materializationFailure(snapshot.repository, worktreePath, createdWorktree, createdWorktreeRoot, err, "The detached execution worktree failed its integrity checks.")
 		}
 	}
 
-	artifact, err := workspaceArtifact(snapshot, storeRoot, worktreePath, executionCWD, registration)
+	artifact, err := workspaceArtifact(snapshot, storeRoot, worktreePath, executionCWD, registration, rawDescriptor)
 	if err != nil {
-		return nil, materializationFailure(snapshot.repository, worktreePath, createdWorktree, err, "The execution workspace artifact could not be constructed.")
+		return nil, materializationFailure(snapshot.repository, worktreePath, createdWorktree, createdWorktreeRoot, err, "The execution workspace artifact could not be constructed.")
 	}
 	identity, err := contracts.RootArtifactIdentityFor(contracts.RootArtifactKindExecutionWorkspace, 0)
 	if err != nil {
-		return nil, materializationFailure(snapshot.repository, worktreePath, createdWorktree, err, "The execution workspace artifact identity is invalid.")
+		return nil, materializationFailure(snapshot.repository, worktreePath, createdWorktree, createdWorktreeRoot, err, "The execution workspace artifact identity is invalid.")
 	}
 	ref, err := st.SaveContractArtifact(executionWorkspaceCategory, identity.ArtifactID, artifact, identity.RefID)
 	if err != nil {
-		return nil, materializationFailure(snapshot.repository, worktreePath, createdWorktree, err, "The execution workspace artifact could not be persisted.")
+		return nil, materializationFailure(snapshot.repository, worktreePath, createdWorktree, createdWorktreeRoot, err, "The execution workspace artifact could not be persisted.")
 	}
 	persisted, err := st.LoadArtifactPayloadRaw(ref)
 	if err != nil {
-		return nil, materializationFailure(snapshot.repository, worktreePath, createdWorktree, err, "The persisted execution workspace artifact could not be loaded.")
+		return nil, materializationFailure(snapshot.repository, worktreePath, createdWorktree, createdWorktreeRoot, err, "The persisted execution workspace artifact could not be loaded.")
 	}
 	if _, err := contracts.ValidateRootArtifactRef(ref, contracts.RootArtifactKindExecutionWorkspace, 0, persisted); err != nil {
-		return nil, materializationFailure(snapshot.repository, worktreePath, createdWorktree, err, "The persisted execution workspace artifact ref failed validation.")
+		return nil, materializationFailure(snapshot.repository, worktreePath, createdWorktree, createdWorktreeRoot, err, "The persisted execution workspace artifact ref failed validation.")
 	}
 	if err := verifyWorkspaceIdentity(persisted); err != nil {
-		return nil, materializationFailure(snapshot.repository, worktreePath, createdWorktree, err, "The persisted execution workspace identity failed validation.")
+		return nil, materializationFailure(snapshot.repository, worktreePath, createdWorktree, createdWorktreeRoot, err, "The persisted execution workspace identity failed validation.")
 	}
 	want, err := contracts.CanonicalJSONBytes(artifact)
 	if err != nil {
-		return nil, materializationFailure(snapshot.repository, worktreePath, createdWorktree, err, "The execution workspace artifact could not be verified.")
+		return nil, materializationFailure(snapshot.repository, worktreePath, createdWorktree, createdWorktreeRoot, err, "The execution workspace artifact could not be verified.")
 	}
 	got, err := contracts.CanonicalJSONBytes(persisted)
 	if err != nil || !bytes.Equal(got, want) {
 		if err == nil {
 			err = errors.New("persisted workspace payload changed")
 		}
-		return nil, materializationFailure(snapshot.repository, worktreePath, createdWorktree, err, "The persisted execution workspace artifact changed during persistence.")
+		return nil, materializationFailure(snapshot.repository, worktreePath, createdWorktree, createdWorktreeRoot, err, "The persisted execution workspace artifact changed during persistence.")
 	}
 
 	return &Materialized{
@@ -156,7 +192,12 @@ func Materialize(ctx context.Context, st *store.Store, snapshot *Snapshot) (*Mat
 	}, nil
 }
 
-func verifyMaterializedWorktree(ctx context.Context, repository *repositorySnapshot, worktreePath string) (string, worktreeRegistration, error) {
+func verifyMaterializedWorktree(
+	ctx context.Context,
+	repository *repositorySnapshot,
+	worktreePath string,
+	rawDescriptor *rawExportDescriptor,
+) (string, worktreeRegistration, error) {
 	canonicalWorktree, err := canonicalExistingDirectory(worktreePath)
 	if err != nil {
 		return "", worktreeRegistration{}, err
@@ -220,19 +261,22 @@ func verifyMaterializedWorktree(ctx context.Context, repository *repositorySnaps
 	if err := os.Remove(probePath); err != nil {
 		return "", worktreeRegistration{}, fmt.Errorf("worktree write probe could not be removed: %w", err)
 	}
-	statusOutput, err := runGit(ctx, repository.gitBinary, canonicalWorktree, "status", "--porcelain=v1", "-z", "--untracked-files=all")
-	if err != nil {
-		return "", worktreeRegistration{}, err
-	}
-	if len(statusOutput) != 0 {
-		return "", worktreeRegistration{}, errors.New("new worktree is not clean")
+	if err := verifyRawExport(ctx, canonicalWorktree, rawDescriptor); err != nil {
+		return "", worktreeRegistration{}, fmt.Errorf("raw export inventory mismatch: %w", err)
 	}
 
 	record.Path = canonicalWorktree
 	return mappedCWD, record, nil
 }
 
-func workspaceArtifact(snapshot *Snapshot, sessionDir string, worktreePath string, executionCWD string, registration worktreeRegistration) (map[string]any, error) {
+func workspaceArtifact(
+	snapshot *Snapshot,
+	sessionDir string,
+	worktreePath string,
+	executionCWD string,
+	registration worktreeRegistration,
+	rawDescriptor *rawExportDescriptor,
+) (map[string]any, error) {
 	achievedPolicy := PolicyInherited
 	if worktreePath != "" {
 		// Version 1 implements both required policies with a detached writable
@@ -292,14 +336,28 @@ func workspaceArtifact(snapshot *Snapshot, sessionDir string, worktreePath strin
 			"effective":          snapshot.policy.Effective,
 			"achieved":           achievedPolicy,
 		},
-		"identity":     identity,
-		"registration": registrationPayload,
-		"base":         base,
-		"source":       cloneMap(snapshot.sourceReport),
-		"exclusions":   cloneMap(snapshot.exclusions),
+		"identity":                         identity,
+		"registration":                     registrationPayload,
+		"base":                             base,
+		"source":                           cloneMap(snapshot.sourceReport),
+		"exclusions":                       cloneMap(snapshot.exclusions),
+		SourceStagedChangesKey:             snapshot.sourceChanges.Staged,
+		SourceUnstagedChangesKey:           snapshot.sourceChanges.Unstaged,
+		SourceUnignoredUntrackedChangesKey: snapshot.sourceChanges.Untracked,
+		AllowDirtySourceRequestedKey:       snapshot.allowDirtySource,
+		"repository_inventory_limits": map[string]any{
+			"max_files": snapshot.inventoryLimits.maxFiles,
+			"max_bytes": snapshot.inventoryLimits.maxBytes,
+		},
 	}
+	provenance := provenanceForAchievedPolicy(achievedPolicy)
+	fields[WorkspaceContentSourceKey] = provenance.WorkspaceContentSource
+	fields[WorkingTreeChangesIncludedKey] = provenance.WorkingTreeChangesIncluded
 	if snapshot.repository != nil {
 		fields["source_before_digest"] = snapshot.repository.sourceDigest
+	}
+	if rawDescriptor != nil {
+		fields["committed_export"] = rawExportArtifactMap(rawDescriptor)
 	}
 	return contracts.NormalizeRootArtifact(contracts.RootArtifactKindExecutionWorkspace, fields)
 }
@@ -339,10 +397,28 @@ func repositoryWorktreeRegistered(ctx context.Context, repository *repositorySna
 }
 
 func repositoryWorktreeRegistration(ctx context.Context, repository *repositorySnapshot, path string) (worktreeRegistration, bool, error) {
+	return repositoryWorktreeRegistrationMatching(ctx, repository, path, false)
+}
+
+func repositoryWorktreeRegisteredExact(ctx context.Context, repository *repositorySnapshot, path string) (bool, error) {
+	_, found, err := repositoryWorktreeRegistrationExact(ctx, repository, path)
+	return found, err
+}
+
+func repositoryWorktreeRegistrationExact(ctx context.Context, repository *repositorySnapshot, path string) (worktreeRegistration, bool, error) {
+	return repositoryWorktreeRegistrationMatching(ctx, repository, path, true)
+}
+
+func repositoryWorktreeRegistrationMatching(
+	ctx context.Context,
+	repository *repositorySnapshot,
+	path string,
+	exact bool,
+) (worktreeRegistration, bool, error) {
 	if repository == nil {
 		return worktreeRegistration{}, false, errors.New("repository snapshot is required")
 	}
-	target, err := canonicalPathAllowMissing(path)
+	target, err := lexicalAbsolutePath(path)
 	if err != nil {
 		return worktreeRegistration{}, false, err
 	}
@@ -355,11 +431,21 @@ func repositoryWorktreeRegistration(ctx context.Context, repository *repositoryS
 		return worktreeRegistration{}, false, err
 	}
 	for _, record := range records {
-		candidate, err := canonicalPathAllowMissing(record.Path)
+		candidate, err := lexicalAbsolutePath(record.Path)
 		if err != nil {
 			return worktreeRegistration{}, false, err
 		}
-		if pathsEquivalent(candidate, target) {
+		matches := candidate == target
+		if !exact && !matches {
+			candidateInfo, candidateErr := os.Lstat(candidate)
+			targetInfo, targetErr := os.Lstat(target)
+			matches = candidateErr == nil &&
+				targetErr == nil &&
+				candidateInfo.Mode()&os.ModeSymlink == 0 &&
+				targetInfo.Mode()&os.ModeSymlink == 0 &&
+				os.SameFile(candidateInfo, targetInfo)
+		}
+		if matches {
 			record.Path = candidate
 			return record, true, nil
 		}
@@ -406,40 +492,52 @@ func parseWorktreeRegistrations(data []byte) ([]worktreeRegistration, error) {
 	return records, nil
 }
 
-func materializationFailure(repository *repositorySnapshot, worktreePath string, created bool, cause error, message string) error {
+func materializationFailure(
+	repository *repositorySnapshot,
+	worktreePath string,
+	created bool,
+	expectedRoot os.FileInfo,
+	cause error,
+	message string,
+) error {
 	if created {
-		if rollbackErr := rollbackMaterializedWorktreeAfterFailure(repository, worktreePath); rollbackErr != nil {
+		if materializationBeforeFailureRollback != nil {
+			if hookErr := materializationBeforeFailureRollback(worktreePath); hookErr != nil {
+				cause = errors.Join(cause, fmt.Errorf("before worktree rollback: %w", hookErr))
+			}
+		}
+		if rollbackErr := rollbackMaterializedWorktreeAfterFailure(repository, worktreePath, expectedRoot); rollbackErr != nil {
 			cause = errors.Join(cause, fmt.Errorf("worktree rollback failed: %w", rollbackErr))
 		}
 	}
-	return workspaceError(cause, DiagnosticCodeIntegrity, contracts.DiagnosticPhasePreflight, "/session_dir", message, map[string]any{"worktree_path": worktreePath})
+	code := DiagnosticCodeIntegrity
+	path := "/session_dir"
+	details := map[string]any{"worktree_path": worktreePath}
+	var limitErr *contracts.ResourceLimitError
+	if errors.As(cause, &limitErr) {
+		code = DiagnosticCodeInventoryLimit
+		path = "/runtime_config/limits"
+		details = resourceLimitDetails(limitErr)
+		details["worktree_path"] = worktreePath
+	}
+	return workspaceError(cause, code, contracts.DiagnosticPhasePreflight, path, message, details)
 }
 
-func rollbackMaterializedWorktreeAfterFailure(repository *repositorySnapshot, worktreePath string) error {
-	cleanupContext, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-	return rollbackMaterializedWorktree(cleanupContext, repository, worktreePath)
-}
-
-func rollbackMaterializedWorktree(ctx context.Context, repository *repositorySnapshot, worktreePath string) error {
+func rollbackMaterializedWorktreeAfterFailure(
+	repository *repositorySnapshot,
+	worktreePath string,
+	expectedRoot os.FileInfo,
+) error {
 	if repository == nil || strings.TrimSpace(worktreePath) == "" {
 		return nil
 	}
-	var failures []error
-	registered, err := repositoryWorktreeRegistered(ctx, repository, worktreePath)
-	if err != nil {
-		failures = append(failures, err)
-	} else if registered {
-		if _, err := runGit(ctx, repository.gitBinary, repository.root, "worktree", "remove", "--force", worktreePath); err != nil {
-			failures = append(failures, err)
-		}
-	}
-	if _, err := os.Lstat(worktreePath); err == nil {
-		if removeErr := os.RemoveAll(worktreePath); removeErr != nil {
-			failures = append(failures, removeErr)
-		}
-	} else if !os.IsNotExist(err) {
-		failures = append(failures, err)
-	}
-	return errors.Join(failures...)
+	cleanupContext, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	return CleanupInitializationWorktree(
+		cleanupContext,
+		repository.root,
+		worktreePath,
+		repository.headCommit,
+		expectedRoot,
+	)
 }

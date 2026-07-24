@@ -107,13 +107,18 @@ The installed or packaged binary discovers bundled skills and the optional PDF h
 
 ```bash
 make test
+make test-race
+make cross-compile
+make cross-compile-tests
 make smoke-fake-providers
 make package
 ```
 
 `make smoke-fake-providers` is the Go-only release smoke gate. It builds the CLI, shadows `codex`, `claude`, and `gemini` with deterministic fake provider binaries in `PATH`, writes sessions into a temp relay home, and checks the required provider matrix plus `resume`, `cleanup`, `clean`, `contracts --json`, `show --graph --json`, and `display --html-only`. Live Codex, Claude, and Gemini runs are useful local release evidence, but they are optional and are not required for CI.
 
-`make test` also reruns the complete generic Go suite with integration-bound optional recipe defaults disabled. Run that configuration alone with `make test-without-optional-defaults`.
+`make test` also reruns the complete generic Go suite with integration-bound optional recipe defaults disabled. Run that configuration alone with `make test-without-optional-defaults`. CI keeps `go vet ./...`, `go test ./... -count=1`, and `make test-without-optional-defaults` as separate steps.
+
+Cross-compilation is a merge gate, not a runtime certification claim. `make cross-compile` builds every production package for `darwin/arm64` and `windows/amd64`, while `make cross-compile-tests` compiles the repository's practical test packages for those targets. These gates do not execute foreign binaries and do not certify runtime support on macOS or Windows.
 
 ### Manual skill install from a checkout
 
@@ -327,7 +332,13 @@ convo-relay run "Evaluate the supplied records" \
   --json -o ./session-result.json
 ```
 
-Root recipe mode uses the recipe's exact participant-turn schedule, optional fresh reducer, lifecycle minimum, named inputs, and declarative result contract. It has no compile-target flag because it always selects the root target. Ordinary runs and nested relay execution continue to use their existing paths. See [Root recipe and integration contracts](docs/root-recipe-integration.md) for the unified compiler API, bundle and schema subset, assertions, recovery, persistence, inspection, and cleanup contracts.
+Root recipe mode uses the recipe's exact participant-turn schedule, optional fresh reducer, lifecycle minimum, named inputs, and declarative result contract. It has no compile-target flag because it always selects the root target. Ordinary runs and nested relay execution continue to use their existing paths.
+
+Provider CLIs are trusted same-user processes. They run with the invoking user's authority and are not a sandbox or security boundary: they can access any source, session, credential, network, or other path the user can access. Named inputs are copied into the session and integrity-checked before and after every provider attempt, during recovery, and before result validation. Those copies are snapshots, not immutable or filesystem read-only objects; a provider can change them between checks, and orchestration detects that change at the next boundary.
+
+The `read_only` and `ephemeral` workspace policy names are compatibility and lifecycle values. Both execute in a writable, session-managed detached worktree. They neither make the filesystem read-only nor protect the source repository or session state from a same-user provider. Failed or interrupted worktrees remain registered for inspection until cleanup succeeds.
+
+See [Root recipe and integration contracts](docs/root-recipe-integration.md) for the unified compiler API, bundle and schema subset, assertions, recovery, persistence, inspection, cleanup, raw Git-object materialization, and trust-boundary contracts.
 
 When a top-level slot uses the `relay` backend, `--model-a` or `--model-b` selects the relay backend recipe for that slot. Nested relay profiles do not read those top-level model flags; their recipe and profile selection comes from the settings file.
 
@@ -439,7 +450,7 @@ convo-relay stop a1b2c3d4
 convo-relay kill a1b2c3d4
 ```
 
-`stop` sends `SIGTERM` to the tracked relay process, which lets the relay mark the session interrupted and terminate the active backend subprocess. `kill` sends `SIGKILL` and marks the session killed immediately.
+On Unix, `stop` sends `SIGTERM` to the tracked relay process, which lets the relay mark the session interrupted and terminate the active backend subprocess. A live-process graceful stop is unsupported on Windows: it returns an explicit error without changing session state or removing PID and cleanup evidence. Use `kill` or `stop --kill` there. Force-kill marks the session killed immediately after the platform process-termination request succeeds.
 
 ### Display a session
 
@@ -511,7 +522,7 @@ Then read /tmp/auth-review.md and summarize what each agent found.
 | `proposals` | List dynamic spawn proposals for a session |
 | `approve` | Approve a spawn proposal, run its child relay, and collapse the result |
 | `reject` | Reject a spawn proposal with an operator reason |
-| `stop` | Ask a running relay process to stop cleanly |
+| `stop` | Ask a running relay process to stop cleanly (Unix live processes) |
 | `kill` | Force-kill a tracked relay process |
 | `display` | Generate styled HTML/PDF visualization of a session |
 | `diff` | Show contested and withdrawn ledger changes |
@@ -535,7 +546,7 @@ Then read /tmp/auth-review.md and summarize what each agent found.
 | `--recipe-file FILE` | run | Attach session-scoped transient relay recipes from TOML and persist the source artifact |
 | `--recipe ID` | run | Execute a configured recipe directly as the root session |
 | `--input NAME=PATH` | run --recipe | Bind one named contract input; repeat for many-valued inputs |
-| `--workspace-isolation {inherited,read_only,ephemeral}` | run --recipe | Request a root workspace policy that does not weaken the recipe minimum |
+| `--workspace-isolation {inherited,read_only,ephemeral}` | run --recipe | Request a root workspace lifecycle policy; `read_only` and `ephemeral` both use writable detached worktrees |
 | `--task-plan FILE` | run | Attach the launch task plan from a JSON or markdown/text file so display exports can show it |
 | `--investigation {auto,normal,context_only}` | run | Prompt policy for evidence behavior. Default `auto` cites inspected files/context; `normal` is conceptual; `context_only` requires `--context` and avoids repo exploration |
 | `--dynamic {off,ask,auto-safe}` | run | Enable dynamic spawn proposal handling. Default is `off` |
@@ -557,6 +568,11 @@ Then read /tmp/auth-review.md and summarize what each agent found.
 | `--limit N` | list | Max sessions to show (default: 20) |
 
 ## Session isolation
+
+Session separation is an organizational and provider-state boundary, not a
+security boundary. Backend processes run as the current user and retain that
+user's filesystem and network authority, including access to source and
+session paths outside the slot-scoped directories.
 
 Each session is stored under `~/.codex-claude/sessions/<uuid>/`:
 

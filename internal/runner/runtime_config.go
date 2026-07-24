@@ -15,7 +15,7 @@ const (
 )
 
 func loadEffectiveRuntimeConfig(settingsPath string, provided recipes.RuntimeConfig, recipeFiles []string, generatedRecipeFiles []string, transientSources []recipes.TransientRecipeSource) (recipes.RuntimeConfig, []recipes.TransientRecipeFile, error) {
-	if runtimeConfigProvided(provided) {
+	if directRuntimeConfigProvided(provided) {
 		if err := recipes.ValidateRuntimeLimits(provided.EffectiveLimits()); err != nil {
 			return recipes.RuntimeConfig{}, nil, err
 		}
@@ -38,6 +38,10 @@ func loadEffectiveRuntimeConfig(settingsPath string, provided recipes.RuntimeCon
 
 func runtimeConfigProvided(config recipes.RuntimeConfig) bool {
 	return len(config.BackendProfiles) > 0 && len(config.RelayRecipes) > 0
+}
+
+func directRuntimeConfigProvided(config recipes.RuntimeConfig) bool {
+	return runtimeConfigProvided(config) || recipes.RuntimeLimitsProvided(config.Limits)
 }
 
 func cloneRuntimeConfig(config recipes.RuntimeConfig) recipes.RuntimeConfig {

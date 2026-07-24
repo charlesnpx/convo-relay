@@ -1677,6 +1677,88 @@ func TestStopMarksOrphanedAndKillMarksKilled(t *testing.T) {
 	}
 }
 
+func TestStopUnsupportedGracefulPreservesStatePIDAndForceKillRemainsAvailable(t *testing.T) {
+	sessionDir := filepath.Join(t.TempDir(), "session")
+	st := store.New(sessionDir)
+	if err := st.EnsureSession(); err != nil {
+		t.Fatalf("ensure session: %v", err)
+	}
+	if err := st.SaveMetaMap(map[string]any{
+		"session_id":       "unsupported-graceful",
+		"status":           "running",
+		"cleanup_evidence": "retain",
+	}); err != nil {
+		t.Fatalf("save meta: %v", err)
+	}
+	if err := st.SaveTranscriptItems([]any{}); err != nil {
+		t.Fatalf("save transcript: %v", err)
+	}
+	pidPath := filepath.Join(sessionDir, "relay.pid")
+	if err := os.WriteFile(pidPath, []byte("4242\n"), 0o644); err != nil {
+		t.Fatalf("write pid: %v", err)
+	}
+	cleanupPath := filepath.Join(sessionDir, "cleanup.pending")
+	if err := os.WriteFile(cleanupPath, []byte("retain cleanup evidence\n"), 0o644); err != nil {
+		t.Fatalf("write cleanup evidence: %v", err)
+	}
+	metaPath := filepath.Join(sessionDir, "meta.json")
+	metaBefore, err := os.ReadFile(metaPath)
+	if err != nil {
+		t.Fatalf("read meta before stop: %v", err)
+	}
+	pidBefore, err := os.ReadFile(pidPath)
+	if err != nil {
+		t.Fatalf("read pid before stop: %v", err)
+	}
+
+	stopRequests := []bool{}
+	operations := stopProcessOperations{
+		alive: func(pid int) bool {
+			return pid == 4242
+		},
+		requestStop: func(pid int, force bool) error {
+			if pid != 4242 {
+				t.Fatalf("stop pid = %d, want 4242", pid)
+			}
+			stopRequests = append(stopRequests, force)
+			if !force {
+				return errGracefulStopUnsupported
+			}
+			return nil
+		},
+	}
+	report, err := stopWithProcessOperations(sessionDir, StopOptions{}, operations)
+	if report != nil || !errors.Is(err, errGracefulStopUnsupported) {
+		t.Fatalf("unsupported graceful stop = %#v, %v", report, err)
+	}
+	metaAfter, readErr := os.ReadFile(metaPath)
+	if readErr != nil || string(metaAfter) != string(metaBefore) {
+		t.Fatalf("unsupported graceful stop changed meta: err=%v\nbefore=%s\nafter=%s", readErr, metaBefore, metaAfter)
+	}
+	pidAfter, readErr := os.ReadFile(pidPath)
+	if readErr != nil || string(pidAfter) != string(pidBefore) {
+		t.Fatalf("unsupported graceful stop changed pid evidence: err=%v before=%q after=%q", readErr, pidBefore, pidAfter)
+	}
+	if body, readErr := os.ReadFile(cleanupPath); readErr != nil || string(body) != "retain cleanup evidence\n" {
+		t.Fatalf("unsupported graceful stop changed cleanup evidence: %q, %v", body, readErr)
+	}
+
+	report, err = stopWithProcessOperations(sessionDir, StopOptions{ForceKill: true}, operations)
+	if err != nil || report["status"] != "killed" {
+		t.Fatalf("force kill after unsupported graceful stop = %#v, %v", report, err)
+	}
+	if len(stopRequests) != 2 || stopRequests[0] || !stopRequests[1] {
+		t.Fatalf("process stop requests = %#v", stopRequests)
+	}
+	if _, statErr := os.Stat(pidPath); !os.IsNotExist(statErr) {
+		t.Fatalf("force kill left pid evidence: %v", statErr)
+	}
+	meta := mustLoadMeta(t, sessionDir)
+	if meta["status"] != "killed" || meta["stop_reason"] != "killed" {
+		t.Fatalf("force kill meta = %#v", meta)
+	}
+}
+
 func TestSessionAdminResolvesListsCleansAndCleansUp(t *testing.T) {
 	env := setupFakeCodex(t)
 	deadDir := filepath.Join(env.relayHome, "sessions", "phase7-dead")

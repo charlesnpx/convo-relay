@@ -400,27 +400,7 @@ func loadManifestEntry(st *store.Store, entry map[string]any, expectedOrdinal in
 }
 
 func safeMaterializationDirectory(sessionRoot string, requestedPath string) (string, error) {
-	absoluteRoot, err := filepath.Abs(sessionRoot)
-	if err != nil {
-		return "", err
-	}
-	absolutePath, err := filepath.Abs(requestedPath)
-	if err != nil {
-		return "", err
-	}
-	absoluteExecutionRoot := filepath.Join(absoluteRoot, "execution")
-	relativeExecutionPath, err := filepath.Rel(absoluteExecutionRoot, absolutePath)
-	if err != nil || relativeExecutionPath == "." || filepath.IsAbs(relativeExecutionPath) || relativeExecutionPath == ".." || strings.HasPrefix(relativeExecutionPath, ".."+string(filepath.Separator)) {
-		return "", diagnosticError(
-			err,
-			DiagnosticCodeIntegrity,
-			contracts.DiagnosticPhasePolicy,
-			"",
-			"Named inputs must be materialized in a dedicated directory inside the session execution area.",
-			map[string]any{"execution_input_dir": absolutePath},
-		)
-	}
-	relativePath, err := filepath.Rel(absoluteRoot, absolutePath)
+	absoluteRoot, absolutePath, relativePath, err := materializationDirectoryPaths(sessionRoot, requestedPath)
 	if err != nil {
 		return "", err
 	}
@@ -452,6 +432,60 @@ func safeMaterializationDirectory(sessionRoot string, requestedPath string) (str
 		return "", err
 	}
 	return absolutePath, nil
+}
+
+func safeExistingMaterializationDirectory(sessionRoot string, requestedPath string) (string, error) {
+	absoluteRoot, absolutePath, relativePath, err := materializationDirectoryPaths(sessionRoot, requestedPath)
+	if err != nil {
+		return "", err
+	}
+	rootInfo, err := os.Lstat(absoluteRoot)
+	if err != nil {
+		return "", err
+	}
+	if rootInfo.Mode()&os.ModeSymlink != 0 || !rootInfo.IsDir() {
+		return "", diagnosticError(nil, DiagnosticCodeIntegrity, contracts.DiagnosticPhasePolicy, "", "Named input session root must be a real directory.", nil)
+	}
+	currentPath := absoluteRoot
+	for _, component := range strings.Split(relativePath, string(filepath.Separator)) {
+		currentPath = filepath.Join(currentPath, component)
+		info, statErr := os.Lstat(currentPath)
+		if statErr != nil {
+			return "", statErr
+		}
+		if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
+			return "", diagnosticError(nil, DiagnosticCodeIntegrity, contracts.DiagnosticPhasePolicy, "", "Named input materialization path must not contain symlinks or non-directory components.", map[string]any{"path": currentPath})
+		}
+	}
+	return absolutePath, nil
+}
+
+func materializationDirectoryPaths(sessionRoot string, requestedPath string) (string, string, string, error) {
+	absoluteRoot, err := filepath.Abs(sessionRoot)
+	if err != nil {
+		return "", "", "", err
+	}
+	absolutePath, err := filepath.Abs(requestedPath)
+	if err != nil {
+		return "", "", "", err
+	}
+	absoluteExecutionRoot := filepath.Join(absoluteRoot, "execution")
+	relativeExecutionPath, err := filepath.Rel(absoluteExecutionRoot, absolutePath)
+	if err != nil || relativeExecutionPath == "." || filepath.IsAbs(relativeExecutionPath) || relativeExecutionPath == ".." || strings.HasPrefix(relativeExecutionPath, ".."+string(filepath.Separator)) {
+		return "", "", "", diagnosticError(
+			err,
+			DiagnosticCodeIntegrity,
+			contracts.DiagnosticPhasePolicy,
+			"",
+			"Named inputs must be materialized in a dedicated directory inside the session execution area.",
+			map[string]any{"execution_input_dir": absolutePath},
+		)
+	}
+	relativePath, err := filepath.Rel(absoluteRoot, absolutePath)
+	if err != nil {
+		return "", "", "", err
+	}
+	return absoluteRoot, absolutePath, relativePath, nil
 }
 
 func validateMaterializationDirectory(path string, inputCount int) error {

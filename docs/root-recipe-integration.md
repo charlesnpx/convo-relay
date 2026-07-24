@@ -1,10 +1,36 @@
 # Root recipe and integration contracts
 
 Convo Relay can execute a configured recipe as the root session. This mode is
-for bounded procedures that need an exact turn schedule, named immutable
-inputs, an optional fresh reducer, declarative result validation, and durable
-inspection. It is separate from ordinary `runner.Run` and from using `relay`
-as one participant backend.
+for bounded procedures that need an exact turn schedule, named input
+snapshots with boundary integrity checks, an optional fresh reducer,
+declarative result validation, and durable inspection. It is separate from
+ordinary `runner.Run` and from using `relay` as one participant backend.
+
+## Trust boundary
+
+Every provider is a trusted same-user process. A provider runs with the
+invoking user's authority; it is not sandboxed, containerized, mounted
+read-only, placed under a separate user, or isolated from credentials or the
+network. It can access any source repository, session path, or other resource
+visible to that user, regardless of the selected workspace policy.
+
+The integrity and workspace controls below detect and report changes at
+orchestration boundaries. They do not prevent a provider from making changes
+between checks and are not a security boundary.
+
+## Portability gate
+
+Cross-compilation is a merge gate, not evidence of runtime certification.
+CI builds every production package and compiles practical test packages for
+`darwin/arm64` and `windows/amd64`. It does not execute foreign binaries and
+does not certify runtime support on macOS or Windows.
+
+The Linux test job keeps `go vet ./...`, `go test ./... -count=1`, and
+`make test-without-optional-defaults` as separate validation steps.
+
+A live-process graceful stop is unsupported on Windows. The request returns
+an explicit error without changing session state or removing PID and cleanup
+evidence; `kill` and `stop --kill` retain the force-kill path.
 
 ## One compiler, explicit targets
 
@@ -53,8 +79,8 @@ relay runs retain their existing flags and behavior.
 The root runner performs preflight before creating a session or launching a
 provider. It resolves the recipe and profiles, compiles the root plan, binds
 the selected contract and inputs, checks backend readiness and workspace
-feasibility, then persists the immutable execution inputs before the first
-participant turn.
+feasibility, then persists retained input snapshots and verifies them before
+the first participant turn.
 
 ## Integration bundle
 
@@ -136,13 +162,46 @@ validation diagnostics.
 `--input <name>=<path>` may be repeated. Names must exactly match the selected
 contract. Cardinality, byte size, media type, UTF-8 or JSON requirements, and
 optional schemas are checked before provider launch. Repeated `many` values
-retain caller order.
+retain caller order. The effective per-file ceiling is the smaller of the
+contract's `max_bytes` and the runtime `named_input_max_bytes`; the aggregate
+runtime ceiling counts raw source bytes before base64 persistence and uses
+checked integer accounting.
+
+The public limit diagnostics remain `named_input_file_too_large` for an
+individual input and `named_input_total_too_large` for the aggregate ceiling.
+Internal accounting may retain a more specific resource classification.
 
 The session persists an ordered manifest plus content-addressed input
-artifacts. The execution workspace receives verified copies. Inspection and
-recovery use the persisted bytes and digests, not the current source paths.
-Positional `--context` remains available for ordinary runs; it is rejected
-when a selected contract declares named inputs.
+artifacts. The execution area receives retained copies, and participant and
+reducer prompts receive their paths and content metadata as data. The
+facilitator is integrity-checked too, but its prompt receives neither the
+named-input projection nor workspace provenance.
+
+Retained copies are writable snapshots, not immutable files and not a
+filesystem read-only guarantee. Orchestration verifies their exact directory
+layout, type, mode, size, and digest before and after every participant,
+facilitator, and reducer attempt—including every retry—then again before
+result validation. The mandatory post-attempt check uses a bounded
+orchestration-owned context that survives provider or caller cancellation. A
+mismatch or verifier failure discards that attempt's output, prevents retry,
+and terminates with `named_input_integrity_failed`; any provider failure or
+cancellation remains a secondary cause. A provider can still mutate a copy
+between checks, so detection occurs at the next boundary.
+
+Provider-boundary failures record a 1-based `provider_attempt` in the
+authoritative `named_input_integrity_failure` record and its diagnostic
+details. Non-provider boundaries omit that field. A post-attempt verifier that
+cannot complete reports the content-free mismatch category
+`verification_incomplete`.
+
+Recovery verifies any present retained materialization before session writes
+or provider construction and never repairs mismatched evidence. A narrowly
+defined legacy session with no descriptor, retained directory, artifact,
+index, or graph evidence may materialize the persisted manifest once and
+immediately verify it. Inspection and recovery use persisted bytes and
+digests, not current source paths. Positional `--context` remains available
+for ordinary runs; it is rejected when a selected contract declares named
+inputs.
 
 ## Execution, lifecycle, and recovery
 
@@ -169,10 +228,31 @@ input snapshots. Completed participant or reducer work is not replayed when
 its durable checkpoint and artifacts are valid.
 
 Workspace policies are ordered `inherited`, `read_only`, and `ephemeral`; a
-CLI request may strengthen but not weaken the recipe minimum. Ephemeral mode
-uses a verified detached worktree, records source identity and cleanup state,
-and detects source-tree mutation. Failed or interrupted root sessions retain
-their managed workspace for inspection and retryable cleanup.
+CLI request may strengthen but not weaken the recipe minimum. The
+`read_only` name does not create a read-only filesystem. Both `read_only` and
+`ephemeral` use writable, session-managed detached worktrees. They do not
+protect the source repository or session state from a trusted same-user
+provider.
+
+Preflight inventories only the source set defined by the workspace contract,
+not every same-user-visible path. Required detached execution starts from the
+committed tree; a dirty source requires an explicit override and still uses
+committed content rather than staged, unstaged, or untracked changes.
+Repository inventory includes at most eight repositories, counting the
+superproject as depth 1. A ninth repository and an initialized-repository
+cycle report `workspace_inventory_depth_exceeded` and
+`workspace_inventory_cycle_detected`, respectively; file or byte ceilings use
+`workspace_inventory_limit_exceeded`.
+Orchestration records source identity and checks that inventoried set again
+at terminal finalization. Failed or interrupted root sessions retain their
+managed worktree and Git registration until cleanup succeeds.
+
+Committed content is materialized from raw Git objects. This deliberately
+does not run Git LFS smudging, clean/smudge filters, `working-tree-encoding`,
+end-of-line conversion, export attributes, or other checkout transforms. An
+LFS-managed path therefore contains its committed pointer blob. Gitlinks are
+materialized as counted empty directories; submodule content is not fetched
+or recursively materialized.
 
 ## Results, persistence, and administration
 

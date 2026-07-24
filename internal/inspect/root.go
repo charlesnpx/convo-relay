@@ -2,9 +2,11 @@ package inspect
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/charlesnpx/convo-relay/internal/contracts"
 	"github.com/charlesnpx/convo-relay/internal/graph"
@@ -100,6 +102,13 @@ func BuildRootInspectionReport(sessionDir string, meta map[string]any, includeRa
 	bundleRef := addRoot("integration_bundle_ref", meta["integration_bundle_ref"], contracts.RootArtifactKindIntegrationBundle, 0, contractID != "")
 	contractRef := addRoot("integration_contract_ref", meta["integration_contract_ref"], contracts.RootArtifactKindIntegrationContract, 0, contractID != "")
 	manifestRef := addRoot("named_input_manifest_ref", meta["named_input_manifest_ref"], contracts.RootArtifactKindNamedInputManifest, 0, contractID != "")
+	retainedInputRef := addRoot(
+		"retained_input_materialization_ref",
+		meta["retained_input_materialization_ref"],
+		contracts.RootArtifactKindRetainedInputs,
+		0,
+		contractID != "",
+	)
 	workspaceRef := addRoot("execution_workspace_ref", meta["execution_workspace_ref"], contracts.RootArtifactKindExecutionWorkspace, 0, true)
 	rawResultRef := addRoot("raw_result_ref", meta["raw_result_ref"], contracts.RootArtifactKindRawResult, 0, false)
 	validationRef := addRoot("result_validation_ref", meta["result_validation_ref"], contracts.RootArtifactKindResultValidation, 0, validationStatus != "")
@@ -119,6 +128,8 @@ func BuildRootInspectionReport(sessionDir string, meta map[string]any, includeRa
 
 	checkpoints := rootCheckpointSummary(checkpointItems, checkpointInspected, latestCheckpoint)
 	inputs := namedInputIntegrity(st, manifestRef, contractID)
+	inputs["retained_materialization_ref"] = retainedInputRef.status
+	inputs["retained_integrity"] = retainedInputIntegrityProjection(meta, retainedInputRef.status, contractID != "")
 	workspaceSummary := rootWorkspaceSummary(meta, workspaceRef)
 	providers := rootProviderSummaries(meta)
 	cleanup := rootCleanupSummary(meta)
@@ -177,11 +188,28 @@ func BuildRootHealthChecks(sessionDir string, meta map[string]any, root map[stri
 
 	inputs, _ := root["named_inputs"].(map[string]any)
 	inputStatus := strings.TrimSpace(stringFromAny(inputs["status"]))
-	checks = append(checks, map[string]any{
+	inputCheck := map[string]any{
 		"name":   "root_named_input_digests",
 		"status": map[bool]string{true: "ok", false: "error"}[inputStatus == "ok" || inputStatus == "not_applicable"],
 		"detail": inputs,
-	})
+	}
+	retainedIntegrity := mapFromAny(inputs["retained_integrity"])
+	if strings.TrimSpace(stringFromAny(retainedIntegrity["status"])) == "failed" {
+		inputCheck["status"] = "error"
+	}
+	if retainedRef, ok := meta["retained_input_materialization_ref"].(map[string]any); ok {
+		verifyCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		err := namedinputs.VerifyRetained(verifyCtx, store.New(sessionDir), retainedRef, "inspection", "health", nil)
+		cancel()
+		if err != nil {
+			inputCheck["status"] = "error"
+			inputCheck["retained_error"] = err.Error()
+			inputCheck["retained_failure"] = retainedInputErrorProjection(err, "inspection", "health")
+		} else {
+			inputCheck["retained_status"] = "ok"
+		}
+	}
+	checks = append(checks, inputCheck)
 
 	workspaceCheck := map[string]any{"name": "root_workspace_registration", "status": "ok"}
 	recovered, err := workspace.Recover(context.Background(), store.New(sessionDir))
@@ -407,6 +435,133 @@ func namedInputIntegrity(st *store.Store, manifest inspectedRootRef, contractID 
 	return map[string]any{"status": "ok", "ok": true, "input_count": inputCount, "json_value_count": count, "json_inputs": names}
 }
 
+func retainedInputIntegrityProjection(meta map[string]any, refStatus map[string]any, integrationBound bool) map[string]any {
+	if !integrationBound {
+		return map[string]any{"status": "not_applicable", "ok": true}
+	}
+	if failure, ok := meta["named_input_integrity_failure"].(map[string]any); ok ||
+		strings.TrimSpace(stringFromAny(meta["stop_reason"])) == namedinputs.DiagnosticCodeIntegrity {
+		result := map[string]any{
+			"status":         "failed",
+			"ok":             false,
+			"failure":        sanitizeRetainedInputFailure(failure),
+			"failure_causes": retainedFailureCauses(meta["failure_causes"]),
+		}
+		if boolFromAny(meta["source_mutated"]) {
+			result["source_mutated"] = true
+		}
+		return result
+	}
+	if !boolFromAny(refStatus["present"]) || !boolFromAny(refStatus["ok"]) {
+		return map[string]any{"status": "missing_or_invalid", "ok": false}
+	}
+	return map[string]any{"status": "recorded", "ok": true}
+}
+
+func retainedInputErrorProjection(err error, role string, boundary string) map[string]any {
+	result := map[string]any{
+		"code":             namedinputs.DiagnosticCodeIntegrity,
+		"role":             strings.TrimSpace(role),
+		"attempt_boundary": strings.TrimSpace(boundary),
+		"diagnostics":      []any{},
+	}
+	var diagnosticErr *contracts.DiagnosticError
+	if errors.As(err, &diagnosticErr) {
+		items := make([]any, 0, len(diagnosticErr.Diagnostics))
+		for _, diagnostic := range diagnosticErr.Diagnostics {
+			items = append(items, sanitizeRetainedInputDiagnostic(diagnostic.ToMap()))
+		}
+		result["diagnostics"] = items
+	}
+	if err != nil {
+		result["error"] = err.Error()
+		result["error_type"] = fmt.Sprintf("%T", err)
+	}
+	return result
+}
+
+func sanitizeRetainedInputFailure(failure map[string]any) map[string]any {
+	result := map[string]any{}
+	for _, key := range []string{"code", "role", "provider_attempt", "attempt_boundary", "error", "error_type"} {
+		if failure[key] != nil {
+			result[key] = failure[key]
+		}
+	}
+	items := []any{}
+	for _, raw := range asSlice(failure["diagnostics"]) {
+		if diagnostic, ok := raw.(map[string]any); ok {
+			items = append(items, sanitizeRetainedInputDiagnostic(diagnostic))
+		}
+	}
+	result["diagnostics"] = items
+	if providerFailure, ok := failure["provider_failure"].(map[string]any); ok {
+		sanitized := map[string]any{}
+		for _, key := range []string{
+			"phase", "actor", "backend", "category", "retryable", "attempts",
+			"timed_out", "stalled", "return_code", "remediation_code",
+			"remediation", "sanitized_detail", "raw_detail_hidden",
+		} {
+			if providerFailure[key] != nil {
+				sanitized[key] = providerFailure[key]
+			}
+		}
+		result["provider_failure"] = sanitized
+	}
+	return result
+}
+
+func sanitizeRetainedInputDiagnostic(diagnostic map[string]any) map[string]any {
+	result := map[string]any{}
+	for _, key := range []string{"code", "phase", "path", "message"} {
+		if diagnostic[key] != nil {
+			result[key] = diagnostic[key]
+		}
+	}
+	details, _ := diagnostic["details"].(map[string]any)
+	safeDetails := map[string]any{}
+	for _, key := range []string{
+		"role", "provider_attempt", "attempt_boundary", "input_name", "input_ordinal",
+		"mismatch_category", "cause_type", "ordinal",
+	} {
+		if details[key] != nil {
+			safeDetails[key] = details[key]
+		}
+	}
+	for _, key := range []string{"expected", "observed"} {
+		observation, _ := details[key].(map[string]any)
+		safeObservation := map[string]any{}
+		for _, observationKey := range []string{"size_bytes", "digest", "type", "mode", "path"} {
+			if observation[observationKey] != nil {
+				safeObservation[observationKey] = observation[observationKey]
+			}
+		}
+		if len(safeObservation) > 0 {
+			safeDetails[key] = safeObservation
+		}
+	}
+	if len(safeDetails) > 0 {
+		result["details"] = safeDetails
+	}
+	return result
+}
+
+func retainedFailureCauses(value any) []any {
+	result := []any{}
+	for _, raw := range asSlice(value) {
+		switch typed := raw.(type) {
+		case string:
+			if cause := strings.TrimSpace(typed); cause != "" {
+				result = append(result, cause)
+			}
+		case map[string]any:
+			if cause := strings.TrimSpace(stringFromAny(typed["code"])); cause != "" {
+				result = append(result, cause)
+			}
+		}
+	}
+	return result
+}
+
 func rootWorkspaceSummary(meta map[string]any, ref inspectedRootRef) map[string]any {
 	summary := map[string]any{
 		"ref":                  ref.status,
@@ -420,6 +575,33 @@ func rootWorkspaceSummary(meta map[string]any, ref inspectedRootRef) map[string]
 		"source_after_digest":  meta["source_after_digest"],
 	}
 	if ref.payload != nil {
+		provenance, provenanceErr := workspace.ValidateProvenanceProjection(meta, ref.payload)
+		projection := provenance.Projection()
+		for key, value := range projection {
+			summary[key] = value
+		}
+		summary["provenance_projection_valid"] = provenanceErr == nil
+		if provenanceErr != nil {
+			summary["provenance_projection_error"] = provenanceErr.Error()
+			ref.status["ok"] = false
+			ref.status["status"] = "invalid"
+			ref.status["root_contract_valid"] = false
+			ref.status["error_type"] = errorType(provenanceErr)
+			ref.status["error"] = provenanceErr.Error()
+		}
+		launchFacts, launchFactsErr := workspace.ValidateLaunchFactsProjection(meta, ref.payload)
+		for key, value := range launchFacts.Projection() {
+			summary[key] = value
+		}
+		summary["dirty_source_projection_valid"] = launchFactsErr == nil
+		if launchFactsErr != nil {
+			summary["dirty_source_projection_error"] = launchFactsErr.Error()
+			ref.status["ok"] = false
+			ref.status["status"] = "invalid"
+			ref.status["root_contract_valid"] = false
+			ref.status["error_type"] = errorType(launchFactsErr)
+			ref.status["error"] = launchFactsErr.Error()
+		}
 		if policy, ok := ref.payload["policy"].(map[string]any); ok {
 			summary["configured_policy"] = valueOr(summary["configured_policy"], policy["requested"])
 			summary["effective_policy"] = valueOr(summary["effective_policy"], policy["effective"])
@@ -598,6 +780,8 @@ func FormatRootSummary(root map[string]any) string {
 	cleanup := mapFromAny(root["cleanup"])
 	recovery := mapFromAny(root["recovery"])
 	artifacts := mapFromAny(root["artifact_validation"])
+	namedInputs := mapFromAny(root["named_inputs"])
+	retainedIntegrity := mapFromAny(namedInputs["retained_integrity"])
 	contract := firstNonEmpty(integration["contract_id"], "none")
 	providerCount := len(asSlice(providers["participants"]))
 	if providers["facilitator"] != nil {
@@ -614,6 +798,7 @@ func FormatRootSummary(root map[string]any) string {
 		fmt.Sprintf("Result: %v (%v)", valueOr(result["source"], "pending"), valueOr(result["validation_status"], "pending")),
 		fmt.Sprintf("Workspace: %v/%v, source %v", valueOr(workspaceState["effective_policy"], "unknown"), valueOr(workspaceState["achieved_policy"], "unknown"), valueOr(workspaceState["source_check"], "pending")),
 		fmt.Sprintf("Providers: %d sanitized summaries", providerCount),
+		fmt.Sprintf("Named inputs: %v (retained integrity %v)", valueOr(namedInputs["status"], "unknown"), valueOr(retainedIntegrity["status"], "unknown")),
 		fmt.Sprintf("Checkpoints: %v (%v valid, chain=%v)", valueOr(checkpoints["count"], 0), valueOr(checkpoints["valid_count"], 0), valueOr(checkpoints["chain_valid"], false)),
 		fmt.Sprintf("Cleanup: result=%v, administrative=%v", valueOr(cleanup["result_cleanup_status"], "pending"), valueOr(cleanup["administrative_status"], "not_started")),
 		fmt.Sprintf("Recovery: resumed=%v, count=%v, pending=%v", valueOr(recovery["resumed"], false), valueOr(recovery["resume_count"], 0), valueOr(recovery["pending"], false)),

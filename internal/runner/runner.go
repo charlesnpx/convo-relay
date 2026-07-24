@@ -7,7 +7,6 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
-	"syscall"
 	"time"
 
 	"github.com/charlesnpx/convo-relay/internal/graph"
@@ -85,6 +84,9 @@ type ResumeOptions struct {
 	// backendFactory is a test seam for root recovery. Ordinary resume keeps
 	// using the established slot restoration path.
 	backendFactory rootBackendFactory
+
+	retainedInputVerifier            rootRetainedInputVerifier
+	retainedInputVerificationTimeout time.Duration
 }
 
 type StopOptions struct {
@@ -490,8 +492,22 @@ func Resume(ctx context.Context, sessionDir string, opts ResumeOptions) (map[str
 }
 
 func Stop(sessionDir string, opts StopOptions) (map[string]any, error) {
+	return stopWithProcessOperations(sessionDir, opts, stopProcessOperations{
+		alive:       processAlive,
+		requestStop: requestProcessStop,
+	})
+}
+
+func stopWithProcessOperations(
+	sessionDir string,
+	opts StopOptions,
+	operations stopProcessOperations,
+) (map[string]any, error) {
 	if strings.TrimSpace(sessionDir) == "" {
 		return nil, fmt.Errorf("--session-dir is required")
+	}
+	if operations.alive == nil || operations.requestStop == nil {
+		return nil, errors.New("process control is unavailable")
 	}
 	meta, err := loadSessionMeta(sessionDir)
 	if err != nil {
@@ -506,7 +522,7 @@ func Stop(sessionDir string, opts StopOptions) (map[string]any, error) {
 		return nil, fmt.Errorf("no tracked relay process for session %s", sessionIDFromDir(sessionDir))
 	}
 	st := store.New(sessionDir)
-	if !processAlive(pid) {
+	if !operations.alive(pid) {
 		meta = meta.WithStatus("orphaned").
 			WithActualRounds(transcript.Len()).
 			With("orphaned_at", utcNow())
@@ -523,11 +539,7 @@ func Stop(sessionDir string, opts StopOptions) (map[string]any, error) {
 		removePID(sessionDir)
 		return map[string]any{"session_id": sessionIDFromDir(sessionDir), "status": meta.String("status"), "pid": pid}, nil
 	}
-	sig := syscall.SIGTERM
-	if opts.ForceKill {
-		sig = syscall.SIGKILL
-	}
-	if err := signalProcess(pid, sig); err != nil {
+	if err := operations.requestStop(pid, opts.ForceKill); err != nil {
 		return nil, err
 	}
 	if opts.ForceKill {

@@ -16,6 +16,7 @@ import (
 	"github.com/charlesnpx/convo-relay/internal/readiness"
 	"github.com/charlesnpx/convo-relay/internal/recipes"
 	"github.com/charlesnpx/convo-relay/internal/store"
+	"github.com/charlesnpx/convo-relay/internal/workspace"
 )
 
 const rootRecipeTestBundle = `{
@@ -120,6 +121,11 @@ func TestRunRecipeUsesExplicitRootTargetAndPersistsDirectContractlessSession(t *
 	if meta.String("recipe_id") != "neutral-root" {
 		t.Fatalf("normalized recipe id = %q", meta.String("recipe_id"))
 	}
+	if meta.String(workspace.WorkspaceContentSourceKey) != workspace.WorkspaceContentSourceWorkingTree ||
+		meta.Get(workspace.WorkingTreeChangesIncludedKey) != true ||
+		meta.Get(workspace.WorkspaceProvenanceInferredKey) != false {
+		t.Fatalf("workspace provenance projection = %#v", meta.ToMap())
+	}
 	contextRefs := meta.Slice("launch_context_refs")
 	inputRefs := meta.Slice("input_bundle_refs")
 	if len(contextRefs) != 1 || len(inputRefs) != 2 {
@@ -142,6 +148,13 @@ func TestRunRecipeUsesExplicitRootTargetAndPersistsDirectContractlessSession(t *
 	if workspaceCheckpoint["phase"] != "workspace_ready" || workspaceCheckpoint["preflight_complete"] != true || workspaceCheckpoint["workspace_ready"] != true {
 		t.Fatalf("workspace checkpoint = %#v", workspaceCheckpoint)
 	}
+	assertRootRecipeArtifact(
+		t,
+		st,
+		workspaceCheckpoint["execution_workspace_ref"],
+		contracts.RootArtifactKindExecutionWorkspace,
+		0,
+	)
 	participantCheckpoint := assertRootRecipeArtifact(t, st, checkpointRefs[1], contracts.RootArtifactKindRootCheckpoint, 2)
 	if participantCheckpoint["phase"] != "participant_turns_complete" || intFromAny(participantCheckpoint["participant_turns_completed"], 0) != 2 {
 		t.Fatalf("participant checkpoint = %#v", participantCheckpoint)

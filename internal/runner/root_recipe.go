@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/charlesnpx/convo-relay/internal/contracts"
 	"github.com/charlesnpx/convo-relay/internal/graph"
@@ -55,6 +56,8 @@ type RecipeOptions struct {
 	InputBindings         []string
 	WorkspaceIsolation    string
 	WorkspaceExplicit     bool
+	AllowDirtySource      bool
+	WarningCallback       RecipeWarningCallback
 	SettingsPath          string
 	LaunchCWD             string
 	TimeoutSeconds        int
@@ -74,6 +77,9 @@ type RecipeOptions struct {
 	// backendFactory is an internal test seam. Production root execution uses
 	// the same low-level backend factory as ordinary relay execution.
 	backendFactory rootBackendFactory
+
+	retainedInputVerifier            rootRetainedInputVerifier
+	retainedInputVerificationTimeout time.Duration
 }
 
 type recipePreflight struct {
@@ -97,6 +103,7 @@ type recipePreflight struct {
 	promptPolicy       PromptPolicy
 	backendReadiness   []readiness.Record
 	workspace          *workspace.Snapshot
+	warning            *RecipeWarning
 }
 
 type preparedTransientRecipe struct {
@@ -118,7 +125,9 @@ type persistedRecipeRun struct {
 	launchContextRefs     []any
 	launchSkillRefs       []any
 	inputManifestRef      map[string]any
+	retainedInputRef      map[string]any
 	providerInputs        map[string]any
+	workspaceArtifact     map[string]any
 	workspaceRef          map[string]any
 	executionCWD          string
 	checkpointRef         map[string]any
@@ -245,10 +254,13 @@ func preflightRecipe(ctx context.Context, opts RecipeOptions) (*recipePreflight,
 	}
 	opts.LaunchPlan = normalizedLaunchPlan
 	preparedInputs, err := namedinputs.Prepare(namedinputs.Options{
-		Contract:               selectedContract,
-		Bindings:               append([]string{}, opts.InputBindings...),
-		SourceAnchor:           launchCWD,
-		PositionalContextCount: len(launchContexts),
+		Contract:                selectedContract,
+		Bindings:                append([]string{}, opts.InputBindings...),
+		SourceAnchor:            launchCWD,
+		PositionalContextCount:  len(launchContexts),
+		Context:                 ctx,
+		NamedInputMaxBytes:      runtimeConfig.EffectiveLimits().NamedInputMaxBytes,
+		NamedInputTotalMaxBytes: runtimeConfig.EffectiveLimits().NamedInputTotalMaxBytes,
 	})
 	if err != nil {
 		return nil, err
@@ -293,6 +305,9 @@ func preflightRecipe(ctx context.Context, opts RecipeOptions) (*recipePreflight,
 		MinimumPolicy:     stringFromAny(rootPlan["workspace_isolation_minimum"]),
 		RequestedPolicy:   opts.WorkspaceIsolation,
 		RequestedExplicit: opts.WorkspaceExplicit,
+		AllowDirtySource:  opts.AllowDirtySource,
+		InventoryMaxFiles: runtimeConfig.EffectiveLimits().RepositoryInventoryMaxFiles,
+		InventoryMaxBytes: runtimeConfig.EffectiveLimits().RepositoryInventoryMaxBytes,
 	})
 	if err != nil {
 		return nil, err
@@ -301,6 +316,19 @@ func preflightRecipe(ctx context.Context, opts RecipeOptions) (*recipePreflight,
 	sessionID = sessionIDFromDir(sessionDir)
 	if err := validateNewRecipeSessionDestination(sessionDir); err != nil {
 		return nil, err
+	}
+	var warning *RecipeWarning
+	if changes := workspaceSnapshot.SourceChanges(); workspaceSnapshot.AllowDirtySource() && changes.Dirty() {
+		value := RecipeWarning{
+			Code:                       RecipeWarningCodeDirtySourceCommittedHead,
+			Message:                    "Dirty source changes are excluded; isolated execution uses committed HEAD.",
+			StagedChanges:              changes.Staged,
+			UnstagedChanges:            changes.Unstaged,
+			UntrackedChanges:           changes.Untracked,
+			WorkspaceContentSource:     workspace.WorkspaceContentSourceCommittedHead,
+			WorkingTreeChangesIncluded: false,
+		}
+		warning = &value
 	}
 
 	opts.RecipeID = recipeID
@@ -330,6 +358,7 @@ func preflightRecipe(ctx context.Context, opts RecipeOptions) (*recipePreflight,
 		promptPolicy:       promptPolicy,
 		backendReadiness:   append([]readiness.Record{}, backendReadiness...),
 		workspace:          workspaceSnapshot,
+		warning:            warning,
 	}, nil
 }
 
@@ -380,32 +409,69 @@ func startRecipeRun(ctx context.Context, preflight *recipePreflight) (map[string
 	if preflight == nil {
 		return nil, errors.New("root recipe preflight is required")
 	}
-	if err := ensureSessionDir(preflight.sessionDir); err != nil {
-		return nil, err
+	if preflight.warning != nil {
+		deliverRecipeWarning(preflight.options.WarningCallback, *preflight.warning)
 	}
-	persisted, err := persistRecipePreflight(ctx, preflight)
+	transaction, err := beginRootInitialization(preflight)
 	if err != nil {
 		return nil, err
 	}
-	meta := rootRecipeMeta(preflight, persisted)
-	transcript := model.EmptyTranscript()
-	if err := persisted.st.SaveMeta(meta); err != nil {
-		return nil, err
+	persisted, err := persistRecipePreflight(ctx, preflight, transaction)
+	if err != nil {
+		return nil, transaction.Fail(err)
 	}
+	meta, err := rootRecipeMeta(preflight, persisted)
+	if err != nil {
+		return nil, transaction.Fail(err)
+	}
+	transcript := model.EmptyTranscript()
 	if err := persisted.st.SaveTranscript(transcript); err != nil {
-		return nil, err
+		return nil, transaction.Fail(err)
+	}
+	if err := runRootInitializationAfterMutation("transcript_persisted"); err != nil {
+		return nil, transaction.Fail(err)
+	}
+	if err := transaction.advance("transcript_persisted"); err != nil {
+		return nil, transaction.Fail(err)
 	}
 	if _, err := persisted.st.AppendSessionEventV1("node_started", graph.RootNodeID, "Root recipe execution is ready", rootRecipeStartEvent(preflight, persisted), store.EventOptions{}); err != nil {
-		return nil, err
+		return nil, transaction.Fail(err)
+	}
+	if err := runRootInitializationAfterMutation("start_event_persisted"); err != nil {
+		return nil, transaction.Fail(err)
+	}
+	if err := transaction.advance("start_event_persisted"); err != nil {
+		return nil, transaction.Fail(err)
 	}
 	if _, _, err := graph.RepairAndSaveFromEvents(persisted.st); err != nil {
-		return nil, err
+		return nil, transaction.Fail(err)
+	}
+	if err := runRootInitializationAfterMutation("graph_persisted"); err != nil {
+		return nil, transaction.Fail(err)
+	}
+	if err := transaction.advance("graph_persisted"); err != nil {
+		return nil, transaction.Fail(err)
+	}
+	meta = meta.
+		With("initialization_state", RootInitializationStateReady).
+		With("initialization_token", transaction.token).
+		With("initialization_phase", "ready").
+		With("initialization_ready_at", utcNow())
+	if err := transaction.markReady(meta.ToMap()); err != nil {
+		return nil, transaction.Fail(err)
 	}
 	return runRootParticipants(ctx, preflight, persisted, meta, transcript)
 }
 
-func persistRecipePreflight(ctx context.Context, preflight *recipePreflight) (*persistedRecipeRun, error) {
-	st := store.New(preflight.sessionDir)
+func persistRecipePreflight(
+	ctx context.Context,
+	preflight *recipePreflight,
+	transaction *rootInitializationTransaction,
+) (*persistedRecipeRun, error) {
+	if transaction == nil {
+		return nil, errors.New("root recipe persistence requires an initialization transaction")
+	}
+	st := transaction.st
 	runtimeConfigRef, err := persistPreparedRuntimeConfigSnapshot(st, preflight.runtimeSnapshot)
 	if err != nil {
 		return nil, err
@@ -481,6 +547,7 @@ func persistRecipePreflight(ctx context.Context, preflight *recipePreflight) (*p
 	}
 
 	var inputManifestRef map[string]any
+	var retainedInputRef map[string]any
 	var providerInputs map[string]any
 	if preflight.selectedContract != nil {
 		persistedInputs, err := namedinputs.Persist(st, preflight.preparedInputs)
@@ -489,15 +556,67 @@ func persistRecipePreflight(ctx context.Context, preflight *recipePreflight) (*p
 		}
 		inputManifestRef = persistedInputs.ManifestRef
 	}
-	materializedWorkspace, err := workspace.Materialize(ctx, st, preflight.workspace)
+	materializedWorkspace, err := transaction.materializeWorkspace(ctx, preflight.workspace)
 	if err != nil {
 		return nil, err
 	}
+	if err := runRootInitializationAfterMutation("workspace_materialized"); err != nil {
+		return nil, err
+	}
+	if err := transaction.advance("workspace_materialized"); err != nil {
+		return nil, err
+	}
 	if inputManifestRef != nil {
-		providerInputs, err = namedinputs.Materialize(st, inputManifestRef, filepath.Join(preflight.sessionDir, "execution", "inputs"))
-		if err != nil {
+		if err := transaction.beginOwnedScope("retained_input_materialization", filepath.Join("execution", "inputs")); err != nil {
 			return nil, err
 		}
+		retained, materializeErr := namedinputs.MaterializeRetained(
+			ctx,
+			st,
+			inputManifestRef,
+			filepath.Join(preflight.sessionDir, "execution", "inputs"),
+		)
+		err = materializeErr
+		if err != nil {
+			return nil, errors.Join(err, transaction.abortOwnedScope())
+		}
+		if err := namedinputs.VerifyRetained(
+			ctx,
+			st,
+			retained.DescriptorRef,
+			"initialization_scope",
+			namedinputs.IntegrityBoundaryInitialization,
+			nil,
+		); err != nil {
+			return nil, err
+		}
+		if err := transaction.completeOwnedScope(); err != nil {
+			return nil, err
+		}
+		providerInputs = retained.ProviderInputs
+		retainedInputRef = retained.DescriptorRef
+		if err := runRootInitializationAfterMutation("inputs_materialized"); err != nil {
+			return nil, err
+		}
+		if err := transaction.advance("inputs_materialized"); err != nil {
+			return nil, err
+		}
+		if err := namedinputs.VerifyRetained(
+			ctx,
+			st,
+			retainedInputRef,
+			"initialization",
+			namedinputs.IntegrityBoundaryInitialization,
+			nil,
+		); err != nil {
+			return nil, err
+		}
+	}
+	if err := runRootInitializationAfterMutation("retained_inputs_verified"); err != nil {
+		return nil, err
+	}
+	if err := transaction.advance("retained_inputs_verified"); err != nil {
+		return nil, err
 	}
 
 	persisted := &persistedRecipeRun{
@@ -512,7 +631,9 @@ func persistRecipePreflight(ctx context.Context, preflight *recipePreflight) (*p
 		launchContextRefs:     launchContextRefs,
 		launchSkillRefs:       launchSkillRefs,
 		inputManifestRef:      inputManifestRef,
+		retainedInputRef:      retainedInputRef,
 		providerInputs:        providerInputs,
+		workspaceArtifact:     cloneMap(materializedWorkspace.Artifact),
 		workspaceRef:          materializedWorkspace.ArtifactRef,
 		executionCWD:          materializedWorkspace.ExecutionCWD,
 	}
@@ -524,64 +645,85 @@ func persistRecipePreflight(ctx context.Context, preflight *recipePreflight) (*p
 	if err != nil {
 		return nil, err
 	}
+	if err := runRootInitializationAfterMutation("checkpoint_1_persisted"); err != nil {
+		return nil, err
+	}
+	if err := transaction.advance("checkpoint_1_persisted"); err != nil {
+		return nil, err
+	}
 	return persisted, nil
 }
 
-func rootRecipeMeta(preflight *recipePreflight, persisted *persistedRecipeRun) model.SessionMeta {
+func rootRecipeMeta(preflight *recipePreflight, persisted *persistedRecipeRun) (model.SessionMeta, error) {
 	participantTurns := intFromAny(preflight.rootPlan["participant_turns"], 0)
+	provenance, err := workspace.ProvenanceProjection(persisted.workspaceArtifact)
+	if err != nil {
+		return model.EmptySessionMeta(), fmt.Errorf("project execution workspace provenance: %w", err)
+	}
 	meta := map[string]any{
-		"session_id":                      preflight.sessionID,
-		"execution_kind":                  "recipe",
-		"task":                            preflight.options.Task,
-		"initial_prompt":                  preflight.options.Task,
-		"title":                           makeTitle(preflight.options.Task),
-		"status":                          "ready",
-		"recipe_id":                       preflight.options.RecipeID,
-		"recipe_ref":                      persisted.recipeRef,
-		"root_recipe_plan_ref":            persisted.rootPlanRef,
-		"runtime_config_ref":              persisted.runtimeConfigRef,
-		"runtime_config_version":          RuntimeConfigSnapshotVersion,
-		"transient_recipe_refs":           persisted.transientRecipeRefs,
-		"transient_recipe_contract_refs":  persisted.transientContractRefs,
-		"integration_bundle_ref":          nil,
-		"integration_contract_ref":        nil,
-		"named_input_manifest_ref":        nil,
-		"provider_inputs":                 nil,
-		"execution_workspace_ref":         persisted.workspaceRef,
-		"root_checkpoint_refs":            []any{persisted.checkpointRef},
-		"latest_root_checkpoint_ref":      persisted.checkpointRef,
-		"participant_turns":               participantTurns,
-		"actual_participant_turns":        0,
-		"participant_turns_completed":     0,
-		"next_unsealed_participant_turn":  1,
-		"sealed_participant_turns":        []any{},
-		"actual_rounds":                   0,
-		"max_rounds":                      participantTurns,
-		"round_limit_mode":                "fixed",
-		"rounds":                          participantTurns,
-		"participant_schedule":            preflight.rootPlan["participant_schedule"],
-		"slots":                           rootParticipantEnvelopes(preflight.rootPlan),
-		"facilitator":                     preflight.rootPlan["facilitator"],
-		"reducer":                         preflight.rootPlan["reducer"],
-		"result_source":                   preflight.rootPlan["result_source"],
-		"mode":                            preflight.rootPlan["mode"],
-		"ledger":                          emptyLedger(),
-		"lifecycle":                       preflight.rootPlan["lifecycle"],
-		"launch_plan":                     preflight.options.LaunchPlan,
-		"launch_context_refs":             persisted.launchContextRefs,
-		"input_bundle_refs":               append(append([]any{}, persisted.launchContextRefs...), persisted.launchSkillRefs...),
-		"investigation_mode":              preflight.promptPolicy.InvestigationMode,
-		"prompt_policy":                   preflight.promptPolicy.ToMap(),
-		"prompt_policy_version":           preflight.promptPolicy.Version,
-		"source_launch_cwd":               preflight.launchCWD,
-		"launch_cwd":                      persisted.executionCWD,
-		"execution_cwd":                   persisted.executionCWD,
-		"launch_working_directory_policy": "root_recipe_execution_workspace",
-		"workspace_isolation":             preflight.workspace.Policy().Effective,
-		"backend_readiness":               preflight.backendReadiness,
-		"timeout_seconds":                 preflight.options.TimeoutSeconds,
-		"stall_timeout_seconds":           preflight.options.StallTimeoutSeconds,
-		"created_at":                      utcNow(),
+		"session_id":                         preflight.sessionID,
+		"execution_kind":                     "recipe",
+		"task":                               preflight.options.Task,
+		"initial_prompt":                     preflight.options.Task,
+		"title":                              makeTitle(preflight.options.Task),
+		"status":                             "ready",
+		"recipe_id":                          preflight.options.RecipeID,
+		"recipe_ref":                         persisted.recipeRef,
+		"root_recipe_plan_ref":               persisted.rootPlanRef,
+		"runtime_config_ref":                 persisted.runtimeConfigRef,
+		"runtime_config_version":             RuntimeConfigSnapshotVersion,
+		"transient_recipe_refs":              persisted.transientRecipeRefs,
+		"transient_recipe_contract_refs":     persisted.transientContractRefs,
+		"integration_bundle_ref":             nil,
+		"integration_contract_ref":           nil,
+		"named_input_manifest_ref":           nil,
+		"retained_input_materialization_ref": nil,
+		"provider_inputs":                    nil,
+		"execution_workspace_ref":            persisted.workspaceRef,
+		"root_checkpoint_refs":               []any{persisted.checkpointRef},
+		"latest_root_checkpoint_ref":         persisted.checkpointRef,
+		"participant_turns":                  participantTurns,
+		"actual_participant_turns":           0,
+		"participant_turns_completed":        0,
+		"next_unsealed_participant_turn":     1,
+		"sealed_participant_turns":           []any{},
+		"actual_rounds":                      0,
+		"max_rounds":                         participantTurns,
+		"round_limit_mode":                   "fixed",
+		"rounds":                             participantTurns,
+		"participant_schedule":               preflight.rootPlan["participant_schedule"],
+		"slots":                              rootParticipantEnvelopes(preflight.rootPlan),
+		"facilitator":                        preflight.rootPlan["facilitator"],
+		"reducer":                            preflight.rootPlan["reducer"],
+		"result_source":                      preflight.rootPlan["result_source"],
+		"mode":                               preflight.rootPlan["mode"],
+		"ledger":                             emptyLedger(),
+		"lifecycle":                          preflight.rootPlan["lifecycle"],
+		"launch_plan":                        preflight.options.LaunchPlan,
+		"launch_context_refs":                persisted.launchContextRefs,
+		"input_bundle_refs":                  append(append([]any{}, persisted.launchContextRefs...), persisted.launchSkillRefs...),
+		"investigation_mode":                 preflight.promptPolicy.InvestigationMode,
+		"prompt_policy":                      preflight.promptPolicy.ToMap(),
+		"prompt_policy_version":              preflight.promptPolicy.Version,
+		"source_launch_cwd":                  preflight.launchCWD,
+		"launch_cwd":                         persisted.executionCWD,
+		"execution_cwd":                      persisted.executionCWD,
+		"launch_working_directory_policy":    "root_recipe_execution_workspace",
+		"workspace_isolation":                preflight.workspace.Policy().Effective,
+		"backend_readiness":                  preflight.backendReadiness,
+		"timeout_seconds":                    preflight.options.TimeoutSeconds,
+		"stall_timeout_seconds":              preflight.options.StallTimeoutSeconds,
+		"created_at":                         utcNow(),
+	}
+	for key, value := range provenance {
+		meta[key] = value
+	}
+	launchFacts, err := workspace.LaunchFactsFromArtifact(persisted.workspaceArtifact)
+	if err != nil {
+		return model.EmptySessionMeta(), fmt.Errorf("project execution workspace launch facts: %w", err)
+	}
+	for key, value := range launchFacts.Projection() {
+		meta[key] = value
 	}
 	if strings.TrimSpace(preflight.runtimeConfig.SettingsPath) != "" {
 		meta["settings_path"] = preflight.runtimeConfig.SettingsPath
@@ -595,49 +737,52 @@ func rootRecipeMeta(preflight *recipePreflight, persisted *persistedRecipeRun) m
 	}
 	if persisted.inputManifestRef != nil {
 		meta["named_input_manifest_ref"] = persisted.inputManifestRef
+		meta["retained_input_materialization_ref"] = persisted.retainedInputRef
 		meta["provider_inputs"] = persisted.providerInputs
 	}
-	return model.NewSessionMeta(meta)
+	return model.NewSessionMeta(meta), nil
 }
 
 func rootRecipeStartEvent(preflight *recipePreflight, persisted *persistedRecipeRun) map[string]any {
 	return map[string]any{
-		"session_ref":              preflight.sessionID,
-		"execution_kind":           "recipe",
-		"recipe_id":                preflight.options.RecipeID,
-		"recipe_ref":               persisted.recipeRef,
-		"root_recipe_plan_ref":     persisted.rootPlanRef,
-		"runtime_config_ref":       persisted.runtimeConfigRef,
-		"integration_bundle_ref":   persisted.bundleRef,
-		"integration_contract_ref": persisted.contractRef,
-		"named_input_manifest_ref": persisted.inputManifestRef,
-		"execution_workspace_ref":  persisted.workspaceRef,
-		"root_checkpoint_ref":      persisted.checkpointRef,
-		"participant_turns":        preflight.rootPlan["participant_turns"],
-		"actual_participant_turns": 0,
-		"participant_schedule":     preflight.rootPlan["participant_schedule"],
-		"result_source":            preflight.rootPlan["result_source"],
-		"dynamic_mode":             "off",
-		"task":                     preflight.options.Task,
+		"session_ref":                        preflight.sessionID,
+		"execution_kind":                     "recipe",
+		"recipe_id":                          preflight.options.RecipeID,
+		"recipe_ref":                         persisted.recipeRef,
+		"root_recipe_plan_ref":               persisted.rootPlanRef,
+		"runtime_config_ref":                 persisted.runtimeConfigRef,
+		"integration_bundle_ref":             persisted.bundleRef,
+		"integration_contract_ref":           persisted.contractRef,
+		"named_input_manifest_ref":           persisted.inputManifestRef,
+		"retained_input_materialization_ref": persisted.retainedInputRef,
+		"execution_workspace_ref":            persisted.workspaceRef,
+		"root_checkpoint_ref":                persisted.checkpointRef,
+		"participant_turns":                  preflight.rootPlan["participant_turns"],
+		"actual_participant_turns":           0,
+		"participant_schedule":               preflight.rootPlan["participant_schedule"],
+		"result_source":                      preflight.rootPlan["result_source"],
+		"dynamic_mode":                       "off",
+		"task":                               preflight.options.Task,
 	}
 }
 
 func rootCheckpointFields(preflight *recipePreflight, persisted *persistedRecipeRun) map[string]any {
 	return map[string]any{
-		"ordinal":                     1,
-		"phase":                       "workspace_ready",
-		"status":                      "completed",
-		"preflight_complete":          true,
-		"workspace_ready":             true,
-		"participant_turns_completed": 0,
-		"recipe_ref":                  persisted.recipeRef,
-		"root_recipe_plan_ref":        persisted.rootPlanRef,
-		"runtime_config_ref":          persisted.runtimeConfigRef,
-		"integration_bundle_ref":      persisted.bundleRef,
-		"integration_contract_ref":    persisted.contractRef,
-		"named_input_manifest_ref":    persisted.inputManifestRef,
-		"execution_workspace_ref":     persisted.workspaceRef,
-		"created_at":                  utcNow(),
+		"ordinal":                            1,
+		"phase":                              "workspace_ready",
+		"status":                             "completed",
+		"preflight_complete":                 true,
+		"workspace_ready":                    true,
+		"participant_turns_completed":        0,
+		"recipe_ref":                         persisted.recipeRef,
+		"root_recipe_plan_ref":               persisted.rootPlanRef,
+		"runtime_config_ref":                 persisted.runtimeConfigRef,
+		"integration_bundle_ref":             persisted.bundleRef,
+		"integration_contract_ref":           persisted.contractRef,
+		"named_input_manifest_ref":           persisted.inputManifestRef,
+		"retained_input_materialization_ref": persisted.retainedInputRef,
+		"execution_workspace_ref":            persisted.workspaceRef,
+		"created_at":                         utcNow(),
 	}
 }
 

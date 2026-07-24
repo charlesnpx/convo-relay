@@ -1,9 +1,11 @@
 package namedinputs
 
 import (
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"math"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -15,6 +17,15 @@ import (
 	"github.com/charlesnpx/convo-relay/internal/integration"
 	"github.com/charlesnpx/convo-relay/internal/store"
 )
+
+func TestPublicNamedInputLimitDiagnosticCodesRemainStable(t *testing.T) {
+	if DiagnosticCodeFileTooLarge != "named_input_file_too_large" {
+		t.Fatalf("individual input limit code = %q", DiagnosticCodeFileTooLarge)
+	}
+	if DiagnosticCodeTotalTooLarge != "named_input_total_too_large" {
+		t.Fatalf("aggregate input limit code = %q", DiagnosticCodeTotalTooLarge)
+	}
+}
 
 func TestPreparePreservesGlobalAndPerNameOrderAndEqualsInPaths(t *testing.T) {
 	root := t.TempDir()
@@ -186,6 +197,120 @@ func TestPrepareRejectsNonregularMissingAndOversizedFilesAtBoundaries(t *testing
 	}
 	_, err = Prepare(Options{Contract: selected, Bindings: []string{"value=" + symlink}})
 	requireDiagnosticCode(t, err, DiagnosticCodeFileNotRegular)
+}
+
+func TestPrepareUsesMinimumContractAndRuntimePerFileLimits(t *testing.T) {
+	root := t.TempDir()
+	exact := writeInputFile(t, root, "exact.bin", []byte("1234"))
+	over := writeInputFile(t, root, "over.bin", []byte("12345"))
+	tests := []struct {
+		name          string
+		contractLimit int64
+		runtimeLimit  int64
+		wantEffective int64
+	}{
+		{name: "runtime is lower", contractLimit: 8, runtimeLimit: 4, wantEffective: 4},
+		{name: "contract is lower", contractLimit: 4, runtimeLimit: 8, wantEffective: 4},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			selected := selectedContract(t, map[string]any{
+				"value": inputDeclaration(true, integration.CardinalityOne, "application/octet-stream", test.contractLimit, nil),
+			})
+			prepared, err := Prepare(Options{
+				Contract:                selected,
+				Bindings:                []string{"value=" + exact},
+				NamedInputMaxBytes:      test.runtimeLimit,
+				NamedInputTotalMaxBytes: 64,
+			})
+			if err != nil || prepared.Items()[0].SizeBytes != test.wantEffective {
+				t.Fatalf("exact effective boundary = %#v, %v", prepared, err)
+			}
+			_, err = Prepare(Options{
+				Contract:                selected,
+				Bindings:                []string{"value=" + over},
+				NamedInputMaxBytes:      test.runtimeLimit,
+				NamedInputTotalMaxBytes: 64,
+			})
+			diagnostic := requireDiagnosticCode(t, err, DiagnosticCodeFileTooLarge)
+			if diagnostic.Details["effective_max_bytes"] != test.wantEffective ||
+				diagnostic.Details["contract_max_bytes"] != test.contractLimit ||
+				diagnostic.Details["runtime_max_bytes"] != test.runtimeLimit ||
+				diagnostic.Details["observed"] != int64(5) {
+				t.Fatalf("per-file limit diagnostic = %#v", diagnostic)
+			}
+		})
+	}
+}
+
+func TestPrepareEnforcesAggregateRawByteBoundaryBeforeBase64Persistence(t *testing.T) {
+	root := t.TempDir()
+	first := writeInputFile(t, root, "first.bin", []byte{0x00, 0x01, 0x02})
+	second := writeInputFile(t, root, "second.bin", []byte{0x03, 0x04, 0x05})
+	selected := selectedContract(t, map[string]any{
+		"value": inputDeclaration(true, integration.CardinalityMany, "application/octet-stream", 16, nil),
+	})
+	options := Options{
+		Contract:                selected,
+		Bindings:                []string{"value=" + first, "value=" + second},
+		NamedInputMaxBytes:      16,
+		NamedInputTotalMaxBytes: 6,
+	}
+	prepared, err := Prepare(options)
+	if err != nil || len(prepared.Items()) != 2 {
+		t.Fatalf("exact aggregate raw-byte boundary = %#v, %v", prepared, err)
+	}
+	// Six raw bytes encode to eight base64 bytes. Acceptance at six proves the
+	// aggregate budget is applied before persistence encoding.
+	options.NamedInputTotalMaxBytes = 5
+	_, err = Prepare(options)
+	diagnostic := requireDiagnosticCode(t, err, DiagnosticCodeTotalTooLarge)
+	if diagnostic.Details["current"] != int64(3) ||
+		diagnostic.Details["increment"] != int64(3) ||
+		diagnostic.Details["observed"] != int64(6) ||
+		diagnostic.Details["limit"] != int64(5) {
+		t.Fatalf("aggregate limit diagnostic = %#v", diagnostic)
+	}
+}
+
+func TestPrepareObservesContextCancellation(t *testing.T) {
+	root := t.TempDir()
+	value := writeInputFile(t, root, "value.bin", []byte("value"))
+	selected := selectedContract(t, map[string]any{
+		"value": inputDeclaration(true, integration.CardinalityOne, "application/octet-stream", 16, nil),
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	_, err := Prepare(Options{
+		Context:                 ctx,
+		Contract:                selected,
+		Bindings:                []string{"value=" + value},
+		NamedInputMaxBytes:      16,
+		NamedInputTotalMaxBytes: 16,
+	})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("canceled prepare = %v", err)
+	}
+}
+
+func TestReadRegularFileRejectsAggregateAccountingOverflow(t *testing.T) {
+	root := t.TempDir()
+	value := writeInputFile(t, root, "value.bin", []byte("x"))
+	_, _, _, _, err := readRegularFile(
+		context.Background(),
+		value,
+		root,
+		math.MaxInt64,
+		math.MaxInt64,
+		math.MaxInt64,
+	)
+	var limitErr *contracts.ResourceLimitError
+	if !errors.As(err, &limitErr) ||
+		limitErr.Code != contracts.DiagnosticCodeResourceAccountingOverflow ||
+		limitErr.Current != math.MaxInt64 ||
+		limitErr.Increment != 1 {
+		t.Fatalf("aggregate accounting overflow = %#v, %v", limitErr, err)
+	}
 }
 
 func TestPrepareAppliesStrictMediaEncodingAndPerItemJSONSchemas(t *testing.T) {
