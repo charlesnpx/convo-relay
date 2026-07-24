@@ -2,11 +2,13 @@ package inspect
 
 import (
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 
+	"github.com/charlesnpx/convo-relay/internal/contracts"
 	"github.com/charlesnpx/convo-relay/internal/graph"
 	"github.com/charlesnpx/convo-relay/internal/store"
 )
@@ -157,6 +159,31 @@ func TestBuildHealthReports(t *testing.T) {
 	formatted := FormatHealthReport(report)
 	if !strings.Contains(formatted, "Health: ok") || !strings.Contains(formatted, "Scope: session") {
 		t.Fatalf("formatted health:\n%s", formatted)
+	}
+}
+
+func TestResolveSessionRootForHealthInspectionReturnsContextualOrdinaryErrors(t *testing.T) {
+	fixtureRoot := t.TempDir()
+	regularFile := filepath.Join(fixtureRoot, "session-file")
+	if err := os.WriteFile(regularFile, []byte("not a session directory"), 0o644); err != nil {
+		t.Fatalf("write regular file: %v", err)
+	}
+
+	for _, path := range []string{
+		filepath.Join(fixtureRoot, "missing"),
+		regularFile,
+	} {
+		_, err := resolveSessionRootForHealthInspection(path)
+		if err == nil {
+			t.Fatalf("resolve %s: expected error", path)
+		}
+		if !strings.HasPrefix(err.Error(), "resolve session root for health inspection:") {
+			t.Fatalf("resolve %s error = %q", path, err)
+		}
+		var diagnostic *contracts.DiagnosticError
+		if errors.As(err, &diagnostic) {
+			t.Fatalf("resolve %s returned contract diagnostic: %#v", path, diagnostic)
+		}
 	}
 }
 
