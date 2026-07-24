@@ -214,6 +214,8 @@ func Preflight(ctx context.Context, options Options) (*Snapshot, error) {
 			if topologyErr.code == DiagnosticCodeInventoryDepth {
 				message = "The source workspace repository topology exceeds the supported depth."
 				details["max_repository_depth"] = topologyErr.maxRepositoryDepth
+			} else {
+				details["repository_root"] = topologyErr.repositoryRoot
 			}
 			return nil, workspaceError(
 				err,

@@ -312,6 +312,17 @@ func Finalize(ctx context.Context, st *store.Store) (*Finalization, error) {
 	}
 	repository, err := inspectRepositoryWithLimits(ctx, "git", paths.sourceGitRoot, inventoryLimits)
 	if err != nil {
+		var limitErr *contracts.ResourceLimitError
+		if errors.As(err, &limitErr) {
+			return nil, workspaceError(
+				err,
+				DiagnosticCodeInventoryLimit,
+				contracts.DiagnosticPhasePreflight,
+				"/runtime_config/limits",
+				"The source repository exceeds its configured inventory budget.",
+				resourceLimitDetails(limitErr),
+			)
+		}
 		return nil, fmt.Errorf("recompute source workspace inventory: %w", err)
 	}
 	if !pathsEquivalent(repository.root, paths.sourceGitRoot) {

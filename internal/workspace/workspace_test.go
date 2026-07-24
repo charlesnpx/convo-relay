@@ -371,6 +371,10 @@ func TestRepositoryInventoryRejectsInitializedSubmoduleCycles(t *testing.T) {
 	if err != nil {
 		t.Fatalf("canonical cycle root: %v", err)
 	}
+	canonicalLoopRoot, err := canonicalExistingDirectory(loopWorktree)
+	if err != nil {
+		t.Fatalf("canonical nested cycle root: %v", err)
+	}
 
 	_, err = inspectRepositoryWithLimits(
 		context.Background(),
@@ -381,7 +385,8 @@ func TestRepositoryInventoryRejectsInitializedSubmoduleCycles(t *testing.T) {
 	var topologyErr *repositoryTopologyError
 	if !errors.As(err, &topologyErr) ||
 		topologyErr.code != DiagnosticCodeInventoryCycle ||
-		topologyErr.repositoryDepth != 2 {
+		topologyErr.repositoryDepth != 2 ||
+		topologyErr.repositoryRoot != canonicalLoopRoot {
 		t.Fatalf("repository cycle error = %#v, %v", topologyErr, err)
 	}
 	_, err = Preflight(context.Background(), Options{
@@ -391,7 +396,8 @@ func TestRepositoryInventoryRejectsInitializedSubmoduleCycles(t *testing.T) {
 	requireDiagnosticCode(t, err, DiagnosticCodeInventoryCycle)
 	var diagnosticErr *contracts.DiagnosticError
 	if !errors.As(err, &diagnosticErr) ||
-		diagnosticErr.Diagnostics[0].Details["repository_depth"] != 2 {
+		diagnosticErr.Diagnostics[0].Details["repository_depth"] != 2 ||
+		diagnosticErr.Diagnostics[0].Details["repository_root"] != canonicalLoopRoot {
 		t.Fatalf("repository cycle diagnostic = %#v, %v", diagnosticErr, err)
 	}
 }

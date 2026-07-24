@@ -31,6 +31,7 @@ const maxRepositoryInventoryDepth = 8
 type repositoryTopologyError struct {
 	code               string
 	repositoryDepth    int
+	repositoryRoot     string
 	maxRepositoryDepth int
 }
 
@@ -224,6 +225,7 @@ func inspectRepositoryPass(
 		return nil, &repositoryTopologyError{
 			code:            DiagnosticCodeInventoryCycle,
 			repositoryDepth: depth,
+			repositoryRoot:  root,
 		}
 	}
 	accounting.active[repositoryIdentity] = true

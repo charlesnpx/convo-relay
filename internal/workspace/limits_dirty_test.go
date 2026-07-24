@@ -230,6 +230,53 @@ func TestRepositoryInventoryAndFinalizationObserveCancellation(t *testing.T) {
 	}
 }
 
+func TestFinalizeMapsPersistedRepositoryInventoryLimitToWorkspaceDiagnostic(t *testing.T) {
+	root := newCommittedRepo(t)
+	baseline := mustPreflight(t, Options{
+		LaunchCWD:         root,
+		SessionDir:        filepath.Join(t.TempDir(), "baseline"),
+		MinimumPolicy:     PolicyInherited,
+		InventoryMaxFiles: 1_000,
+		InventoryMaxBytes: 1_000_000,
+	})
+	inventory := baseline.sourceReport["inventory"].(map[string]any)
+	fileLimit := intFromWorkspaceAny(inventory["file_count"])
+	if fileLimit < 1 {
+		t.Fatalf("baseline file count = %d", fileLimit)
+	}
+
+	sessionDir := filepath.Join(t.TempDir(), "session")
+	snapshot := mustPreflight(t, Options{
+		LaunchCWD:         root,
+		SessionDir:        sessionDir,
+		MinimumPolicy:     PolicyInherited,
+		InventoryMaxFiles: fileLimit,
+		InventoryMaxBytes: 1_000_000,
+	})
+	st := store.New(sessionDir)
+	if _, err := Materialize(context.Background(), st, snapshot); err != nil {
+		t.Fatalf("materialize exact inventory boundary: %v", err)
+	}
+	writeTestFile(t, filepath.Join(root, "post-materialization.txt"), []byte("one file beyond the persisted boundary\n"), 0o644)
+
+	finalized, err := Finalize(context.Background(), st)
+	if finalized != nil {
+		t.Fatalf("inventory-limit finalization = %#v, want nil", finalized)
+	}
+	requireDiagnosticCode(t, err, DiagnosticCodeInventoryLimit)
+	var diagnosticErr *contracts.DiagnosticError
+	if !errors.As(err, &diagnosticErr) ||
+		diagnosticErr.Diagnostics[0].Path != "/runtime_config/limits" {
+		t.Fatalf("terminal inventory-limit diagnostic = %#v, %v", diagnosticErr, err)
+	}
+	var limitErr *contracts.ResourceLimitError
+	if !errors.As(err, &limitErr) ||
+		limitErr.Code != contracts.DiagnosticCodeRepositoryInventoryMaxFiles ||
+		limitErr.Limit != fileLimit {
+		t.Fatalf("terminal inventory-limit cause = %#v, %v", limitErr, err)
+	}
+}
+
 func TestWorkspaceContextReaderObservesCancellationDuringRead(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	reader := &contextReader{
