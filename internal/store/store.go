@@ -46,10 +46,13 @@ type FileMutationObserver interface {
 
 // FileMutationPlan identifies the exact transaction-created temporary file
 // reserved by an observer. Store writes through that existing file rather than
-// creating an unjournaled inode of its own.
+// creating an unjournaled inode of its own. RequireAbsentTarget makes the
+// commit a no-replace publication; observers must first preserve and remove
+// any owned prior target as part of their durable intent protocol.
 type FileMutationPlan struct {
-	ID            string
-	TemporaryPath string
+	ID                  string
+	TemporaryPath       string
+	RequireAbsentTarget bool
 }
 
 func NewWithFileMutationObserver(root string, observer FileMutationObserver) *Store {

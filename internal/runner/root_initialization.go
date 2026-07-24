@@ -333,9 +333,21 @@ func (t *rootInitializationTransaction) compensate() error {
 		_ = t.writeJournal()
 		return err
 	}
+	worktreeRoot, err := t.initializationWorktreeRootIdentity()
+	if err != nil {
+		t.cleanupState = "blocked_foreign_entries"
+		_ = t.writeJournal()
+		return err
+	}
 	cleanupContext, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	if err := workspace.CleanupInitializationWorktree(cleanupContext, t.sourceGitRoot, t.worktreePath, t.headCommit); err != nil {
+	if err := workspace.CleanupInitializationWorktree(
+		cleanupContext,
+		t.sourceGitRoot,
+		t.worktreePath,
+		t.headCommit,
+		worktreeRoot,
+	); err != nil {
 		t.cleanupState = "failed"
 		_ = t.writeJournal()
 		return fmt.Errorf("compensate initialization worktree: %w", err)

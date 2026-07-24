@@ -1,6 +1,7 @@
 package runner
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"os"
@@ -371,6 +372,55 @@ func TestInitializationPendingFileIntentRecoversCommitBeforeCompletionRecord(t *
 	}
 }
 
+func TestInitializationPendingOverwriteIntentRecoversStagedPreviousTarget(t *testing.T) {
+	for _, commit := range []bool{false, true} {
+		name := "before no-replace publication"
+		if commit {
+			name = "after no-replace publication"
+		}
+		t.Run(name, func(t *testing.T) {
+			launchRoot := newRootInitializationRepository(t)
+			sessionDir := filepath.Join(t.TempDir(), "session")
+			preflight, err := preflightRecipe(context.Background(), rootInitializationOptions(launchRoot, sessionDir))
+			if err != nil {
+				t.Fatalf("preflight: %v", err)
+			}
+			transaction, err := beginRootInitialization(preflight)
+			if err != nil {
+				t.Fatalf("begin initialization: %v", err)
+			}
+
+			target := filepath.Join(transaction.sessionRoot, "artifacts", "interrupted", "overwrite.json")
+			if err := transaction.st.WriteFileAtomically(target, []byte("previous owned body\n"), 0o600); err != nil {
+				t.Fatalf("write previous owned target: %v", err)
+			}
+			nextBody := []byte("next owned body\n")
+			plan, err := transaction.BeforeFileMutation(target, nextBody, 0o600)
+			if err != nil {
+				t.Fatalf("persist overwrite mutation intent: %v", err)
+			}
+			if _, err := os.Lstat(target); !os.IsNotExist(err) {
+				t.Fatalf("owned target was not staged before publication: %v", err)
+			}
+			if transaction.pendingWrite == nil || transaction.pendingWrite.PreviousPath == "" {
+				t.Fatal("overwrite intent omitted its staged previous path")
+			}
+			if _, err := os.Lstat(filepath.Join(transaction.sessionRoot, transaction.pendingWrite.PreviousPath)); err != nil {
+				t.Fatalf("staged previous target: %v", err)
+			}
+			if commit {
+				commitPendingInitializationWrite(t, plan, target, nextBody, 0o600)
+			}
+			abandonRootInitializationLease(t, transaction)
+
+			report, err := CleanSession(sessionDir)
+			if err != nil || report["status"] != "deleted" {
+				t.Fatalf("recover pending overwrite = %#v, %v", report, err)
+			}
+		})
+	}
+}
+
 func TestInitializationPendingFileIntentRejectsSameContentReplacement(t *testing.T) {
 	launchRoot := newRootInitializationRepository(t)
 	sessionDir := filepath.Join(t.TempDir(), "session")
@@ -417,6 +467,115 @@ func TestInitializationPendingFileIntentRejectsSameContentReplacement(t *testing
 	}
 	if report, err := CleanSession(sessionDir); err != nil || report["status"] != "deleted" {
 		t.Fatalf("cleanup after pending replacement removal = %#v, %v", report, err)
+	}
+}
+
+func TestInitializationStoreCommitRejectsForeignTargetIntroducedAfterIntent(t *testing.T) {
+	launchRoot := newRootInitializationRepository(t)
+	sessionDir := filepath.Join(t.TempDir(), "session")
+	preflight, err := preflightRecipe(context.Background(), rootInitializationOptions(launchRoot, sessionDir))
+	if err != nil {
+		t.Fatalf("preflight: %v", err)
+	}
+	transaction, err := beginRootInitialization(preflight)
+	if err != nil {
+		t.Fatalf("begin initialization: %v", err)
+	}
+	t.Cleanup(func() { rootInitializationBeforeFileCommit = nil })
+
+	relative := filepath.Join("artifacts", "foreign-target.json")
+	target := filepath.Join(transaction.sessionRoot, relative)
+	foreignBody := []byte("foreign target must survive\n")
+	rootInitializationBeforeFileCommit = func(observed string) error {
+		if observed != relative {
+			return nil
+		}
+		if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+			return err
+		}
+		return os.WriteFile(target, foreignBody, 0o600)
+	}
+	err = transaction.st.WriteFileAtomically(target, []byte("transaction body\n"), 0o600)
+	rootInitializationBeforeFileCommit = nil
+	if err == nil {
+		t.Fatal("journaled Store write replaced a target introduced after intent persistence")
+	}
+	if data, readErr := os.ReadFile(target); readErr != nil || !bytes.Equal(data, foreignBody) {
+		t.Fatalf("foreign target changed: %q, %v", data, readErr)
+	}
+	if transaction.pendingWrite == nil {
+		t.Fatal("failed no-replace commit discarded its recovery intent")
+	}
+
+	if err := os.Remove(target); err != nil {
+		t.Fatalf("remove preserved foreign target: %v", err)
+	}
+	if err := transaction.resolvePendingWrite(); err != nil {
+		t.Fatalf("resolve failed no-replace write: %v", err)
+	}
+	if err := transaction.compensate(); err != nil {
+		t.Fatalf("compensate after foreign target removal: %v", err)
+	}
+}
+
+func TestInitializationStoreCommitRejectsOwnedTargetReplacementAfterIntent(t *testing.T) {
+	launchRoot := newRootInitializationRepository(t)
+	sessionDir := filepath.Join(t.TempDir(), "session")
+	preflight, err := preflightRecipe(context.Background(), rootInitializationOptions(launchRoot, sessionDir))
+	if err != nil {
+		t.Fatalf("preflight: %v", err)
+	}
+	transaction, err := beginRootInitialization(preflight)
+	if err != nil {
+		t.Fatalf("begin initialization: %v", err)
+	}
+	t.Cleanup(func() { rootInitializationBeforeFileCommit = nil })
+
+	relative := filepath.Join("artifacts", "owned-target.json")
+	target := filepath.Join(transaction.sessionRoot, relative)
+	previousBody := []byte("owned previous body\n")
+	if err := transaction.st.WriteFileAtomically(target, previousBody, 0o600); err != nil {
+		t.Fatalf("write owned target: %v", err)
+	}
+	ownedInfo, err := os.Lstat(target)
+	if err != nil {
+		t.Fatalf("stat owned target: %v", err)
+	}
+
+	foreignBody := []byte("same path replacement must survive\n")
+	rootInitializationBeforeFileCommit = func(observed string) error {
+		if observed != relative {
+			return nil
+		}
+		if err := os.Remove(target); err != nil {
+			return err
+		}
+		return os.WriteFile(target, foreignBody, 0o600)
+	}
+	err = transaction.st.WriteFileAtomically(target, []byte("replacement transaction body\n"), 0o600)
+	rootInitializationBeforeFileCommit = nil
+	if err == nil {
+		t.Fatal("journaled Store write replaced a substituted owned target")
+	}
+	replacementInfo, statErr := os.Lstat(target)
+	if statErr != nil {
+		t.Fatalf("stat preserved replacement: %v", statErr)
+	}
+	if os.SameFile(ownedInfo, replacementInfo) {
+		t.Fatal("test replacement retained the original owned inode")
+	}
+	if data, readErr := os.ReadFile(target); readErr != nil || !bytes.Equal(data, foreignBody) {
+		t.Fatalf("replacement target changed: %q, %v", data, readErr)
+	}
+
+	if err := os.Remove(target); err != nil {
+		t.Fatalf("remove preserved replacement target: %v", err)
+	}
+	if err := transaction.resolvePendingWrite(); err != nil {
+		t.Fatalf("resolve replaced owned target after foreign removal: %v", err)
+	}
+	if err := transaction.compensate(); err != nil {
+		t.Fatalf("compensate after owned-target replacement: %v", err)
 	}
 }
 

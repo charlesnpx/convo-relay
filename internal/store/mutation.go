@@ -635,7 +635,8 @@ func (s *Store) writeIndentedJSONFile(path string, value any) error {
 }
 
 func AtomicWriteFile(path string, body []byte) error {
-	return atomicWriteFileAt(path, body, 0o600, "")
+	_, err := atomicWriteFileAt(path, body, 0o600, "", false)
+	return err
 }
 
 // WriteFileAtomically applies the Store's optional transaction observer. The
@@ -643,7 +644,8 @@ func AtomicWriteFile(path string, body []byte) error {
 // file. Store validates and writes through that existing inode.
 func (s *Store) WriteFileAtomically(path string, body []byte, mode os.FileMode) (err error) {
 	if s == nil || s.mutationObserver == nil {
-		return atomicWriteFileAt(path, body, mode, "")
+		_, err := atomicWriteFileAt(path, body, mode, "", false)
+		return err
 	}
 	plan, err := s.mutationObserver.BeforeFileMutation(path, bytes.Clone(body), mode)
 	if err != nil {
@@ -659,31 +661,43 @@ func (s *Store) WriteFileAtomically(path string, body []byte, mode os.FileMode) 
 	if strings.TrimSpace(plan.TemporaryPath) == "" {
 		return errors.New("file mutation observer did not reserve a temporary path")
 	}
-	if err := atomicWriteFileAt(path, body, mode, plan.TemporaryPath); err != nil {
+	if !plan.RequireAbsentTarget {
+		return errors.New("file mutation observer did not require a no-replace commit")
+	}
+	committed, err = atomicWriteFileAt(path, body, mode, plan.TemporaryPath, true)
+	if err != nil {
 		return err
 	}
-	committed = true
+	if !committed {
+		return errors.New("atomic file write returned without committing its target")
+	}
 	return nil
 }
 
-func atomicWriteFileAt(path string, body []byte, mode os.FileMode, reservedTemporaryPath string) (err error) {
+func atomicWriteFileAt(
+	path string,
+	body []byte,
+	mode os.FileMode,
+	reservedTemporaryPath string,
+	requireAbsentTarget bool,
+) (committed bool, err error) {
 	if mode.Perm() == 0 {
 		mode = 0o600
 	}
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		return err
+		return false, err
 	}
 	var tmp *os.File
 	if strings.TrimSpace(reservedTemporaryPath) == "" {
 		tmp, err = os.CreateTemp(filepath.Dir(path), "."+filepath.Base(path)+".*.tmp")
 	} else {
 		if filepath.Dir(filepath.Clean(reservedTemporaryPath)) != filepath.Dir(filepath.Clean(path)) {
-			return errors.New("reserved atomic-write temporary path must share the target directory")
+			return false, errors.New("reserved atomic-write temporary path must share the target directory")
 		}
 		tmp, err = os.OpenFile(reservedTemporaryPath, os.O_WRONLY, mode.Perm())
 	}
 	if err != nil {
-		return err
+		return false, err
 	}
 	tmpName := tmp.Name()
 	openedInfo, statErr := tmp.Stat()
@@ -695,29 +709,29 @@ func atomicWriteFileAt(path string, body []byte, mode os.FileMode, reservedTempo
 		!pathInfo.Mode().IsRegular() ||
 		!os.SameFile(openedInfo, pathInfo) {
 		_ = tmp.Close()
-		return errors.Join(statErr, pathErr, errors.New("atomic-write temporary path changed before use"))
+		return false, errors.Join(statErr, pathErr, errors.New("atomic-write temporary path changed before use"))
 	}
 	defer func() {
 		err = errors.Join(err, removeAtomicTemporaryExact(tmpName, openedInfo))
 	}()
 	if err := tmp.Truncate(0); err != nil {
 		_ = tmp.Close()
-		return err
+		return false, err
 	}
 	if err := tmp.Chmod(mode.Perm()); err != nil {
 		_ = tmp.Close()
-		return err
+		return false, err
 	}
 	if _, err := tmp.Write(body); err != nil {
 		_ = tmp.Close()
-		return err
+		return false, err
 	}
 	if err := tmp.Sync(); err != nil {
 		_ = tmp.Close()
-		return err
+		return false, err
 	}
 	if err := tmp.Close(); err != nil {
-		return err
+		return false, err
 	}
 	finalInfo, statErr := os.Lstat(tmpName)
 	if statErr != nil ||
@@ -726,9 +740,25 @@ func atomicWriteFileAt(path string, body []byte, mode os.FileMode, reservedTempo
 		!os.SameFile(openedInfo, finalInfo) ||
 		finalInfo.Size() != int64(len(body)) ||
 		finalInfo.Mode().Perm() != mode.Perm() {
-		return errors.Join(statErr, errors.New("atomic-write temporary path changed before commit"))
+		return false, errors.Join(statErr, errors.New("atomic-write temporary path changed before commit"))
 	}
-	return os.Rename(tmpName, path)
+	if requireAbsentTarget {
+		if err := os.Link(tmpName, path); err != nil {
+			return false, fmt.Errorf("publish atomic-write target without replacement: %w", err)
+		}
+		targetInfo, targetErr := os.Lstat(path)
+		if targetErr != nil ||
+			targetInfo.Mode()&os.ModeSymlink != 0 ||
+			!targetInfo.Mode().IsRegular() ||
+			!os.SameFile(finalInfo, targetInfo) {
+			return true, errors.Join(targetErr, errors.New("atomic-write target changed after no-replace publication"))
+		}
+		return true, nil
+	}
+	if err := os.Rename(tmpName, path); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 func removeAtomicTemporaryExact(path string, expected os.FileInfo) error {

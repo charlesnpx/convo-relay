@@ -332,6 +332,65 @@ func TestMaterializationFailureRollbackRejectsAncestorSymlinkWithoutTouchingOuts
 	}
 }
 
+func TestMaterializationFailureRollbackPreservesSamePathWorktreeReplacement(t *testing.T) {
+	root := newCommittedRepo(t)
+	head := testGit(t, root, "rev-parse", "HEAD")
+	sessionDir := filepath.Join(t.TempDir(), "session")
+	if err := os.MkdirAll(sessionDir, 0o755); err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+	writeTestFile(t, filepath.Join(sessionDir, "artifacts"), []byte("block artifact persistence"), 0o644)
+
+	snapshot := mustPreflight(t, Options{
+		LaunchCWD:       root,
+		SessionDir:      sessionDir,
+		MinimumPolicy:   PolicyEphemeral,
+		RequestedPolicy: PolicyEphemeral,
+	})
+	target := filepath.Join(snapshot.SessionDir(), "execution", "worktree")
+	sentinel := filepath.Join(target, "preserve-replacement.txt")
+	t.Cleanup(func() {
+		materializationBeforeFailureRollback = nil
+		_ = os.RemoveAll(target)
+		testGit(t, root, "worktree", "prune")
+	})
+	materializationBeforeFailureRollback = func(observedTarget string) error {
+		if observedTarget != target {
+			return fmt.Errorf("rollback target = %s, want %s", observedTarget, target)
+		}
+		backlink, err := os.ReadFile(filepath.Join(target, ".git"))
+		if err != nil {
+			return err
+		}
+		if err := os.RemoveAll(target); err != nil {
+			return err
+		}
+		if err := os.MkdirAll(target, 0o755); err != nil {
+			return err
+		}
+		if err := os.WriteFile(filepath.Join(target, ".git"), backlink, 0o644); err != nil {
+			return err
+		}
+		return os.WriteFile(sentinel, []byte("preserve same-path replacement\n"), 0o644)
+	}
+
+	materialized, err := Materialize(context.Background(), store.New(sessionDir), snapshot)
+	if materialized != nil || err == nil {
+		t.Fatalf("same-path replacement rollback = %#v, %v", materialized, err)
+	}
+	if data, readErr := os.ReadFile(sentinel); readErr != nil || string(data) != "preserve same-path replacement\n" {
+		t.Fatalf("same-path replacement sentinel changed: %q, %v", data, readErr)
+	}
+	record, registered, inspectErr := repositoryWorktreeRegistrationExact(
+		context.Background(),
+		snapshot.repository,
+		target,
+	)
+	if inspectErr != nil || !registered || record.Head != head {
+		t.Fatalf("original registration changed: record=%#v registered=%v err=%v", record, registered, inspectErr)
+	}
+}
+
 func TestWorktreeRegistrationMatchesCaseVariantPath(t *testing.T) {
 	root := newCommittedRepo(t)
 	sessionDir := filepath.Join(t.TempDir(), "case-registration-session")

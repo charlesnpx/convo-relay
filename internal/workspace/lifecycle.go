@@ -71,6 +71,7 @@ func CleanupInitializationWorktree(
 	sourceGitRoot string,
 	worktreePath string,
 	expectedHead string,
+	expectedRoot os.FileInfo,
 ) error {
 	if strings.TrimSpace(sourceGitRoot) == "" || strings.TrimSpace(worktreePath) == "" {
 		return nil
@@ -101,8 +102,14 @@ func CleanupInitializationWorktree(
 		if record.Bare || !record.Detached || record.Branch != "" || strings.TrimSpace(record.Head) != strings.TrimSpace(expectedHead) {
 			return contracts.NewValidationError("initialization worktree registration does not match its journal")
 		}
+		if err := validateInitializationWorktreeRootIdentity(target, expectedRoot); err != nil {
+			return err
+		}
 		if err := rejectSymlinkPathComponents(target); err != nil {
 			return contracts.NewValidationError("initialization worktree path changed before Git cleanup: %v", err)
+		}
+		if err := validateInitializationWorktreeRootIdentity(target, expectedRoot); err != nil {
+			return err
 		}
 		if _, err := runGit(ctx, repository.gitBinary, repository.root, "worktree", "remove", "--force", target); err != nil {
 			return err
@@ -120,6 +127,23 @@ func CleanupInitializationWorktree(
 		return contracts.NewValidationError("initialization worktree path remained after its Git registration was removed")
 	} else if err != nil && !os.IsNotExist(err) {
 		return err
+	}
+	return nil
+}
+
+func validateInitializationWorktreeRootIdentity(target string, expected os.FileInfo) error {
+	current, err := os.Lstat(target)
+	if os.IsNotExist(err) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if current.Mode()&os.ModeSymlink != 0 || !current.IsDir() {
+		return contracts.NewValidationError("initialization worktree root changed type before Git cleanup")
+	}
+	if expected == nil || !expected.IsDir() || !os.SameFile(expected, current) {
+		return contracts.NewValidationError("initialization worktree root changed identity before Git cleanup")
 	}
 	return nil
 }

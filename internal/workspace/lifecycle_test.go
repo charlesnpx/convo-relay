@@ -302,6 +302,10 @@ func TestCleanupInitializationWorktreePreservesUnrelatedPrunableRegistration(t *
 	if err != nil {
 		t.Fatalf("canonicalize target worktree: %v", err)
 	}
+	targetIdentity, err := os.Lstat(target)
+	if err != nil {
+		t.Fatalf("capture target worktree identity: %v", err)
+	}
 	unrelated, err = canonicalExistingDirectory(unrelated)
 	if err != nil {
 		t.Fatalf("canonicalize unrelated worktree: %v", err)
@@ -316,7 +320,7 @@ func TestCleanupInitializationWorktreePreservesUnrelatedPrunableRegistration(t *
 	if err != nil {
 		t.Fatalf("inspect cleanup repository: %v", err)
 	}
-	if err := CleanupInitializationWorktree(context.Background(), root, target, head); err != nil {
+	if err := CleanupInitializationWorktree(context.Background(), root, target, head, targetIdentity); err != nil {
 		t.Fatalf("cleanup exact initialization worktree: %v", err)
 	}
 	if registered, err := repositoryWorktreeRegistered(context.Background(), repository, target); err != nil || registered {
@@ -356,7 +360,7 @@ func TestCleanupInitializationWorktreeRejectsReplacementSymlinksWithoutFollowing
 			t.Fatalf("substitute leaf symlink: %v", err)
 		}
 
-		if err := CleanupInitializationWorktree(context.Background(), root, target, head); err == nil || !strings.Contains(err.Error(), "symlink") {
+		if err := CleanupInitializationWorktree(context.Background(), root, target, head, nil); err == nil || !strings.Contains(err.Error(), "symlink") {
 			t.Fatalf("leaf-symlink cleanup error = %v", err)
 		}
 		if _, err := os.Stat(sentinel); err != nil {
@@ -385,7 +389,7 @@ func TestCleanupInitializationWorktreeRejectsReplacementSymlinksWithoutFollowing
 		}
 		target := filepath.Join(session, "execution", "worktree")
 
-		if err := CleanupInitializationWorktree(context.Background(), root, target, head); err == nil || !strings.Contains(err.Error(), "symlink") {
+		if err := CleanupInitializationWorktree(context.Background(), root, target, head, nil); err == nil || !strings.Contains(err.Error(), "symlink") {
 			t.Fatalf("ancestor-symlink cleanup error = %v", err)
 		}
 		if _, err := os.Stat(sentinel); err != nil {
@@ -405,7 +409,7 @@ func TestCleanupInitializationWorktreeLeavesUnregisteredDirectoryForTransactionO
 	sentinel := filepath.Join(target, "sentinel.txt")
 	writeTestFile(t, sentinel, []byte("requires transaction ownership\n"), 0o644)
 
-	if err := CleanupInitializationWorktree(context.Background(), root, target, head); err != nil {
+	if err := CleanupInitializationWorktree(context.Background(), root, target, head, nil); err != nil {
 		t.Fatalf("inspect unregistered initialization worktree: %v", err)
 	}
 	if _, err := os.Stat(sentinel); err != nil {

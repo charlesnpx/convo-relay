@@ -39,6 +39,7 @@ type rootInitializationWriteIntent struct {
 	TemporaryPath     string
 	TemporaryIdentity string
 	Previous          *rootInitializationOwnedEntry
+	PreviousPath      string
 	Directories       []rootInitializationOwnedEntry
 }
 
@@ -120,6 +121,7 @@ func (intent rootInitializationWriteIntent) toMap() map[string]any {
 	payload["planned_directories"] = directories
 	if intent.Previous != nil {
 		payload["previous"] = intent.Previous.toMap()
+		payload["previous_path"] = filepath.ToSlash(intent.PreviousPath)
 	}
 	return payload
 }
@@ -161,6 +163,18 @@ func rootInitializationWriteIntentFromMap(value any) (*rootInitializationWriteIn
 			return nil, errors.New("initialization pending write previous path is invalid")
 		}
 		intent.Previous = &previous
+		intent.PreviousPath = filepath.Clean(filepath.FromSlash(strings.TrimSpace(stringFromAny(item["previous_path"]))))
+		wantPreviousPath := filepath.Join(
+			filepath.Dir(target.Path),
+			"."+filepath.Base(target.Path)+".initialization-"+intent.ID+".previous",
+		)
+		if intent.PreviousPath != wantPreviousPath ||
+			filepath.IsAbs(intent.PreviousPath) ||
+			!rootInitializationPathAllowed(intent.PreviousPath) {
+			return nil, errors.New("initialization pending write previous staging path is invalid")
+		}
+	} else if strings.TrimSpace(stringFromAny(item["previous_path"])) != "" {
+		return nil, errors.New("initialization pending write without a previous target has a staging path")
 	}
 	rawDirectories, ok := item["planned_directories"].([]any)
 	if !ok {
@@ -258,6 +272,29 @@ func (t *rootInitializationTransaction) BeforeFileMutation(
 		copy := prior
 		previous = &copy
 	}
+	actualTarget, targetExists, err := rootInitializationMaybeRecordPath(t.sessionRoot, relative)
+	if err != nil {
+		return store.FileMutationPlan{}, err
+	}
+	switch {
+	case previous == nil && targetExists:
+		return store.FileMutationPlan{}, fmt.Errorf("root initialization write target %s is a foreign existing entry", relative)
+	case previous != nil && (!targetExists || !rootInitializationEntryMatches(*previous, actualTarget, true)):
+		return store.FileMutationPlan{}, fmt.Errorf("root initialization write target %s no longer has its owned identity", relative)
+	}
+	previousRelative := ""
+	if previous != nil {
+		previousRelative = filepath.Join(
+			filepath.Dir(relative),
+			"."+filepath.Base(relative)+".initialization-"+id+".previous",
+		)
+		previousAbsolute := filepath.Join(t.sessionRoot, previousRelative)
+		if _, err := os.Lstat(previousAbsolute); err == nil {
+			return store.FileMutationPlan{}, errors.New("root initialization previous-target staging path already exists")
+		} else if !os.IsNotExist(err) {
+			return store.FileMutationPlan{}, err
+		}
+	}
 	plannedDirectories := make([]rootInitializationOwnedEntry, 0)
 	for parent := filepath.Dir(relative); parent != "."; parent = filepath.Dir(parent) {
 		if _, exists := t.ownedEntries[parent]; exists {
@@ -276,6 +313,7 @@ func (t *rootInitializationTransaction) BeforeFileMutation(
 		Target:        target,
 		TemporaryPath: temporaryRelative,
 		Previous:      previous,
+		PreviousPath:  previousRelative,
 		Directories:   plannedDirectories,
 	}
 	if err := t.writeJournal(); err != nil {
@@ -315,37 +353,24 @@ func (t *rootInitializationTransaction) BeforeFileMutation(
 	if err := t.writeJournal(); err != nil {
 		return store.FileMutationPlan{}, err
 	}
-	return store.FileMutationPlan{ID: id, TemporaryPath: temporaryAbsolute}, nil
+	if err := t.stagePendingPreviousTarget(); err != nil {
+		return store.FileMutationPlan{}, err
+	}
+	return store.FileMutationPlan{
+		ID:                  id,
+		TemporaryPath:       temporaryAbsolute,
+		RequireAbsentTarget: true,
+	}, nil
 }
 
-func (t *rootInitializationTransaction) AfterFileMutation(plan store.FileMutationPlan, committed bool) error {
+func (t *rootInitializationTransaction) AfterFileMutation(plan store.FileMutationPlan, _ bool) error {
 	if t == nil || t.pendingWrite == nil || t.pendingWrite.ID != plan.ID {
 		return errors.New("root initialization file write completion does not match its persisted intent")
 	}
-	intent := *t.pendingWrite
-	if committed {
-		actual, err := rootInitializationRecordPath(t.sessionRoot, intent.Target.Path)
-		if err != nil {
-			return err
-		}
-		if intent.TemporaryIdentity == "" ||
-			actual.Identity != intent.TemporaryIdentity ||
-			!rootInitializationEntryMatches(intent.Target, actual, false) {
-			return fmt.Errorf("root initialization write %s does not match its persisted content intent", intent.Target.Path)
-		}
-		t.addOwnedEntryWithParents(actual)
-	} else {
-		if err := t.removePendingTemporary(intent); err != nil {
-			return err
-		}
-		for _, planned := range intent.Directories {
-			if _, exists := t.ownedEntries[planned.Path]; !exists {
-				t.ownedEntries[planned.Path] = planned
-			}
-		}
-	}
-	t.pendingWrite = nil
-	return t.writeJournal()
+	// Completion is recovered from exact filesystem identities rather than the
+	// caller's Boolean alone. That also covers a process failure after a
+	// no-replace publication but before Store returned success.
+	return t.resolvePendingWrite()
 }
 
 func (t *rootInitializationTransaction) resolvePendingWrite() error {
@@ -362,6 +387,19 @@ func (t *rootInitializationTransaction) resolvePendingWrite() error {
 	if err != nil {
 		return err
 	}
+	previous, previousExists, err := t.pendingPreviousRecord(intent)
+	if err != nil {
+		return err
+	}
+	if previousExists &&
+		(intent.Previous == nil ||
+			!rootInitializationEntryMatches(
+				*intent.Previous,
+				rootInitializationEntryAtTargetPath(previous, intent.Target.Path),
+				true,
+			)) {
+		return fmt.Errorf("pending initialization previous target %s has a foreign file identity", intent.PreviousPath)
+	}
 	switch {
 	case targetExists && rootInitializationEntryMatches(intent.Target, target, false):
 		if intent.TemporaryIdentity == "" || target.Identity != intent.TemporaryIdentity {
@@ -373,13 +411,135 @@ func (t *rootInitializationTransaction) resolvePendingWrite() error {
 	case targetExists:
 		return fmt.Errorf("pending initialization write target %s was replaced by foreign content", intent.Target.Path)
 	case intent.Previous != nil:
-		delete(t.ownedEntries, intent.Target.Path)
+		if !previousExists {
+			// The previously owned inode was removed outside the transaction.
+			// Once its replacement is also absent there is no foreign entry to
+			// delete, so recovery can forget the lost owned intermediate and
+			// continue exact cleanup.
+			delete(t.ownedEntries, intent.Target.Path)
+			break
+		}
+		if err := restoreInitializationStagedEntry(
+			filepath.Join(t.sessionRoot, intent.PreviousPath),
+			filepath.Join(t.sessionRoot, intent.Target.Path),
+			previous,
+		); err != nil {
+			return fmt.Errorf("restore pending initialization previous target %s: %w", intent.Target.Path, err)
+		}
+		target, err = rootInitializationRecordPath(t.sessionRoot, intent.Target.Path)
+		if err != nil || !rootInitializationEntryMatches(*intent.Previous, target, true) {
+			return errors.Join(err, fmt.Errorf("restored pending initialization target %s changed identity", intent.Target.Path))
+		}
+		t.ownedEntries[target.Path] = target
+	}
+	if err := t.removePendingPrevious(intent); err != nil {
+		return err
 	}
 	if err := t.removePendingTemporary(intent); err != nil {
 		return err
 	}
 	t.pendingWrite = nil
 	return t.writeJournal()
+}
+
+func (t *rootInitializationTransaction) stagePendingPreviousTarget() error {
+	if t == nil || t.pendingWrite == nil || t.pendingWrite.Previous == nil {
+		return nil
+	}
+	intent := *t.pendingWrite
+	targetPath := filepath.Join(t.sessionRoot, intent.Target.Path)
+	previousPath := filepath.Join(t.sessionRoot, intent.PreviousPath)
+	if _, err := os.Lstat(previousPath); err == nil {
+		return errors.New("root initialization previous-target staging path already exists")
+	} else if !os.IsNotExist(err) {
+		return err
+	}
+	if err := os.Rename(targetPath, previousPath); err != nil {
+		return fmt.Errorf("stage root initialization previous target: %w", err)
+	}
+	moved, err := rootInitializationRecordPath(t.sessionRoot, intent.PreviousPath)
+	if err == nil {
+		moved.Path = intent.Target.Path
+	}
+	if err == nil && rootInitializationEntryMatches(*intent.Previous, moved, true) {
+		return nil
+	}
+	staged, stagedErr := rootInitializationRecordPath(t.sessionRoot, intent.PreviousPath)
+	if stagedErr == nil {
+		staged.Path = intent.PreviousPath
+	}
+	restoreErr := stagedErr
+	if restoreErr == nil {
+		restoreErr = restoreInitializationStagedEntry(previousPath, targetPath, staged)
+	}
+	return errors.Join(
+		err,
+		restoreErr,
+		fmt.Errorf("root initialization write target %s changed identity before staging", intent.Target.Path),
+	)
+}
+
+func (t *rootInitializationTransaction) pendingPreviousRecord(
+	intent rootInitializationWriteIntent,
+) (rootInitializationOwnedEntry, bool, error) {
+	if intent.Previous == nil || strings.TrimSpace(intent.PreviousPath) == "" {
+		return rootInitializationOwnedEntry{}, false, nil
+	}
+	record, exists, err := rootInitializationMaybeRecordPath(t.sessionRoot, intent.PreviousPath)
+	if err != nil || !exists {
+		return record, exists, err
+	}
+	return record, true, nil
+}
+
+func (t *rootInitializationTransaction) removePendingPrevious(intent rootInitializationWriteIntent) error {
+	if intent.Previous == nil || strings.TrimSpace(intent.PreviousPath) == "" {
+		return nil
+	}
+	previous, exists, err := t.pendingPreviousRecord(intent)
+	if err != nil || !exists {
+		return err
+	}
+	if !rootInitializationEntryMatches(*intent.Previous, rootInitializationEntryAtTargetPath(previous, intent.Target.Path), true) {
+		return fmt.Errorf("pending initialization previous target %s has a foreign file identity", intent.PreviousPath)
+	}
+	return os.Remove(filepath.Join(t.sessionRoot, intent.PreviousPath))
+}
+
+func restoreInitializationStagedEntry(
+	stagedPath string,
+	targetPath string,
+	staged rootInitializationOwnedEntry,
+) error {
+	if staged.Kind != "regular" {
+		if _, err := os.Lstat(targetPath); err == nil {
+			return errors.New("initialization target was populated before staged entry restoration")
+		} else if !os.IsNotExist(err) {
+			return err
+		}
+		return os.Rename(stagedPath, targetPath)
+	}
+	if err := os.Link(stagedPath, targetPath); err != nil {
+		return fmt.Errorf("publish staged initialization entry without replacement: %w", err)
+	}
+	targetInfo, targetErr := os.Lstat(targetPath)
+	stagedInfo, stagedErr := os.Lstat(stagedPath)
+	if targetErr != nil ||
+		stagedErr != nil ||
+		targetInfo.Mode()&os.ModeSymlink != 0 ||
+		!targetInfo.Mode().IsRegular() ||
+		!os.SameFile(stagedInfo, targetInfo) {
+		return errors.Join(targetErr, stagedErr, errors.New("restored initialization entry changed identity"))
+	}
+	return os.Remove(stagedPath)
+}
+
+func rootInitializationEntryAtTargetPath(
+	entry rootInitializationOwnedEntry,
+	targetPath string,
+) rootInitializationOwnedEntry {
+	entry.Path = targetPath
+	return entry
 }
 
 func (t *rootInitializationTransaction) removePendingTemporary(intent rootInitializationWriteIntent) error {
@@ -572,6 +732,39 @@ func (t *rootInitializationTransaction) validateWorkspaceScope(materialized *wor
 	return nil
 }
 
+func (t *rootInitializationTransaction) initializationWorktreeRootIdentity() (os.FileInfo, error) {
+	if t == nil || strings.TrimSpace(t.worktreePath) == "" {
+		return nil, nil
+	}
+	info, err := os.Lstat(t.worktreePath)
+	if os.IsNotExist(err) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
+		return nil, errors.New("initialization worktree root changed type before cleanup")
+	}
+	relative, err := rootInitializationRelativePath(t.sessionRoot, t.worktreePath)
+	if err != nil {
+		return nil, err
+	}
+	expected, exists := t.ownedEntries[relative]
+	actual := rootInitializationOwnedEntry{
+		Path:     relative,
+		Kind:     "directory",
+		Mode:     uint32(info.Mode().Perm()),
+		Identity: rootInitializationFileIdentity(t.worktreePath, info),
+	}
+	if !exists ||
+		expected.Identity == "" ||
+		!rootInitializationEntryMatches(expected, actual, true) {
+		return nil, errors.New("initialization worktree root changed identity before cleanup")
+	}
+	return info, nil
+}
+
 func (t *rootInitializationTransaction) addOwnedEntryWithParents(entry rootInitializationOwnedEntry) {
 	if t.ownedEntries == nil {
 		t.ownedEntries = map[string]rootInitializationOwnedEntry{}
@@ -749,6 +942,15 @@ func (t *rootInitializationTransaction) validateOwnedInventory() error {
 			if path == t.pendingWrite.TemporaryPath &&
 				t.pendingWrite.TemporaryIdentity != "" &&
 				record.Identity == t.pendingWrite.TemporaryIdentity {
+				continue
+			}
+			if t.pendingWrite.Previous != nil &&
+				path == t.pendingWrite.PreviousPath &&
+				rootInitializationEntryMatches(
+					*t.pendingWrite.Previous,
+					rootInitializationEntryAtTargetPath(record, t.pendingWrite.Target.Path),
+					true,
+				) {
 				continue
 			}
 			plannedDirectory := false
@@ -953,6 +1155,10 @@ func (t *rootInitializationTransaction) compensateBootstrap() error {
 		_ = t.writeJournal()
 		return err
 	}
+	worktreeRoot, err := t.initializationWorktreeRootIdentity()
+	if err != nil {
+		return err
+	}
 	cleanupContext, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	if err := workspace.CleanupInitializationWorktree(
@@ -960,6 +1166,7 @@ func (t *rootInitializationTransaction) compensateBootstrap() error {
 		t.sourceGitRoot,
 		t.worktreePath,
 		t.headCommit,
+		worktreeRoot,
 	); err != nil {
 		return err
 	}
@@ -1131,7 +1338,7 @@ func rootInitializationPathAllowed(relative string) bool {
 	}
 	if strings.HasPrefix(top, ".") &&
 		strings.Contains(top, ".initialization-") &&
-		strings.HasSuffix(top, ".tmp") {
+		(strings.HasSuffix(top, ".tmp") || strings.HasSuffix(top, ".previous")) {
 		base := strings.TrimPrefix(strings.SplitN(top, ".initialization-", 2)[0], ".")
 		for _, allowed := range rootInitializationOwnedEntries {
 			if base == allowed {
