@@ -201,6 +201,9 @@ func (s *rootExecutionState) run(ctx context.Context) (map[string]any, error) {
 			return s.markFailed("participant_prompt", err)
 		}
 		if err := s.runParticipantTurn(ctx, ordinal, s.slots[(ordinal-1)%len(s.slots)], prompt, steering); err != nil {
+			if _, integrityFailure := asRootNamedInputIntegrityError(err); integrityFailure {
+				return s.markNamedInputIntegrityFailed(err)
+			}
 			if errors.Is(err, context.Canceled) || errors.Is(ctx.Err(), context.Canceled) {
 				return s.markInterrupted("context canceled")
 			}
@@ -223,12 +226,15 @@ func (s *rootExecutionState) runParticipantTurn(
 ) error {
 	var participantResult TurnResult
 	var err error
-	participantResult, err = runWithRetryableProviderErrors(ctx, slot.Label(), func() (TurnResult, error) {
+	participantResult, err = runRootProviderTurnWithRetainedIntegrity(ctx, s, "participant", slot.Label(), slot.Name(), func() (TurnResult, error) {
 		return slot.RunTurn(ctx, prompt, TurnOptions{
 			TimeoutSeconds:      s.preflight.options.TimeoutSeconds,
 			StallTimeoutSeconds: s.preflight.options.StallTimeoutSeconds,
 		})
 	})
+	if _, integrityFailure := asRootNamedInputIntegrityError(err); integrityFailure {
+		return err
+	}
 	participantProviderResult := providerResultForTurn(slot.Name(), participantResult)
 	if err != nil {
 		failure := providerFailurePayload("participant", slot.Label(), slot.Name(), err, participantProviderResult)
@@ -241,12 +247,15 @@ func (s *rootExecutionState) runParticipantTurn(
 	}
 
 	var facilitatorResult TurnResult
-	facilitatorResult, err = runWithRetryableProviderErrors(ctx, s.facilitator.Label(), func() (TurnResult, error) {
+	facilitatorResult, err = runRootProviderTurnWithRetainedIntegrity(ctx, s, "facilitator", s.facilitator.Label(), s.facilitator.Name(), func() (TurnResult, error) {
 		return s.facilitator.RunTurn(ctx, s.facilitatorPrompt(participantResult.Content, slot.Label()), TurnOptions{
 			TimeoutSeconds:      s.preflight.options.TimeoutSeconds,
 			StallTimeoutSeconds: s.preflight.options.StallTimeoutSeconds,
 		})
 	})
+	if _, integrityFailure := asRootNamedInputIntegrityError(err); integrityFailure {
+		return err
+	}
 	facilitatorProviderResult := providerResultForTurn(s.facilitator.Name(), facilitatorResult)
 	var ledger model.Ledger
 	var report LedgerParseReport
@@ -571,21 +580,22 @@ func appendRootSteeringBlock(prompt string, ordinal int, steering []map[string]a
 
 func (s *rootExecutionState) markParticipantsComplete() (map[string]any, error) {
 	checkpoint, err := contracts.NormalizeRootArtifact(contracts.RootArtifactKindRootCheckpoint, map[string]any{
-		"ordinal":                     2,
-		"phase":                       "participant_turns_complete",
-		"status":                      "completed",
-		"preflight_complete":          true,
-		"workspace_ready":             true,
-		"participant_turns_completed": s.transcript.Len(),
-		"recipe_ref":                  s.persisted.recipeRef,
-		"root_recipe_plan_ref":        s.persisted.rootPlanRef,
-		"runtime_config_ref":          s.persisted.runtimeConfigRef,
-		"integration_bundle_ref":      s.persisted.bundleRef,
-		"integration_contract_ref":    s.persisted.contractRef,
-		"named_input_manifest_ref":    s.persisted.inputManifestRef,
-		"execution_workspace_ref":     s.persisted.workspaceRef,
-		"ledger":                      s.meta.Ledger().ToMap(),
-		"created_at":                  utcNow(),
+		"ordinal":                            2,
+		"phase":                              "participant_turns_complete",
+		"status":                             "completed",
+		"preflight_complete":                 true,
+		"workspace_ready":                    true,
+		"participant_turns_completed":        s.transcript.Len(),
+		"recipe_ref":                         s.persisted.recipeRef,
+		"root_recipe_plan_ref":               s.persisted.rootPlanRef,
+		"runtime_config_ref":                 s.persisted.runtimeConfigRef,
+		"integration_bundle_ref":             s.persisted.bundleRef,
+		"integration_contract_ref":           s.persisted.contractRef,
+		"named_input_manifest_ref":           s.persisted.inputManifestRef,
+		"retained_input_materialization_ref": s.persisted.retainedInputRef,
+		"execution_workspace_ref":            s.persisted.workspaceRef,
+		"ledger":                             s.meta.Ledger().ToMap(),
+		"created_at":                         utcNow(),
 	})
 	if err != nil {
 		return s.markFailed("participant_checkpoint", err)

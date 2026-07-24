@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/charlesnpx/convo-relay/internal/contracts"
 	"github.com/charlesnpx/convo-relay/internal/graph"
@@ -76,6 +77,9 @@ type RecipeOptions struct {
 	// backendFactory is an internal test seam. Production root execution uses
 	// the same low-level backend factory as ordinary relay execution.
 	backendFactory rootBackendFactory
+
+	retainedInputVerifier            rootRetainedInputVerifier
+	retainedInputVerificationTimeout time.Duration
 }
 
 type recipePreflight struct {
@@ -250,10 +254,13 @@ func preflightRecipe(ctx context.Context, opts RecipeOptions) (*recipePreflight,
 	}
 	opts.LaunchPlan = normalizedLaunchPlan
 	preparedInputs, err := namedinputs.Prepare(namedinputs.Options{
-		Contract:               selectedContract,
-		Bindings:               append([]string{}, opts.InputBindings...),
-		SourceAnchor:           launchCWD,
-		PositionalContextCount: len(launchContexts),
+		Contract:                selectedContract,
+		Bindings:                append([]string{}, opts.InputBindings...),
+		SourceAnchor:            launchCWD,
+		PositionalContextCount:  len(launchContexts),
+		Context:                 ctx,
+		NamedInputMaxBytes:      runtimeConfig.EffectiveLimits().NamedInputMaxBytes,
+		NamedInputTotalMaxBytes: runtimeConfig.EffectiveLimits().NamedInputTotalMaxBytes,
 	})
 	if err != nil {
 		return nil, err
@@ -736,23 +743,24 @@ func rootRecipeMeta(preflight *recipePreflight, persisted *persistedRecipeRun) (
 
 func rootRecipeStartEvent(preflight *recipePreflight, persisted *persistedRecipeRun) map[string]any {
 	return map[string]any{
-		"session_ref":              preflight.sessionID,
-		"execution_kind":           "recipe",
-		"recipe_id":                preflight.options.RecipeID,
-		"recipe_ref":               persisted.recipeRef,
-		"root_recipe_plan_ref":     persisted.rootPlanRef,
-		"runtime_config_ref":       persisted.runtimeConfigRef,
-		"integration_bundle_ref":   persisted.bundleRef,
-		"integration_contract_ref": persisted.contractRef,
-		"named_input_manifest_ref": persisted.inputManifestRef,
-		"execution_workspace_ref":  persisted.workspaceRef,
-		"root_checkpoint_ref":      persisted.checkpointRef,
-		"participant_turns":        preflight.rootPlan["participant_turns"],
-		"actual_participant_turns": 0,
-		"participant_schedule":     preflight.rootPlan["participant_schedule"],
-		"result_source":            preflight.rootPlan["result_source"],
-		"dynamic_mode":             "off",
-		"task":                     preflight.options.Task,
+		"session_ref":                        preflight.sessionID,
+		"execution_kind":                     "recipe",
+		"recipe_id":                          preflight.options.RecipeID,
+		"recipe_ref":                         persisted.recipeRef,
+		"root_recipe_plan_ref":               persisted.rootPlanRef,
+		"runtime_config_ref":                 persisted.runtimeConfigRef,
+		"integration_bundle_ref":             persisted.bundleRef,
+		"integration_contract_ref":           persisted.contractRef,
+		"named_input_manifest_ref":           persisted.inputManifestRef,
+		"retained_input_materialization_ref": persisted.retainedInputRef,
+		"execution_workspace_ref":            persisted.workspaceRef,
+		"root_checkpoint_ref":                persisted.checkpointRef,
+		"participant_turns":                  preflight.rootPlan["participant_turns"],
+		"actual_participant_turns":           0,
+		"participant_schedule":               preflight.rootPlan["participant_schedule"],
+		"result_source":                      preflight.rootPlan["result_source"],
+		"dynamic_mode":                       "off",
+		"task":                               preflight.options.Task,
 	}
 }
 

@@ -22,6 +22,80 @@ type Materialized struct {
 	DescriptorRef  map[string]any
 }
 
+// LoadRetained verifies a present retained materialization and reconstructs
+// the provider projection exclusively from its digest-checked descriptor and
+// manifest. It performs no writes.
+func LoadRetained(
+	ctx context.Context,
+	st *store.Store,
+	manifestRef map[string]any,
+	descriptorRef map[string]any,
+	role string,
+	boundary string,
+) (*Materialized, error) {
+	if err := VerifyRetained(ctx, st, descriptorRef, role, boundary); err != nil {
+		return nil, err
+	}
+	descriptor, descriptorEntries, _, err := loadRetainedDescriptor(st, descriptorRef)
+	if err != nil {
+		return nil, err
+	}
+	manifest, manifestEntries, err := loadManifest(st, manifestRef)
+	if err != nil {
+		return nil, err
+	}
+	descriptorManifestRef, err := contracts.ValidateArtifactRef(descriptor["manifest_ref"])
+	if err != nil || !matchingArtifactRefs(descriptorManifestRef, manifestRef) {
+		return nil, integrityError(err, "Retained named input descriptor does not match its manifest ref.", nil)
+	}
+	if descriptor["contract_id"] != manifest["contract_id"] ||
+		len(descriptorEntries) != len(manifestEntries) {
+		return nil, integrityError(nil, "Retained named input descriptor does not match its manifest.", nil)
+	}
+
+	rawDescriptorEntries, _ := descriptor["inputs"].([]any)
+	providerItems := make([]any, 0, len(descriptorEntries))
+	for index, descriptorEntry := range descriptorEntries {
+		if err := retainedContextError(ctx); err != nil {
+			return nil, err
+		}
+		manifestEntry := manifestEntries[index]
+		rawDescriptorEntry, _ := rawDescriptorEntries[index].(map[string]any)
+		if descriptorEntry.ordinal != manifestEntry.ordinal ||
+			descriptorEntry.name != manifestEntry.name ||
+			descriptorEntry.nameOrdinal != manifestEntry.nameOrdinal ||
+			descriptorEntry.sizeBytes != manifestEntry.sizeBytes ||
+			descriptorEntry.rawDigest != manifestEntry.rawDigest ||
+			!matchingArtifactRefs(rawDescriptorEntry["content_ref"], manifestEntry.contentRef) {
+			return nil, integrityError(
+				nil,
+				"Retained named input descriptor entry does not match its manifest.",
+				map[string]any{"ordinal": index + 1},
+			)
+		}
+		providerItems = append(providerItems, map[string]any{
+			"name":              manifestEntry.name,
+			"ordinal":           manifestEntry.ordinal,
+			"name_ordinal":      manifestEntry.nameOrdinal,
+			"materialized_path": descriptorEntry.path,
+			"size_bytes":        manifestEntry.sizeBytes,
+			"raw_digest":        manifestEntry.rawDigest,
+			"media_type":        manifestEntry.mediaType,
+			"schema_status":     manifestEntry.schemaStatus,
+			"content_ref":       cloneMap(manifestEntry.contentRef),
+		})
+	}
+	return &Materialized{
+		ProviderInputs: map[string]any{
+			"contract_id":  manifest["contract_id"],
+			"manifest_ref": cloneMap(manifestRef),
+			"inputs":       providerItems,
+		},
+		Descriptor:    cloneMap(descriptor),
+		DescriptorRef: cloneMap(descriptorRef),
+	}, nil
+}
+
 // MaterializeRetained writes the manifest bytes to an exact ordinal layout
 // and persists the descriptor consumed by the exact no-follow verifier.
 func MaterializeRetained(
@@ -158,13 +232,34 @@ func VerifyRetained(
 	}
 	sort.Slice(actual, func(left int, right int) bool { return actual[left].Name() < actual[right].Name() })
 	if len(actual) > len(entries) {
-		observed := actual[len(entries)].Name()
+		expectedNames := make(map[string]bool, len(entries))
+		for _, entry := range entries {
+			expectedNames[entry.filename] = true
+		}
+		observed := ""
+		for _, entry := range actual {
+			if !expectedNames[entry.Name()] {
+				observed = entry.Name()
+				break
+			}
+		}
 		mismatch := retainedMismatch(role, boundary, entries, len(entries), IntegrityMismatchUnexpected)
 		mismatch.Observed.Path = filepath.Join(directory, observed)
 		return retainedMismatchError(mismatch, nil)
 	}
 	if len(actual) < len(entries) {
-		mismatch := retainedMismatch(role, boundary, entries, len(actual), IntegrityMismatchMissing)
+		actualNames := make(map[string]bool, len(actual))
+		for _, entry := range actual {
+			actualNames[entry.Name()] = true
+		}
+		missingIndex := 0
+		for index, entry := range entries {
+			if !actualNames[entry.filename] {
+				missingIndex = index
+				break
+			}
+		}
+		mismatch := retainedMismatch(role, boundary, entries, missingIndex, IntegrityMismatchMissing)
 		return retainedMismatchError(mismatch, nil)
 	}
 	for index, entry := range entries {
@@ -236,6 +331,9 @@ func VerifyRetained(
 		closeErr := handle.Close()
 		if statErr != nil || closeErr != nil {
 			return errors.Join(readErr, statErr, closeErr)
+		}
+		if contextErr := retainedContextError(ctx); contextErr != nil {
+			return contextErr
 		}
 		pathAfter, pathErr := os.Lstat(target)
 		if pathErr != nil || !after.Mode().IsRegular() || !os.SameFile(opened, after) ||
@@ -381,7 +479,7 @@ func retainedMismatchError(mismatch IntegrityMismatch, cause error) error {
 		details["cause_type"] = fmt.Sprintf("%T", cause)
 		diagnostic.Details = details
 	}
-	return contracts.NewDiagnosticError("Retained named input integrity verification failed.", diagnostic)
+	return contracts.WrapDiagnosticError(cause, "Retained named input integrity verification failed.", diagnostic)
 }
 
 func retainedFilenamePresent(entries []os.DirEntry, filename string) bool {
@@ -391,6 +489,14 @@ func retainedFilenamePresent(entries []os.DirEntry, filename string) bool {
 		}
 	}
 	return false
+}
+
+func matchingArtifactRefs(left any, right any) bool {
+	leftRef, leftErr := contracts.ValidateArtifactRef(left)
+	rightRef, rightErr := contracts.ValidateArtifactRef(right)
+	return leftErr == nil && rightErr == nil &&
+		leftRef["id"] == rightRef["id"] &&
+		leftRef["digest"] == rightRef["digest"]
 }
 
 func retainedEntryType(mode os.FileMode) string {

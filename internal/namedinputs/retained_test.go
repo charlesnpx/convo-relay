@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 
 	"github.com/charlesnpx/convo-relay/internal/contracts"
@@ -132,6 +133,10 @@ func TestVerifyRetainedRejectsEveryExactLayoutMismatchWithoutContents(t *testing
 				diagnostic.Details["attempt_boundary"] != IntegrityBoundaryBeforeAttempt {
 				t.Fatalf("retained mismatch diagnostic = %#v", diagnostic)
 			}
+			if test.name == "missing" &&
+				(diagnostic.Details["input_name"] != "value" || diagnostic.Details["input_ordinal"] != 1) {
+				t.Fatalf("early missing input diagnostic = %#v", diagnostic)
+			}
 			if containsKeyRecursive(diagnostic.ToMap(), "bytes") ||
 				containsKeyRecursive(diagnostic.ToMap(), "content") {
 				t.Fatalf("retained mismatch diagnostic exposed contents: %#v", diagnostic)
@@ -142,8 +147,7 @@ func TestVerifyRetainedRejectsEveryExactLayoutMismatchWithoutContents(t *testing
 
 func TestVerifyRetainedObservesCancellationWhileHashing(t *testing.T) {
 	st, materialized := retainedFixture(t)
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
+	ctx := newCancelAfterDoneChecksContext(3)
 	if err := VerifyRetained(ctx, st, materialized.DescriptorRef, "initialization", IntegrityBoundaryInitialization); !errors.Is(err, context.Canceled) {
 		t.Fatalf("canceled retained verification = %v", err)
 	}
@@ -162,6 +166,60 @@ func TestVerifyRetainedDoesNotRecreateMissingMaterializationDirectory(t *testing
 	}
 	if _, statErr := os.Lstat(directory); !os.IsNotExist(statErr) {
 		t.Fatalf("verification recreated missing retained directory: %v", statErr)
+	}
+}
+
+func TestVerifyRetainedReportsAnExtraEntryThatSortsBeforeExpectedFiles(t *testing.T) {
+	st, materialized := retainedFixture(t)
+	directory := materialized.Descriptor["directory"].(string)
+	extra := filepath.Join(directory, "000000")
+	if err := os.WriteFile(extra, []byte("extra"), 0o444); err != nil {
+		t.Fatalf("write early-sorting extra: %v", err)
+	}
+	err := VerifyRetained(
+		context.Background(),
+		st,
+		materialized.DescriptorRef,
+		"inspection",
+		"health",
+	)
+	var diagnosticErr *contracts.DiagnosticError
+	if !errors.As(err, &diagnosticErr) || len(diagnosticErr.Diagnostics) != 1 {
+		t.Fatalf("unexpected-entry error = %T %v", err, err)
+	}
+	diagnostic := diagnosticErr.Diagnostics[0]
+	observed, _ := diagnostic.Details["observed"].(map[string]any)
+	if diagnostic.Details["mismatch_category"] != IntegrityMismatchUnexpected ||
+		filepath.Clean(stringValue(observed["path"])) != filepath.Clean(extra) {
+		t.Fatalf("unexpected-entry diagnostic = %#v", diagnostic)
+	}
+}
+
+func TestLoadRetainedReconstructsProjectionWithoutWriting(t *testing.T) {
+	st, materialized := retainedFixture(t)
+	before, err := os.ReadDir(materialized.Descriptor["directory"].(string))
+	if err != nil {
+		t.Fatalf("read retained directory before load: %v", err)
+	}
+	manifestRef := materialized.Descriptor["manifest_ref"].(map[string]any)
+	loaded, err := LoadRetained(
+		context.Background(),
+		st,
+		manifestRef,
+		materialized.DescriptorRef,
+		"recovery",
+		IntegrityBoundaryRecovery,
+	)
+	if err != nil {
+		t.Fatalf("load retained: %v", err)
+	}
+	after, err := os.ReadDir(materialized.Descriptor["directory"].(string))
+	if err != nil {
+		t.Fatalf("read retained directory after load: %v", err)
+	}
+	if len(before) != len(after) || len(loaded.ProviderInputs["inputs"].([]any)) != 2 ||
+		!matchingArtifactRefs(loaded.DescriptorRef, materialized.DescriptorRef) {
+		t.Fatalf("loaded retained projection = %#v", loaded)
 	}
 }
 
@@ -227,4 +285,42 @@ func saveRetainedDescriptor(t *testing.T, st *store.Store, descriptor map[string
 		t.Fatalf("save retained descriptor: %v", err)
 	}
 	return ref
+}
+
+type cancelAfterDoneChecksContext struct {
+	context.Context
+
+	mu          sync.Mutex
+	done        chan struct{}
+	checks      int
+	cancelAfter int
+	canceled    bool
+}
+
+func newCancelAfterDoneChecksContext(cancelAfter int) *cancelAfterDoneChecksContext {
+	return &cancelAfterDoneChecksContext{
+		Context:     context.Background(),
+		done:        make(chan struct{}),
+		cancelAfter: cancelAfter,
+	}
+}
+
+func (c *cancelAfterDoneChecksContext) Done() <-chan struct{} {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.checks++
+	if !c.canceled && c.checks >= c.cancelAfter {
+		close(c.done)
+		c.canceled = true
+	}
+	return c.done
+}
+
+func (c *cancelAfterDoneChecksContext) Err() error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.canceled {
+		return context.Canceled
+	}
+	return nil
 }

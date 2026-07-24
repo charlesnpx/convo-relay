@@ -43,6 +43,23 @@ Old sessions do not need this field. Inspectors and display paths must continue 
 
 Retryable provider failures are not persisted as completed turns. They are retried by the runner with the Python-compatible backoff series `5s`, `10s`, `20s`, `40s`, `80s`, `160s`. If all attempts fail, the session is marked failed with a retry-exhaustion error and no successful transcript entry is appended for that turn.
 
+For root recipes, every provider is a trusted same-user process running with
+the invoking user's authority. Slot-scoped homes and detached worktrees
+organize lifecycle state; they are not sandboxes and do not isolate a provider
+from source repositories, session files, credentials, the network, or other
+same-user-visible resources.
+
+When an integration contract has named inputs, the retry boundary verifies
+the retained snapshots immediately before and after each participant,
+facilitator, and reducer attempt. The post-attempt verification uses a finite
+orchestration-owned context that remains live after provider or caller
+cancellation. Retained inputs are not immutable or filesystem read-only, so a
+provider can change them between checks. A failed boundary check suppresses
+retry and rejects the response before it can enter transcript, facilitator,
+reducer, raw-result, validation, or canonical-result artifacts. A provider
+error, timeout, stall, or cancellation from the same attempt is retained only
+as a secondary, sanitized cause.
+
 Failed provider turns append a `provider_failure` event and mirror the sanitized failure payload into `meta.provider_failures`. Payloads include:
 
 - `phase`: `turn` or `facilitator`

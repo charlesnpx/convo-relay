@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -35,17 +36,18 @@ type persistedRootReducerAttempt struct {
 }
 
 type preparedRootRecovery struct {
-	st          *store.Store
-	meta        model.SessionMeta
-	transcript  model.Transcript
-	preflight   *recipePreflight
-	persisted   *persistedRecipeRun
-	workspace   *workspace.Materialized
-	checkpoints map[int]*persistedRootRecoveryArtifact
-	attempts    []persistedRootReducerAttempt
-	candidate   *rootCandidate
-	validation  *persistedRootRecoveryArtifact
-	canonical   *persistedRootRecoveryArtifact
+	st                          *store.Store
+	meta                        model.SessionMeta
+	transcript                  model.Transcript
+	preflight                   *recipePreflight
+	persisted                   *persistedRecipeRun
+	workspace                   *workspace.Materialized
+	checkpoints                 map[int]*persistedRootRecoveryArtifact
+	attempts                    []persistedRootReducerAttempt
+	candidate                   *rootCandidate
+	validation                  *persistedRootRecoveryArtifact
+	canonical                   *persistedRootRecoveryArtifact
+	legacyRetainedInputsMissing bool
 }
 
 // resumeRootRecipe performs every prerequisite and policy check before it can
@@ -58,9 +60,17 @@ func resumeRootRecipe(ctx context.Context, sessionDir string, opts ResumeOptions
 	if err := validateRootResumeOverrides(opts); err != nil {
 		return nil, err
 	}
+	if err := rejectNamedInputIntegrityTerminal(initialMeta); err != nil {
+		return nil, err
+	}
 	if err := guardRootLifecycleMeta(initialMeta, rootLifecycleActionResume); err != nil {
 		return nil, err
 	}
+	canonicalSessionDir, err := canonicalRootRecoverySessionDir(sessionDir)
+	if err != nil {
+		return nil, err
+	}
+	sessionDir = canonicalSessionDir
 	preparedBeforeLock, err := prepareRootRecovery(ctx, sessionDir, opts)
 	if err != nil {
 		return nil, err
@@ -87,6 +97,9 @@ func resumeRootRecipe(ctx context.Context, sessionDir string, opts ResumeOptions
 	if err := guardRootLifecycleMeta(prepared.meta, rootLifecycleActionResume); err != nil {
 		return nil, err
 	}
+	if err := rejectNamedInputIntegrityTerminal(prepared.meta); err != nil {
+		return nil, err
+	}
 	if complete, terminalErr := prepared.completedResult(); complete {
 		return sessionResult(sessionDir, prepared.meta, prepared.transcript), terminalErr
 	}
@@ -95,6 +108,25 @@ func resumeRootRecipe(ctx context.Context, sessionDir string, opts ResumeOptions
 	}
 	defer removePID(sessionDir)
 	return prepared.run(ctx)
+}
+
+func canonicalRootRecoverySessionDir(sessionDir string) (string, error) {
+	absolute, err := filepath.Abs(sessionDir)
+	if err != nil {
+		return "", err
+	}
+	resolved, err := filepath.EvalSymlinks(absolute)
+	if err != nil {
+		return "", err
+	}
+	info, err := os.Stat(resolved)
+	if err != nil {
+		return "", err
+	}
+	if !info.IsDir() {
+		return "", fmt.Errorf("root recovery session path is not a directory: %s", resolved)
+	}
+	return filepath.Clean(resolved), nil
 }
 
 func (prepared *preparedRootRecovery) completedResult() (bool, error) {
@@ -218,11 +250,180 @@ func validateRootResumeOverrides(opts ResumeOptions) error {
 	)
 }
 
+func rejectNamedInputIntegrityTerminal(meta model.SessionMeta) error {
+	failedForIntegrity := meta.String("stop_reason") == RootNamedInputIntegrityStopReason ||
+		meta.String("execution_phase") == RootNamedInputIntegrityExecutionPhase
+	if !failedForIntegrity {
+		for _, raw := range meta.Slice("failure_causes") {
+			cause := ""
+			switch typed := raw.(type) {
+			case string:
+				cause = typed
+			case map[string]any:
+				cause = stringFromAny(typed["code"])
+			}
+			if strings.TrimSpace(cause) == RootFailureCauseNamedInputIntegrity {
+				failedForIntegrity = true
+				break
+			}
+		}
+	}
+	if !failedForIntegrity {
+		return nil
+	}
+	return rootRecipeDiagnostic(
+		namedinputs.DiagnosticCodeIntegrity,
+		contracts.DiagnosticPhasePolicy,
+		"/resume",
+		"A root session terminated for named input integrity failure and cannot be resumed.",
+		map[string]any{
+			"status":          meta.String("status"),
+			"stop_reason":     meta.String("stop_reason"),
+			"execution_phase": meta.String("execution_phase"),
+		},
+	)
+}
+
 func rootResumeRuntimeConfigProvided(config recipes.RuntimeConfig) bool {
 	return len(config.BackendProfiles) > 0 ||
 		len(config.RelayRecipes) > 0 ||
 		recipes.RuntimeLimitsProvided(config.Limits) ||
 		strings.TrimSpace(config.SettingsPath) != ""
+}
+
+func prepareRootRecoveryRetainedInputs(
+	ctx context.Context,
+	sessionDir string,
+	st *store.Store,
+	meta model.SessionMeta,
+	checkpoints map[int]*persistedRootRecoveryArtifact,
+	manifestRef map[string]any,
+	selectedContract *integration.SelectedContract,
+) (*namedinputs.Materialized, bool, error) {
+	type retainedRefSource struct {
+		label string
+		value any
+	}
+	sources := []retainedRefSource{{
+		label: "session metadata",
+		value: meta.Get("retained_input_materialization_ref"),
+	}}
+	for _, ordinal := range []int{1, 2, 3, 4, 5} {
+		if checkpoint := checkpoints[ordinal]; checkpoint != nil {
+			sources = append(sources, retainedRefSource{
+				label: fmt.Sprintf("checkpoint %d", ordinal),
+				value: checkpoint.payload["retained_input_materialization_ref"],
+			})
+		}
+	}
+
+	var retainedRef map[string]any
+	for _, source := range sources {
+		ref, err := optionalArtifactRef(source.value, "retained_input_materialization_ref")
+		if err != nil {
+			return nil, false, err
+		}
+		if ref == nil {
+			continue
+		}
+		if retainedRef == nil {
+			retainedRef = ref
+			continue
+		}
+		if err := requireMatchingArtifactRef(
+			retainedRef,
+			ref,
+			"retained input materialization across "+source.label,
+		); err != nil {
+			return nil, false, err
+		}
+	}
+
+	if selectedContract == nil {
+		if retainedRef != nil {
+			return nil, false, persistenceIntegrityError(
+				"Contractless root recovery cannot reference retained named inputs.",
+				nil,
+			)
+		}
+		return nil, false, nil
+	}
+	if retainedRef != nil {
+		materialized, err := namedinputs.LoadRetained(
+			ctx,
+			st,
+			manifestRef,
+			retainedRef,
+			"recovery",
+			namedinputs.IntegrityBoundaryRecovery,
+		)
+		if err != nil {
+			return nil, false, err
+		}
+		return materialized, false, nil
+	}
+	if err := requireLegacyRetainedInputsAbsent(st, sessionDir); err != nil {
+		return nil, false, err
+	}
+	return nil, true, nil
+}
+
+func requireLegacyRetainedInputsAbsent(st *store.Store, sessionDir string) error {
+	inputDir := filepath.Join(sessionDir, "execution", "inputs")
+	if _, err := os.Lstat(inputDir); err == nil {
+		return persistenceIntegrityError(
+			"Legacy root recovery found retained input evidence without its authoritative descriptor; the evidence was preserved.",
+			map[string]any{"path": inputDir},
+		)
+	} else if !os.IsNotExist(err) {
+		return err
+	}
+
+	identity, err := contracts.RootArtifactIdentityFor(contracts.RootArtifactKindRetainedInputs, 0)
+	if err != nil {
+		return err
+	}
+	if _, err := st.ResolveArtifactRef(identity.RefID, ""); err == nil {
+		return persistenceIntegrityError(
+			"Legacy root recovery found an unreferenced retained input descriptor; the evidence was preserved.",
+			nil,
+		)
+	} else {
+		var notFound store.NotFoundError
+		if !errors.As(err, &notFound) {
+			return err
+		}
+	}
+	descriptorPath := filepath.Join(
+		sessionDir,
+		"artifacts",
+		contracts.RootArtifactKindRetainedInputs,
+		identity.ArtifactID+".json",
+	)
+	if _, err := os.Lstat(descriptorPath); err == nil {
+		return persistenceIntegrityError(
+			"Legacy root recovery found an unindexed retained input descriptor; the evidence was preserved.",
+			map[string]any{"path": descriptorPath},
+		)
+	} else if !os.IsNotExist(err) {
+		return err
+	}
+	if artifacts, ok := st.LoadGraph()["artifacts"].(map[string]any); ok {
+		if artifacts[contracts.RootArtifactKindRetainedInputs+"/"+identity.ArtifactID] != nil {
+			return persistenceIntegrityError(
+				"Legacy root recovery found retained input graph evidence without its descriptor ref; the evidence was preserved.",
+				nil,
+			)
+		}
+	}
+	return nil
+}
+
+func retainedProviderInputs(materialized *namedinputs.Materialized) map[string]any {
+	if materialized == nil {
+		return nil
+	}
+	return cloneMap(materialized.ProviderInputs)
 }
 
 func prepareRootRecovery(ctx context.Context, sessionDir string, opts ResumeOptions) (*preparedRootRecovery, error) {
@@ -340,6 +541,21 @@ func prepareRootRecovery(ctx context.Context, sessionDir string, opts ResumeOpti
 	} else if baseRefs["named_input_manifest_ref"] != nil {
 		return nil, persistenceIntegrityError("Contractless root recovery cannot reference a named input manifest.", nil)
 	}
+	retainedInputs, legacyRetainedInputsMissing, err := prepareRootRecoveryRetainedInputs(
+		ctx,
+		sessionDir,
+		st,
+		meta,
+		checkpoints,
+		baseRefs["named_input_manifest_ref"],
+		selectedContract,
+	)
+	if err != nil {
+		return nil, err
+	}
+	if retainedInputs != nil {
+		baseRefs["retained_input_materialization_ref"] = cloneMap(retainedInputs.DescriptorRef)
+	}
 
 	workspaceState, err := workspace.Recover(ctx, st)
 	if err != nil {
@@ -398,13 +614,15 @@ func prepareRootRecovery(ctx context.Context, sessionDir string, opts ResumeOpti
 	timeout, stallTimeout := recoveredRootTimeouts(meta, opts)
 	preflight := &recipePreflight{
 		options: RecipeOptions{
-			SessionDir:          sessionDir,
-			SessionID:           sessionIDFromDir(sessionDir),
-			Task:                meta.String("task"),
-			RecipeID:            meta.String("recipe_id"),
-			TimeoutSeconds:      timeout,
-			StallTimeoutSeconds: stallTimeout,
-			backendFactory:      opts.backendFactory,
+			SessionDir:                       sessionDir,
+			SessionID:                        sessionIDFromDir(sessionDir),
+			Task:                             meta.String("task"),
+			RecipeID:                         meta.String("recipe_id"),
+			TimeoutSeconds:                   timeout,
+			StallTimeoutSeconds:              stallTimeout,
+			backendFactory:                   opts.backendFactory,
+			retainedInputVerifier:            opts.retainedInputVerifier,
+			retainedInputVerificationTimeout: opts.retainedInputVerificationTimeout,
 		},
 		sessionDir:         sessionDir,
 		sessionID:          sessionIDFromDir(sessionDir),
@@ -429,22 +647,26 @@ func prepareRootRecovery(ctx context.Context, sessionDir string, opts ResumeOpti
 		contractRef:           cloneMap(baseRefs["integration_contract_ref"]),
 		launchContextRefs:     append([]any{}, meta.Slice("launch_context_refs")...),
 		inputManifestRef:      cloneMap(baseRefs["named_input_manifest_ref"]),
+		retainedInputRef:      cloneMap(baseRefs["retained_input_materialization_ref"]),
+		providerInputs:        retainedProviderInputs(retainedInputs),
+		workspaceArtifact:     cloneMap(workspaceState.Artifact),
 		workspaceRef:          cloneMap(workspaceState.ArtifactRef),
 		executionCWD:          workspaceState.ExecutionCWD,
 		checkpointRef:         cloneMap(checkpointTwo.ref),
 	}
 	return &preparedRootRecovery{
-		st:          st,
-		meta:        meta,
-		transcript:  transcript,
-		preflight:   preflight,
-		persisted:   persisted,
-		workspace:   workspaceState,
-		checkpoints: checkpoints,
-		attempts:    attempts,
-		candidate:   candidate,
-		validation:  validation,
-		canonical:   canonical,
+		st:                          st,
+		meta:                        meta,
+		transcript:                  transcript,
+		preflight:                   preflight,
+		persisted:                   persisted,
+		workspace:                   workspaceState,
+		checkpoints:                 checkpoints,
+		attempts:                    attempts,
+		candidate:                   candidate,
+		validation:                  validation,
+		canonical:                   canonical,
+		legacyRetainedInputsMissing: legacyRetainedInputsMissing,
 	}, nil
 }
 
@@ -456,6 +678,11 @@ func (prepared *preparedRootRecovery) run(ctx context.Context) (map[string]any, 
 		meta:       prepared.meta,
 		transcript: prepared.transcript,
 		startedAt:  time.Now(),
+	}
+	if prepared.legacyRetainedInputsMissing {
+		if err := state.materializeLegacyRootRecoveryInputs(ctx); err != nil {
+			return state.result(), err
+		}
 	}
 	state.adoptRootRecoveryArtifacts(prepared)
 	if err := state.saveProgress(); err != nil {
@@ -490,9 +717,6 @@ func (prepared *preparedRootRecovery) run(ctx context.Context) (map[string]any, 
 			}
 			prepared.candidate = &candidate
 		} else {
-			if err := state.materializeRootRecoveryInputs(); err != nil {
-				return state.markRootRecoveryPending("named_input_recovery", err)
-			}
 			return state.runRootResultPhases(ctx)
 		}
 	} else if prepared.checkpoints[3] == nil {
@@ -551,6 +775,8 @@ func (s *rootExecutionState) adoptRootRecoveryArtifacts(prepared *preparedRootRe
 		With("integration_bundle_ref", s.persisted.bundleRef).
 		With("integration_contract_ref", s.persisted.contractRef).
 		With("named_input_manifest_ref", s.persisted.inputManifestRef).
+		With("retained_input_materialization_ref", s.persisted.retainedInputRef).
+		With("provider_inputs", s.persisted.providerInputs).
 		With("execution_workspace_ref", s.persisted.workspaceRef).
 		With("launch_cwd", s.persisted.executionCWD).
 		With("execution_cwd", s.persisted.executionCWD).
@@ -595,17 +821,34 @@ func (s *rootExecutionState) adoptRootRecoveryArtifacts(prepared *preparedRootRe
 	}
 }
 
-func (s *rootExecutionState) materializeRootRecoveryInputs() error {
+func (s *rootExecutionState) materializeLegacyRootRecoveryInputs(ctx context.Context) error {
 	if s.preflight.selectedContract == nil {
 		return nil
 	}
-	projection, err := namedinputs.Materialize(s.st, s.persisted.inputManifestRef, filepath.Join(s.preflight.sessionDir, "execution", "inputs"))
+	materialized, err := namedinputs.MaterializeRetained(
+		ctx,
+		s.st,
+		s.persisted.inputManifestRef,
+		filepath.Join(s.preflight.sessionDir, "execution", "inputs"),
+	)
 	if err != nil {
 		return err
 	}
-	s.persisted.providerInputs = projection
-	s.meta = s.meta.With("provider_inputs", projection)
-	return s.saveProgress()
+	if err := namedinputs.VerifyRetained(
+		ctx,
+		s.st,
+		materialized.DescriptorRef,
+		"recovery",
+		namedinputs.IntegrityBoundaryRecovery,
+	); err != nil {
+		return err
+	}
+	s.persisted.retainedInputRef = cloneMap(materialized.DescriptorRef)
+	s.persisted.providerInputs = cloneMap(materialized.ProviderInputs)
+	s.meta = s.meta.
+		With("retained_input_materialization_ref", materialized.DescriptorRef).
+		With("provider_inputs", materialized.ProviderInputs)
+	return nil
 }
 
 func (s *rootExecutionState) finishRecoveredRootCleanup(prepared *preparedRootRecovery) (map[string]any, error) {
@@ -1252,7 +1495,7 @@ func validateRootRecoveryMeta(meta model.SessionMeta, plan map[string]any, refs 
 			return persistenceIntegrityError("Root recovery metadata differs from the persisted root plan.", map[string]any{"field": check.field})
 		}
 	}
-	for _, key := range []string{"recipe_ref", "root_recipe_plan_ref", "runtime_config_ref", "integration_bundle_ref", "integration_contract_ref", "named_input_manifest_ref"} {
+	for _, key := range []string{"recipe_ref", "root_recipe_plan_ref", "runtime_config_ref", "integration_bundle_ref", "integration_contract_ref", "named_input_manifest_ref", "retained_input_materialization_ref"} {
 		metaRef, err := optionalArtifactRef(meta.Get(key), key)
 		if err != nil {
 			return err
