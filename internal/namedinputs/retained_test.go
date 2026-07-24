@@ -121,7 +121,15 @@ func TestVerifyRetainedRejectsEveryExactLayoutMismatchWithoutContents(t *testing
 		t.Run(test.name, func(t *testing.T) {
 			st, materialized := retainedFixture(t)
 			ref := test.mutate(t, st, materialized)
-			err := VerifyRetained(context.Background(), st, ref, "participant", IntegrityBoundaryBeforeAttempt)
+			providerAttempt := 3
+			err := VerifyRetained(
+				context.Background(),
+				st,
+				ref,
+				"participant",
+				IntegrityBoundaryBeforeAttempt,
+				&providerAttempt,
+			)
 			var diagnosticErr *contracts.DiagnosticError
 			if !errors.As(err, &diagnosticErr) || len(diagnosticErr.Diagnostics) != 1 {
 				t.Fatalf("retained mismatch error = %T %v", err, err)
@@ -130,6 +138,7 @@ func TestVerifyRetainedRejectsEveryExactLayoutMismatchWithoutContents(t *testing
 			if diagnostic.Code != DiagnosticCodeIntegrity ||
 				diagnostic.Details["mismatch_category"] != test.category ||
 				diagnostic.Details["role"] != "participant" ||
+				diagnostic.Details["provider_attempt"] != 3 ||
 				diagnostic.Details["attempt_boundary"] != IntegrityBoundaryBeforeAttempt {
 				t.Fatalf("retained mismatch diagnostic = %#v", diagnostic)
 			}
@@ -148,7 +157,7 @@ func TestVerifyRetainedRejectsEveryExactLayoutMismatchWithoutContents(t *testing
 func TestVerifyRetainedObservesCancellationWhileHashing(t *testing.T) {
 	st, materialized := retainedFixture(t)
 	ctx := newCancelAfterDoneChecksContext(3)
-	if err := VerifyRetained(ctx, st, materialized.DescriptorRef, "initialization", IntegrityBoundaryInitialization); !errors.Is(err, context.Canceled) {
+	if err := VerifyRetained(ctx, st, materialized.DescriptorRef, "initialization", IntegrityBoundaryInitialization, nil); !errors.Is(err, context.Canceled) {
 		t.Fatalf("canceled retained verification = %v", err)
 	}
 }
@@ -159,7 +168,7 @@ func TestVerifyRetainedDoesNotRecreateMissingMaterializationDirectory(t *testing
 	if err := os.RemoveAll(directory); err != nil {
 		t.Fatalf("remove retained materialization directory: %v", err)
 	}
-	err := VerifyRetained(context.Background(), st, materialized.DescriptorRef, "initialization", IntegrityBoundaryInitialization)
+	err := VerifyRetained(context.Background(), st, materialized.DescriptorRef, "initialization", IntegrityBoundaryInitialization, nil)
 	var diagnosticErr *contracts.DiagnosticError
 	if !errors.As(err, &diagnosticErr) {
 		t.Fatalf("missing retained directory error = %T %v", err, err)
@@ -182,6 +191,7 @@ func TestVerifyRetainedReportsAnExtraEntryThatSortsBeforeExpectedFiles(t *testin
 		materialized.DescriptorRef,
 		"inspection",
 		"health",
+		nil,
 	)
 	var diagnosticErr *contracts.DiagnosticError
 	if !errors.As(err, &diagnosticErr) || len(diagnosticErr.Diagnostics) != 1 {
@@ -252,7 +262,7 @@ func retainedFixture(t *testing.T) (*store.Store, *Materialized) {
 	if err != nil {
 		t.Fatalf("materialize retained fixture: %v", err)
 	}
-	if err := VerifyRetained(context.Background(), st, materialized.DescriptorRef, "initialization", IntegrityBoundaryInitialization); err != nil {
+	if err := VerifyRetained(context.Background(), st, materialized.DescriptorRef, "initialization", IntegrityBoundaryInitialization, nil); err != nil {
 		t.Fatalf("verify retained fixture: %v", err)
 	}
 	return st, materialized

@@ -21,12 +21,14 @@ type rootRetainedInputVerifier func(
 	map[string]any,
 	string,
 	string,
+	*int,
 ) error
 
 type rootNamedInputIntegrityError struct {
 	cause           error
 	role            string
 	boundary        string
+	providerAttempt *int
 	providerCause   error
 	providerFailure map[string]any
 }
@@ -67,26 +69,47 @@ func runRootProviderTurnWithRetainedIntegrity(
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	providerAttempt := 0
 	return runWithRetryableProviderErrors(ctx, actor, func() (TurnResult, error) {
-		if err := state.verifyRetainedInputs(ctx, role, namedinputs.IntegrityBoundaryBeforeAttempt); err != nil {
+		providerAttempt++
+		currentAttempt := providerAttempt
+		attemptRef := &currentAttempt
+		if err := state.verifyRetainedInputs(
+			ctx,
+			role,
+			namedinputs.IntegrityBoundaryBeforeAttempt,
+			attemptRef,
+		); err != nil {
 			if ctx.Err() != nil && errors.Is(err, ctx.Err()) {
 				return TurnResult{}, ctx.Err()
 			}
 			return TurnResult{}, &rootNamedInputIntegrityError{
-				cause:    err,
-				role:     role,
-				boundary: namedinputs.IntegrityBoundaryBeforeAttempt,
+				cause:           err,
+				role:            role,
+				boundary:        namedinputs.IntegrityBoundaryBeforeAttempt,
+				providerAttempt: attemptRef,
 			}
 		}
 
 		result, providerErr := operation()
 		postBase := context.WithoutCancel(ctx)
 		postCtx, cancel := context.WithTimeout(postBase, state.retainedInputVerificationTimeout())
-		verifyErr := state.verifyRetainedInputs(postCtx, role, namedinputs.IntegrityBoundaryAfterAttempt)
+		verifyErr := state.verifyRetainedInputs(
+			postCtx,
+			role,
+			namedinputs.IntegrityBoundaryAfterAttempt,
+			attemptRef,
+		)
 		cancel()
 		if verifyErr == nil {
 			return result, providerErr
 		}
+		verifyErr = normalizePostAttemptVerificationError(
+			verifyErr,
+			role,
+			namedinputs.IntegrityBoundaryAfterAttempt,
+			attemptRef,
+		)
 
 		providerCause := rootProviderSecondaryCause(actor, result, providerErr)
 		if providerCause == nil {
@@ -115,6 +138,7 @@ func runRootProviderTurnWithRetainedIntegrity(
 			cause:           verifyErr,
 			role:            role,
 			boundary:        namedinputs.IntegrityBoundaryAfterAttempt,
+			providerAttempt: attemptRef,
 			providerCause:   providerCause,
 			providerFailure: providerFailure,
 		}
@@ -135,7 +159,40 @@ func rootProviderSecondaryCause(actor string, result TurnResult, runErr error) e
 	}
 }
 
-func (s *rootExecutionState) verifyRetainedInputs(ctx context.Context, role string, boundary string) error {
+func normalizePostAttemptVerificationError(
+	err error,
+	role string,
+	boundary string,
+	providerAttempt *int,
+) error {
+	if err == nil {
+		return nil
+	}
+	if !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
+		var diagnosticErr *contracts.DiagnosticError
+		if errors.As(err, &diagnosticErr) {
+			for _, diagnostic := range diagnosticErr.Diagnostics {
+				category, _ := diagnostic.Details["mismatch_category"].(string)
+				if strings.TrimSpace(category) != "" {
+					return err
+				}
+			}
+		}
+	}
+	return namedinputs.NewVerificationIncompleteError(
+		err,
+		role,
+		boundary,
+		providerAttempt,
+	)
+}
+
+func (s *rootExecutionState) verifyRetainedInputs(
+	ctx context.Context,
+	role string,
+	boundary string,
+	providerAttempt *int,
+) error {
 	if s == nil || s.preflight == nil || s.preflight.selectedContract == nil {
 		return nil
 	}
@@ -147,10 +204,11 @@ func (s *rootExecutionState) verifyRetainedInputs(ctx context.Context, role stri
 				contracts.DiagnosticPhasePolicy,
 				"/retained_input_materialization_ref",
 				"Retained named input descriptor is missing.",
-				map[string]any{
-					"role":             strings.TrimSpace(role),
-					"attempt_boundary": strings.TrimSpace(boundary),
-				},
+				integrityBoundaryDetails(
+					role,
+					boundary,
+					providerAttempt,
+				),
 			),
 		)
 	}
@@ -164,7 +222,19 @@ func (s *rootExecutionState) verifyRetainedInputs(ctx context.Context, role stri
 		s.persisted.retainedInputRef,
 		strings.TrimSpace(role),
 		strings.TrimSpace(boundary),
+		providerAttempt,
 	)
+}
+
+func integrityBoundaryDetails(role string, boundary string, providerAttempt *int) map[string]any {
+	details := map[string]any{
+		"role":             strings.TrimSpace(role),
+		"attempt_boundary": strings.TrimSpace(boundary),
+	}
+	if providerAttempt != nil && *providerAttempt > 0 {
+		details["provider_attempt"] = *providerAttempt
+	}
+	return details
 }
 
 func (s *rootExecutionState) retainedInputVerificationTimeout() time.Duration {
@@ -177,7 +247,7 @@ func (s *rootExecutionState) retainedInputVerificationTimeout() time.Duration {
 func (s *rootExecutionState) verifyRetainedInputsIndependently(role string, boundary string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), s.retainedInputVerificationTimeout())
 	defer cancel()
-	return s.verifyRetainedInputs(ctx, role, boundary)
+	return s.verifyRetainedInputs(ctx, role, boundary, nil)
 }
 
 func asRootNamedInputIntegrityError(err error) (*rootNamedInputIntegrityError, bool) {
@@ -259,11 +329,29 @@ func rootNamedInputIntegrityProjection(failure *rootNamedInputIntegrityError) ma
 		"attempt_boundary": strings.TrimSpace(failure.boundary),
 		"diagnostics":      []any{},
 	}
+	if failure != nil && failure.providerAttempt != nil && *failure.providerAttempt > 0 {
+		result["provider_attempt"] = *failure.providerAttempt
+	}
 	var diagnosticErr *contracts.DiagnosticError
 	if failure != nil && errors.As(failure.cause, &diagnosticErr) {
 		diagnostics := make([]any, 0, len(diagnosticErr.Diagnostics))
 		for _, diagnostic := range diagnosticErr.Diagnostics {
-			diagnostics = append(diagnostics, diagnostic.ToMap())
+			projected := diagnostic.ToMap()
+			details, _ := projected["details"].(map[string]any)
+			if failure.providerAttempt != nil && *failure.providerAttempt > 0 {
+				if details == nil {
+					details = map[string]any{}
+				}
+				details["provider_attempt"] = *failure.providerAttempt
+			} else if details != nil {
+				delete(details, "provider_attempt")
+			}
+			if len(details) > 0 {
+				projected["details"] = details
+			} else {
+				delete(projected, "details")
+			}
+			diagnostics = append(diagnostics, projected)
 		}
 		result["diagnostics"] = diagnostics
 	}

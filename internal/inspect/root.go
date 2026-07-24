@@ -199,7 +199,7 @@ func BuildRootHealthChecks(sessionDir string, meta map[string]any, root map[stri
 	}
 	if retainedRef, ok := meta["retained_input_materialization_ref"].(map[string]any); ok {
 		verifyCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-		err := namedinputs.VerifyRetained(verifyCtx, store.New(sessionDir), retainedRef, "inspection", "health")
+		err := namedinputs.VerifyRetained(verifyCtx, store.New(sessionDir), retainedRef, "inspection", "health", nil)
 		cancel()
 		if err != nil {
 			inputCheck["status"] = "error"
@@ -482,7 +482,7 @@ func retainedInputErrorProjection(err error, role string, boundary string) map[s
 
 func sanitizeRetainedInputFailure(failure map[string]any) map[string]any {
 	result := map[string]any{}
-	for _, key := range []string{"code", "role", "attempt_boundary", "error", "error_type"} {
+	for _, key := range []string{"code", "role", "provider_attempt", "attempt_boundary", "error", "error_type"} {
 		if failure[key] != nil {
 			result[key] = failure[key]
 		}
@@ -520,7 +520,7 @@ func sanitizeRetainedInputDiagnostic(diagnostic map[string]any) map[string]any {
 	details, _ := diagnostic["details"].(map[string]any)
 	safeDetails := map[string]any{}
 	for _, key := range []string{
-		"role", "attempt_boundary", "input_name", "input_ordinal",
+		"role", "provider_attempt", "attempt_boundary", "input_name", "input_ordinal",
 		"mismatch_category", "cause_type", "ordinal",
 	} {
 		if details[key] != nil {

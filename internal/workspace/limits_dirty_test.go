@@ -65,7 +65,7 @@ func TestRepositoryInventoryBudgetsAcceptExactBoundariesAndRejectOneOver(t *test
 		InventoryMaxFiles: files - 1,
 		InventoryMaxBytes: bytes,
 	})
-	requireDiagnosticCode(t, err, contracts.DiagnosticCodeRepositoryInventoryMaxFiles)
+	requireDiagnosticCode(t, err, DiagnosticCodeInventoryLimit)
 	_, err = Preflight(context.Background(), Options{
 		LaunchCWD:         root,
 		SessionDir:        filepath.Join(t.TempDir(), "byte-over"),
@@ -73,7 +73,7 @@ func TestRepositoryInventoryBudgetsAcceptExactBoundariesAndRejectOneOver(t *test
 		InventoryMaxFiles: files,
 		InventoryMaxBytes: bytes - 1,
 	})
-	requireDiagnosticCode(t, err, contracts.DiagnosticCodeRepositoryInventoryMaxBytes)
+	requireDiagnosticCode(t, err, DiagnosticCodeInventoryLimit)
 
 	if err := os.Remove(filepath.Join(root, "sub", "dir", "nested.txt")); err != nil {
 		t.Fatalf("remove tracked file: %v", err)
@@ -150,7 +150,7 @@ func TestMaterializePreservesRawExportRepositoryBudgetDiagnostic(t *testing.T) {
 		InventoryMaxBytes: 1,
 	})
 	_, err := Materialize(context.Background(), store.New(sessionDir), snapshot)
-	requireDiagnosticCode(t, err, contracts.DiagnosticCodeRepositoryInventoryMaxBytes)
+	requireDiagnosticCode(t, err, DiagnosticCodeInventoryLimit)
 	var diagnosticErr *contracts.DiagnosticError
 	if !errors.As(err, &diagnosticErr) || diagnosticErr.Diagnostics[0].Path != "/runtime_config/limits" {
 		t.Fatalf("raw-export limit diagnostic = %#v, %v", diagnosticErr, err)
@@ -189,7 +189,7 @@ func TestMaterializeRejectsOversizedCommittedBlobWithoutBlockingBatchClose(t *te
 	defer cancel()
 	started := time.Now()
 	_, err := Materialize(ctx, store.New(sessionDir), snapshot)
-	requireDiagnosticCode(t, err, contracts.DiagnosticCodeRepositoryInventoryMaxBytes)
+	requireDiagnosticCode(t, err, DiagnosticCodeInventoryLimit)
 	if elapsed := time.Since(started); elapsed >= 2*time.Second {
 		t.Fatalf("oversized raw export waited for cat-file batch shutdown: %s", elapsed)
 	}

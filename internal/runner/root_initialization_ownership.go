@@ -653,6 +653,7 @@ func (t *rootInitializationTransaction) resolvePendingScope() error {
 			ref,
 			"initialization_recovery",
 			namedinputs.IntegrityBoundaryInitialization,
+			nil,
 		); err != nil {
 			return err
 		}

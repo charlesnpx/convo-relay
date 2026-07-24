@@ -31,6 +31,9 @@ const (
 	DiagnosticCodeGitRequired        = "workspace_git_repository_required"
 	DiagnosticCodeUnbornRepository   = "workspace_unborn_repository"
 	DiagnosticCodeInventoryFailed    = "workspace_inventory_failed"
+	DiagnosticCodeInventoryLimit     = "workspace_inventory_limit_exceeded"
+	DiagnosticCodeInventoryCycle     = "workspace_inventory_cycle_detected"
+	DiagnosticCodeInventoryDepth     = "workspace_inventory_depth_exceeded"
 	DiagnosticCodeSessionConflict    = "workspace_session_path_conflict"
 	DiagnosticCodeLaunchNotCommitted = "workspace_launch_path_not_committed"
 	DiagnosticCodeCreationFailed     = "workspace_creation_failed"
@@ -202,11 +205,30 @@ func Preflight(ctx context.Context, options Options) (*Snapshot, error) {
 	}
 	repository, err := inspectRepositoryWithLimits(ctx, gitBinary, launchCWD, inventoryLimits)
 	if err != nil {
+		var topologyErr *repositoryTopologyError
+		if errors.As(err, &topologyErr) {
+			details := map[string]any{
+				"repository_depth": topologyErr.repositoryDepth,
+			}
+			message := "The source workspace repository topology contains a cycle."
+			if topologyErr.code == DiagnosticCodeInventoryDepth {
+				message = "The source workspace repository topology exceeds the supported depth."
+				details["max_repository_depth"] = topologyErr.maxRepositoryDepth
+			}
+			return nil, workspaceError(
+				err,
+				topologyErr.code,
+				contracts.DiagnosticPhasePreflight,
+				"/launch_cwd",
+				message,
+				details,
+			)
+		}
 		var limitErr *contracts.ResourceLimitError
 		if errors.As(err, &limitErr) {
 			return nil, workspaceError(
 				err,
-				limitErr.Code,
+				DiagnosticCodeInventoryLimit,
 				contracts.DiagnosticPhasePreflight,
 				"/runtime_config/limits",
 				"The source repository exceeds its configured inventory budget.",

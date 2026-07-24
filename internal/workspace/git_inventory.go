@@ -26,6 +26,32 @@ var (
 	errInventoryDrift   = errors.New("source changed while its inventory was being captured")
 )
 
+const maxRepositoryInventoryDepth = 8
+
+type repositoryTopologyError struct {
+	code               string
+	repositoryDepth    int
+	maxRepositoryDepth int
+}
+
+func (e *repositoryTopologyError) Error() string {
+	if e == nil {
+		return ""
+	}
+	switch e.code {
+	case DiagnosticCodeInventoryCycle:
+		return fmt.Sprintf("repository inventory cycle detected at repository depth %d", e.repositoryDepth)
+	case DiagnosticCodeInventoryDepth:
+		return fmt.Sprintf(
+			"repository inventory depth %d exceeds maximum %d",
+			e.repositoryDepth,
+			e.maxRepositoryDepth,
+		)
+	default:
+		return "repository inventory topology is invalid"
+	}
+}
+
 type repositorySnapshot struct {
 	gitBinary      string
 	root           string
@@ -96,14 +122,14 @@ func inspectRepositoryWithLimits(
 	launchCWD string,
 	limits repositoryInventoryLimits,
 ) (*repositorySnapshot, error) {
-	previous, err := inspectRepositoryPass(ctx, gitBinary, launchCWD, newRepositoryInventoryState(limits), 0)
+	previous, err := inspectRepositoryPass(ctx, gitBinary, launchCWD, newRepositoryInventoryState(limits), 1)
 	if err != nil {
 		return nil, err
 	}
 	// Require two matching complete inventories. One additional pass is a
 	// bounded retry for a source that changed between the first two passes.
 	for attempt := 0; attempt < 2; attempt++ {
-		current, err := inspectRepositoryPass(ctx, gitBinary, launchCWD, newRepositoryInventoryState(limits), 0)
+		current, err := inspectRepositoryPass(ctx, gitBinary, launchCWD, newRepositoryInventoryState(limits), 1)
 		if err != nil {
 			return nil, err
 		}
@@ -163,8 +189,12 @@ func inspectRepositoryPass(
 	if err := contextError(ctx); err != nil {
 		return nil, err
 	}
-	if depth > 8 {
-		return nil, fmt.Errorf("repository inventory depth exceeds 8")
+	if depth > maxRepositoryInventoryDepth {
+		return nil, &repositoryTopologyError{
+			code:               DiagnosticCodeInventoryDepth,
+			repositoryDepth:    depth,
+			maxRepositoryDepth: maxRepositoryInventoryDepth,
+		}
 	}
 	if accounting == nil {
 		return nil, errors.New("repository inventory accounting is required")
@@ -191,7 +221,10 @@ func inspectRepositoryPass(
 		return nil, err
 	}
 	if accounting.active[repositoryIdentity] {
-		return nil, fmt.Errorf("repository inventory cycle detected at %s", root)
+		return nil, &repositoryTopologyError{
+			code:            DiagnosticCodeInventoryCycle,
+			repositoryDepth: depth,
+		}
 	}
 	accounting.active[repositoryIdentity] = true
 	defer delete(accounting.active, repositoryIdentity)

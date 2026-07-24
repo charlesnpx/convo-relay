@@ -116,9 +116,9 @@ make package
 
 `make smoke-fake-providers` is the Go-only release smoke gate. It builds the CLI, shadows `codex`, `claude`, and `gemini` with deterministic fake provider binaries in `PATH`, writes sessions into a temp relay home, and checks the required provider matrix plus `resume`, `cleanup`, `clean`, `contracts --json`, `show --graph --json`, and `display --html-only`. Live Codex, Claude, and Gemini runs are useful local release evidence, but they are optional and are not required for CI.
 
-`make test` also reruns the complete generic Go suite with integration-bound optional recipe defaults disabled. Run that configuration alone with `make test-without-optional-defaults`.
+`make test` also reruns the complete generic Go suite with integration-bound optional recipe defaults disabled. Run that configuration alone with `make test-without-optional-defaults`. CI keeps `go vet ./...`, `go test ./... -count=1`, and `make test-without-optional-defaults` as separate steps.
 
-Cross-compilation is a merge gate, not a runtime certification claim. `make cross-compile` builds every production package for `darwin/amd64` and `windows/amd64`, while `make cross-compile-tests` compiles the repository's practical test packages for those targets. These gates do not execute foreign binaries and do not certify runtime support on macOS or Windows.
+Cross-compilation is a merge gate, not a runtime certification claim. `make cross-compile` builds every production package for `darwin/arm64` and `windows/amd64`, while `make cross-compile-tests` compiles the repository's practical test packages for those targets. These gates do not execute foreign binaries and do not certify runtime support on macOS or Windows.
 
 ### Manual skill install from a checkout
 

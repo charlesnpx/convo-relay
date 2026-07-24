@@ -22,6 +22,7 @@ const (
 	IntegrityMismatchPath       = "path"
 	IntegrityMismatchSize       = "size"
 	IntegrityMismatchDigest     = "digest"
+	IntegrityMismatchIncomplete = "verification_incomplete"
 )
 
 // IntegrityObservation contains only filesystem metadata. Input contents are
@@ -38,6 +39,7 @@ type IntegrityObservation struct {
 // boundary without retaining the input's bytes.
 type IntegrityMismatch struct {
 	Role            string               `json:"role"`
+	ProviderAttempt *int                 `json:"provider_attempt,omitempty"`
 	AttemptBoundary string               `json:"attempt_boundary"`
 	InputName       string               `json:"input_name"`
 	InputOrdinal    int                  `json:"input_ordinal"`
@@ -56,12 +58,48 @@ func (m IntegrityMismatch) Diagnostic() contracts.Diagnostic {
 		"expected":          integrityObservationMap(m.Expected),
 		"observed":          integrityObservationMap(m.Observed),
 	}
+	if m.ProviderAttempt != nil && *m.ProviderAttempt > 0 {
+		details["provider_attempt"] = *m.ProviderAttempt
+	}
 	return contracts.NewDiagnostic(
 		DiagnosticCodeIntegrity,
 		contracts.DiagnosticPhasePolicy,
 		inputValuePointer(m.InputName, m.InputOrdinal),
 		fmt.Sprintf("Retained named input %q failed integrity verification.", m.InputName),
 		details,
+	)
+}
+
+// NewVerificationIncompleteError reports a fail-closed verifier outcome
+// without persisting the verifier's message or any retained-input bytes.
+func NewVerificationIncompleteError(
+	cause error,
+	role string,
+	boundary string,
+	providerAttempt *int,
+) error {
+	details := map[string]any{
+		"role":              strings.TrimSpace(role),
+		"attempt_boundary":  strings.TrimSpace(boundary),
+		"mismatch_category": IntegrityMismatchIncomplete,
+	}
+	if providerAttempt != nil && *providerAttempt > 0 {
+		details["provider_attempt"] = *providerAttempt
+	}
+	if cause != nil {
+		details["cause_type"] = fmt.Sprintf("%T", cause)
+	}
+	diagnostic := contracts.NewDiagnostic(
+		DiagnosticCodeIntegrity,
+		contracts.DiagnosticPhasePolicy,
+		"/retained_input_materialization_ref",
+		"Retained named input verification could not be completed.",
+		details,
+	)
+	return contracts.WrapDiagnosticError(
+		cause,
+		"Retained named input verification could not be completed.",
+		diagnostic,
 	)
 }
 

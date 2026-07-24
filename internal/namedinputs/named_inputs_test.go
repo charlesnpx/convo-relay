@@ -18,6 +18,15 @@ import (
 	"github.com/charlesnpx/convo-relay/internal/store"
 )
 
+func TestPublicNamedInputLimitDiagnosticCodesRemainStable(t *testing.T) {
+	if DiagnosticCodeFileTooLarge != "named_input_file_too_large" {
+		t.Fatalf("individual input limit code = %q", DiagnosticCodeFileTooLarge)
+	}
+	if DiagnosticCodeTotalTooLarge != "named_input_total_too_large" {
+		t.Fatalf("aggregate input limit code = %q", DiagnosticCodeTotalTooLarge)
+	}
+}
+
 func TestPreparePreservesGlobalAndPerNameOrderAndEqualsInPaths(t *testing.T) {
 	root := t.TempDir()
 	firstMany := writeInputFile(t, root, "many=first.txt", []byte("first"))
@@ -176,7 +185,7 @@ func TestPrepareRejectsNonregularMissingAndOversizedFilesAtBoundaries(t *testing
 		t.Fatalf("exact boundary = %#v, %v", prepared, err)
 	}
 	_, err := Prepare(Options{Contract: selected, Bindings: []string{"value=" + over}})
-	requireDiagnosticCode(t, err, contracts.DiagnosticCodeNamedInputMaxBytes)
+	requireDiagnosticCode(t, err, DiagnosticCodeFileTooLarge)
 	_, err = Prepare(Options{Contract: selected, Bindings: []string{"value=" + root}})
 	requireDiagnosticCode(t, err, DiagnosticCodeFileNotRegular)
 	_, err = Prepare(Options{Contract: selected, Bindings: []string{"value=" + filepath.Join(root, "missing.bin")}})
@@ -223,7 +232,7 @@ func TestPrepareUsesMinimumContractAndRuntimePerFileLimits(t *testing.T) {
 				NamedInputMaxBytes:      test.runtimeLimit,
 				NamedInputTotalMaxBytes: 64,
 			})
-			diagnostic := requireDiagnosticCode(t, err, contracts.DiagnosticCodeNamedInputMaxBytes)
+			diagnostic := requireDiagnosticCode(t, err, DiagnosticCodeFileTooLarge)
 			if diagnostic.Details["effective_max_bytes"] != test.wantEffective ||
 				diagnostic.Details["contract_max_bytes"] != test.contractLimit ||
 				diagnostic.Details["runtime_max_bytes"] != test.runtimeLimit ||
@@ -255,7 +264,7 @@ func TestPrepareEnforcesAggregateRawByteBoundaryBeforeBase64Persistence(t *testi
 	// aggregate budget is applied before persistence encoding.
 	options.NamedInputTotalMaxBytes = 5
 	_, err = Prepare(options)
-	diagnostic := requireDiagnosticCode(t, err, contracts.DiagnosticCodeNamedInputTotalMaxBytes)
+	diagnostic := requireDiagnosticCode(t, err, DiagnosticCodeTotalTooLarge)
 	if diagnostic.Details["current"] != int64(3) ||
 		diagnostic.Details["increment"] != int64(3) ||
 		diagnostic.Details["observed"] != int64(6) ||

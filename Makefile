@@ -6,7 +6,7 @@ BINARY := bin/convo-relay
 VERSION ?= $(shell git describe --tags --exact-match 2>/dev/null || echo 1.0.0-dev)
 LDFLAGS ?= -X main.cliVersion=$(VERSION)
 
-CROSS_TARGETS ?= darwin/amd64 windows/amd64
+CROSS_TARGETS ?= darwin/arm64 windows/amd64
 
 .PHONY: build install install-assets install-skills test test-without-optional-defaults test-race cross-compile cross-compile-tests smoke-fake-providers package clean
 

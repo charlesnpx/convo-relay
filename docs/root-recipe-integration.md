@@ -22,8 +22,11 @@ between checks and are not a security boundary.
 
 Cross-compilation is a merge gate, not evidence of runtime certification.
 CI builds every production package and compiles practical test packages for
-`darwin/amd64` and `windows/amd64`. It does not execute foreign binaries and
+`darwin/arm64` and `windows/amd64`. It does not execute foreign binaries and
 does not certify runtime support on macOS or Windows.
+
+The Linux test job keeps `go vet ./...`, `go test ./... -count=1`, and
+`make test-without-optional-defaults` as separate validation steps.
 
 A live-process graceful stop is unsupported on Windows. The request returns
 an explicit error without changing session state or removing PID and cleanup
@@ -164,6 +167,10 @@ contract's `max_bytes` and the runtime `named_input_max_bytes`; the aggregate
 runtime ceiling counts raw source bytes before base64 persistence and uses
 checked integer accounting.
 
+The public limit diagnostics remain `named_input_file_too_large` for an
+individual input and `named_input_total_too_large` for the aggregate ceiling.
+Internal accounting may retain a more specific resource classification.
+
 The session persists an ordered manifest plus content-addressed input
 artifacts. The execution area receives retained copies, and participant and
 reducer prompts receive their paths and content metadata as data. The
@@ -180,6 +187,12 @@ mismatch or verifier failure discards that attempt's output, prevents retry,
 and terminates with `named_input_integrity_failed`; any provider failure or
 cancellation remains a secondary cause. A provider can still mutate a copy
 between checks, so detection occurs at the next boundary.
+
+Provider-boundary failures record a 1-based `provider_attempt` in the
+authoritative `named_input_integrity_failure` record and its diagnostic
+details. Non-provider boundaries omit that field. A post-attempt verifier that
+cannot complete reports the content-free mismatch category
+`verification_incomplete`.
 
 Recovery verifies any present retained materialization before session writes
 or provider construction and never repairs mismatched evidence. A narrowly
@@ -225,6 +238,11 @@ Preflight inventories only the source set defined by the workspace contract,
 not every same-user-visible path. Required detached execution starts from the
 committed tree; a dirty source requires an explicit override and still uses
 committed content rather than staged, unstaged, or untracked changes.
+Repository inventory includes at most eight repositories, counting the
+superproject as depth 1. A ninth repository and an initialized-repository
+cycle report `workspace_inventory_depth_exceeded` and
+`workspace_inventory_cycle_detected`, respectively; file or byte ceilings use
+`workspace_inventory_limit_exceeded`.
 Orchestration records source identity and checks that inventoried set again
 at terminal finalization. Failed or interrupted root sessions retain their
 managed worktree and Git registration until cleanup succeeds.

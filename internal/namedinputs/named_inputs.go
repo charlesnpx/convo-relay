@@ -28,7 +28,8 @@ const (
 	DiagnosticCodeContextConflict  = "named_input_context_conflict"
 	DiagnosticCodeFileUnavailable  = "named_input_file_unavailable"
 	DiagnosticCodeFileNotRegular   = "named_input_file_not_regular"
-	DiagnosticCodeFileTooLarge     = contracts.DiagnosticCodeNamedInputMaxBytes
+	DiagnosticCodeFileTooLarge     = "named_input_file_too_large"
+	DiagnosticCodeTotalTooLarge    = "named_input_total_too_large"
 	DiagnosticCodeInvalidMediaType = "invalid_named_input_media_type"
 	DiagnosticCodeIntegrity        = "named_input_integrity_failed"
 	SchemaStatusValidated          = "validated"
@@ -650,12 +651,13 @@ func prefixFileError(
 		code = DiagnosticCodeFileNotRegular
 		message = "Named input path must identify a regular file and must not be a symlink."
 	case errors.As(err, &limitErr):
-		code = limitErr.Code
-		if code == contracts.DiagnosticCodeNamedInputTotalMaxBytes ||
-			code == contracts.DiagnosticCodeResourceAccountingOverflow {
+		if limitErr.Code == contracts.DiagnosticCodeNamedInputTotalMaxBytes ||
+			limitErr.Code == contracts.DiagnosticCodeResourceAccountingOverflow {
+			code = DiagnosticCodeTotalTooLarge
 			path = "/runtime_config/limits/named_input_total_max_bytes"
 			message = "Named inputs exceed the configured aggregate raw-byte budget."
 		} else {
+			code = DiagnosticCodeFileTooLarge
 			message = "Named input file exceeds its effective raw-byte budget."
 		}
 		for key, value := range resourceLimitDetails(limitErr) {

@@ -515,7 +515,7 @@ func materializationFailure(
 	details := map[string]any{"worktree_path": worktreePath}
 	var limitErr *contracts.ResourceLimitError
 	if errors.As(cause, &limitErr) {
-		code = limitErr.Code
+		code = DiagnosticCodeInventoryLimit
 		path = "/runtime_config/limits"
 		details = resourceLimitDetails(limitErr)
 		details["worktree_path"] = worktreePath

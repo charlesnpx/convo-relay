@@ -586,6 +586,7 @@ func persistRecipePreflight(
 			retained.DescriptorRef,
 			"initialization_scope",
 			namedinputs.IntegrityBoundaryInitialization,
+			nil,
 		); err != nil {
 			return nil, err
 		}
@@ -606,6 +607,7 @@ func persistRecipePreflight(
 			retainedInputRef,
 			"initialization",
 			namedinputs.IntegrityBoundaryInitialization,
+			nil,
 		); err != nil {
 			return nil, err
 		}

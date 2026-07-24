@@ -56,6 +56,24 @@ func TestResolvePolicyOrderingAndExplicitOverrides(t *testing.T) {
 	}
 }
 
+func TestPublicWorkspaceInventoryDiagnosticCodesRemainStable(t *testing.T) {
+	codes := map[string]string{
+		"limit": DiagnosticCodeInventoryLimit,
+		"cycle": DiagnosticCodeInventoryCycle,
+		"depth": DiagnosticCodeInventoryDepth,
+	}
+	want := map[string]string{
+		"limit": "workspace_inventory_limit_exceeded",
+		"cycle": "workspace_inventory_cycle_detected",
+		"depth": "workspace_inventory_depth_exceeded",
+	}
+	for name, code := range codes {
+		if code != want[name] {
+			t.Fatalf("%s workspace inventory code = %q, want %q", name, code, want[name])
+		}
+	}
+}
+
 func TestPreflightDoesNotClaimAchievedPolicy(t *testing.T) {
 	root := newCommittedRepo(t)
 	snapshot := mustPreflight(t, Options{LaunchCWD: root, SessionDir: filepath.Join(t.TempDir(), "session"), MinimumPolicy: PolicyReadOnly})
@@ -274,14 +292,14 @@ func TestPreflightInventoriesInitializedDirtyAndDeinitializedSubmodules(t *testi
 		InventoryMaxFiles: totalFiles - 1,
 		InventoryMaxBytes: totalBytes,
 	})
-	requireDiagnosticCode(t, err, contracts.DiagnosticCodeRepositoryInventoryMaxFiles)
+	requireDiagnosticCode(t, err, DiagnosticCodeInventoryLimit)
 	_, err = Preflight(context.Background(), Options{
 		LaunchCWD:         root,
 		SessionDir:        filepath.Join(t.TempDir(), "byte-budget"),
 		InventoryMaxFiles: totalFiles,
 		InventoryMaxBytes: totalBytes - 1,
 	})
-	requireDiagnosticCode(t, err, contracts.DiagnosticCodeRepositoryInventoryMaxBytes)
+	requireDiagnosticCode(t, err, DiagnosticCodeInventoryLimit)
 
 	moduleWorktree := filepath.Join(root, "vendor", "module")
 	writeTestFile(t, filepath.Join(moduleWorktree, "committed.txt"), []byte("staged submodule\n"), 0o644)
@@ -360,13 +378,26 @@ func TestRepositoryInventoryRejectsInitializedSubmoduleCycles(t *testing.T) {
 		canonicalRoot,
 		repositoryInventoryLimits{maxFiles: 1_000, maxBytes: 1_000_000},
 	)
-	if err == nil || !strings.Contains(err.Error(), "repository inventory cycle detected") {
-		t.Fatalf("repository cycle error = %v", err)
+	var topologyErr *repositoryTopologyError
+	if !errors.As(err, &topologyErr) ||
+		topologyErr.code != DiagnosticCodeInventoryCycle ||
+		topologyErr.repositoryDepth != 2 {
+		t.Fatalf("repository cycle error = %#v, %v", topologyErr, err)
+	}
+	_, err = Preflight(context.Background(), Options{
+		LaunchCWD:  canonicalRoot,
+		SessionDir: filepath.Join(t.TempDir(), "cycle-session"),
+	})
+	requireDiagnosticCode(t, err, DiagnosticCodeInventoryCycle)
+	var diagnosticErr *contracts.DiagnosticError
+	if !errors.As(err, &diagnosticErr) ||
+		diagnosticErr.Diagnostics[0].Details["repository_depth"] != 2 {
+		t.Fatalf("repository cycle diagnostic = %#v, %v", diagnosticErr, err)
 	}
 }
 
 func TestRepositoryInventoryAllowsDepthEightAndRejectsDepthNine(t *testing.T) {
-	root := newInitializedSubmoduleChain(t, 9)
+	root := newInitializedSubmoduleChain(t, 8)
 	canonicalRoot, err := canonicalExistingDirectory(root)
 	if err != nil {
 		t.Fatalf("canonical submodule-chain root: %v", err)
@@ -387,8 +418,25 @@ func TestRepositoryInventoryAllowsDepthEightAndRejectsDepthNine(t *testing.T) {
 		root,
 		repositoryInventoryLimits{maxFiles: 10_000, maxBytes: 1_000_000_000},
 	)
-	if err == nil || !strings.Contains(err.Error(), "repository inventory depth exceeds 8") {
-		t.Fatalf("depth-nine initialized submodule chain error = %v", err)
+	var topologyErr *repositoryTopologyError
+	if !errors.As(err, &topologyErr) ||
+		topologyErr.code != DiagnosticCodeInventoryDepth ||
+		topologyErr.repositoryDepth != 9 ||
+		topologyErr.maxRepositoryDepth != 8 {
+		t.Fatalf("depth-nine initialized submodule chain error = %#v, %v", topologyErr, err)
+	}
+	_, err = Preflight(context.Background(), Options{
+		LaunchCWD:         root,
+		SessionDir:        filepath.Join(t.TempDir(), "depth-session"),
+		InventoryMaxFiles: 10_000,
+		InventoryMaxBytes: 1_000_000_000,
+	})
+	requireDiagnosticCode(t, err, DiagnosticCodeInventoryDepth)
+	var diagnosticErr *contracts.DiagnosticError
+	if !errors.As(err, &diagnosticErr) ||
+		diagnosticErr.Diagnostics[0].Details["repository_depth"] != 9 ||
+		diagnosticErr.Diagnostics[0].Details["max_repository_depth"] != 8 {
+		t.Fatalf("depth-nine workspace diagnostic = %#v, %v", diagnosticErr, err)
 	}
 }
 

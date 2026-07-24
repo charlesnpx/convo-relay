@@ -840,6 +840,7 @@ func (s *rootExecutionState) materializeLegacyRootRecoveryInputs(ctx context.Con
 		materialized.DescriptorRef,
 		"recovery",
 		namedinputs.IntegrityBoundaryRecovery,
+		nil,
 	); err != nil {
 		return err
 	}

@@ -33,7 +33,7 @@ func LoadRetained(
 	role string,
 	boundary string,
 ) (*Materialized, error) {
-	if err := VerifyRetained(ctx, st, descriptorRef, role, boundary); err != nil {
+	if err := VerifyRetained(ctx, st, descriptorRef, role, boundary, nil); err != nil {
 		return nil, err
 	}
 	descriptor, descriptorEntries, _, err := loadRetainedDescriptor(st, descriptorRef)
@@ -207,6 +207,7 @@ func VerifyRetained(
 	descriptorRef map[string]any,
 	role string,
 	boundary string,
+	providerAttempt *int,
 ) error {
 	if ctx == nil {
 		ctx = context.Background()
@@ -220,13 +221,13 @@ func VerifyRetained(
 	}
 	directory, err = safeExistingMaterializationDirectory(st.Root, directory)
 	if err != nil {
-		mismatch := retainedMismatch(role, boundary, entries, 0, IntegrityMismatchMissing)
+		mismatch := retainedMismatch(role, boundary, providerAttempt, entries, 0, IntegrityMismatchMissing)
 		mismatch.Observed.Path = directory
 		return retainedMismatchError(mismatch, err)
 	}
 	actual, err := readRetainedDirectoryNoFollow(directory)
 	if err != nil {
-		mismatch := retainedMismatch(role, boundary, entries, 0, IntegrityMismatchMissing)
+		mismatch := retainedMismatch(role, boundary, providerAttempt, entries, 0, IntegrityMismatchMissing)
 		mismatch.Observed.Path = directory
 		return retainedMismatchError(mismatch, err)
 	}
@@ -243,7 +244,7 @@ func VerifyRetained(
 				break
 			}
 		}
-		mismatch := retainedMismatch(role, boundary, entries, len(entries), IntegrityMismatchUnexpected)
+		mismatch := retainedMismatch(role, boundary, providerAttempt, entries, len(entries), IntegrityMismatchUnexpected)
 		mismatch.Observed.Path = filepath.Join(directory, observed)
 		return retainedMismatchError(mismatch, nil)
 	}
@@ -259,7 +260,7 @@ func VerifyRetained(
 				break
 			}
 		}
-		mismatch := retainedMismatch(role, boundary, entries, missingIndex, IntegrityMismatchMissing)
+		mismatch := retainedMismatch(role, boundary, providerAttempt, entries, missingIndex, IntegrityMismatchMissing)
 		return retainedMismatchError(mismatch, nil)
 	}
 	for index, entry := range entries {
@@ -267,7 +268,7 @@ func VerifyRetained(
 			return err
 		}
 		if entry.ordinal != index+1 {
-			mismatch := retainedMismatch(role, boundary, entries, index, IntegrityMismatchReordered)
+			mismatch := retainedMismatch(role, boundary, providerAttempt, entries, index, IntegrityMismatchReordered)
 			return retainedMismatchError(mismatch, nil)
 		}
 		if actual[index].Name() != entry.filename {
@@ -275,40 +276,40 @@ func VerifyRetained(
 			if !retainedFilenamePresent(actual, entry.filename) {
 				category = IntegrityMismatchPath
 			}
-			mismatch := retainedMismatch(role, boundary, entries, index, category)
+			mismatch := retainedMismatch(role, boundary, providerAttempt, entries, index, category)
 			mismatch.Observed.Path = filepath.Join(directory, actual[index].Name())
 			return retainedMismatchError(mismatch, nil)
 		}
 		target := filepath.Join(directory, entry.filename)
 		if filepath.Clean(target) != filepath.Clean(entry.path) {
-			mismatch := retainedMismatch(role, boundary, entries, index, IntegrityMismatchPath)
+			mismatch := retainedMismatch(role, boundary, providerAttempt, entries, index, IntegrityMismatchPath)
 			mismatch.Observed.Path = target
 			return retainedMismatchError(mismatch, nil)
 		}
 		info, err := os.Lstat(target)
 		if err != nil {
-			mismatch := retainedMismatch(role, boundary, entries, index, IntegrityMismatchMissing)
+			mismatch := retainedMismatch(role, boundary, providerAttempt, entries, index, IntegrityMismatchMissing)
 			return retainedMismatchError(mismatch, err)
 		}
 		if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
-			mismatch := retainedMismatch(role, boundary, entries, index, IntegrityMismatchType)
+			mismatch := retainedMismatch(role, boundary, providerAttempt, entries, index, IntegrityMismatchType)
 			mismatch.Observed.Type = retainedEntryType(info.Mode())
 			return retainedMismatchError(mismatch, nil)
 		}
 		if gotMode := fmt.Sprintf("%04o", info.Mode().Perm()); gotMode != entry.mode {
-			mismatch := retainedMismatch(role, boundary, entries, index, IntegrityMismatchMode)
+			mismatch := retainedMismatch(role, boundary, providerAttempt, entries, index, IntegrityMismatchMode)
 			mismatch.Observed.Mode = gotMode
 			return retainedMismatchError(mismatch, nil)
 		}
 		if info.Size() != entry.sizeBytes {
-			mismatch := retainedMismatch(role, boundary, entries, index, IntegrityMismatchSize)
+			mismatch := retainedMismatch(role, boundary, providerAttempt, entries, index, IntegrityMismatchSize)
 			observed := info.Size()
 			mismatch.Observed.SizeBytes = &observed
 			return retainedMismatchError(mismatch, nil)
 		}
 		handle, err := openNamedInputFileNoFollow(target)
 		if err != nil {
-			mismatch := retainedMismatch(role, boundary, entries, index, IntegrityMismatchType)
+			mismatch := retainedMismatch(role, boundary, providerAttempt, entries, index, IntegrityMismatchType)
 			return retainedMismatchError(mismatch, err)
 		}
 		opened, statErr := handle.Stat()
@@ -316,7 +317,7 @@ func VerifyRetained(
 			opened.Size() != info.Size() || opened.Mode() != info.Mode() ||
 			!opened.ModTime().Equal(info.ModTime()) {
 			closeErr := handle.Close()
-			mismatch := retainedMismatch(role, boundary, entries, index, IntegrityMismatchPath)
+			mismatch := retainedMismatch(role, boundary, providerAttempt, entries, index, IntegrityMismatchPath)
 			return retainedMismatchError(mismatch, errors.Join(statErr, closeErr))
 		}
 		hasher := sha256.New()
@@ -341,11 +342,11 @@ func VerifyRetained(
 			after.Mode() != opened.Mode() || !after.ModTime().Equal(opened.ModTime()) ||
 			pathAfter.Size() != opened.Size() || pathAfter.Mode() != opened.Mode() ||
 			!pathAfter.ModTime().Equal(opened.ModTime()) {
-			mismatch := retainedMismatch(role, boundary, entries, index, IntegrityMismatchPath)
+			mismatch := retainedMismatch(role, boundary, providerAttempt, entries, index, IntegrityMismatchPath)
 			return retainedMismatchError(mismatch, pathErr)
 		}
 		if readErr != nil || size != entry.sizeBytes || extraCount != 0 {
-			mismatch := retainedMismatch(role, boundary, entries, index, IntegrityMismatchSize)
+			mismatch := retainedMismatch(role, boundary, providerAttempt, entries, index, IntegrityMismatchSize)
 			observed := size + int64(extraCount)
 			if after.Size() != entry.sizeBytes {
 				observed = after.Size()
@@ -355,7 +356,7 @@ func VerifyRetained(
 		}
 		digest := contracts.DigestPrefix + hex.EncodeToString(hasher.Sum(nil))
 		if digest != entry.rawDigest {
-			mismatch := retainedMismatch(role, boundary, entries, index, IntegrityMismatchDigest)
+			mismatch := retainedMismatch(role, boundary, providerAttempt, entries, index, IntegrityMismatchDigest)
 			mismatch.Observed.Digest = digest
 			return retainedMismatchError(mismatch, nil)
 		}
@@ -444,6 +445,7 @@ func loadRetainedDescriptor(
 func retainedMismatch(
 	role string,
 	boundary string,
+	providerAttempt *int,
 	entries []retainedEntry,
 	index int,
 	category string,
@@ -455,6 +457,7 @@ func retainedMismatch(
 	size := entry.sizeBytes
 	return IntegrityMismatch{
 		Role:            role,
+		ProviderAttempt: providerAttempt,
 		AttemptBoundary: boundary,
 		InputName:       entry.name,
 		InputOrdinal:    entry.ordinal,

@@ -2,6 +2,7 @@ package runner
 
 import (
 	"context"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"os"
@@ -101,6 +102,7 @@ func TestRootRetainedInputIntegrityRejectsSuccessfulProviderMutations(t *testing
 				test.role,
 				namedinputs.IntegrityBoundaryAfterAttempt,
 			)
+			assertIntegrityProviderAttempt(t, failure, 1)
 			if got := len(recorder.snapshotCalls()); got != test.wantCalls {
 				t.Fatalf("provider calls = %d, want %d: %#v", got, test.wantCalls, recorder.snapshotCalls())
 			}
@@ -132,6 +134,102 @@ func TestRootRetainedInputIntegrityRejectsSuccessfulProviderMutations(t *testing
 			assertSessionOmitsText(t, sessionDir, rejectedOutput)
 		})
 	}
+}
+
+func TestRootRetainedInputIntegrityRecordsPreAttemptProviderOrdinal(t *testing.T) {
+	sessionDir := filepath.Join(t.TempDir(), "session")
+	launchCWD := t.TempDir()
+	writeRootRecipeTestFile(t, filepath.Join(launchCWD, "payload.json"), `{"value":"original"}`)
+	retainedPath := filepath.Join(sessionDir, "execution", "inputs", "000001")
+	recorder := &rootBackendRecorder{}
+	recorder.handler = func(_ context.Context, call rootBackendCall) (TurnResult, error) {
+		return successfulRootTurn(call.Backend, `{"value":"provider-must-not-run"}`), nil
+	}
+	var mutation sync.Once
+	var mutationErr error
+	verifier := func(
+		ctx context.Context,
+		st *store.Store,
+		ref map[string]any,
+		role string,
+		boundary string,
+		providerAttempt *int,
+	) error {
+		if boundary == namedinputs.IntegrityBoundaryBeforeAttempt {
+			if providerAttempt == nil || *providerAttempt != 1 {
+				return fmt.Errorf("pre-attempt provider ordinal = %v", providerAttempt)
+			}
+			mutation.Do(func() {
+				mutationErr = tamperRootRetainedInput(retainedPath, `{"value":"tampered-before-attempt"}`)
+			})
+			if mutationErr != nil {
+				return mutationErr
+			}
+		}
+		return namedinputs.VerifyRetained(ctx, st, ref, role, boundary, providerAttempt)
+	}
+	options := rootNamedInputRecipeOptions(sessionDir, launchCWD, false, recorder)
+	options.retainedInputVerifier = verifier
+
+	result, err := RunRecipe(context.Background(), options)
+	failure := assertRootNamedInputIntegrityTerminal(
+		t,
+		result,
+		err,
+		"participant",
+		namedinputs.IntegrityBoundaryBeforeAttempt,
+	)
+	assertIntegrityProviderAttempt(t, failure, 1)
+	if calls := recorder.snapshotCalls(); len(calls) != 0 {
+		t.Fatalf("pre-attempt integrity failure reached provider: %#v", calls)
+	}
+}
+
+func TestRootRetainedInputIntegrityRecordsRetryProviderOrdinal(t *testing.T) {
+	withFakeRetryBackoff(t, func(context.Context, time.Duration) error { return nil })
+	const (
+		firstRejected  = "RETRY-ATTEMPT-ONE-OUTPUT-MUST-NOT-PERSIST"
+		secondRejected = "RETRY-ATTEMPT-TWO-OUTPUT-MUST-NOT-PERSIST"
+	)
+	sessionDir := filepath.Join(t.TempDir(), "session")
+	launchCWD := t.TempDir()
+	writeRootRecipeTestFile(t, filepath.Join(launchCWD, "payload.json"), `{"value":"original"}`)
+	retainedPath := filepath.Join(sessionDir, "execution", "inputs", "000001")
+	recorder := &rootBackendRecorder{}
+	providerCalls := 0
+	recorder.handler = func(_ context.Context, call rootBackendCall) (TurnResult, error) {
+		providerCalls++
+		if providerCalls == 1 {
+			return successfulRootTurn(call.Backend, `{"value":"`+firstRejected+`"}`), RetryableProviderError{
+				Label:  call.Label,
+				Detail: "temporary retry fixture",
+			}
+		}
+		if err := tamperRootRetainedInput(retainedPath, `{"value":"tampered-on-retry"}`); err != nil {
+			return TurnResult{}, err
+		}
+		return successfulRootTurn(call.Backend, `{"value":"`+secondRejected+`"}`), nil
+	}
+
+	result, err := RunRecipe(context.Background(), rootNamedInputRecipeOptions(
+		sessionDir,
+		launchCWD,
+		false,
+		recorder,
+	))
+	failure := assertRootNamedInputIntegrityTerminal(
+		t,
+		result,
+		err,
+		"participant",
+		namedinputs.IntegrityBoundaryAfterAttempt,
+		2,
+	)
+	assertIntegrityProviderAttempt(t, failure, 2)
+	if providerCalls != 2 || len(recorder.snapshotCalls()) != 2 {
+		t.Fatalf("provider retry calls = %d, recorded %#v", providerCalls, recorder.snapshotCalls())
+	}
+	assertSessionOmitsText(t, sessionDir, firstRejected, secondRejected)
 }
 
 func TestRootRetainedInputIntegrityWinsOverEveryProviderOutcomeAndPreventsRetry(t *testing.T) {
@@ -253,6 +351,7 @@ func TestRootRetainedInputIntegrityWinsOverEveryProviderOutcomeAndPreventsRetry(
 				"participant",
 				namedinputs.IntegrityBoundaryAfterAttempt,
 			)
+			assertIntegrityProviderAttempt(t, failure, 1)
 			if got := len(recorder.snapshotCalls()); got != 1 {
 				t.Fatalf("tampered attempt was retried: calls=%d %#v", got, recorder.snapshotCalls())
 			}
@@ -276,6 +375,7 @@ func TestRootRetainedInputIntegrityWinsOverEveryProviderOutcomeAndPreventsRetry(
 }
 
 func TestRootRetainedInputIntegrityFailsClosedWhenPostVerifierErrorsOrExpires(t *testing.T) {
+	unclassifiedErr := errors.New("forced unclassified retained-input verifier failure")
 	tests := []struct {
 		name      string
 		timeout   time.Duration
@@ -283,33 +383,36 @@ func TestRootRetainedInputIntegrityFailsClosedWhenPostVerifierErrorsOrExpires(t 
 		wantError error
 	}{
 		{
-			name:    "verifier error",
+			name:    "unclassified verifier error",
 			timeout: time.Second,
-			verifier: func(ctx context.Context, st *store.Store, ref map[string]any, role string, boundary string) error {
+			verifier: func(ctx context.Context, st *store.Store, ref map[string]any, role string, boundary string, providerAttempt *int) error {
 				if boundary == namedinputs.IntegrityBoundaryAfterAttempt {
-					return contracts.NewDiagnosticError(
-						"Forced retained-input verifier failure.",
-						contracts.NewDiagnostic(
-							namedinputs.DiagnosticCodeIntegrity,
-							contracts.DiagnosticPhasePolicy,
-							"",
-							"Forced retained-input verifier failure.",
-							map[string]any{"role": role, "attempt_boundary": boundary},
-						),
-					)
+					return unclassifiedErr
 				}
-				return namedinputs.VerifyRetained(ctx, st, ref, role, boundary)
+				return namedinputs.VerifyRetained(ctx, st, ref, role, boundary, providerAttempt)
 			},
+			wantError: unclassifiedErr,
+		},
+		{
+			name:    "verifier cancellation",
+			timeout: time.Second,
+			verifier: func(ctx context.Context, st *store.Store, ref map[string]any, role string, boundary string, providerAttempt *int) error {
+				if boundary == namedinputs.IntegrityBoundaryAfterAttempt {
+					return context.Canceled
+				}
+				return namedinputs.VerifyRetained(ctx, st, ref, role, boundary, providerAttempt)
+			},
+			wantError: context.Canceled,
 		},
 		{
 			name:    "verifier deadline",
 			timeout: 15 * time.Millisecond,
-			verifier: func(ctx context.Context, st *store.Store, ref map[string]any, role string, boundary string) error {
+			verifier: func(ctx context.Context, st *store.Store, ref map[string]any, role string, boundary string, providerAttempt *int) error {
 				if boundary == namedinputs.IntegrityBoundaryAfterAttempt {
 					<-ctx.Done()
 					return ctx.Err()
 				}
-				return namedinputs.VerifyRetained(ctx, st, ref, role, boundary)
+				return namedinputs.VerifyRetained(ctx, st, ref, role, boundary, providerAttempt)
 			},
 			wantError: context.DeadlineExceeded,
 		},
@@ -329,13 +432,15 @@ func TestRootRetainedInputIntegrityFailsClosedWhenPostVerifierErrorsOrExpires(t 
 			options.retainedInputVerificationTimeout = test.timeout
 
 			result, err := RunRecipe(context.Background(), options)
-			assertRootNamedInputIntegrityTerminal(
+			failure := assertRootNamedInputIntegrityTerminal(
 				t,
 				result,
 				err,
 				"participant",
 				namedinputs.IntegrityBoundaryAfterAttempt,
 			)
+			assertIntegrityProviderAttempt(t, failure, 1)
+			assertIntegrityMismatchCategory(t, failure, namedinputs.IntegrityMismatchIncomplete)
 			if len(recorder.snapshotCalls()) != 1 {
 				t.Fatalf("verifier failure retried provider: %#v", recorder.snapshotCalls())
 			}
@@ -344,6 +449,9 @@ func TestRootRetainedInputIntegrityFailsClosedWhenPostVerifierErrorsOrExpires(t 
 			}
 			if len(asSlice(result["provider_failures"])) != 0 {
 				t.Fatalf("verifier failure invented provider failure: %#v", result["provider_failures"])
+			}
+			if strings.Contains(stringFromAny(failure["error"]), unclassifiedErr.Error()) {
+				t.Fatalf("verification-incomplete record exposed verifier text: %#v", failure)
 			}
 			assertSessionOmitsText(t, sessionDir, rejectedOutput)
 		})
@@ -365,7 +473,7 @@ func TestRootRetainedInputIntegrityRunsImmediatelyBeforeResultValidation(t *test
 	var mu sync.Mutex
 	boundaries := []string{}
 	var mutated bool
-	verifier := func(ctx context.Context, st *store.Store, ref map[string]any, role string, boundary string) error {
+	verifier := func(ctx context.Context, st *store.Store, ref map[string]any, role string, boundary string, providerAttempt *int) error {
 		mu.Lock()
 		boundaries = append(boundaries, role+":"+boundary)
 		if boundary == namedinputs.IntegrityBoundaryResultValidation && !mutated {
@@ -376,19 +484,20 @@ func TestRootRetainedInputIntegrityRunsImmediatelyBeforeResultValidation(t *test
 			}
 		}
 		mu.Unlock()
-		return namedinputs.VerifyRetained(ctx, st, ref, role, boundary)
+		return namedinputs.VerifyRetained(ctx, st, ref, role, boundary, providerAttempt)
 	}
 	options := rootNamedInputRecipeOptions(sessionDir, launchCWD, false, recorder)
 	options.retainedInputVerifier = verifier
 
 	result, err := RunRecipe(context.Background(), options)
-	assertRootNamedInputIntegrityTerminal(
+	failure := assertRootNamedInputIntegrityTerminal(
 		t,
 		result,
 		err,
 		"result_validation",
 		namedinputs.IntegrityBoundaryResultValidation,
 	)
+	assertIntegrityProviderAttempt(t, failure, 0)
 	if result["raw_result_ref"] == nil {
 		t.Fatalf("candidate was not persisted before validation boundary: %#v", result)
 	}
@@ -487,6 +596,7 @@ func TestRootNamedInputIntegritySurvivesNonSourceWorkspaceFinalizationFailure(t 
 	if err := os.WriteFile(workspacePath, []byte("{}"), 0o600); err != nil {
 		t.Fatalf("corrupt workspace artifact: %v", err)
 	}
+	providerAttempt := 1
 	integrityCause := contracts.NewDiagnosticError(
 		"Retained named input changed.",
 		contracts.NewDiagnostic(
@@ -494,7 +604,12 @@ func TestRootNamedInputIntegritySurvivesNonSourceWorkspaceFinalizationFailure(t 
 			contracts.DiagnosticPhasePolicy,
 			"",
 			"Retained named input changed.",
-			nil,
+			map[string]any{
+				"role":              "participant",
+				"provider_attempt":  providerAttempt,
+				"attempt_boundary":  namedinputs.IntegrityBoundaryAfterAttempt,
+				"mismatch_category": namedinputs.IntegrityMismatchDigest,
+			},
 		),
 	)
 	state := &rootExecutionState{
@@ -505,17 +620,19 @@ func TestRootNamedInputIntegritySurvivesNonSourceWorkspaceFinalizationFailure(t 
 		startedAt:  time.Now(),
 	}
 	result, err := state.markNamedInputIntegrityFailed(&rootNamedInputIntegrityError{
-		cause:    integrityCause,
-		role:     "participant",
-		boundary: namedinputs.IntegrityBoundaryAfterAttempt,
+		cause:           integrityCause,
+		role:            "participant",
+		boundary:        namedinputs.IntegrityBoundaryAfterAttempt,
+		providerAttempt: &providerAttempt,
 	})
-	assertRootNamedInputIntegrityTerminal(
+	failure := assertRootNamedInputIntegrityTerminal(
 		t,
 		result,
 		err,
 		"participant",
 		namedinputs.IntegrityBoundaryAfterAttempt,
 	)
+	assertIntegrityProviderAttempt(t, failure, 1)
 	causes := asSlice(result["failure_causes"])
 	if len(causes) != 2 ||
 		causes[0] != RootFailureCauseNamedInputIntegrity ||
@@ -804,6 +921,7 @@ func TestLegacyAbsentRetainedInputsMaterializeOnceAndThenVerifyAsPresent(t *test
 		state.persisted.retainedInputRef,
 		"test",
 		namedinputs.IntegrityBoundaryRecovery,
+		nil,
 	); err != nil {
 		t.Fatalf("verify legacy materialization: %v", err)
 	}
@@ -918,21 +1036,25 @@ func TestRootRecoveryAcceptsStoryTwoRetainedRefShapeAndRejectsConflicts(t *testi
 
 func TestRootIntegrityInspectionSurfacesShareContentFreeTerminalProjection(t *testing.T) {
 	const inputSecret = "INPUT-CONTENT-MUST-NOT-LEAK"
+	const tamperedInput = "TAMPERED-RETAINED-INPUT-MUST-NOT-PERSIST"
 	const rejectedOutput = "INSPECTION-REJECTED-OUTPUT-MUST-NOT-LEAK"
+	originalPayload := `{"secret":"` + inputSecret + `"}`
+	tamperedPayload := `{"secret":"` + tamperedInput + `"}`
+	rejectedPayload := `{"value":"` + rejectedOutput + `"}`
 	sessionDir := filepath.Join(t.TempDir(), "session")
 	launchCWD := t.TempDir()
 	writeRootRecipeTestFile(
 		t,
 		filepath.Join(launchCWD, "payload.json"),
-		`{"secret":"`+inputSecret+`"}`,
+		originalPayload,
 	)
 	retainedPath := filepath.Join(sessionDir, "execution", "inputs", "000001")
 	recorder := &rootBackendRecorder{}
 	recorder.handler = func(_ context.Context, call rootBackendCall) (TurnResult, error) {
-		if err := tamperRootRetainedInput(retainedPath, `{"secret":"tampered"}`); err != nil {
+		if err := tamperRootRetainedInput(retainedPath, tamperedPayload); err != nil {
 			return TurnResult{}, err
 		}
-		return successfulRootTurn(call.Backend, `{"value":"`+rejectedOutput+`"}`), nil
+		return successfulRootTurn(call.Backend, rejectedPayload), nil
 	}
 	result, runErr := RunRecipe(context.Background(), rootNamedInputRecipeOptions(
 		sessionDir,
@@ -940,12 +1062,64 @@ func TestRootIntegrityInspectionSurfacesShareContentFreeTerminalProjection(t *te
 		false,
 		recorder,
 	))
-	assertRootNamedInputIntegrityTerminal(
+	authoritativeFailure := assertRootNamedInputIntegrityTerminal(
 		t,
 		result,
 		runErr,
 		"participant",
 		namedinputs.IntegrityBoundaryAfterAttempt,
+	)
+	assertIntegrityProviderAttempt(t, authoritativeFailure, 1)
+	if _, exists := result["provider_attempt"]; exists {
+		t.Fatalf("result duplicated provider_attempt outside the integrity record: %#v", result)
+	}
+
+	st := store.New(sessionDir)
+	meta, err := st.LoadMeta()
+	if err != nil {
+		t.Fatalf("load terminal integrity metadata: %v", err)
+	}
+	metaFailure, _ := meta.Get("named_input_integrity_failure").(map[string]any)
+	assertCanonicalIntegrityRecord(t, authoritativeFailure, metaFailure, "metadata")
+	if meta.Get("provider_attempt") != nil {
+		t.Fatalf("metadata duplicated provider_attempt outside the integrity record: %#v", meta.ToMap())
+	}
+	events, err := st.ReadEvents()
+	if err != nil {
+		t.Fatalf("read terminal integrity events: %v", err)
+	}
+	failedEvent := lastEventOfType(events, "node_failed")
+	failedPayload, _ := failedEvent["payload"].(map[string]any)
+	eventFailure, _ := failedPayload["integrity_failure"].(map[string]any)
+	assertCanonicalIntegrityRecord(t, authoritativeFailure, eventFailure, "node_failed event")
+	if _, exists := failedPayload["provider_attempt"]; exists {
+		t.Fatalf("node_failed payload duplicated provider_attempt: %#v", failedPayload)
+	}
+
+	manifestRef, _ := result["named_input_manifest_ref"].(map[string]any)
+	assertionInputs, loadErr := namedinputs.LoadAssertionInputs(
+		st,
+		manifestRef,
+		"neutral/integrity-contract-v1",
+	)
+	if loadErr != nil {
+		t.Fatalf("load authoritative named-input snapshot: %v", loadErr)
+	}
+	payloads := assertionInputs["payload"]
+	if len(payloads) != 1 {
+		t.Fatalf("authoritative named-input snapshot = %#v", assertionInputs)
+	}
+	original, _ := payloads[0].(map[string]any)
+	if original["secret"] != inputSecret {
+		t.Fatalf("authoritative named-input snapshot = %#v", assertionInputs)
+	}
+	assertIntegrityPersistenceIsolation(
+		t,
+		sessionDir,
+		retainedPath,
+		tamperedPayload,
+		rejectedPayload,
+		rejectedOutput,
 	)
 
 	show, err := inspect.BuildShowTranscriptReport(sessionDir, 0, "")
@@ -968,6 +1142,11 @@ func TestRootIntegrityInspectionSurfacesShareContentFreeTerminalProjection(t *te
 	var want []byte
 	for index, report := range reports {
 		projection := rootRetainedIntegrityFromReport(t, report)
+		projectedFailure, _ := projection["failure"].(map[string]any)
+		assertCanonicalIntegrityRecord(t, authoritativeFailure, projectedFailure, fmt.Sprintf("inspection report %d", index))
+		if _, exists := projection["provider_attempt"]; exists {
+			t.Fatalf("inspection report %d duplicated provider_attempt: %#v", index, projection)
+		}
 		encoded, encodeErr := contracts.CanonicalJSONBytes(projection)
 		if encodeErr != nil {
 			t.Fatalf("encode report %d projection: %v", index, encodeErr)
@@ -1064,6 +1243,7 @@ func assertRootNamedInputIntegrityTerminal(
 	err error,
 	role string,
 	boundary string,
+	wantProviderAttempt ...int,
 ) map[string]any {
 	t.Helper()
 	if err == nil {
@@ -1087,7 +1267,120 @@ func assertRootNamedInputIntegrityTerminal(
 		failure["attempt_boundary"] != boundary {
 		t.Fatalf("integrity failure projection = %#v", failure)
 	}
+	expectedAttempt := 0
+	if boundary == namedinputs.IntegrityBoundaryBeforeAttempt ||
+		boundary == namedinputs.IntegrityBoundaryAfterAttempt {
+		expectedAttempt = 1
+	}
+	if len(wantProviderAttempt) > 0 {
+		expectedAttempt = wantProviderAttempt[0]
+	}
+	assertIntegrityProviderAttempt(t, failure, expectedAttempt)
 	return failure
+}
+
+func assertIntegrityProviderAttempt(t *testing.T, failure map[string]any, want int) {
+	t.Helper()
+	rawAttempt, exists := failure["provider_attempt"]
+	if want < 1 {
+		if exists {
+			t.Fatalf("non-provider integrity record included provider_attempt: %#v", failure)
+		}
+	} else if !exists || intFromAny(rawAttempt, 0) != want {
+		t.Fatalf("integrity record provider_attempt = %#v, want %d: %#v", rawAttempt, want, failure)
+	}
+	diagnostics := asSlice(failure["diagnostics"])
+	if len(diagnostics) == 0 {
+		t.Fatalf("integrity record omitted diagnostics: %#v", failure)
+	}
+	for _, raw := range diagnostics {
+		diagnostic, _ := raw.(map[string]any)
+		details, _ := diagnostic["details"].(map[string]any)
+		rawDiagnosticAttempt, diagnosticExists := details["provider_attempt"]
+		if want < 1 {
+			if diagnosticExists {
+				t.Fatalf("non-provider diagnostic included provider_attempt: %#v", diagnostic)
+			}
+		} else if !diagnosticExists || intFromAny(rawDiagnosticAttempt, 0) != want {
+			t.Fatalf("diagnostic provider_attempt = %#v, want %d: %#v", rawDiagnosticAttempt, want, diagnostic)
+		}
+	}
+}
+
+func assertIntegrityMismatchCategory(t *testing.T, failure map[string]any, want string) {
+	t.Helper()
+	diagnostics := asSlice(failure["diagnostics"])
+	if len(diagnostics) != 1 {
+		t.Fatalf("integrity diagnostics = %#v", diagnostics)
+	}
+	diagnostic, _ := diagnostics[0].(map[string]any)
+	details, _ := diagnostic["details"].(map[string]any)
+	if details["mismatch_category"] != want {
+		t.Fatalf("integrity mismatch category = %#v, want %q", details["mismatch_category"], want)
+	}
+}
+
+func assertCanonicalIntegrityRecord(
+	t *testing.T,
+	want map[string]any,
+	got map[string]any,
+	surface string,
+) {
+	t.Helper()
+	wantJSON, err := contracts.CanonicalJSONBytes(want)
+	if err != nil {
+		t.Fatalf("encode authoritative integrity record: %v", err)
+	}
+	gotJSON, err := contracts.CanonicalJSONBytes(got)
+	if err != nil {
+		t.Fatalf("encode %s integrity record: %v", surface, err)
+	}
+	if string(gotJSON) != string(wantJSON) {
+		t.Fatalf("%s integrity record differs:\nwant %s\ngot  %s", surface, wantJSON, gotJSON)
+	}
+}
+
+func assertIntegrityPersistenceIsolation(
+	t *testing.T,
+	sessionDir string,
+	retainedPath string,
+	tamperedPayload string,
+	rejectedPayload string,
+	rejectedMarker string,
+) {
+	t.Helper()
+	retainedData, err := os.ReadFile(retainedPath)
+	if err != nil || string(retainedData) != tamperedPayload {
+		t.Fatalf("tampered retained evidence = %q, %v", retainedData, err)
+	}
+	forbidden := []string{
+		tamperedPayload,
+		base64.StdEncoding.EncodeToString([]byte(tamperedPayload)),
+		rejectedPayload,
+		base64.StdEncoding.EncodeToString([]byte(rejectedPayload)),
+		rejectedMarker,
+	}
+	err = filepath.WalkDir(sessionDir, func(path string, entry os.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if !entry.Type().IsRegular() || filepath.Clean(path) == filepath.Clean(retainedPath) {
+			return nil
+		}
+		data, readErr := os.ReadFile(path)
+		if readErr != nil {
+			return readErr
+		}
+		for _, text := range forbidden {
+			if strings.Contains(string(data), text) {
+				return fmt.Errorf("%s contains rejected integrity evidence %q", path, text)
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
 }
 
 func assertSessionOmitsText(t *testing.T, sessionDir string, forbidden ...string) {
