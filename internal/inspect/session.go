@@ -3,6 +3,7 @@ package inspect
 import (
 	"fmt"
 	"html"
+	"os"
 	"path/filepath"
 	"regexp"
 	"strconv"
@@ -212,19 +213,27 @@ func FormatExportMarkdown(report map[string]any) string {
 }
 
 func BuildSessionHealthReport(sessionDir string) (map[string]any, error) {
-	meta, err := LoadMeta(sessionDir)
+	requestedSessionDir := sessionDir
+	meta, err := LoadMeta(requestedSessionDir)
 	if err != nil {
 		return nil, err
 	}
-	transcript, err := LoadTranscript(sessionDir)
+	transcript, err := LoadTranscript(requestedSessionDir)
 	if err != nil {
 		return nil, err
 	}
-	events, eventsErr := store.New(sessionDir).ReadEvents()
+	events, eventsErr := store.New(requestedSessionDir).ReadEvents()
 	diagnostics := sessionDiagnostics(meta, transcript, events)
 	if eventsErr != nil {
 		diagnostics["events_error"] = eventsErr.Error()
 		diagnostics["attention_required"] = true
+	}
+	rootSessionDir := requestedSessionDir
+	if IsRootSession(meta) {
+		rootSessionDir, err = resolveSessionRootForHealthInspection(requestedSessionDir)
+		if err != nil {
+			return nil, err
+		}
 	}
 	status := "ok"
 	if attention, _ := diagnostics["attention_required"].(bool); attention {
@@ -233,8 +242,8 @@ func BuildSessionHealthReport(sessionDir string) (map[string]any, error) {
 	report := map[string]any{
 		"scope":       "session",
 		"status":      status,
-		"session_id":  filepath.Base(filepath.Clean(sessionDir)),
-		"session_dir": sessionDir,
+		"session_id":  filepath.Base(filepath.Clean(requestedSessionDir)),
+		"session_dir": requestedSessionDir,
 		"summary": map[string]any{
 			"session_status": valueOr(meta["status"], "unknown"),
 			"actual_rounds":  valueOr(meta["actual_rounds"], len(transcript)),
@@ -242,8 +251,8 @@ func BuildSessionHealthReport(sessionDir string) (map[string]any, error) {
 		},
 		"diagnostics": diagnostics,
 	}
-	if root := BuildRootInspectionReport(sessionDir, meta, false); root != nil {
-		checks := BuildRootHealthChecks(sessionDir, meta, root)
+	if root := BuildRootInspectionReport(rootSessionDir, meta, false); root != nil {
+		checks := BuildRootHealthChecks(rootSessionDir, meta, root)
 		report["root"] = root
 		report["checks"] = checks
 		for _, raw := range checks {
@@ -256,6 +265,25 @@ func BuildSessionHealthReport(sessionDir string) (map[string]any, error) {
 		report["status"] = status
 	}
 	return model.NewHealthReport(report).ToMap(), nil
+}
+
+func resolveSessionRootForHealthInspection(sessionDir string) (string, error) {
+	absolute, err := filepath.Abs(sessionDir)
+	if err != nil {
+		return "", fmt.Errorf("resolve session root for health inspection: %w", err)
+	}
+	canonical, err := filepath.EvalSymlinks(absolute)
+	if err != nil {
+		return "", fmt.Errorf("resolve session root for health inspection: %w", err)
+	}
+	info, err := os.Stat(canonical)
+	if err != nil {
+		return "", fmt.Errorf("resolve session root for health inspection: %w", err)
+	}
+	if !info.IsDir() {
+		return "", fmt.Errorf("resolve session root for health inspection: resolved path is not a directory: %s", canonical)
+	}
+	return filepath.Clean(canonical), nil
 }
 
 func BuildGlobalHealthReport(settingsPath string) map[string]any {
