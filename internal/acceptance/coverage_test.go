@@ -43,6 +43,7 @@ func TestGenericAcceptanceCoverageIsComplete(t *testing.T) {
 		{name: "raw committed workspace semantics", tests: []string{"TestRawExportBypassesHooksFiltersReplacementSparseAndCheckoutConversion", "TestRawExportMaterializesGitlinksAsCountedEmptyDirectories"}},
 		{name: "dirty source contract", tests: []string{"TestDirtyIsolatedLaunchRequiresExplicitCommittedHeadOverride", "TestDirtySourceOverrideRejectsInheritedAndNonGitExecution", "TestRootNamedInputIntegrityAndSourceMutationPreserveOrderedCauses", "TestRootNamedInputIntegritySurvivesNonSourceWorkspaceFinalizationFailure"}},
 		{name: "trusted provider documentation", tests: []string{"TestRootRecipeDocumentationStatesTrustedProviderBoundaries"}},
+		{name: "portability and CI gates", tests: []string{"TestStopUnsupportedGracefulPreservesStatePIDAndForceKillRemainsAvailable", "TestPortabilityGatesCoverSupportedTargetsWithoutRuntimeCertification"}},
 		{name: "digest-checked session contracts", tests: []string{"TestEveryRootArtifactKindRoundTripsWithSafeRefAndRejectsTampering", "TestRootInspectionProjectionIsSharedDigestCheckedAndPayloadRedacted"}},
 		{name: "persisted recovery snapshots", tests: []string{"TestRootRecoveryUsesPersistedBundleContractAndNamedInputSnapshots"}},
 		{name: "readiness separated from recipe structure", tests: []string{"TestRecipeCatalogClassificationPrecedenceAndFilters", "TestDefaultReadinessRunsOnlyVersionProbes"}},
@@ -113,6 +114,69 @@ func TestRootRecipeDocumentationStatesTrustedProviderBoundaries(t *testing.T) {
 	}
 	if strings.Contains(text, "named immutable inputs") {
 		t.Error("root recipe documentation still describes named inputs as immutable")
+	}
+}
+
+func TestPortabilityGatesCoverSupportedTargetsWithoutRuntimeCertification(t *testing.T) {
+	_, sourceFile, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("locate acceptance test source")
+	}
+	repoRoot := filepath.Clean(filepath.Join(filepath.Dir(sourceFile), "..", ".."))
+	read := func(relative string) string {
+		t.Helper()
+		data, err := os.ReadFile(filepath.Join(repoRoot, relative))
+		if err != nil {
+			t.Fatalf("read %s: %v", relative, err)
+		}
+		return strings.Join(strings.Fields(strings.ToLower(string(data))), " ")
+	}
+
+	makefile := read("Makefile")
+	for _, required := range []string{
+		"test-race:",
+		"./internal/runner",
+		"./internal/store",
+		"./internal/workspace",
+		"./internal/namedinputs",
+		"./cmd/convo-relay",
+		"cross-compile:",
+		"darwin/amd64 windows/amd64",
+		"go build ./...",
+		"cross-compile-tests:",
+		"go test -c",
+	} {
+		if !strings.Contains(makefile, required) {
+			t.Errorf("Makefile portability gates are missing %q", required)
+		}
+	}
+
+	workflow := read(filepath.Join(".github", "workflows", "tests.yml"))
+	for _, required := range []string{
+		"run: go vet ./...",
+		"run: go test ./... -count=1",
+		"run: make smoke-fake-providers",
+		"run: make package",
+		"run: make test-race",
+		"run: make cross-compile",
+		"run: make cross-compile-tests",
+	} {
+		if !strings.Contains(workflow, required) {
+			t.Errorf("CI portability gates are missing %q", required)
+		}
+	}
+
+	documentation := read("README.md") + " " + read(filepath.Join("docs", "root-recipe-integration.md"))
+	for _, required := range []string{
+		"cross-compilation is a merge gate",
+		"does not execute foreign binaries",
+		"does not certify runtime support on macos or windows",
+		"live-process graceful stop is unsupported on windows",
+		"without changing session state or removing pid and cleanup evidence",
+	} {
+		if !strings.Contains(documentation, required) {
+			t.Errorf("portability documentation is missing %q", required)
+		}
 	}
 }
 

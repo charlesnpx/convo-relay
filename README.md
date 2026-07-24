@@ -107,6 +107,9 @@ The installed or packaged binary discovers bundled skills and the optional PDF h
 
 ```bash
 make test
+make test-race
+make cross-compile
+make cross-compile-tests
 make smoke-fake-providers
 make package
 ```
@@ -114,6 +117,8 @@ make package
 `make smoke-fake-providers` is the Go-only release smoke gate. It builds the CLI, shadows `codex`, `claude`, and `gemini` with deterministic fake provider binaries in `PATH`, writes sessions into a temp relay home, and checks the required provider matrix plus `resume`, `cleanup`, `clean`, `contracts --json`, `show --graph --json`, and `display --html-only`. Live Codex, Claude, and Gemini runs are useful local release evidence, but they are optional and are not required for CI.
 
 `make test` also reruns the complete generic Go suite with integration-bound optional recipe defaults disabled. Run that configuration alone with `make test-without-optional-defaults`.
+
+Cross-compilation is a merge gate, not a runtime certification claim. `make cross-compile` builds every production package for `darwin/amd64` and `windows/amd64`, while `make cross-compile-tests` compiles the repository's practical test packages for those targets. These gates do not execute foreign binaries and do not certify runtime support on macOS or Windows.
 
 ### Manual skill install from a checkout
 
@@ -445,7 +450,7 @@ convo-relay stop a1b2c3d4
 convo-relay kill a1b2c3d4
 ```
 
-`stop` sends `SIGTERM` to the tracked relay process, which lets the relay mark the session interrupted and terminate the active backend subprocess. `kill` sends `SIGKILL` and marks the session killed immediately.
+On Unix, `stop` sends `SIGTERM` to the tracked relay process, which lets the relay mark the session interrupted and terminate the active backend subprocess. A live-process graceful stop is unsupported on Windows: it returns an explicit error without changing session state or removing PID and cleanup evidence. Use `kill` or `stop --kill` there. Force-kill marks the session killed immediately after the platform process-termination request succeeds.
 
 ### Display a session
 
@@ -517,7 +522,7 @@ Then read /tmp/auth-review.md and summarize what each agent found.
 | `proposals` | List dynamic spawn proposals for a session |
 | `approve` | Approve a spawn proposal, run its child relay, and collapse the result |
 | `reject` | Reject a spawn proposal with an operator reason |
-| `stop` | Ask a running relay process to stop cleanly |
+| `stop` | Ask a running relay process to stop cleanly (Unix live processes) |
 | `kill` | Force-kill a tracked relay process |
 | `display` | Generate styled HTML/PDF visualization of a session |
 | `diff` | Show contested and withdrawn ledger changes |

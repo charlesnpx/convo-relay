@@ -6,7 +6,6 @@ import (
 	"io"
 	"os"
 	"path/filepath"
-	"syscall"
 
 	"github.com/charlesnpx/convo-relay/internal/contracts"
 )
@@ -47,7 +46,7 @@ func lockSessionMutation(sessionDir string) (*sessionMutationLock, error) {
 	if sessionMutationLockAfterOpen != nil {
 		sessionMutationLockAfterOpen(lockPath)
 	}
-	if err := syscall.Flock(int(file.Fd()), syscall.LOCK_EX); err != nil {
+	if err := lockFileExclusive(file); err != nil {
 		_ = file.Close()
 		return nil, err
 	}
@@ -63,7 +62,7 @@ func lockSessionMutation(sessionDir string) (*sessionMutationLock, error) {
 		rootAfter.Mode()&os.ModeSymlink != 0 ||
 		!rootAfter.IsDir() ||
 		!os.SameFile(rootBefore, rootAfter) {
-		_ = syscall.Flock(int(file.Fd()), syscall.LOCK_UN)
+		_ = unlockFile(file)
 		_ = file.Close()
 		return nil, errors.New("session mutation lock path changed while waiting for the lock")
 	}
@@ -79,7 +78,7 @@ func (l *sessionMutationLock) Unlock() error {
 	if l == nil || l.file == nil {
 		return nil
 	}
-	unlockErr := syscall.Flock(int(l.file.Fd()), syscall.LOCK_UN)
+	unlockErr := unlockFile(l.file)
 	closeErr := l.file.Close()
 	l.file = nil
 	if unlockErr != nil {

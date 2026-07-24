@@ -4,14 +4,12 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
-	"errors"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
-	"syscall"
 	"time"
 
 	"github.com/charlesnpx/convo-relay/internal/contracts"
@@ -138,18 +136,6 @@ func readPID(sessionDir string) (int, error) {
 		return 0, err
 	}
 	return pid, nil
-}
-
-func processAlive(pid int) bool {
-	if pid <= 0 {
-		return false
-	}
-	err := syscall.Kill(pid, 0)
-	return err == nil || errors.Is(err, syscall.EPERM)
-}
-
-func signalProcess(pid int, signal syscall.Signal) error {
-	return syscall.Kill(pid, signal)
 }
 
 func ensureSessionDir(sessionDir string) error {

@@ -18,6 +18,17 @@ The integrity and workspace controls below detect and report changes at
 orchestration boundaries. They do not prevent a provider from making changes
 between checks and are not a security boundary.
 
+## Portability gate
+
+Cross-compilation is a merge gate, not evidence of runtime certification.
+CI builds every production package and compiles practical test packages for
+`darwin/amd64` and `windows/amd64`. It does not execute foreign binaries and
+does not certify runtime support on macOS or Windows.
+
+A live-process graceful stop is unsupported on Windows. The request returns
+an explicit error without changing session state or removing PID and cleanup
+evidence; `kill` and `stop --kill` retain the force-kill path.
+
 ## One compiler, explicit targets
 
 `recipes.CompileRecipe` is the only canonical exported recipe compiler. Every
