@@ -85,6 +85,9 @@ type ResumeOptions struct {
 	// backendFactory is a test seam for root recovery. Ordinary resume keeps
 	// using the established slot restoration path.
 	backendFactory rootBackendFactory
+
+	retainedInputVerifier            rootRetainedInputVerifier
+	retainedInputVerificationTimeout time.Duration
 }
 
 type StopOptions struct {

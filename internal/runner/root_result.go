@@ -10,6 +10,7 @@ import (
 	"github.com/charlesnpx/convo-relay/internal/graph"
 	"github.com/charlesnpx/convo-relay/internal/integration"
 	"github.com/charlesnpx/convo-relay/internal/model"
+	"github.com/charlesnpx/convo-relay/internal/namedinputs"
 	"github.com/charlesnpx/convo-relay/internal/store"
 	"github.com/charlesnpx/convo-relay/internal/workspace"
 )
@@ -58,6 +59,9 @@ func (e rootReducerExecutionError) Unwrap() error {
 func (s *rootExecutionState) runRootResultPhases(ctx context.Context) (map[string]any, error) {
 	candidate, err := s.produceRootCandidate(ctx)
 	if err != nil {
+		if _, integrityFailure := asRootNamedInputIntegrityError(err); integrityFailure {
+			return s.markNamedInputIntegrityFailed(err)
+		}
 		if errors.Is(err, context.Canceled) || errors.Is(ctx.Err(), context.Canceled) {
 			return s.markRootPostParticipantInterrupted("reducer", "context canceled")
 		}
@@ -133,12 +137,15 @@ func (s *rootExecutionState) runFreshRootReducer(ctx context.Context) (rootCandi
 	if err != nil {
 		return rootCandidate{}, err
 	}
-	result, runErr := runWithRetryableProviderErrors(ctx, reducer.Label(), func() (TurnResult, error) {
+	result, runErr := runRootProviderTurnWithRetainedIntegrity(ctx, s, "reducer", reducer.Label(), reducer.Name(), func() (TurnResult, error) {
 		return reducer.RunTurn(ctx, prompt, TurnOptions{
 			TimeoutSeconds:      s.preflight.options.TimeoutSeconds,
 			StallTimeoutSeconds: s.preflight.options.StallTimeoutSeconds,
 		})
 	})
+	if _, integrityFailure := asRootNamedInputIntegrityError(runErr); integrityFailure {
+		return rootCandidate{}, runErr
+	}
 	providerResult := providerResultForTurn(reducer.Name(), result)
 	if runErr == nil && !result.Recovered {
 		switch {
@@ -383,6 +390,13 @@ func positiveIntOrNil(value int) any {
 }
 
 func (s *rootExecutionState) validateAndCompleteRootCandidate(candidate rootCandidate) (map[string]any, error) {
+	if err := s.verifyRetainedInputsIndependently("result_validation", namedinputs.IntegrityBoundaryResultValidation); err != nil {
+		return s.markNamedInputIntegrityFailed(&rootNamedInputIntegrityError{
+			cause:    err,
+			role:     "result_validation",
+			boundary: namedinputs.IntegrityBoundaryResultValidation,
+		})
+	}
 	if s.preflight.selectedContract == nil {
 		if err := s.persistRootValidation("not_required", candidate.rawResultRef, nil, nil); err != nil {
 			return s.markRootRecoveryPending("result_validation_persistence", err)
@@ -578,22 +592,23 @@ func (s *rootExecutionState) recordRootValidationCheckpoint(
 
 func (s *rootExecutionState) saveRootResultCheckpoint(ordinal int, phase string, status string, fields map[string]any) (map[string]any, error) {
 	payload := map[string]any{
-		"ordinal":                     ordinal,
-		"phase":                       phase,
-		"status":                      status,
-		"preflight_complete":          true,
-		"workspace_ready":             true,
-		"participant_turns_completed": s.transcript.Len(),
-		"recipe_ref":                  s.persisted.recipeRef,
-		"root_recipe_plan_ref":        s.persisted.rootPlanRef,
-		"runtime_config_ref":          s.persisted.runtimeConfigRef,
-		"integration_bundle_ref":      s.persisted.bundleRef,
-		"integration_contract_ref":    s.persisted.contractRef,
-		"named_input_manifest_ref":    s.persisted.inputManifestRef,
-		"execution_workspace_ref":     s.persisted.workspaceRef,
-		"previous_checkpoint_ref":     s.meta.Get("latest_root_checkpoint_ref"),
-		"ledger":                      s.meta.Ledger().ToMap(),
-		"created_at":                  utcNow(),
+		"ordinal":                            ordinal,
+		"phase":                              phase,
+		"status":                             status,
+		"preflight_complete":                 true,
+		"workspace_ready":                    true,
+		"participant_turns_completed":        s.transcript.Len(),
+		"recipe_ref":                         s.persisted.recipeRef,
+		"root_recipe_plan_ref":               s.persisted.rootPlanRef,
+		"runtime_config_ref":                 s.persisted.runtimeConfigRef,
+		"integration_bundle_ref":             s.persisted.bundleRef,
+		"integration_contract_ref":           s.persisted.contractRef,
+		"named_input_manifest_ref":           s.persisted.inputManifestRef,
+		"retained_input_materialization_ref": s.persisted.retainedInputRef,
+		"execution_workspace_ref":            s.persisted.workspaceRef,
+		"previous_checkpoint_ref":            s.meta.Get("latest_root_checkpoint_ref"),
+		"ledger":                             s.meta.Ledger().ToMap(),
+		"created_at":                         utcNow(),
 	}
 	for key, value := range fields {
 		payload[key] = value

@@ -17,6 +17,8 @@ const (
 	RootNamedInputIntegrityExecutionPhase     = "named_input_integrity_check"
 	RootFailureCauseNamedInputIntegrity       = namedinputs.DiagnosticCodeIntegrity
 	RootFailureCauseSourceMutated             = workspace.StopReasonSourceMutated
+	RootFailureCauseProviderCanceled          = "provider_canceled"
+	RootFailureCauseProviderFailed            = "provider_failed"
 	RecipeWarningCodeDirtySourceCommittedHead = "dirty_source_committed_head"
 )
 

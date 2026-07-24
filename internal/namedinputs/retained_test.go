@@ -165,6 +165,60 @@ func TestVerifyRetainedDoesNotRecreateMissingMaterializationDirectory(t *testing
 	}
 }
 
+func TestVerifyRetainedReportsAnExtraEntryThatSortsBeforeExpectedFiles(t *testing.T) {
+	st, materialized := retainedFixture(t)
+	directory := materialized.Descriptor["directory"].(string)
+	extra := filepath.Join(directory, "000000")
+	if err := os.WriteFile(extra, []byte("extra"), 0o444); err != nil {
+		t.Fatalf("write early-sorting extra: %v", err)
+	}
+	err := VerifyRetained(
+		context.Background(),
+		st,
+		materialized.DescriptorRef,
+		"inspection",
+		"health",
+	)
+	var diagnosticErr *contracts.DiagnosticError
+	if !errors.As(err, &diagnosticErr) || len(diagnosticErr.Diagnostics) != 1 {
+		t.Fatalf("unexpected-entry error = %T %v", err, err)
+	}
+	diagnostic := diagnosticErr.Diagnostics[0]
+	observed, _ := diagnostic.Details["observed"].(map[string]any)
+	if diagnostic.Details["mismatch_category"] != IntegrityMismatchUnexpected ||
+		filepath.Clean(stringValue(observed["path"])) != filepath.Clean(extra) {
+		t.Fatalf("unexpected-entry diagnostic = %#v", diagnostic)
+	}
+}
+
+func TestLoadRetainedReconstructsProjectionWithoutWriting(t *testing.T) {
+	st, materialized := retainedFixture(t)
+	before, err := os.ReadDir(materialized.Descriptor["directory"].(string))
+	if err != nil {
+		t.Fatalf("read retained directory before load: %v", err)
+	}
+	manifestRef := materialized.Descriptor["manifest_ref"].(map[string]any)
+	loaded, err := LoadRetained(
+		context.Background(),
+		st,
+		manifestRef,
+		materialized.DescriptorRef,
+		"recovery",
+		IntegrityBoundaryRecovery,
+	)
+	if err != nil {
+		t.Fatalf("load retained: %v", err)
+	}
+	after, err := os.ReadDir(materialized.Descriptor["directory"].(string))
+	if err != nil {
+		t.Fatalf("read retained directory after load: %v", err)
+	}
+	if len(before) != len(after) || len(loaded.ProviderInputs["inputs"].([]any)) != 2 ||
+		!matchingArtifactRefs(loaded.DescriptorRef, materialized.DescriptorRef) {
+		t.Fatalf("loaded retained projection = %#v", loaded)
+	}
+}
+
 func retainedFixture(t *testing.T) (*store.Store, *Materialized) {
 	t.Helper()
 	root := t.TempDir()

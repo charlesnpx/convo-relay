@@ -8,10 +8,11 @@ import (
 )
 
 const (
-	IntegrityBoundaryInitialization = "initialization"
-	IntegrityBoundaryBeforeAttempt  = "before_attempt"
-	IntegrityBoundaryAfterAttempt   = "after_attempt"
-	IntegrityBoundaryRecovery       = "recovery"
+	IntegrityBoundaryInitialization   = "initialization"
+	IntegrityBoundaryBeforeAttempt    = "before_attempt"
+	IntegrityBoundaryAfterAttempt     = "after_attempt"
+	IntegrityBoundaryResultValidation = "before_result_validation"
+	IntegrityBoundaryRecovery         = "recovery"
 
 	IntegrityMismatchMissing    = "missing"
 	IntegrityMismatchUnexpected = "unexpected"
