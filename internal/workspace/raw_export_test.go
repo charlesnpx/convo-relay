@@ -40,6 +40,10 @@ func TestRawExportBypassesHooksFiltersReplacementSparseAndCheckoutConversion(t *
 	}
 	testGit(t, root, "add", "--all")
 	testGit(t, root, "commit", "-q", "-m", "raw export fixtures")
+	testGit(t, root, "reset", "--hard", "HEAD")
+	if status := testGit(t, root, "status", "--short", "--untracked-files=all"); status != "" {
+		t.Fatalf("raw export fixture is dirty after checkout refresh:\n%s", status)
+	}
 	encodedBlob := gitBlobBytes(t, root, "HEAD:encoded.txt")
 	if !bytes.Equal(encodedBlob, []byte("encoded\n")) || bytes.Equal(encodedBlob, utf16WorkingTree) {
 		t.Fatalf("working-tree encoding fixture committed unexpected blob bytes: %x", encodedBlob)
