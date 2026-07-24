@@ -1,6 +1,7 @@
 package runner
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"errors"
@@ -14,6 +15,7 @@ import (
 	"time"
 
 	"github.com/charlesnpx/convo-relay/internal/contracts"
+	"github.com/charlesnpx/convo-relay/internal/gitexec"
 	"github.com/charlesnpx/convo-relay/internal/model"
 	"github.com/charlesnpx/convo-relay/internal/store"
 )
@@ -164,32 +166,65 @@ func ensureGitRepo(path string) error {
 	if _, err := exec.LookPath("git"); err != nil {
 		return nil
 	}
-	initCmd := exec.Command("git", "init")
-	initCmd.Dir = path
-	if err := initCmd.Run(); err != nil {
+	if _, err := gitexec.Run(context.Background(), "git", path, nil, "init"); err != nil {
 		return nil
 	}
-	commitCmd := exec.Command("git", "commit", "--allow-empty", "-m", "relay session init")
-	commitCmd.Dir = path
-	commitCmd.Env = append(os.Environ(),
-		"GIT_AUTHOR_NAME=Relay",
-		"GIT_AUTHOR_EMAIL=relay@example.invalid",
-		"GIT_COMMITTER_NAME=Relay",
-		"GIT_COMMITTER_EMAIL=relay@example.invalid",
+	_, _ = gitexec.Run(
+		context.Background(),
+		"git",
+		path,
+		map[string]string{
+			"GIT_AUTHOR_NAME":     "Relay",
+			"GIT_AUTHOR_EMAIL":    "relay@example.invalid",
+			"GIT_COMMITTER_NAME":  "Relay",
+			"GIT_COMMITTER_EMAIL": "relay@example.invalid",
+		},
+		"commit", "--allow-empty", "-m", "relay session init",
 	)
-	_ = commitCmd.Run()
 	return nil
 }
 
 func pathHasGitRepo(path string) bool {
-	if path == "" {
+	root, ok := gitRootForPath(path)
+	if !ok {
 		return false
+	}
+	canonicalPath, err := filepath.EvalSymlinks(path)
+	if err != nil {
+		return false
+	}
+	canonicalPath, err = filepath.Abs(canonicalPath)
+	if err != nil {
+		return false
+	}
+	return filepath.Clean(canonicalPath) == root
+}
+
+func pathWithinGitRepo(path string) bool {
+	_, ok := gitRootForPath(path)
+	return ok
+}
+
+func gitRootForPath(path string) (string, bool) {
+	if path == "" {
+		return "", false
 	}
 	info, err := os.Stat(path)
 	if err != nil || !info.IsDir() {
-		return false
+		return "", false
 	}
-	cmd := exec.Command("git", "rev-parse", "--show-toplevel")
-	cmd.Dir = path
-	return cmd.Run() == nil
+	output, err := gitexec.Run(context.Background(), "git", path, nil, "rev-parse", "--show-toplevel")
+	if err != nil {
+		return "", false
+	}
+	root := strings.TrimSpace(string(output))
+	root, err = filepath.EvalSymlinks(root)
+	if err != nil {
+		return "", false
+	}
+	root, err = filepath.Abs(root)
+	if err != nil {
+		return "", false
+	}
+	return filepath.Clean(root), true
 }

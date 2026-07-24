@@ -2,9 +2,11 @@ package workspace
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -29,6 +31,7 @@ func TestMaterializeRequiredPoliciesCreateVerifiedDetachedWorktreeAndArtifact(t 
 				SessionDir:        sessionDir,
 				SessionPathSource: SessionPathExplicit,
 				MinimumPolicy:     policy,
+				AllowDirtySource:  true,
 			})
 			if snapshot.HeadCommit() != originalHead {
 				t.Fatalf("snapshot HEAD = %s, want %s", snapshot.HeadCommit(), originalHead)
@@ -265,6 +268,126 @@ func TestMaterializeCompensatesArtifactStateWhenFinalGraphWriteFails(t *testing.
 	registered, inspectErr := repositoryWorktreeRegistered(context.Background(), snapshot.repository, target)
 	if inspectErr != nil || registered {
 		t.Fatalf("rolled back registration = %v, %v", registered, inspectErr)
+	}
+}
+
+func TestMaterializationFailureRollbackRejectsAncestorSymlinkWithoutTouchingOutsideRegistration(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("symlink creation requires additional Windows privileges")
+	}
+	root := newCommittedRepo(t)
+	head := testGit(t, root, "rev-parse", "HEAD")
+	sessionDir := filepath.Join(t.TempDir(), "session")
+	if err := os.MkdirAll(sessionDir, 0o755); err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+	writeTestFile(t, filepath.Join(sessionDir, "artifacts"), []byte("block artifact persistence"), 0o644)
+
+	outsideExecution := filepath.Join(t.TempDir(), "outside-execution")
+	outsideWorktree := filepath.Join(outsideExecution, "worktree")
+	testGit(t, root, "worktree", "add", "--detach", outsideWorktree, head)
+	outsideWorktree, err := canonicalExistingDirectory(outsideWorktree)
+	if err != nil {
+		t.Fatalf("canonicalize outside worktree: %v", err)
+	}
+	outsideExecution = filepath.Dir(outsideWorktree)
+	t.Cleanup(func() {
+		materializationBeforeFailureRollback = nil
+		testGit(t, root, "worktree", "remove", "--force", outsideWorktree)
+		testGit(t, root, "worktree", "prune")
+	})
+	sentinel := filepath.Join(outsideWorktree, "outside-sentinel.txt")
+	writeTestFile(t, sentinel, []byte("preserve outside worktree\n"), 0o644)
+
+	snapshot := mustPreflight(t, Options{
+		LaunchCWD:       root,
+		SessionDir:      sessionDir,
+		MinimumPolicy:   PolicyEphemeral,
+		RequestedPolicy: PolicyEphemeral,
+	})
+	sessionDir = snapshot.SessionDir()
+	target := filepath.Join(sessionDir, "execution", "worktree")
+	materializationBeforeFailureRollback = func(observedTarget string) error {
+		if observedTarget != target {
+			return fmt.Errorf("rollback target = %s, want %s", observedTarget, target)
+		}
+		if err := os.RemoveAll(filepath.Join(sessionDir, "execution")); err != nil {
+			return err
+		}
+		return os.Symlink(outsideExecution, filepath.Join(sessionDir, "execution"))
+	}
+
+	materialized, err := Materialize(context.Background(), store.New(sessionDir), snapshot)
+	if materialized != nil || err == nil {
+		t.Fatalf("ancestor-symlink rollback = %#v, %v", materialized, err)
+	}
+	if data, err := os.ReadFile(sentinel); err != nil || string(data) != "preserve outside worktree\n" {
+		t.Fatalf("outside sentinel changed: %q, %v", data, err)
+	}
+	if record, registered, err := repositoryWorktreeRegistrationExact(context.Background(), snapshot.repository, outsideWorktree); err != nil || !registered || record.Head != head {
+		t.Fatalf("outside registration changed: record=%#v registered=%v err=%v", record, registered, err)
+	}
+	if record, registered, err := repositoryWorktreeRegistrationExact(context.Background(), snapshot.repository, target); err != nil || !registered || record.Head != head {
+		t.Fatalf("original exact registration was removed through an alias: record=%#v registered=%v err=%v", record, registered, err)
+	}
+}
+
+func TestMaterializationFailureRollbackPreservesSamePathWorktreeReplacement(t *testing.T) {
+	root := newCommittedRepo(t)
+	head := testGit(t, root, "rev-parse", "HEAD")
+	sessionDir := filepath.Join(t.TempDir(), "session")
+	if err := os.MkdirAll(sessionDir, 0o755); err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+	writeTestFile(t, filepath.Join(sessionDir, "artifacts"), []byte("block artifact persistence"), 0o644)
+
+	snapshot := mustPreflight(t, Options{
+		LaunchCWD:       root,
+		SessionDir:      sessionDir,
+		MinimumPolicy:   PolicyEphemeral,
+		RequestedPolicy: PolicyEphemeral,
+	})
+	target := filepath.Join(snapshot.SessionDir(), "execution", "worktree")
+	sentinel := filepath.Join(target, "preserve-replacement.txt")
+	t.Cleanup(func() {
+		materializationBeforeFailureRollback = nil
+		_ = os.RemoveAll(target)
+		testGit(t, root, "worktree", "prune")
+	})
+	materializationBeforeFailureRollback = func(observedTarget string) error {
+		if observedTarget != target {
+			return fmt.Errorf("rollback target = %s, want %s", observedTarget, target)
+		}
+		backlink, err := os.ReadFile(filepath.Join(target, ".git"))
+		if err != nil {
+			return err
+		}
+		if err := os.RemoveAll(target); err != nil {
+			return err
+		}
+		if err := os.MkdirAll(target, 0o755); err != nil {
+			return err
+		}
+		if err := os.WriteFile(filepath.Join(target, ".git"), backlink, 0o644); err != nil {
+			return err
+		}
+		return os.WriteFile(sentinel, []byte("preserve same-path replacement\n"), 0o644)
+	}
+
+	materialized, err := Materialize(context.Background(), store.New(sessionDir), snapshot)
+	if materialized != nil || err == nil {
+		t.Fatalf("same-path replacement rollback = %#v, %v", materialized, err)
+	}
+	if data, readErr := os.ReadFile(sentinel); readErr != nil || string(data) != "preserve same-path replacement\n" {
+		t.Fatalf("same-path replacement sentinel changed: %q, %v", data, readErr)
+	}
+	record, registered, inspectErr := repositoryWorktreeRegistrationExact(
+		context.Background(),
+		snapshot.repository,
+		target,
+	)
+	if inspectErr != nil || !registered || record.Head != head {
+		t.Fatalf("original registration changed: record=%#v registered=%v err=%v", record, registered, inspectErr)
 	}
 }
 

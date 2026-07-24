@@ -15,6 +15,9 @@ import (
 	"strconv"
 	"strings"
 	"syscall"
+
+	"github.com/charlesnpx/convo-relay/internal/contracts"
+	"github.com/charlesnpx/convo-relay/internal/gitexec"
 )
 
 var (
@@ -24,16 +27,30 @@ var (
 )
 
 type repositorySnapshot struct {
-	gitBinary     string
-	root          string
-	launchCWD     string
-	launchSubpath string
-	headCommit    string
-	headTree      string
-	objectFormat  string
-	sourceDigest  string
-	sourceReport  map[string]any
-	exclusions    map[string]any
+	gitBinary      string
+	root           string
+	launchCWD      string
+	launchSubpath  string
+	headCommit     string
+	headTree       string
+	objectFormat   string
+	sourceDigest   string
+	sourceReport   map[string]any
+	exclusions     map[string]any
+	inventoryFiles int64
+	inventoryBytes int64
+}
+
+type repositoryInventoryLimits struct {
+	maxFiles int64
+	maxBytes int64
+}
+
+type repositoryInventoryState struct {
+	limits repositoryInventoryLimits
+	files  int64
+	bytes  int64
+	active map[string]bool
 }
 
 type indexEntry struct {
@@ -61,32 +78,32 @@ type filesystemEntry struct {
 	gitlinkState    string
 	submoduleID     string
 	submoduleDigest string
+	submoduleSource map[string]any
+	submoduleFiles  int64
+	submoduleBytes  int64
 }
-
-type gitCommandError struct {
-	args   []string
-	detail string
-	cause  error
-}
-
-func (e *gitCommandError) Error() string {
-	if e.detail != "" {
-		return fmt.Sprintf("git %s: %s", strings.Join(e.args, " "), e.detail)
-	}
-	return fmt.Sprintf("git %s: %v", strings.Join(e.args, " "), e.cause)
-}
-
-func (e *gitCommandError) Unwrap() error { return e.cause }
 
 func inspectRepository(ctx context.Context, gitBinary string, launchCWD string) (*repositorySnapshot, error) {
-	previous, err := inspectRepositoryPass(ctx, gitBinary, launchCWD)
+	return inspectRepositoryWithLimits(ctx, gitBinary, launchCWD, repositoryInventoryLimits{
+		maxFiles: 100_000,
+		maxBytes: 2 * 1024 * 1024 * 1024,
+	})
+}
+
+func inspectRepositoryWithLimits(
+	ctx context.Context,
+	gitBinary string,
+	launchCWD string,
+	limits repositoryInventoryLimits,
+) (*repositorySnapshot, error) {
+	previous, err := inspectRepositoryPass(ctx, gitBinary, launchCWD, newRepositoryInventoryState(limits), 0)
 	if err != nil {
 		return nil, err
 	}
 	// Require two matching complete inventories. One additional pass is a
 	// bounded retry for a source that changed between the first two passes.
 	for attempt := 0; attempt < 2; attempt++ {
-		current, err := inspectRepositoryPass(ctx, gitBinary, launchCWD)
+		current, err := inspectRepositoryPass(ctx, gitBinary, launchCWD, newRepositoryInventoryState(limits), 0)
 		if err != nil {
 			return nil, err
 		}
@@ -100,6 +117,13 @@ func inspectRepository(ctx context.Context, gitBinary string, launchCWD string) 
 		previous = current
 	}
 	return nil, errInventoryDrift
+}
+
+func newRepositoryInventoryState(limits repositoryInventoryLimits) *repositoryInventoryState {
+	return &repositoryInventoryState{
+		limits: limits,
+		active: map[string]bool{},
+	}
 }
 
 func repositorySnapshotsEquivalent(left *repositorySnapshot, right *repositorySnapshot) (bool, error) {
@@ -129,7 +153,24 @@ func repositorySnapshotsEquivalent(left *repositorySnapshot, right *repositorySn
 	return leftDigest == rightDigest, nil
 }
 
-func inspectRepositoryPass(ctx context.Context, gitBinary string, launchCWD string) (*repositorySnapshot, error) {
+func inspectRepositoryPass(
+	ctx context.Context,
+	gitBinary string,
+	launchCWD string,
+	accounting *repositoryInventoryState,
+	depth int,
+) (*repositorySnapshot, error) {
+	if err := contextError(ctx); err != nil {
+		return nil, err
+	}
+	if depth > 8 {
+		return nil, fmt.Errorf("repository inventory depth exceeds 8")
+	}
+	if accounting == nil {
+		return nil, errors.New("repository inventory accounting is required")
+	}
+	filesBefore := accounting.files
+	bytesBefore := accounting.bytes
 	rootOutput, err := runGit(ctx, gitBinary, launchCWD, "rev-parse", "--show-toplevel")
 	if err != nil {
 		if ctx != nil && ctx.Err() != nil {
@@ -145,6 +186,15 @@ func inspectRepositoryPass(ctx context.Context, gitBinary string, launchCWD stri
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v", errNotGitRepository, err)
 	}
+	repositoryIdentity, err := repositoryInventoryIdentity(ctx, gitBinary, root)
+	if err != nil {
+		return nil, err
+	}
+	if accounting.active[repositoryIdentity] {
+		return nil, fmt.Errorf("repository inventory cycle detected at %s", root)
+	}
+	accounting.active[repositoryIdentity] = true
+	defer delete(accounting.active, repositoryIdentity)
 	headOutput, err := runGit(ctx, gitBinary, root, "rev-parse", "--verify", "HEAD^{commit}")
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v", errUnbornRepository, err)
@@ -170,7 +220,15 @@ func inspectRepositoryPass(ctx context.Context, gitBinary string, launchCWD stri
 	}
 	launchSubpath = filepath.ToSlash(launchSubpath)
 
-	indexOutput, err := runGit(ctx, gitBinary, root, "ls-files", "--stage", "-z", "--")
+	indexRecordLimit := limitsIndexRecordCeiling(accounting.limits.maxFiles)
+	indexOutput, err := runGitNULRecords(
+		ctx,
+		gitBinary,
+		root,
+		indexRecordLimit,
+		accounting.limits.maxFiles,
+		"ls-files", "--stage", "-z", "--",
+	)
 	if err != nil {
 		return nil, err
 	}
@@ -178,7 +236,14 @@ func inspectRepositoryPass(ctx context.Context, gitBinary string, launchCWD stri
 	if err != nil {
 		return nil, err
 	}
-	headTreeOutput, err := runGit(ctx, gitBinary, root, "ls-tree", "-r", "-z", "--full-tree", "HEAD")
+	headTreeOutput, err := runGitNULRecords(
+		ctx,
+		gitBinary,
+		root,
+		accounting.limits.maxFiles,
+		accounting.limits.maxFiles,
+		"ls-tree", "-r", "-z", "--full-tree", "HEAD",
+	)
 	if err != nil {
 		return nil, err
 	}
@@ -186,7 +251,14 @@ func inspectRepositoryPass(ctx context.Context, gitBinary string, launchCWD stri
 	if err != nil {
 		return nil, err
 	}
-	untrackedOutput, err := runGit(ctx, gitBinary, root, "ls-files", "--others", "--exclude-standard", "-z", "--")
+	untrackedOutput, err := runGitNULRecords(
+		ctx,
+		gitBinary,
+		root,
+		accounting.limits.maxFiles,
+		accounting.limits.maxFiles,
+		"ls-files", "--others", "--exclude-standard", "-z", "--",
+	)
 	if err != nil {
 		return nil, err
 	}
@@ -196,7 +268,7 @@ func inspectRepositoryPass(ctx context.Context, gitBinary string, launchCWD stri
 	trackedFilesystem := make([]filesystemEntry, 0, len(trackedPaths))
 	for _, path := range trackedPaths {
 		expectedGitlink := pathIsGitlink(path, indexEntries)
-		entry, err := inspectFilesystemEntry(ctx, gitBinary, root, path, expectedGitlink)
+		entry, err := inspectFilesystemEntry(ctx, gitBinary, root, path, expectedGitlink, accounting, depth)
 		if err != nil {
 			return nil, fmt.Errorf("tracked path %q: %w", path, err)
 		}
@@ -204,18 +276,35 @@ func inspectRepositoryPass(ctx context.Context, gitBinary string, launchCWD stri
 	}
 	untrackedFilesystem := make([]filesystemEntry, 0, len(untrackedPaths))
 	for _, path := range untrackedPaths {
-		entry, err := inspectFilesystemEntry(ctx, gitBinary, root, path, false)
+		entry, err := inspectFilesystemEntry(ctx, gitBinary, root, path, false, accounting, depth)
 		if err != nil {
 			return nil, fmt.Errorf("untracked path %q: %w", path, err)
 		}
 		untrackedFilesystem = append(untrackedFilesystem, entry)
 	}
 
-	stagedOutput, err := runGit(ctx, gitBinary, root, "diff-index", "--cached", "--name-only", "-z", "HEAD", "--")
+	filterOverrides, err := checkoutFilterDisableArgs(ctx, gitBinary, root)
 	if err != nil {
 		return nil, err
 	}
-	unstagedOutput, err := runGit(ctx, gitBinary, root, "diff-files", "--name-only", "-z", "--")
+	stagedArgs := append(append([]string{}, filterOverrides...),
+		"diff-index", "--cached", "--name-only", "-z", "--no-ext-diff", "--no-textconv", "--ignore-submodules=none", "HEAD", "--",
+	)
+	stagedOutput, err := runGit(ctx, gitBinary, root, stagedArgs...)
+	if err != nil {
+		return nil, err
+	}
+	// Always compare through a freshly constructed index. Its entries have no
+	// reusable filesystem stat cache, so repository-local trustctime/checkStat
+	// settings and skip-worktree/assume-unchanged hints cannot hide changed
+	// bytes from the dirty-source decision.
+	unstagedOutput, err := diffFilesWithUnhintedIndex(
+		ctx,
+		gitBinary,
+		root,
+		indexOutput,
+		filterOverrides,
+	)
 	if err != nil {
 		return nil, err
 	}
@@ -255,19 +344,23 @@ func inspectRepositoryPass(ctx context.Context, gitBinary string, launchCWD stri
 			"index_entries":      indexReport,
 			"tracked_worktree":   trackedReport,
 			"untracked_worktree": untrackedReport,
+			"file_count":         accounting.files - filesBefore,
+			"byte_count":         accounting.bytes - bytesBefore,
 		},
 	}
 	return &repositorySnapshot{
-		gitBinary:     gitBinary,
-		root:          root,
-		launchCWD:     launchCWD,
-		launchSubpath: launchSubpath,
-		headCommit:    headCommit,
-		headTree:      headTree,
-		objectFormat:  objectFormat,
-		sourceDigest:  sourceDigest,
-		sourceReport:  sourceReport,
-		exclusions:    exclusions,
+		gitBinary:      gitBinary,
+		root:           root,
+		launchCWD:      launchCWD,
+		launchSubpath:  launchSubpath,
+		headCommit:     headCommit,
+		headTree:       headTree,
+		objectFormat:   objectFormat,
+		sourceDigest:   sourceDigest,
+		sourceReport:   sourceReport,
+		exclusions:     exclusions,
+		inventoryFiles: accounting.files - filesBefore,
+		inventoryBytes: accounting.bytes - bytesBefore,
 	}, nil
 }
 
@@ -287,36 +380,176 @@ func verifyCommittedLaunchSubpath(ctx context.Context, repository *repositorySna
 }
 
 func runGit(ctx context.Context, gitBinary string, cwd string, args ...string) ([]byte, error) {
-	if ctx == nil {
-		ctx = context.Background()
+	return gitexec.Run(ctx, gitBinary, cwd, nil, args...)
+}
+
+func runGitNULRecords(
+	ctx context.Context,
+	gitBinary string,
+	cwd string,
+	recordLimit int64,
+	repositoryFileLimit int64,
+	args ...string,
+) ([]byte, error) {
+	output, err := gitexec.RunNULRecords(ctx, gitBinary, cwd, nil, recordLimit, args...)
+	if err == nil {
+		return output, nil
 	}
-	commandArgs := make([]string, 0, len(args)+2)
-	if strings.TrimSpace(cwd) != "" {
-		commandArgs = append(commandArgs, "-C", cwd)
+	var recordErr *gitexec.OutputRecordLimitError
+	if errors.As(err, &recordErr) {
+		observed := repositoryFileLimit
+		if observed < int64(^uint64(0)>>1) {
+			observed++
+		}
+		return nil, &contracts.ResourceLimitError{
+			Code:     contracts.DiagnosticCodeRepositoryInventoryMaxFiles,
+			Resource: "repository inventory files",
+			Limit:    repositoryFileLimit,
+			Observed: observed,
+		}
 	}
-	commandArgs = append(commandArgs, args...)
-	command := exec.CommandContext(ctx, gitBinary, commandArgs...)
-	command.Env = controlledGitEnvironment(os.Environ())
-	output, err := command.CombinedOutput()
+	return nil, err
+}
+
+func limitsIndexRecordCeiling(fileLimit int64) int64 {
+	if fileLimit <= 0 {
+		return fileLimit
+	}
+	const maximumInt64 = int64(^uint64(0) >> 1)
+	if fileLimit > maximumInt64/4 {
+		return maximumInt64
+	}
+	return fileLimit * 4
+}
+
+func diffFilesWithUnhintedIndex(
+	ctx context.Context,
+	gitBinary string,
+	root string,
+	indexEntries []byte,
+	filterOverrides []string,
+) (output []byte, err error) {
+	tempRoot, err := os.MkdirTemp("", "convo-relay-index-")
 	if err != nil {
-		return nil, &gitCommandError{args: args, detail: strings.TrimSpace(string(output)), cause: err}
+		return nil, fmt.Errorf("create temporary Git index directory: %w", err)
+	}
+	defer func() {
+		err = errors.Join(err, os.RemoveAll(tempRoot))
+	}()
+	indexPath := filepath.Join(tempRoot, "index")
+	environment := map[string]string{"GIT_INDEX_FILE": indexPath}
+	if _, err := gitexec.Run(
+		ctx,
+		gitBinary,
+		root,
+		environment,
+		"read-tree",
+		"--empty",
+	); err != nil {
+		return nil, fmt.Errorf("initialize temporary Git index: %w", err)
+	}
+	if len(indexEntries) > 0 {
+		if _, err := gitexec.RunWithInput(
+			ctx,
+			gitBinary,
+			root,
+			environment,
+			indexEntries,
+			"update-index",
+			"-z",
+			"--index-info",
+		); err != nil {
+			return nil, fmt.Errorf("populate temporary Git index: %w", err)
+		}
+	}
+	statOverrides := []string{
+		"-c", "core.trustctime=true",
+		"-c", "core.checkStat=default",
+		"-c", "core.ignoreStat=false",
+	}
+	refreshArgs := append(append(append([]string{}, filterOverrides...), statOverrides...), "update-index", "--really-refresh")
+	if _, err := gitexec.Run(ctx, gitBinary, root, environment, refreshArgs...); err != nil && !gitCommandExitedWith(err, 1) {
+		return nil, fmt.Errorf("refresh temporary Git index: %w", err)
+	}
+	args := append(append(append([]string{}, filterOverrides...), statOverrides...),
+		"diff-files", "--name-only", "-z", "--no-ext-diff", "--no-textconv", "--ignore-submodules=none", "--",
+	)
+	output, err = gitexec.Run(ctx, gitBinary, root, environment, args...)
+	if err != nil {
+		return nil, fmt.Errorf("inspect worktree with temporary Git index: %w", err)
 	}
 	return output, nil
 }
 
-func controlledGitEnvironment(environ []string) []string {
-	result := make([]string, 0, len(environ)+3)
-	for _, entry := range environ {
-		key := entry
-		if separator := strings.IndexByte(entry, '='); separator >= 0 {
-			key = entry[:separator]
+func gitCommandExitedWith(err error, code int) bool {
+	var commandError *gitexec.CommandError
+	if !errors.As(err, &commandError) {
+		return false
+	}
+	var exitError *exec.ExitError
+	return errors.As(commandError.Cause, &exitError) && exitError.ExitCode() == code
+}
+
+func repositoryInventoryIdentity(ctx context.Context, gitBinary string, root string) (string, error) {
+	output, err := runGit(ctx, gitBinary, root, "rev-parse", "--path-format=absolute", "--git-common-dir")
+	if err != nil {
+		output, err = runGit(ctx, gitBinary, root, "rev-parse", "--git-common-dir")
+		if err != nil {
+			return "", err
 		}
-		if strings.EqualFold(key, "LC_ALL") || strings.HasPrefix(strings.ToUpper(key), "GIT_") {
+	}
+	commonDir := strings.TrimSpace(string(output))
+	if commonDir == "" {
+		return "", errors.New("Git repository has no common directory identity")
+	}
+	if !filepath.IsAbs(commonDir) {
+		commonDir = filepath.Join(root, commonDir)
+	}
+	identity, err := canonicalExistingDirectory(commonDir)
+	if err != nil {
+		return "", err
+	}
+	return identity, nil
+}
+
+func checkoutFilterDisableArgs(ctx context.Context, gitBinary string, root string) ([]string, error) {
+	output, err := runGit(ctx, gitBinary, root, "config", "--null", "--name-only", "--list")
+	if err != nil {
+		return nil, err
+	}
+	drivers := map[string]bool{}
+	for _, rawName := range splitNUL(output) {
+		name := string(rawName)
+		if !strings.HasPrefix(name, "filter.") {
 			continue
 		}
-		result = append(result, entry)
+		for _, suffix := range []string{".clean", ".smudge", ".process"} {
+			if !strings.HasSuffix(name, suffix) {
+				continue
+			}
+			driver := strings.TrimSuffix(strings.TrimPrefix(name, "filter."), suffix)
+			if strings.TrimSpace(driver) != "" {
+				drivers[driver] = true
+			}
+		}
 	}
-	return append(result, "LC_ALL=C", "GIT_TERMINAL_PROMPT=0", "GIT_OPTIONAL_LOCKS=0")
+	names := make([]string, 0, len(drivers))
+	for driver := range drivers {
+		names = append(names, driver)
+	}
+	sort.Strings(names)
+	args := make([]string, 0, len(names)*8)
+	for _, driver := range names {
+		prefix := "filter." + driver + "."
+		args = append(
+			args,
+			"-c", prefix+"clean=",
+			"-c", prefix+"smudge=",
+			"-c", prefix+"process=",
+			"-c", prefix+"required=false",
+		)
+	}
+	return args, nil
 }
 
 func parseIndexEntries(data []byte) ([]indexEntry, error) {
@@ -407,24 +640,38 @@ func pathIsGitlink(path string, indexEntries []indexEntry) bool {
 	return false
 }
 
-func inspectFilesystemEntry(ctx context.Context, gitBinary string, root string, gitPath string, expectedGitlink bool) (filesystemEntry, error) {
+func inspectFilesystemEntry(
+	ctx context.Context,
+	gitBinary string,
+	root string,
+	gitPath string,
+	expectedGitlink bool,
+	accounting *repositoryInventoryState,
+	depth int,
+) (filesystemEntry, error) {
+	if err := contextError(ctx); err != nil {
+		return filesystemEntry{}, err
+	}
 	if err := validateGitPath(gitPath); err != nil {
 		return filesystemEntry{}, err
 	}
 	fullPath := filepath.Join(root, filepath.FromSlash(gitPath))
-	before, err := os.Lstat(fullPath)
+	before, obstruction, err := lstatGitPathNoFollow(root, gitPath)
 	if err != nil {
-		if os.IsNotExist(err) || errors.Is(err, syscall.ENOTDIR) {
-			entry := filesystemEntry{path: gitPath, present: false}
-			if errors.Is(err, syscall.ENOTDIR) {
-				entry.obstruction = "ancestor_not_directory"
-			}
-			if expectedGitlink {
-				entry.gitlinkState = "uninitialized"
-			}
-			return entry, nil
-		}
 		return filesystemEntry{}, err
+	}
+	if obstruction != "" {
+		if err := accounting.addEntry(0); err != nil {
+			return filesystemEntry{}, err
+		}
+		entry := filesystemEntry{path: gitPath, present: false}
+		if obstruction != "missing" {
+			entry.obstruction = obstruction
+		}
+		if expectedGitlink {
+			entry.gitlinkState = "uninitialized"
+		}
+		return entry, nil
 	}
 	entry := filesystemEntry{path: gitPath, present: true, permissions: fmt.Sprintf("%04o", before.Mode().Perm())}
 	if before.Mode()&os.ModeSymlink != 0 {
@@ -436,6 +683,9 @@ func inspectFilesystemEntry(ctx context.Context, gitBinary string, root string, 
 		if err != nil || !os.SameFile(before, after) {
 			return filesystemEntry{}, fmt.Errorf("symlink changed during inventory")
 		}
+		if err := accounting.addEntry(int64(len([]byte(target)))); err != nil {
+			return filesystemEntry{}, err
+		}
 		entry.mode = "120000"
 		entry.sizeBytes = int64(len([]byte(target)))
 		entry.rawDigest = digestBytes([]byte(target))
@@ -443,12 +693,21 @@ func inspectFilesystemEntry(ctx context.Context, gitBinary string, root string, 
 	}
 	if before.IsDir() {
 		if expectedGitlink {
-			return inspectGitlinkEntry(ctx, gitBinary, fullPath, entry)
+			if err := accounting.addEntry(0); err != nil {
+				return filesystemEntry{}, err
+			}
+			return inspectGitlinkEntry(ctx, gitBinary, fullPath, entry, accounting, depth)
+		}
+		if err := accounting.addEntry(0); err != nil {
+			return filesystemEntry{}, err
 		}
 		return filesystemEntry{path: gitPath, present: false, obstruction: "directory"}, nil
 	}
 	if !before.Mode().IsRegular() {
 		return filesystemEntry{}, fmt.Errorf("source inventory supports regular files, symlinks, and gitlinks only")
+	}
+	if err := accounting.addEntry(before.Size()); err != nil {
+		return filesystemEntry{}, err
 	}
 	handle, err := openWorkspaceFileNoFollow(fullPath)
 	if err != nil {
@@ -460,9 +719,14 @@ func inspectFilesystemEntry(ctx context.Context, gitBinary string, root string, 
 		return filesystemEntry{}, fmt.Errorf("file changed before inventory read")
 	}
 	hasher := sha256.New()
-	size, err := io.Copy(hasher, handle)
-	if err != nil {
-		return filesystemEntry{}, err
+	size, readErr := io.CopyN(hasher, &contextReader{ctx: ctx, reader: handle}, opened.Size())
+	var extra [1]byte
+	extraCount, extraErr := (&contextReader{ctx: ctx, reader: handle}).Read(extra[:])
+	if extraErr != nil && !errors.Is(extraErr, io.EOF) {
+		readErr = errors.Join(readErr, extraErr)
+	}
+	if readErr != nil || size != opened.Size() || extraCount != 0 {
+		return filesystemEntry{}, errors.Join(readErr, errors.New("file changed during bounded inventory read"))
 	}
 	after, err := handle.Stat()
 	if err != nil || after.Size() != opened.Size() || after.Mode() != opened.Mode() || !after.ModTime().Equal(opened.ModTime()) {
@@ -482,7 +746,47 @@ func inspectFilesystemEntry(ctx context.Context, gitBinary string, root string, 
 	return entry, nil
 }
 
-func inspectGitlinkEntry(ctx context.Context, gitBinary string, fullPath string, entry filesystemEntry) (filesystemEntry, error) {
+func lstatGitPathNoFollow(root string, gitPath string) (os.FileInfo, string, error) {
+	if err := validateGitPath(gitPath); err != nil {
+		return nil, "", err
+	}
+	components := strings.Split(gitPath, "/")
+	current := root
+	for index, component := range components {
+		current = filepath.Join(current, filepath.FromSlash(component))
+		info, err := os.Lstat(current)
+		if os.IsNotExist(err) {
+			return nil, "missing", nil
+		}
+		if errors.Is(err, syscall.ENOTDIR) {
+			return nil, "ancestor_not_directory", nil
+		}
+		if err != nil {
+			return nil, "", err
+		}
+		if index < len(components)-1 {
+			if info.Mode()&os.ModeSymlink != 0 {
+				return nil, "ancestor_symlink", nil
+			}
+			if !info.IsDir() {
+				return nil, "ancestor_not_directory", nil
+			}
+		}
+		if index == len(components)-1 {
+			return info, "", nil
+		}
+	}
+	return nil, "missing", nil
+}
+
+func inspectGitlinkEntry(
+	ctx context.Context,
+	gitBinary string,
+	fullPath string,
+	entry filesystemEntry,
+	accounting *repositoryInventoryState,
+	depth int,
+) (filesystemEntry, error) {
 	rootOutput, err := runGit(ctx, gitBinary, fullPath, "rev-parse", "--show-toplevel")
 	if err != nil {
 		entry.present = false
@@ -500,7 +804,9 @@ func inspectGitlinkEntry(ctx context.Context, gitBinary string, fullPath string,
 		entry.permissions = ""
 		return entry, nil
 	}
-	submodule, err := inspectRepository(ctx, gitBinary, fullPath)
+	filesBefore := accounting.files
+	bytesBefore := accounting.bytes
+	submodule, err := inspectRepositoryPass(ctx, gitBinary, fullPath, accounting, depth+1)
 	if err != nil {
 		return filesystemEntry{}, fmt.Errorf("gitlink inventory: %w", err)
 	}
@@ -509,12 +815,78 @@ func inspectGitlinkEntry(ctx context.Context, gitBinary string, fullPath string,
 	entry.submoduleID = submodule.headCommit
 	entry.submoduleDigest = submodule.sourceDigest
 	entry.rawDigest = submodule.sourceDigest
+	entry.submoduleSource = cloneMap(submodule.sourceReport)
+	entry.submoduleSource["exclusions"] = cloneMap(submodule.exclusions)
+	entry.submoduleFiles = accounting.files - filesBefore
+	entry.submoduleBytes = accounting.bytes - bytesBefore
 	return entry, nil
+}
+
+func (s *repositoryInventoryState) addEntry(size int64) error {
+	if s == nil {
+		return errors.New("repository inventory accounting is required")
+	}
+	files, err := contracts.CheckedAddResource(
+		s.files,
+		1,
+		s.limits.maxFiles,
+		contracts.DiagnosticCodeRepositoryInventoryMaxFiles,
+		"repository inventory files",
+	)
+	if err != nil {
+		return err
+	}
+	bytes, err := contracts.CheckedAddResource(
+		s.bytes,
+		size,
+		s.limits.maxBytes,
+		contracts.DiagnosticCodeRepositoryInventoryMaxBytes,
+		"repository inventory bytes",
+	)
+	if err != nil {
+		return err
+	}
+	s.files = files
+	s.bytes = bytes
+	return nil
+}
+
+type contextReader struct {
+	ctx    context.Context
+	reader io.Reader
+}
+
+func (r *contextReader) Read(buffer []byte) (int, error) {
+	if err := contextError(r.ctx); err != nil {
+		return 0, err
+	}
+	count, err := r.reader.Read(buffer)
+	if contextErr := contextError(r.ctx); contextErr != nil {
+		return count, contextErr
+	}
+	return count, err
+}
+
+func contextError(ctx context.Context) error {
+	if ctx == nil {
+		return nil
+	}
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	default:
+		return nil
+	}
 }
 
 func validateGitPath(path string) error {
 	if path == "" || strings.IndexByte(path, 0) >= 0 || filepath.IsAbs(filepath.FromSlash(path)) {
 		return fmt.Errorf("invalid Git path")
+	}
+	for _, component := range strings.Split(path, "/") {
+		if component == "" || component == "." || component == ".." {
+			return fmt.Errorf("invalid Git path")
+		}
 	}
 	cleaned := filepath.Clean(filepath.FromSlash(path))
 	if cleaned == ".." || strings.HasPrefix(cleaned, ".."+string(filepath.Separator)) {
@@ -562,6 +934,11 @@ func filesystemEntriesReport(entries []filesystemEntry) []any {
 			if entry.submoduleDigest != "" {
 				item["submodule_source_digest"] = entry.submoduleDigest
 			}
+			if entry.submoduleSource != nil {
+				item["submodule_source"] = cloneMap(entry.submoduleSource)
+				item["submodule_inventory_files"] = entry.submoduleFiles
+				item["submodule_inventory_bytes"] = entry.submoduleBytes
+			}
 		}
 		result = append(result, item)
 	}
@@ -589,17 +966,17 @@ func repositoryStateForError(err error) string {
 }
 
 func gitExecutableUnavailable(err error) bool {
-	var commandError *gitCommandError
+	var commandError *gitexec.CommandError
 	if !errors.As(err, &commandError) {
 		return false
 	}
-	if errors.Is(commandError.cause, exec.ErrNotFound) {
+	if errors.Is(commandError.Cause, exec.ErrNotFound) {
 		return true
 	}
 	var executableError *exec.Error
-	if errors.As(commandError.cause, &executableError) {
+	if errors.As(commandError.Cause, &executableError) {
 		return true
 	}
 	var pathError *os.PathError
-	return errors.As(commandError.cause, &pathError)
+	return errors.As(commandError.Cause, &pathError)
 }

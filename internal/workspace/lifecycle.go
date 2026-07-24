@@ -62,6 +62,92 @@ type CleanupResult struct {
 	MetadataPruned    bool
 }
 
+// CleanupInitializationWorktree removes only the exact detached registration
+// captured by an initialization journal. A mismatched live registration is
+// never removed, and an unregistered filesystem entry is left for the
+// transaction-owned session cleanup that has independent ownership evidence.
+func CleanupInitializationWorktree(
+	ctx context.Context,
+	sourceGitRoot string,
+	worktreePath string,
+	expectedHead string,
+	expectedRoot os.FileInfo,
+) error {
+	if strings.TrimSpace(sourceGitRoot) == "" || strings.TrimSpace(worktreePath) == "" {
+		return nil
+	}
+	sourceRoot, err := lexicalAbsolutePath(sourceGitRoot)
+	if err != nil {
+		return err
+	}
+	target, err := lexicalAbsolutePath(worktreePath)
+	if err != nil {
+		return err
+	}
+	if err := rejectSymlinkPathComponents(sourceRoot); err != nil {
+		return contracts.NewValidationError("initialization source repository path is unsafe: %v", err)
+	}
+	if err := rejectSymlinkPathComponents(target); err != nil {
+		return contracts.NewValidationError("initialization worktree path is unsafe: %v", err)
+	}
+	repository, err := repositoryForCleanup(ctx, sourceRoot)
+	if err != nil {
+		return err
+	}
+	record, registered, err := repositoryWorktreeRegistrationExact(ctx, repository, target)
+	if err != nil {
+		return err
+	}
+	if registered {
+		if record.Bare || !record.Detached || record.Branch != "" || strings.TrimSpace(record.Head) != strings.TrimSpace(expectedHead) {
+			return contracts.NewValidationError("initialization worktree registration does not match its journal")
+		}
+		if err := validateInitializationWorktreeRootIdentity(target, expectedRoot); err != nil {
+			return err
+		}
+		if err := rejectSymlinkPathComponents(target); err != nil {
+			return contracts.NewValidationError("initialization worktree path changed before Git cleanup: %v", err)
+		}
+		if err := validateInitializationWorktreeRootIdentity(target, expectedRoot); err != nil {
+			return err
+		}
+		if _, err := runGit(ctx, repository.gitBinary, repository.root, "worktree", "remove", "--force", target); err != nil {
+			return err
+		}
+	}
+	if stillRegistered, err := repositoryWorktreeRegisteredExact(ctx, repository, target); err != nil {
+		return err
+	} else if stillRegistered {
+		return contracts.NewValidationError("initialization worktree registration remained after cleanup")
+	}
+	if err := rejectSymlinkPathComponents(target); err != nil {
+		return contracts.NewValidationError("initialization worktree path changed after Git cleanup: %v", err)
+	}
+	if _, err := os.Lstat(target); err == nil && registered {
+		return contracts.NewValidationError("initialization worktree path remained after its Git registration was removed")
+	} else if err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	return nil
+}
+
+func validateInitializationWorktreeRootIdentity(target string, expected os.FileInfo) error {
+	current, err := os.Lstat(target)
+	if os.IsNotExist(err) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if current.Mode()&os.ModeSymlink != 0 || !current.IsDir() {
+		return contracts.NewValidationError("initialization worktree root changed type before Git cleanup")
+	}
+	if expected == nil || !expected.IsDir() || !os.SameFile(expected, current) {
+		return contracts.NewValidationError("initialization worktree root changed identity before Git cleanup")
+	}
+	return nil
+}
+
 // Recover validates the persisted workspace boundary without changing it.
 // Isolated execution requires the exact detached worktree captured at launch;
 // inherited execution requires its recorded launch directory. The returned
@@ -138,6 +224,15 @@ func Recover(ctx context.Context, st *store.Store) (*Materialized, error) {
 	if err != nil || !pathsEquivalent(worktreeRoot, paths.worktreePath) {
 		return nil, contracts.NewValidationError("required retained execution worktree path changed")
 	}
+	rawDescriptor, hasRawDescriptor, err := rawExportDescriptorFromArtifact(artifact)
+	if err != nil {
+		return nil, contracts.NewValidationError("execution_workspace committed export descriptor is invalid: %v", err)
+	}
+	if hasRawDescriptor {
+		if err := verifyRawExport(ctx, worktreeRoot, rawDescriptor); err != nil {
+			return nil, contracts.NewValidationError("required retained execution worktree content changed: %v", err)
+		}
+	}
 	headOutput, err := runGit(ctx, repository.gitBinary, worktreeRoot, "rev-parse", "--verify", "HEAD^{commit}")
 	if err != nil || strings.TrimSpace(string(headOutput)) != expectedHead {
 		return nil, contracts.NewValidationError("required retained execution worktree HEAD changed")
@@ -211,7 +306,11 @@ func Finalize(ctx context.Context, st *store.Store) (*Finalization, error) {
 	// the launch subdirectory. Inventory from the stable Git root so deleting
 	// or replacing that subdirectory is classified as source mutation instead
 	// of making terminal finalization impossible.
-	repository, err := inspectRepository(ctx, "git", paths.sourceGitRoot)
+	inventoryLimits, err := persistedRepositoryInventoryLimits(artifact)
+	if err != nil {
+		return nil, err
+	}
+	repository, err := inspectRepositoryWithLimits(ctx, "git", paths.sourceGitRoot, inventoryLimits)
 	if err != nil {
 		return nil, fmt.Errorf("recompute source workspace inventory: %w", err)
 	}
@@ -233,6 +332,27 @@ func Finalize(ctx context.Context, st *store.Store) (*Finalization, error) {
 		return nil, err
 	}
 	return finalizationFromArtifact(updated, updatedRef, policy, before, after), nil
+}
+
+func persistedRepositoryInventoryLimits(artifact map[string]any) (repositoryInventoryLimits, error) {
+	defaults := repositoryInventoryLimits{
+		maxFiles: 100_000,
+		maxBytes: 2 * 1024 * 1024 * 1024,
+	}
+	raw, exists := artifact["repository_inventory_limits"]
+	if !exists {
+		return defaults, nil
+	}
+	payload, ok := raw.(map[string]any)
+	if !ok {
+		return repositoryInventoryLimits{}, contracts.NewValidationError("execution_workspace repository inventory limits must be an object")
+	}
+	maxFiles, filesOK := nonnegativeInt64(payload["max_files"])
+	maxBytes, bytesOK := nonnegativeInt64(payload["max_bytes"])
+	if !filesOK || !bytesOK || maxFiles < 1 || maxBytes < 1 {
+		return repositoryInventoryLimits{}, contracts.NewValidationError("execution_workspace repository inventory limits must be positive")
+	}
+	return repositoryInventoryLimits{maxFiles: maxFiles, maxBytes: maxBytes}, nil
 }
 
 // Cleanup removes a persisted detached worktree registration with
