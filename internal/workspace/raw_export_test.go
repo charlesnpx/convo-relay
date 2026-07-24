@@ -81,6 +81,7 @@ func TestRawExportBypassesHooksFiltersReplacementSparseAndCheckoutConversion(t *
 		SessionDir:      sessionDir,
 		MinimumPolicy:   PolicyEphemeral,
 		RequestedPolicy: PolicyEphemeral,
+		AllowDirtySource: true,
 	})
 	materialized, err := Materialize(context.Background(), store.New(sessionDir), snapshot)
 	if err != nil {
