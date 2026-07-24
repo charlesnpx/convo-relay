@@ -421,16 +421,25 @@ func startRecipeRun(ctx context.Context, preflight *recipePreflight) (map[string
 	if err := persisted.st.SaveTranscript(transcript); err != nil {
 		return nil, transaction.Fail(err)
 	}
+	if err := runRootInitializationAfterMutation("transcript_persisted"); err != nil {
+		return nil, transaction.Fail(err)
+	}
 	if err := transaction.advance("transcript_persisted"); err != nil {
 		return nil, transaction.Fail(err)
 	}
 	if _, err := persisted.st.AppendSessionEventV1("node_started", graph.RootNodeID, "Root recipe execution is ready", rootRecipeStartEvent(preflight, persisted), store.EventOptions{}); err != nil {
 		return nil, transaction.Fail(err)
 	}
+	if err := runRootInitializationAfterMutation("start_event_persisted"); err != nil {
+		return nil, transaction.Fail(err)
+	}
 	if err := transaction.advance("start_event_persisted"); err != nil {
 		return nil, transaction.Fail(err)
 	}
 	if _, _, err := graph.RepairAndSaveFromEvents(persisted.st); err != nil {
+		return nil, transaction.Fail(err)
+	}
+	if err := runRootInitializationAfterMutation("graph_persisted"); err != nil {
 		return nil, transaction.Fail(err)
 	}
 	if err := transaction.advance("graph_persisted"); err != nil {
@@ -455,7 +464,7 @@ func persistRecipePreflight(
 	if transaction == nil {
 		return nil, errors.New("root recipe persistence requires an initialization transaction")
 	}
-	st := store.New(preflight.sessionDir)
+	st := transaction.st
 	runtimeConfigRef, err := persistPreparedRuntimeConfigSnapshot(st, preflight.runtimeSnapshot)
 	if err != nil {
 		return nil, err
@@ -540,14 +549,20 @@ func persistRecipePreflight(
 		}
 		inputManifestRef = persistedInputs.ManifestRef
 	}
-	materializedWorkspace, err := workspace.Materialize(ctx, st, preflight.workspace)
+	materializedWorkspace, err := transaction.materializeWorkspace(ctx, preflight.workspace)
 	if err != nil {
+		return nil, err
+	}
+	if err := runRootInitializationAfterMutation("workspace_materialized"); err != nil {
 		return nil, err
 	}
 	if err := transaction.advance("workspace_materialized"); err != nil {
 		return nil, err
 	}
 	if inputManifestRef != nil {
+		if err := transaction.beginOwnedScope("retained_input_materialization", filepath.Join("execution", "inputs")); err != nil {
+			return nil, err
+		}
 		retained, materializeErr := namedinputs.MaterializeRetained(
 			ctx,
 			st,
@@ -556,10 +571,25 @@ func persistRecipePreflight(
 		)
 		err = materializeErr
 		if err != nil {
+			return nil, errors.Join(err, transaction.abortOwnedScope())
+		}
+		if err := namedinputs.VerifyRetained(
+			ctx,
+			st,
+			retained.DescriptorRef,
+			"initialization_scope",
+			namedinputs.IntegrityBoundaryInitialization,
+		); err != nil {
+			return nil, err
+		}
+		if err := transaction.completeOwnedScope(); err != nil {
 			return nil, err
 		}
 		providerInputs = retained.ProviderInputs
 		retainedInputRef = retained.DescriptorRef
+		if err := runRootInitializationAfterMutation("inputs_materialized"); err != nil {
+			return nil, err
+		}
 		if err := transaction.advance("inputs_materialized"); err != nil {
 			return nil, err
 		}
@@ -572,6 +602,9 @@ func persistRecipePreflight(
 		); err != nil {
 			return nil, err
 		}
+	}
+	if err := runRootInitializationAfterMutation("retained_inputs_verified"); err != nil {
+		return nil, err
 	}
 	if err := transaction.advance("retained_inputs_verified"); err != nil {
 		return nil, err
@@ -601,6 +634,9 @@ func persistRecipePreflight(
 	}
 	persisted.checkpointRef, err = saveRootArtifact(st, contracts.RootArtifactKindRootCheckpoint, 1, checkpoint)
 	if err != nil {
+		return nil, err
+	}
+	if err := runRootInitializationAfterMutation("checkpoint_1_persisted"); err != nil {
 		return nil, err
 	}
 	if err := transaction.advance("checkpoint_1_persisted"); err != nil {

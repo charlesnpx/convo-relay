@@ -60,10 +60,7 @@ func MaterializeRetained(
 		} else if err != nil && !os.IsNotExist(err) {
 			return nil, err
 		}
-		if err := store.AtomicWriteFile(target, entry.data); err != nil {
-			return nil, err
-		}
-		if err := os.Chmod(target, 0o444); err != nil {
+		if err := st.WriteFileAtomically(target, entry.data, 0o444); err != nil {
 			return nil, err
 		}
 		providerItem := map[string]any{
@@ -228,10 +225,16 @@ func VerifyRetained(
 			return retainedMismatchError(mismatch, errors.Join(statErr, closeErr))
 		}
 		hasher := sha256.New()
-		size, readErr := io.Copy(hasher, &retainedContextReader{ctx: ctx, reader: handle})
+		reader := &retainedContextReader{ctx: ctx, reader: handle}
+		size, readErr := io.CopyN(hasher, reader, entry.sizeBytes)
+		var extra [1]byte
+		extraCount, extraErr := reader.Read(extra[:])
+		if extraErr != nil && !errors.Is(extraErr, io.EOF) {
+			readErr = errors.Join(readErr, extraErr)
+		}
 		after, statErr := handle.Stat()
 		closeErr := handle.Close()
-		if readErr != nil || statErr != nil || closeErr != nil {
+		if statErr != nil || closeErr != nil {
 			return errors.Join(readErr, statErr, closeErr)
 		}
 		pathAfter, pathErr := os.Lstat(target)
@@ -243,12 +246,16 @@ func VerifyRetained(
 			mismatch := retainedMismatch(role, boundary, entries, index, IntegrityMismatchPath)
 			return retainedMismatchError(mismatch, pathErr)
 		}
-		digest := contracts.DigestPrefix + hex.EncodeToString(hasher.Sum(nil))
-		if size != entry.sizeBytes {
+		if readErr != nil || size != entry.sizeBytes || extraCount != 0 {
 			mismatch := retainedMismatch(role, boundary, entries, index, IntegrityMismatchSize)
-			mismatch.Observed.SizeBytes = &size
-			return retainedMismatchError(mismatch, nil)
+			observed := size + int64(extraCount)
+			if after.Size() != entry.sizeBytes {
+				observed = after.Size()
+			}
+			mismatch.Observed.SizeBytes = &observed
+			return retainedMismatchError(mismatch, readErr)
 		}
+		digest := contracts.DigestPrefix + hex.EncodeToString(hasher.Sum(nil))
 		if digest != entry.rawDigest {
 			mismatch := retainedMismatch(role, boundary, entries, index, IntegrityMismatchDigest)
 			mismatch.Observed.Digest = digest

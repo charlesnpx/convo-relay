@@ -136,7 +136,7 @@ func (s *Store) AppendSessionEventV1(eventType string, nodeID string, summary st
 	if err != nil {
 		return nil, err
 	}
-	if err := appendLineSynced(filepath.Join(s.Root, EventsFilename), line); err != nil {
+	if err := s.appendLineSynced(filepath.Join(s.Root, EventsFilename), line); err != nil {
 		return nil, err
 	}
 	return event, nil
@@ -155,7 +155,7 @@ func (s *Store) SaveProposal(proposal model.Proposal) error {
 	if err != nil {
 		return err
 	}
-	if err := AtomicWriteFile(filepath.Join(s.Root, "proposals", proposalID+".json"), body); err != nil {
+	if err := s.WriteFileAtomically(filepath.Join(s.Root, "proposals", proposalID+".json"), body, 0o600); err != nil {
 		return err
 	}
 	graph := s.loadGraph()
@@ -302,14 +302,14 @@ func (s *Store) saveIndexedArtifact(category string, artifactID string, payload 
 	if err != nil {
 		return nil, err
 	}
-	if err := AtomicWriteFile(payloadPath, body); err != nil {
-		return nil, rollbackArtifactWrite(rollbackFiles, err)
+	if err := s.WriteFileAtomically(payloadPath, body, 0o600); err != nil {
+		return nil, rollbackArtifactWrite(s, rollbackFiles, err)
 	}
 	if err := s.updateArtifactIndex(ref, relPath); err != nil {
-		return nil, rollbackArtifactWrite(rollbackFiles, err)
+		return nil, rollbackArtifactWrite(s, rollbackFiles, err)
 	}
 	if err := s.recordArtifactGraphEntry(category, artifactID, relPath, ref); err != nil {
-		return nil, rollbackArtifactWrite(rollbackFiles, err)
+		return nil, rollbackArtifactWrite(s, rollbackFiles, err)
 	}
 	return ref, nil
 }
@@ -401,17 +401,17 @@ func captureArtifactWriteRollback(paths []string) ([]artifactWriteRollbackFile, 
 	return result, nil
 }
 
-func rollbackArtifactWrite(files []artifactWriteRollbackFile, cause error) error {
+func rollbackArtifactWrite(s *Store, files []artifactWriteRollbackFile, cause error) error {
 	errorsToJoin := []error{cause}
 	for index := len(files) - 1; index >= 0; index-- {
-		if err := files[index].restore(); err != nil {
+		if err := files[index].restore(s); err != nil {
 			errorsToJoin = append(errorsToJoin, fmt.Errorf("restore %s: %w", files[index].path, err))
 		}
 	}
 	return errors.Join(errorsToJoin...)
 }
 
-func (snapshot artifactWriteRollbackFile) restore() error {
+func (snapshot artifactWriteRollbackFile) restore(s *Store) error {
 	info, err := os.Lstat(snapshot.path)
 	if err != nil && !os.IsNotExist(err) {
 		return err
@@ -430,7 +430,13 @@ func (snapshot artifactWriteRollbackFile) restore() error {
 		if exists && info.IsDir() {
 			return fmt.Errorf("rollback target changed into a directory")
 		}
-		if err := AtomicWriteFile(snapshot.path, snapshot.body); err != nil {
+		write := AtomicWriteFile
+		if s != nil {
+			write = func(path string, body []byte) error {
+				return s.WriteFileAtomically(path, body, snapshot.mode.Perm())
+			}
+		}
+		if err := write(snapshot.path, snapshot.body); err != nil {
 			return err
 		}
 		return os.Chmod(snapshot.path, snapshot.mode.Perm())
@@ -510,7 +516,7 @@ func (s *Store) updateArtifactIndex(ref map[string]any, relPath string) error {
 	if err != nil {
 		return err
 	}
-	return AtomicWriteFile(filepath.Join(s.Root, "artifacts", ArtifactIndexFilename), body)
+	return s.WriteFileAtomically(filepath.Join(s.Root, "artifacts", ArtifactIndexFilename), body, 0o600)
 }
 
 func (s *Store) recordArtifactGraphEntry(category string, artifactID string, relPath string, ref map[string]any) error {
@@ -625,21 +631,83 @@ func (s *Store) writeIndentedJSONFile(path string, value any) error {
 	if err != nil {
 		return err
 	}
-	return AtomicWriteFile(path, body)
+	return s.WriteFileAtomically(path, body, 0o600)
 }
 
 func AtomicWriteFile(path string, body []byte) error {
+	return atomicWriteFileAt(path, body, 0o600, "")
+}
+
+// WriteFileAtomically applies the Store's optional transaction observer. The
+// observer persists intent before creating and returning an exact temporary
+// file. Store validates and writes through that existing inode.
+func (s *Store) WriteFileAtomically(path string, body []byte, mode os.FileMode) (err error) {
+	if s == nil || s.mutationObserver == nil {
+		return atomicWriteFileAt(path, body, mode, "")
+	}
+	plan, err := s.mutationObserver.BeforeFileMutation(path, bytes.Clone(body), mode)
+	if err != nil {
+		return err
+	}
+	committed := false
+	defer func() {
+		observerErr := s.mutationObserver.AfterFileMutation(plan, committed)
+		if observerErr != nil {
+			err = errors.Join(err, observerErr)
+		}
+	}()
+	if strings.TrimSpace(plan.TemporaryPath) == "" {
+		return errors.New("file mutation observer did not reserve a temporary path")
+	}
+	if err := atomicWriteFileAt(path, body, mode, plan.TemporaryPath); err != nil {
+		return err
+	}
+	committed = true
+	return nil
+}
+
+func atomicWriteFileAt(path string, body []byte, mode os.FileMode, reservedTemporaryPath string) (err error) {
+	if mode.Perm() == 0 {
+		mode = 0o600
+	}
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return err
 	}
-	tmp, err := os.CreateTemp(filepath.Dir(path), "."+filepath.Base(path)+".*.tmp")
+	var tmp *os.File
+	if strings.TrimSpace(reservedTemporaryPath) == "" {
+		tmp, err = os.CreateTemp(filepath.Dir(path), "."+filepath.Base(path)+".*.tmp")
+	} else {
+		if filepath.Dir(filepath.Clean(reservedTemporaryPath)) != filepath.Dir(filepath.Clean(path)) {
+			return errors.New("reserved atomic-write temporary path must share the target directory")
+		}
+		tmp, err = os.OpenFile(reservedTemporaryPath, os.O_WRONLY, mode.Perm())
+	}
 	if err != nil {
 		return err
 	}
 	tmpName := tmp.Name()
+	openedInfo, statErr := tmp.Stat()
+	pathInfo, pathErr := os.Lstat(tmpName)
+	if statErr != nil ||
+		pathErr != nil ||
+		!openedInfo.Mode().IsRegular() ||
+		pathInfo.Mode()&os.ModeSymlink != 0 ||
+		!pathInfo.Mode().IsRegular() ||
+		!os.SameFile(openedInfo, pathInfo) {
+		_ = tmp.Close()
+		return errors.Join(statErr, pathErr, errors.New("atomic-write temporary path changed before use"))
+	}
 	defer func() {
-		_ = os.Remove(tmpName)
+		err = errors.Join(err, removeAtomicTemporaryExact(tmpName, openedInfo))
 	}()
+	if err := tmp.Truncate(0); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Chmod(mode.Perm()); err != nil {
+		_ = tmp.Close()
+		return err
+	}
 	if _, err := tmp.Write(body); err != nil {
 		_ = tmp.Close()
 		return err
@@ -651,10 +719,47 @@ func AtomicWriteFile(path string, body []byte) error {
 	if err := tmp.Close(); err != nil {
 		return err
 	}
+	finalInfo, statErr := os.Lstat(tmpName)
+	if statErr != nil ||
+		finalInfo.Mode()&os.ModeSymlink != 0 ||
+		!finalInfo.Mode().IsRegular() ||
+		!os.SameFile(openedInfo, finalInfo) ||
+		finalInfo.Size() != int64(len(body)) ||
+		finalInfo.Mode().Perm() != mode.Perm() {
+		return errors.Join(statErr, errors.New("atomic-write temporary path changed before commit"))
+	}
 	return os.Rename(tmpName, path)
 }
 
-func appendLineSynced(path string, line []byte) error {
+func removeAtomicTemporaryExact(path string, expected os.FileInfo) error {
+	current, err := os.Lstat(path)
+	if os.IsNotExist(err) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if expected == nil ||
+		current.Mode()&os.ModeSymlink != 0 ||
+		!current.Mode().IsRegular() ||
+		!os.SameFile(expected, current) {
+		return errors.New("atomic-write temporary path changed before cleanup")
+	}
+	return os.Remove(path)
+}
+
+func (s *Store) appendLineSynced(path string, line []byte) error {
+	if s != nil && s.mutationObserver != nil {
+		existing, err := os.ReadFile(path)
+		if err != nil && !os.IsNotExist(err) {
+			return err
+		}
+		body := make([]byte, 0, len(existing)+len(line)+1)
+		body = append(body, existing...)
+		body = append(body, line...)
+		body = append(body, '\n')
+		return s.WriteFileAtomically(path, body, 0o644)
+	}
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return err
 	}

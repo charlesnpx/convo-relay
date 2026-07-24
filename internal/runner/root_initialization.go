@@ -3,14 +3,11 @@ package runner
 import (
 	"context"
 	"crypto/rand"
-	"crypto/sha256"
-	"encoding/base64"
 	"encoding/hex"
 	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
-	"sort"
 	"strings"
 	"time"
 
@@ -25,6 +22,9 @@ const (
 )
 
 var rootInitializationAfterStage func(string) error
+var rootInitializationAfterMutation func(string) error
+var rootInitializationAfterWorktreeRemoval func() error
+var rootInitializationBeforeFileCommit func(string) error
 
 var rootInitializationOwnedEntries = []string{
 	".git",
@@ -40,19 +40,24 @@ var rootInitializationOwnedEntries = []string{
 }
 
 type rootInitializationTransaction struct {
-	token           string
-	sessionRoot     string
-	preExistingRoot bool
-	sourceGitRoot   string
-	worktreePath    string
-	headCommit      string
-	headTree        string
-	objectFormat    string
-	phase           string
-	cleanupState    string
-	ownedDigest     string
-	claimOwned      bool
-	st              *store.Store
+	token             string
+	sessionRoot       string
+	preExistingRoot   bool
+	sourceGitRoot     string
+	worktreePath      string
+	headCommit        string
+	headTree          string
+	objectFormat      string
+	phase             string
+	cleanupState      string
+	ownedDigest       string
+	claimIdentity     string
+	ownedEntries      map[string]rootInitializationOwnedEntry
+	pendingWrite      *rootInitializationWriteIntent
+	pendingScope      *rootInitializationScopeIntent
+	nextWriteSequence uint64
+	mutationLock      *sessionMutationLock
+	st                *store.Store
 }
 
 func beginRootInitialization(preflight *recipePreflight) (*rootInitializationTransaction, error) {
@@ -71,10 +76,25 @@ func beginRootInitialization(preflight *recipePreflight) (*rootInitializationTra
 	if err != nil {
 		return nil, err
 	}
-	releaseClaimOnError := true
+	mutationLock, err := lockSessionMutation(sessionRoot)
+	if err != nil {
+		_ = removeRootInitializationClaim(sessionRoot, token)
+		if !preExisting {
+			_ = os.Remove(sessionRoot)
+		}
+		return nil, err
+	}
+	releaseLeaseOnError := true
+	var transaction *rootInitializationTransaction
 	defer func() {
-		if releaseClaimOnError {
+		if releaseLeaseOnError {
+			if transaction != nil {
+				_ = transaction.removeBootstrapControls()
+				return
+			}
 			_ = removeRootInitializationClaim(sessionRoot, token)
+			_ = mutationLock.Unlock()
+			_ = mutationLock.removePathAfterUnlock()
 			if !preExisting {
 				_ = os.Remove(sessionRoot)
 			}
@@ -93,15 +113,15 @@ func beginRootInitialization(preflight *recipePreflight) (*rootInitializationTra
 	if statErr != nil || info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
 		return nil, rootRecipeDiagnostic(diagnosticCodeSessionPathInvalid, contracts.DiagnosticPhasePolicy, "/session_dir", "The root initialization destination must be a real directory.", nil)
 	}
-	ownedDigest, err := rootInitializationOwnedInventoryDigest(sessionRoot)
-	if err != nil {
-		return nil, err
+	claimInfo, err := os.Lstat(filepath.Join(sessionRoot, rootInitializationClaimName))
+	if err != nil || claimInfo.Mode()&os.ModeSymlink != 0 || !claimInfo.Mode().IsRegular() {
+		return nil, errors.New("root initialization claim identity could not be established")
 	}
 	worktreePath := ""
 	if preflight.workspace.Policy().Effective != workspace.PolicyInherited {
 		worktreePath = filepath.Join(sessionRoot, "execution", "worktree")
 	}
-	transaction := &rootInitializationTransaction{
+	transaction = &rootInitializationTransaction{
 		token:           token,
 		sessionRoot:     sessionRoot,
 		preExistingRoot: preExisting,
@@ -112,9 +132,19 @@ func beginRootInitialization(preflight *recipePreflight) (*rootInitializationTra
 		objectFormat:    preflight.workspace.ObjectFormat(),
 		phase:           "claimed",
 		cleanupState:    "armed",
-		ownedDigest:     ownedDigest,
-		claimOwned:      true,
-		st:              store.New(sessionRoot),
+		claimIdentity: rootInitializationFileIdentity(
+			filepath.Join(sessionRoot, rootInitializationClaimName),
+			claimInfo,
+		),
+		ownedEntries: map[string]rootInitializationOwnedEntry{},
+		mutationLock: mutationLock,
+	}
+	transaction.st = store.NewWithFileMutationObserver(sessionRoot, transaction)
+	if err := transaction.refreshOwnershipDigest(); err != nil {
+		return nil, err
+	}
+	if err := mutationLock.writeMarker(transaction.lockMarker("initializing")); err != nil {
+		return nil, err
 	}
 	if err := transaction.writeJournal(); err != nil {
 		return nil, err
@@ -140,22 +170,43 @@ func beginRootInitialization(preflight *recipePreflight) (*rootInitializationTra
 		"created_at":                            utcNow(),
 	}
 	if err := transaction.st.SaveMetaMap(initializingMeta); err != nil {
-		releaseClaimOnError = false
-		return nil, errors.Join(err, transaction.compensateWithoutMeta())
+		releaseLeaseOnError = false
+		return nil, errors.Join(err, transaction.compensateBootstrap())
+	}
+	if err := runRootInitializationAfterMutation("initializing_metadata_persisted"); err != nil {
+		releaseLeaseOnError = false
+		return nil, transaction.Fail(err)
 	}
 	if err := transaction.advance("session_claimed"); err != nil {
-		releaseClaimOnError = false
+		releaseLeaseOnError = false
+		return nil, transaction.Fail(err)
+	}
+	if err := transaction.beginOwnedScope("session_repository_initialization", ".git"); err != nil {
+		releaseLeaseOnError = false
 		return nil, transaction.Fail(err)
 	}
 	if err := ensureGitRepo(sessionRoot); err != nil {
-		releaseClaimOnError = false
+		abortErr := transaction.abortOwnedScope()
+		releaseLeaseOnError = false
+		return nil, transaction.Fail(errors.Join(err, abortErr))
+	}
+	if err := validateInitializationSessionRepository(sessionRoot); err != nil {
+		releaseLeaseOnError = false
+		return nil, transaction.Fail(err)
+	}
+	if err := transaction.completeOwnedScope(); err != nil {
+		releaseLeaseOnError = false
+		return nil, transaction.Fail(err)
+	}
+	if err := runRootInitializationAfterMutation("session_repository_initialized"); err != nil {
+		releaseLeaseOnError = false
 		return nil, transaction.Fail(err)
 	}
 	if err := transaction.advance("session_repository_initialized"); err != nil {
-		releaseClaimOnError = false
+		releaseLeaseOnError = false
 		return nil, transaction.Fail(err)
 	}
-	releaseClaimOnError = false
+	releaseLeaseOnError = false
 	return transaction, nil
 }
 
@@ -164,7 +215,7 @@ func (t *rootInitializationTransaction) advance(phase string) error {
 		return errors.New("root initialization transaction is required")
 	}
 	t.phase = strings.TrimSpace(phase)
-	if err := t.refreshOwnedInventory(); err != nil {
+	if err := t.refreshOwnershipDigest(); err != nil {
 		return err
 	}
 	meta, err := t.st.LoadMeta()
@@ -207,15 +258,19 @@ func (t *rootInitializationTransaction) markReady(meta map[string]any) error {
 	if err := t.st.SaveMetaMap(ready); err != nil {
 		return err
 	}
+	t.phase = "ready"
+	t.cleanupState = "disarmed"
 	if rootInitializationAfterStage != nil {
 		if err := rootInitializationAfterStage("ready_metadata_persisted"); err != nil {
 			return err
 		}
 	}
-	t.phase = "ready"
-	t.cleanupState = "disarmed"
 	_ = t.writeJournal()
-	return removeRootInitializationClaim(t.sessionRoot, t.token)
+	if err := removeRootInitializationClaim(t.sessionRoot, t.token); err != nil {
+		return err
+	}
+	t.st.SetFileMutationObserver(nil)
+	return t.releaseMutationLock()
 }
 
 func (t *rootInitializationTransaction) Fail(primary error) error {
@@ -227,6 +282,15 @@ func (t *rootInitializationTransaction) Fail(primary error) error {
 }
 
 func (t *rootInitializationTransaction) compensate() error {
+	defer func() {
+		_ = t.releaseMutationLock()
+	}()
+	if err := t.resolvePendingWrite(); err != nil {
+		return fmt.Errorf("resolve pending initialization write: %w", err)
+	}
+	if err := t.resolvePendingScope(); err != nil {
+		return fmt.Errorf("resolve pending initialization mutation scope: %w", err)
+	}
 	meta, err := t.st.LoadMeta()
 	if err != nil {
 		return fmt.Errorf("read initialization metadata before compensation: %w", err)
@@ -235,36 +299,21 @@ func (t *rootInitializationTransaction) compensate() error {
 	if meta.String("initialization_token") != t.token ||
 		(status != RootInitializationStateInitializing && status != RootInitializationStateFailed) {
 		if status == RootInitializationStateReady && meta.String("initialization_token") == t.token {
+			t.st.SetFileMutationObserver(nil)
 			return removeRootInitializationClaim(t.sessionRoot, t.token)
 		}
 		return errors.New("initialization compensation refused metadata with a mismatched state or transaction token")
 	}
-	if t.claimOwned {
-		if err := t.refreshOwnedInventory(); err != nil {
-			return fmt.Errorf("refresh initialization ownership before compensation: %w", err)
-		}
-		meta = meta.With("initialization_owned_inventory_digest", t.ownedDigest)
-		if err := t.st.SaveMeta(meta); err != nil {
-			return fmt.Errorf("persist initialization ownership before compensation: %w", err)
-		}
-		if err := t.writeJournal(); err != nil {
-			return fmt.Errorf("persist initialization journal ownership before compensation: %w", err)
-		}
-	}
-	if meta.String("initialization_owned_inventory_digest") != t.ownedDigest {
-		return errors.New("initialization compensation refused mismatched ownership metadata")
-	}
 	if err := validateRootInitializationClaim(t.sessionRoot, t.token); err != nil {
 		return fmt.Errorf("validate initialization claim before compensation: %w", err)
 	}
-	observedDigest, err := rootInitializationOwnedInventoryDigest(t.sessionRoot)
-	if err != nil {
+	if err := t.validateClaimIdentity(); err != nil {
 		return err
 	}
-	if observedDigest != t.ownedDigest {
+	if err := t.validateOwnedInventory(); err != nil {
 		t.cleanupState = "blocked_foreign_entries"
 		_ = t.writeJournal()
-		return errors.New("initialization compensation refused foreign session entries")
+		return err
 	}
 	failed := meta.
 		WithStatus(RootInitializationStateFailed).
@@ -279,6 +328,11 @@ func (t *rootInitializationTransaction) compensate() error {
 	if err := t.writeJournal(); err != nil {
 		return err
 	}
+	if err := t.validateOwnedInventory(); err != nil {
+		t.cleanupState = "blocked_foreign_entries"
+		_ = t.writeJournal()
+		return err
+	}
 	cleanupContext, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	if err := workspace.CleanupInitializationWorktree(cleanupContext, t.sourceGitRoot, t.worktreePath, t.headCommit); err != nil {
@@ -286,37 +340,32 @@ func (t *rootInitializationTransaction) compensate() error {
 		_ = t.writeJournal()
 		return fmt.Errorf("compensate initialization worktree: %w", err)
 	}
+	if rootInitializationAfterWorktreeRemoval != nil {
+		if err := rootInitializationAfterWorktreeRemoval(); err != nil {
+			return err
+		}
+	}
 	if err := rejectInitializationSymlinkComponents(t.sessionRoot); err != nil {
 		return fmt.Errorf("validate initialization root before removal: %w", err)
 	}
-	t.cleanupState = "complete"
-	_ = t.writeJournal()
-	if t.preExistingRoot {
-		for _, name := range rootInitializationOwnedEntries {
-			path := filepath.Join(t.sessionRoot, name)
-			if err := rejectInitializationSymlinkComponents(path); err != nil {
-				return fmt.Errorf("validate initialization-owned entry %s: %w", name, err)
-			}
-			if err := os.RemoveAll(path); err != nil {
-				return fmt.Errorf("remove initialization-owned entry %s: %w", name, err)
-			}
-		}
-		return nil
+	t.cleanupState = "worktree_removed"
+	if err := t.writeJournal(); err != nil {
+		return err
 	}
-	if err := os.RemoveAll(t.sessionRoot); err != nil {
-		return fmt.Errorf("remove initialization-owned session root: %w", err)
+	if err := t.removeOwnedEntriesExact(); err != nil {
+		t.cleanupState = "failed"
+		_ = t.writeJournal()
+		return err
 	}
-	return nil
+	t.cleanupState = "entries_removed"
+	if err := t.writeJournal(); err != nil {
+		return err
+	}
+	return t.finalizeInitializationControls()
 }
 
 func (t *rootInitializationTransaction) compensateWithoutMeta() error {
-	if t == nil {
-		return nil
-	}
-	// The journal exists, but cleanup is deliberately refused when matching
-	// initializing metadata was never durably established.
-	t.cleanupState = "blocked_missing_metadata"
-	return t.writeJournal()
+	return t.compensateBootstrap()
 }
 
 func claimRootInitializationDestination(sessionRoot string, token string) (bool, error) {
@@ -462,77 +511,6 @@ func removeRootInitializationClaim(sessionRoot string, token string) error {
 	return os.Remove(path)
 }
 
-func rootInitializationOwnedInventoryDigest(sessionRoot string) (string, error) {
-	if err := rejectInitializationSymlinkComponents(sessionRoot); err != nil {
-		return "", err
-	}
-	allowed := make(map[string]bool, len(rootInitializationOwnedEntries))
-	for _, name := range rootInitializationOwnedEntries {
-		allowed[name] = true
-	}
-	dynamic := map[string]bool{
-		".mutation.lock":              true,
-		rootInitializationClaimName:   true,
-		rootInitializationJournalName: true,
-		"meta.json":                   true,
-	}
-	records := make([]string, 0)
-	err := filepath.WalkDir(sessionRoot, func(path string, entry os.DirEntry, walkErr error) error {
-		if walkErr != nil {
-			return walkErr
-		}
-		relative, err := filepath.Rel(sessionRoot, path)
-		if err != nil {
-			return err
-		}
-		if relative == "." {
-			return nil
-		}
-		relative = filepath.Clean(relative)
-		topLevel := relative
-		if separator := strings.IndexRune(relative, filepath.Separator); separator >= 0 {
-			topLevel = relative[:separator]
-		}
-		if !allowed[topLevel] {
-			return fmt.Errorf("foreign session entry %s is outside the initialization ownership set", relative)
-		}
-		info, err := os.Lstat(path)
-		if err != nil {
-			return err
-		}
-		if dynamic[relative] {
-			if !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 {
-				return fmt.Errorf("initialization control entry %s must be a regular file", relative)
-			}
-			return nil
-		}
-		kind := ""
-		switch {
-		case info.Mode()&os.ModeSymlink != 0:
-			kind = "symlink"
-		case info.IsDir():
-			kind = "directory"
-		case info.Mode().IsRegular():
-			kind = "regular"
-		default:
-			return fmt.Errorf("foreign session entry %s has an unsupported file type", relative)
-		}
-		encodedPath := base64.StdEncoding.EncodeToString([]byte(filepath.ToSlash(relative)))
-		records = append(records, encodedPath+"\x00"+kind)
-		return nil
-	})
-	if err != nil {
-		return "", err
-	}
-	sort.Strings(records)
-	canonical, err := contracts.CanonicalJSONBytes(records)
-	if err != nil {
-		return "", err
-	}
-	sum := sha256.Sum256(canonical)
-	return contracts.DigestPrefix + hex.EncodeToString(sum[:]), nil
-}
-
 func initializationLexicalPath(value string) (string, error) {
 	if strings.TrimSpace(value) == "" {
 		return "", errors.New("root initialization path is required")
@@ -578,21 +556,12 @@ func rejectInitializationSymlinkComponents(value string) error {
 	return nil
 }
 
-func (t *rootInitializationTransaction) refreshOwnedInventory() error {
-	if t == nil {
-		return errors.New("root initialization transaction is required")
-	}
-	digest, err := rootInitializationOwnedInventoryDigest(t.sessionRoot)
-	if err != nil {
+func (t *rootInitializationTransaction) writeJournal() error {
+	if err := t.refreshOwnershipDigest(); err != nil {
 		return err
 	}
-	t.ownedDigest = digest
-	return nil
-}
-
-func (t *rootInitializationTransaction) writeJournal() error {
 	payload := map[string]any{
-		"schema_version":            2,
+		"schema_version":            rootInitializationJournalSchemaVersion,
 		"transaction_token":         t.token,
 		"canonical_session_root":    t.sessionRoot,
 		"pre_existing_session_root": t.preExistingRoot,
@@ -604,15 +573,58 @@ func (t *rootInitializationTransaction) writeJournal() error {
 		"initialization_phase":      t.phase,
 		"cleanup_state":             t.cleanupState,
 		"initialization_claim":      rootInitializationClaimName,
+		"initialization_claim_id":   t.claimIdentity,
 		"owned_inventory_digest":    t.ownedDigest,
 		"owned_top_level_entries":   append([]string(nil), rootInitializationOwnedEntries...),
+		"owned_entries":             t.ownedEntriesPayload(),
+		"next_write_sequence":       int64(t.nextWriteSequence),
+		"pending_file_write":        nil,
+		"pending_mutation_scope":    nil,
 		"updated_at":                utcNow(),
+	}
+	if t.pendingWrite != nil {
+		payload["pending_file_write"] = t.pendingWrite.toMap()
+	}
+	if t.pendingScope != nil {
+		payload["pending_mutation_scope"] = t.pendingScope.toMap()
 	}
 	data, err := contracts.CanonicalJSONBytes(payload)
 	if err != nil {
 		return err
 	}
-	return store.AtomicWriteFile(filepath.Join(t.sessionRoot, rootInitializationJournalName), data)
+	journalPath := filepath.Join(t.sessionRoot, rootInitializationJournalName)
+	temporaryPath := filepath.Join(t.sessionRoot, "."+rootInitializationJournalName+"."+t.token+".tmp")
+	if _, err := os.Lstat(temporaryPath); err == nil {
+		if removeErr := os.Remove(temporaryPath); removeErr != nil {
+			return removeErr
+		}
+	} else if !os.IsNotExist(err) {
+		return err
+	}
+	handle, err := os.OpenFile(temporaryPath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+	if err != nil {
+		return err
+	}
+	writeErr := error(nil)
+	if _, err := handle.Write(data); err != nil {
+		writeErr = err
+	}
+	if writeErr == nil {
+		writeErr = handle.Sync()
+	}
+	closeErr := handle.Close()
+	if writeErr == nil {
+		writeErr = closeErr
+	}
+	if writeErr != nil {
+		_ = os.Remove(temporaryPath)
+		return writeErr
+	}
+	if err := os.Rename(temporaryPath, journalPath); err != nil {
+		_ = os.Remove(temporaryPath)
+		return err
+	}
+	return nil
 }
 
 func rootInitializationToken() (string, error) {
@@ -626,7 +638,11 @@ func rootInitializationToken() (string, error) {
 func loadRootInitializationTransaction(
 	sessionDir string,
 	meta map[string]any,
+	mutationLock *sessionMutationLock,
 ) (*rootInitializationTransaction, error) {
+	if mutationLock == nil || mutationLock.file == nil {
+		return nil, errors.New("root initialization recovery requires the session mutation lease")
+	}
 	inputRoot, err := initializationLexicalPath(sessionDir)
 	if err != nil {
 		return nil, err
@@ -655,26 +671,29 @@ func loadRootInitializationTransaction(
 	if err != nil {
 		return nil, fmt.Errorf("decode root initialization journal: %w", err)
 	}
-	if intFromAny(payload["schema_version"], 0) != 2 {
+	if intFromAny(payload["schema_version"], 0) != rootInitializationJournalSchemaVersion {
 		return nil, errors.New("root initialization journal schema version is invalid")
 	}
+	hasMeta := len(meta) != 0
 	token := strings.TrimSpace(stringFromAny(payload["transaction_token"]))
-	if token == "" || token != strings.TrimSpace(stringFromAny(meta["initialization_token"])) {
+	tokenBytes, tokenErr := hex.DecodeString(token)
+	if tokenErr != nil || len(tokenBytes) != 32 ||
+		(hasMeta && token != strings.TrimSpace(stringFromAny(meta["initialization_token"]))) {
 		return nil, errors.New("root initialization journal token does not match session metadata")
 	}
 	recordedRoot := cleanInitializationPath(payload["canonical_session_root"])
 	metaRoot := cleanInitializationPath(meta["canonical_session_root"])
-	if recordedRoot != absoluteRoot || metaRoot != absoluteRoot {
+	if recordedRoot != absoluteRoot || (hasMeta && metaRoot != absoluteRoot) {
 		return nil, errors.New("root initialization journal session identity is invalid")
 	}
 	sourceGitRoot := cleanInitializationPath(payload["source_git_root"])
 	metaSourceGitRoot := cleanInitializationPath(meta["source_git_root"])
-	if sourceGitRoot != metaSourceGitRoot || (sourceGitRoot != "" && !filepath.IsAbs(sourceGitRoot)) {
+	if (hasMeta && sourceGitRoot != metaSourceGitRoot) || (sourceGitRoot != "" && !filepath.IsAbs(sourceGitRoot)) {
 		return nil, errors.New("root initialization journal source repository identity is invalid")
 	}
 	worktreePath := cleanInitializationPath(payload["expected_worktree_path"])
 	metaWorktreePath := cleanInitializationPath(meta["expected_worktree_path"])
-	if worktreePath != metaWorktreePath {
+	if hasMeta && worktreePath != metaWorktreePath {
 		return nil, errors.New("root initialization journal worktree identity does not match session metadata")
 	}
 	expectedWorktree := filepath.Join(absoluteRoot, "execution", "worktree")
@@ -689,11 +708,11 @@ func loadRootInitializationTransaction(
 		return nil, errors.New("root initialization journal ownership is invalid")
 	}
 	metaPreExisting, metaPreExistingOK := meta["pre_existing_session_root"].(bool)
-	if !metaPreExistingOK || metaPreExisting != preExisting {
+	if hasMeta && (!metaPreExistingOK || metaPreExisting != preExisting) {
 		return nil, errors.New("root initialization journal ownership does not match session metadata")
 	}
 	for _, field := range []string{"captured_commit", "captured_tree", "object_format"} {
-		if strings.TrimSpace(stringFromAny(payload[field])) != strings.TrimSpace(stringFromAny(meta[field])) {
+		if hasMeta && strings.TrimSpace(stringFromAny(payload[field])) != strings.TrimSpace(stringFromAny(meta[field])) {
 			return nil, fmt.Errorf("root initialization journal captured identity field %s does not match session metadata", field)
 		}
 	}
@@ -701,32 +720,62 @@ func loadRootInitializationTransaction(
 		return nil, err
 	}
 	if strings.TrimSpace(stringFromAny(payload["initialization_claim"])) != rootInitializationClaimName ||
-		strings.TrimSpace(stringFromAny(meta["initialization_claim"])) != rootInitializationClaimName {
+		(hasMeta && strings.TrimSpace(stringFromAny(meta["initialization_claim"])) != rootInitializationClaimName) {
 		return nil, errors.New("root initialization journal claim identity is invalid")
 	}
+	claimIdentity := strings.TrimSpace(stringFromAny(payload["initialization_claim_id"]))
+	if claimIdentity == "" {
+		return nil, errors.New("root initialization journal claim file identity is invalid")
+	}
+	ownedEntries, err := parseRootInitializationOwnedEntries(payload["owned_entries"])
+	if err != nil {
+		return nil, err
+	}
 	ownedDigest := strings.TrimSpace(stringFromAny(payload["owned_inventory_digest"]))
-	if ownedDigest == "" || ownedDigest != strings.TrimSpace(stringFromAny(meta["initialization_owned_inventory_digest"])) {
-		return nil, errors.New("root initialization journal ownership digest does not match session metadata")
+	computedDigest, err := rootInitializationOwnershipDigestForPayload(payload["owned_entries"])
+	if err != nil || ownedDigest == "" || ownedDigest != computedDigest {
+		return nil, errors.New("root initialization journal ownership digest is invalid")
+	}
+	pendingWrite, err := rootInitializationWriteIntentFromMap(payload["pending_file_write"])
+	if err != nil {
+		return nil, err
+	}
+	pendingScope, err := rootInitializationScopeIntentFromMap(payload["pending_mutation_scope"])
+	if err != nil {
+		return nil, err
+	}
+	nextWriteSequence := int64FromAny(payload["next_write_sequence"], -1)
+	if nextWriteSequence < 0 {
+		return nil, errors.New("root initialization journal write sequence is invalid")
 	}
 	if err := validateRootInitializationClaim(absoluteRoot, token); err != nil {
 		return nil, err
 	}
 	transaction := &rootInitializationTransaction{
-		token:           token,
-		sessionRoot:     absoluteRoot,
-		preExistingRoot: preExisting,
-		sourceGitRoot:   sourceGitRoot,
-		worktreePath:    worktreePath,
-		headCommit:      strings.TrimSpace(stringFromAny(payload["captured_commit"])),
-		headTree:        strings.TrimSpace(stringFromAny(payload["captured_tree"])),
-		objectFormat:    strings.TrimSpace(stringFromAny(payload["object_format"])),
-		phase:           strings.TrimSpace(stringFromAny(payload["initialization_phase"])),
-		cleanupState:    strings.TrimSpace(stringFromAny(payload["cleanup_state"])),
-		ownedDigest:     ownedDigest,
-		st:              store.New(absoluteRoot),
+		token:             token,
+		sessionRoot:       absoluteRoot,
+		preExistingRoot:   preExisting,
+		sourceGitRoot:     sourceGitRoot,
+		worktreePath:      worktreePath,
+		headCommit:        strings.TrimSpace(stringFromAny(payload["captured_commit"])),
+		headTree:          strings.TrimSpace(stringFromAny(payload["captured_tree"])),
+		objectFormat:      strings.TrimSpace(stringFromAny(payload["object_format"])),
+		phase:             strings.TrimSpace(stringFromAny(payload["initialization_phase"])),
+		cleanupState:      strings.TrimSpace(stringFromAny(payload["cleanup_state"])),
+		ownedDigest:       ownedDigest,
+		claimIdentity:     claimIdentity,
+		ownedEntries:      ownedEntries,
+		pendingWrite:      pendingWrite,
+		pendingScope:      pendingScope,
+		nextWriteSequence: uint64(nextWriteSequence),
+		mutationLock:      mutationLock,
 	}
+	transaction.st = store.NewWithFileMutationObserver(absoluteRoot, transaction)
 	if transaction.phase == "" || transaction.cleanupState == "" {
 		return nil, errors.New("root initialization journal lifecycle fields are invalid")
+	}
+	if err := transaction.validateClaimIdentity(); err != nil {
+		return nil, err
 	}
 	return transaction, nil
 }

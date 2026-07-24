@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -18,6 +19,18 @@ type CommandError struct {
 	Args   []string
 	Detail string
 	Cause  error
+}
+
+type OutputRecordLimitError struct {
+	Limit    int64
+	Observed int64
+}
+
+func (e *OutputRecordLimitError) Error() string {
+	if e == nil {
+		return "Git output record limit exceeded"
+	}
+	return fmt.Sprintf("Git output records exceed limit: observed %d, limit %d", e.Observed, e.Limit)
 }
 
 func (e *CommandError) Error() string {
@@ -138,6 +151,73 @@ func Run(
 	return output, errors.Join(runErr, closeErr)
 }
 
+// RunNULRecords executes a sanitized Git command while applying a record
+// ceiling as stdout is read. It prevents ls-files/ls-tree style commands from
+// buffering output beyond the caller's repository entry ceiling.
+func RunNULRecords(
+	ctx context.Context,
+	binary string,
+	cwd string,
+	extraEnvironment map[string]string,
+	maxRecords int64,
+	args ...string,
+) ([]byte, error) {
+	if maxRecords <= 0 {
+		return Run(ctx, binary, cwd, extraEnvironment, args...)
+	}
+	prepared, err := Prepare(ctx, binary, cwd, extraEnvironment, args...)
+	if err != nil {
+		return nil, err
+	}
+	stdout, err := prepared.Command.StdoutPipe()
+	if err != nil {
+		return nil, errors.Join(err, prepared.Close())
+	}
+	var stderr boundedOutputBuffer
+	prepared.Command.Stderr = &stderr
+	if err := prepared.Command.Start(); err != nil {
+		return nil, errors.Join(err, prepared.Close())
+	}
+	var output bytes.Buffer
+	buffer := make([]byte, 32*1024)
+	var records int64
+	var limitErr error
+	for {
+		count, readErr := stdout.Read(buffer)
+		if count > 0 {
+			chunk := buffer[:count]
+			records += int64(bytes.Count(chunk, []byte{0}))
+			if records > maxRecords {
+				limitErr = &OutputRecordLimitError{Limit: maxRecords, Observed: records}
+				if prepared.Command.Process != nil {
+					_ = prepared.Command.Process.Kill()
+				}
+				break
+			}
+			_, _ = output.Write(chunk)
+		}
+		if readErr != nil {
+			if !errors.Is(readErr, io.EOF) {
+				limitErr = readErr
+			}
+			break
+		}
+	}
+	runErr := prepared.Command.Wait()
+	closeErr := prepared.Close()
+	if limitErr != nil {
+		return nil, errors.Join(limitErr, closeErr)
+	}
+	if runErr != nil {
+		runErr = &CommandError{
+			Args:   append([]string(nil), args...),
+			Detail: stderr.String(),
+			Cause:  runErr,
+		}
+	}
+	return output.Bytes(), errors.Join(runErr, closeErr)
+}
+
 // RunWithInput executes one sanitized Git command with orchestration-owned
 // standard input and captures combined output.
 func RunWithInput(
@@ -207,4 +287,21 @@ func boundedDetail(output []byte) string {
 		output = output[len(output)-maximum:]
 	}
 	return strings.TrimSpace(string(output))
+}
+
+type boundedOutputBuffer struct {
+	data []byte
+}
+
+func (b *boundedOutputBuffer) Write(data []byte) (int, error) {
+	const maximum = 16 * 1024
+	b.data = append(b.data, data...)
+	if len(b.data) > maximum {
+		b.data = append([]byte(nil), b.data[len(b.data)-maximum:]...)
+	}
+	return len(data), nil
+}
+
+func (b *boundedOutputBuffer) String() string {
+	return strings.TrimSpace(string(b.data))
 }

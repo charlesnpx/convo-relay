@@ -29,9 +29,10 @@ type rawTreeEntry struct {
 }
 
 type rawExportDescriptor struct {
-	entries   []rawTreeEntry
-	fileCount int64
-	byteCount int64
+	entries         []rawTreeEntry
+	fileCount       int64
+	byteCount       int64
+	caseInsensitive bool
 }
 
 func exportCapturedTree(
@@ -46,10 +47,12 @@ func exportCapturedTree(
 	if err := contextError(ctx); err != nil {
 		return nil, err
 	}
-	treeOutput, err := runGit(
+	treeOutput, err := runGitNULRecords(
 		ctx,
 		repository.gitBinary,
 		repository.root,
+		limits.maxFiles,
+		limits.maxFiles,
 		"ls-tree", "-r", "-z", "--full-tree", repository.headTree,
 	)
 	if err != nil {
@@ -59,7 +62,11 @@ func exportCapturedTree(
 	if err != nil {
 		return nil, err
 	}
-	entries, err := validateRawTreeEntries(headEntries)
+	caseInsensitive, err := filesystemCaseInsensitive(worktreePath)
+	if err != nil {
+		return nil, fmt.Errorf("probe export filesystem path semantics: %w", err)
+	}
+	entries, err := validateRawTreeEntries(headEntries, caseInsensitive)
 	if err != nil {
 		return nil, err
 	}
@@ -68,7 +75,10 @@ func exportCapturedTree(
 	if err != nil {
 		return nil, err
 	}
-	descriptor := &rawExportDescriptor{entries: make([]rawTreeEntry, 0, len(entries))}
+	descriptor := &rawExportDescriptor{
+		entries:         make([]rawTreeEntry, 0, len(entries)),
+		caseInsensitive: caseInsensitive,
+	}
 	accounting := newRepositoryInventoryState(limits)
 	var exportErr error
 	for _, entry := range entries {
@@ -107,7 +117,8 @@ func exportCapturedTree(
 	return descriptor, nil
 }
 
-func validateRawTreeEntries(entries []headEntry) ([]rawTreeEntry, error) {
+func validateRawTreeEntries(entries []headEntry, caseInsensitive ...bool) ([]rawTreeEntry, error) {
+	foldCase := len(caseInsensitive) > 0 && caseInsensitive[0]
 	result := make([]rawTreeEntry, 0, len(entries))
 	normalizedTargets := map[string]string{}
 	symlinks := map[string]bool{}
@@ -118,13 +129,13 @@ func validateRawTreeEntries(entries []headEntry) ([]rawTreeEntry, error) {
 		if err := validateRawModeType(entry.mode, entry.objectType); err != nil {
 			return nil, fmt.Errorf("captured tree path %q: %w", entry.path, err)
 		}
-		key := normalizedRawTarget(entry.path)
+		key := normalizedRawTarget(entry.path, foldCase)
 		if prior, exists := normalizedTargets[key]; exists {
 			return nil, fmt.Errorf("captured tree paths %q and %q normalize to the same target", prior, entry.path)
 		}
 		normalizedTargets[key] = entry.path
 		for ancestor := parentGitPath(entry.path); ancestor != ""; ancestor = parentGitPath(ancestor) {
-			if symlinks[normalizedRawTarget(ancestor)] {
+			if symlinks[normalizedRawTarget(ancestor, foldCase)] {
 				return nil, fmt.Errorf("captured tree path %q descends through symlink %q", entry.path, ancestor)
 			}
 		}
@@ -181,12 +192,41 @@ func validateRawModeType(mode string, objectType string) error {
 	return nil
 }
 
-func normalizedRawTarget(gitPath string) string {
+func normalizedRawTarget(gitPath string, caseInsensitive bool) string {
 	value := filepath.Clean(filepath.FromSlash(gitPath))
-	if runtime.GOOS == "windows" || runtime.GOOS == "darwin" {
+	if caseInsensitive {
 		value = strings.ToLower(value)
 	}
 	return value
+}
+
+func filesystemCaseInsensitive(root string) (result bool, err error) {
+	probe, err := os.CreateTemp(root, "convo-relay-case-probe-a-")
+	if err != nil {
+		return false, err
+	}
+	probePath := probe.Name()
+	defer func() {
+		err = errors.Join(err, probe.Close(), os.Remove(probePath))
+	}()
+	base := filepath.Base(probePath)
+	variantBase := strings.Replace(base, "a", "A", 1)
+	if variantBase == base {
+		return false, errors.New("case-sensitivity probe could not construct a case variant")
+	}
+	variantPath := filepath.Join(filepath.Dir(probePath), variantBase)
+	originalInfo, err := os.Lstat(probePath)
+	if err != nil {
+		return false, err
+	}
+	variantInfo, err := os.Lstat(variantPath)
+	if os.IsNotExist(err) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return os.SameFile(originalInfo, variantInfo), nil
 }
 
 func parentGitPath(gitPath string) string {
@@ -408,6 +448,9 @@ func verifyRawEntry(ctx context.Context, target string, entry rawTreeEntry) erro
 		if !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 {
 			return fmt.Errorf("mode is %s, want regular file", info.Mode())
 		}
+		if info.Size() != entry.sizeBytes {
+			return fmt.Errorf("raw size mismatch")
+		}
 		wantExecutable := entry.mode == "100755"
 		if gotExecutable := info.Mode().Perm()&0o111 != 0; gotExecutable != wantExecutable {
 			return fmt.Errorf("executable mode mismatch")
@@ -416,11 +459,35 @@ func verifyRawEntry(ctx context.Context, target string, entry rawTreeEntry) erro
 		if err != nil {
 			return err
 		}
+		opened, err := handle.Stat()
+		if err != nil || !opened.Mode().IsRegular() || !os.SameFile(info, opened) || opened.Size() != entry.sizeBytes {
+			_ = handle.Close()
+			return errors.Join(err, errors.New("raw export file changed before verification"))
+		}
 		hasher := sha256.New()
-		size, readErr := io.Copy(hasher, &contextReader{ctx: ctx, reader: handle})
+		reader := &contextReader{ctx: ctx, reader: handle}
+		size, readErr := io.CopyN(hasher, reader, entry.sizeBytes)
+		var extra [1]byte
+		extraCount, extraErr := reader.Read(extra[:])
+		if extraErr != nil && !errors.Is(extraErr, io.EOF) {
+			readErr = errors.Join(readErr, extraErr)
+		}
+		after, statErr := handle.Stat()
 		closeErr := handle.Close()
-		if readErr != nil || closeErr != nil {
-			return errors.Join(readErr, closeErr)
+		pathAfter, pathErr := os.Lstat(target)
+		if readErr != nil ||
+			statErr != nil ||
+			closeErr != nil ||
+			pathErr != nil ||
+			size != entry.sizeBytes ||
+			extraCount != 0 ||
+			!os.SameFile(opened, after) ||
+			!os.SameFile(opened, pathAfter) ||
+			after.Size() != entry.sizeBytes ||
+			pathAfter.Size() != entry.sizeBytes ||
+			after.Mode() != opened.Mode() ||
+			pathAfter.Mode() != opened.Mode() {
+			return errors.Join(readErr, statErr, closeErr, pathErr, errors.New("raw export file changed during bounded verification"))
 		}
 		digest := "sha256:" + hex.EncodeToString(hasher.Sum(nil))
 		if size != entry.sizeBytes || digest != entry.rawDigest {
@@ -466,9 +533,10 @@ func rawExportArtifactMap(descriptor *rawExportDescriptor) map[string]any {
 		entries = append(entries, item)
 	}
 	return map[string]any{
-		"file_count": descriptor.fileCount,
-		"byte_count": descriptor.byteCount,
-		"entries":    entries,
+		"file_count":          descriptor.fileCount,
+		"byte_count":          descriptor.byteCount,
+		"path_case_sensitive": !descriptor.caseInsensitive,
+		"entries":             entries,
 	}
 }
 
@@ -494,6 +562,12 @@ func rawExportDescriptorFromArtifact(artifact map[string]any) (*rawExportDescrip
 		entries:   make([]rawTreeEntry, 0, len(rawEntries)),
 		fileCount: fileCount,
 		byteCount: byteCount,
+	}
+	if caseSensitive, ok := payload["path_case_sensitive"].(bool); ok {
+		descriptor.caseInsensitive = !caseSensitive
+	} else {
+		// Legacy artifacts predate the recorded filesystem probe.
+		descriptor.caseInsensitive = runtime.GOOS == "windows" || runtime.GOOS == "darwin"
 	}
 	var summedBytes int64
 	for index, rawEntry := range rawEntries {
@@ -541,7 +615,7 @@ func rawExportDescriptorFromArtifact(artifact map[string]any) (*rawExportDescrip
 	if summedBytes != byteCount {
 		return nil, true, errors.New("execution_workspace committed_export byte count disagrees with its entries")
 	}
-	validated, err := validateRawTreeEntries(rawEntriesAsHeadEntries(descriptor.entries))
+	validated, err := validateRawTreeEntries(rawEntriesAsHeadEntries(descriptor.entries), descriptor.caseInsensitive)
 	if err != nil {
 		return nil, true, err
 	}

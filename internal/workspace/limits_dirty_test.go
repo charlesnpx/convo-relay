@@ -92,6 +92,42 @@ func TestRepositoryInventoryBudgetsAcceptExactBoundariesAndRejectOneOver(t *test
 	}
 }
 
+func TestTrackedInventoryRejectsSymlinkedAncestorWithoutFollowingOutsideRepository(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("symlink creation requires additional Windows privileges")
+	}
+	root := newCommittedRepo(t)
+	outside := filepath.Join(t.TempDir(), "outside")
+	outsideTarget := filepath.Join(outside, "dir", "nested.txt")
+	writeTestFile(t, outsideTarget, []byte("outside bytes must not be inventoried\n"), 0o644)
+	if err := os.RemoveAll(filepath.Join(root, "sub")); err != nil {
+		t.Fatalf("remove tracked directory: %v", err)
+	}
+	if err := os.Symlink(outside, filepath.Join(root, "sub")); err != nil {
+		t.Fatalf("replace tracked ancestor with symlink: %v", err)
+	}
+
+	snapshot, err := inspectRepository(context.Background(), "git", root)
+	if err != nil {
+		t.Fatalf("inspect repository with symlinked tracked ancestor: %v", err)
+	}
+	tracked := snapshot.sourceReport["inventory"].(map[string]any)["tracked_worktree"].([]any)
+	var observed map[string]any
+	for _, raw := range tracked {
+		entry := raw.(map[string]any)
+		if entry["path"] == "sub/dir/nested.txt" {
+			observed = entry
+			break
+		}
+	}
+	if observed == nil ||
+		observed["present"] != false ||
+		observed["obstruction"] != "ancestor_symlink" ||
+		observed["raw_digest"] != nil {
+		t.Fatalf("tracked entry through outside symlink = %#v", observed)
+	}
+}
+
 func TestMaterializePreservesRawExportRepositoryBudgetDiagnostic(t *testing.T) {
 	root := t.TempDir()
 	testGit(t, root, "init", "-q")

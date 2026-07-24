@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/charlesnpx/convo-relay/internal/contracts"
 	"github.com/charlesnpx/convo-relay/internal/store"
@@ -185,12 +186,13 @@ func TestCleanCompletesStaleInitializingTransactionAndRejectsForeignEntries(t *t
 		if err != nil {
 			t.Fatalf("begin initialization: %v", err)
 		}
-		if _, err := workspace.Materialize(context.Background(), transaction.st, preflight.workspace); err != nil {
+		if _, err := transaction.materializeWorkspace(context.Background(), preflight.workspace); err != nil {
 			t.Fatalf("materialize interrupted worktree: %v", err)
 		}
 		if err := transaction.advance("workspace_materialized"); err != nil {
 			t.Fatalf("record materialized ownership: %v", err)
 		}
+		abandonRootInitializationLease(t, transaction)
 
 		report, err := CleanSession(sessionDir)
 		if err != nil || report["status"] != "deleted" {
@@ -215,7 +217,7 @@ func TestCleanCompletesStaleInitializingTransactionAndRejectsForeignEntries(t *t
 		if err != nil {
 			t.Fatalf("begin initialization: %v", err)
 		}
-		if _, err := workspace.Materialize(context.Background(), transaction.st, preflight.workspace); err != nil {
+		if _, err := transaction.materializeWorkspace(context.Background(), preflight.workspace); err != nil {
 			t.Fatalf("materialize interrupted worktree: %v", err)
 		}
 		if err := transaction.advance("workspace_materialized"); err != nil {
@@ -225,6 +227,7 @@ func TestCleanCompletesStaleInitializingTransactionAndRejectsForeignEntries(t *t
 		if err := os.WriteFile(foreignPath, []byte("foreign"), 0o644); err != nil {
 			t.Fatalf("write foreign entry: %v", err)
 		}
+		abandonRootInitializationLease(t, transaction)
 		if report, err := CleanSession(sessionDir); err == nil || report != nil || !strings.Contains(err.Error(), "foreign") {
 			t.Fatalf("foreign-entry clean = %#v, %v", report, err)
 		}
@@ -232,12 +235,460 @@ func TestCleanCompletesStaleInitializingTransactionAndRejectsForeignEntries(t *t
 			t.Fatalf("foreign entry was removed: %v", err)
 		}
 		_ = os.Remove(foreignPath)
-		meta, _ := transaction.st.LoadMeta()
-		transaction.token = meta.String("initialization_token")
-		if err := transaction.compensate(); err != nil {
-			t.Fatalf("cleanup after removing foreign entry: %v", err)
+		if report, err := CleanSession(sessionDir); err != nil || report["status"] != "deleted" {
+			t.Fatalf("cleanup after removing foreign entry = %#v, %v", report, err)
 		}
 	})
+}
+
+func TestCleanWaitsForLiveRootInitializerMutationLease(t *testing.T) {
+	launchRoot := newRootInitializationRepository(t)
+	sessionDir := filepath.Join(t.TempDir(), "session")
+	preflight, err := preflightRecipe(context.Background(), rootInitializationOptions(launchRoot, sessionDir))
+	if err != nil {
+		t.Fatalf("preflight: %v", err)
+	}
+	transaction, err := beginRootInitialization(preflight)
+	if err != nil {
+		t.Fatalf("begin initialization: %v", err)
+	}
+
+	type cleanResult struct {
+		report map[string]any
+		err    error
+	}
+	result := make(chan cleanResult, 1)
+	go func() {
+		report, err := CleanSession(sessionDir)
+		result <- cleanResult{report: report, err: err}
+	}()
+	select {
+	case observed := <-result:
+		t.Fatalf("clean crossed a live initializer lease: %#v, %v", observed.report, observed.err)
+	case <-time.After(150 * time.Millisecond):
+	}
+
+	// Releasing the process-owned lease simulates process death. The waiting
+	// cleaner may then load the durable journal and complete compensation.
+	abandonRootInitializationLease(t, transaction)
+	select {
+	case observed := <-result:
+		if observed.err != nil || observed.report["status"] != "deleted" {
+			t.Fatalf("stale clean after lease release = %#v, %v", observed.report, observed.err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("clean did not resume after the initializer lease was released")
+	}
+}
+
+func TestMutationLockWaiterRejectsUnlinkedOldInode(t *testing.T) {
+	sessionDir := filepath.Join(t.TempDir(), "session")
+	if err := os.MkdirAll(sessionDir, 0o755); err != nil {
+		t.Fatalf("create session directory: %v", err)
+	}
+	first, err := lockSessionMutation(sessionDir)
+	if err != nil {
+		t.Fatalf("acquire first mutation lock: %v", err)
+	}
+	defer func() {
+		sessionMutationLockAfterOpen = nil
+		_ = first.Unlock()
+	}()
+
+	opened := make(chan struct{})
+	sessionMutationLockAfterOpen = func(string) {
+		sessionMutationLockAfterOpen = nil
+		close(opened)
+	}
+	type lockResult struct {
+		lock *sessionMutationLock
+		err  error
+	}
+	waiter := make(chan lockResult, 1)
+	go func() {
+		lock, err := lockSessionMutation(sessionDir)
+		waiter <- lockResult{lock: lock, err: err}
+	}()
+	select {
+	case <-opened:
+	case <-time.After(5 * time.Second):
+		t.Fatal("waiting lock did not open the original lock inode")
+	}
+
+	if err := os.Remove(first.path); err != nil {
+		t.Fatalf("unlink original mutation lock path: %v", err)
+	}
+	replacement, err := lockSessionMutation(sessionDir)
+	if err != nil {
+		t.Fatalf("acquire replacement mutation lock: %v", err)
+	}
+	defer func() { _ = replacement.Unlock() }()
+	if err := first.Unlock(); err != nil {
+		t.Fatalf("release original mutation lock: %v", err)
+	}
+	select {
+	case observed := <-waiter:
+		if observed.lock != nil {
+			_ = observed.lock.Unlock()
+		}
+		if observed.err == nil || !strings.Contains(observed.err.Error(), "changed while waiting") {
+			t.Fatalf("old-inode waiter = %#v, %v", observed.lock, observed.err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("old-inode waiter did not return after original lock release")
+	}
+}
+
+func TestInitializationPendingFileIntentRecoversCommitBeforeCompletionRecord(t *testing.T) {
+	launchRoot := newRootInitializationRepository(t)
+	sessionDir := filepath.Join(t.TempDir(), "session")
+	preflight, err := preflightRecipe(context.Background(), rootInitializationOptions(launchRoot, sessionDir))
+	if err != nil {
+		t.Fatalf("preflight: %v", err)
+	}
+	transaction, err := beginRootInitialization(preflight)
+	if err != nil {
+		t.Fatalf("begin initialization: %v", err)
+	}
+
+	body := []byte("durable write before phase advance\n")
+	target := filepath.Join(transaction.sessionRoot, "artifacts", "interrupted", "record.json")
+	plan, err := transaction.BeforeFileMutation(target, body, 0o600)
+	if err != nil {
+		t.Fatalf("persist file mutation intent: %v", err)
+	}
+	if plan.TemporaryPath == "" {
+		t.Fatal("file mutation intent omitted its exact temporary path")
+	}
+	// Simulate process death after the target rename but before Store can call
+	// AfterFileMutation or the runner can advance its phase.
+	commitPendingInitializationWrite(t, plan, target, body, 0o600)
+	abandonRootInitializationLease(t, transaction)
+
+	report, err := CleanSession(sessionDir)
+	if err != nil || report["status"] != "deleted" {
+		t.Fatalf("recover pending committed write = %#v, %v", report, err)
+	}
+}
+
+func TestInitializationPendingFileIntentRejectsSameContentReplacement(t *testing.T) {
+	launchRoot := newRootInitializationRepository(t)
+	sessionDir := filepath.Join(t.TempDir(), "session")
+	preflight, err := preflightRecipe(context.Background(), rootInitializationOptions(launchRoot, sessionDir))
+	if err != nil {
+		t.Fatalf("preflight: %v", err)
+	}
+	transaction, err := beginRootInitialization(preflight)
+	if err != nil {
+		t.Fatalf("begin initialization: %v", err)
+	}
+
+	body := []byte("same bytes, different inode\n")
+	target := filepath.Join(transaction.sessionRoot, "artifacts", "interrupted", "record.json")
+	plan, err := transaction.BeforeFileMutation(target, body, 0o600)
+	if err != nil {
+		t.Fatalf("persist file mutation intent: %v", err)
+	}
+	commitPendingInitializationWrite(t, plan, target, body, 0o600)
+	committedInfo, err := os.Lstat(target)
+	if err != nil {
+		t.Fatalf("stat committed pending target: %v", err)
+	}
+	if err := store.AtomicWriteFile(target, body); err != nil {
+		t.Fatalf("replace pending target with identical content: %v", err)
+	}
+	replacementInfo, err := os.Lstat(target)
+	if err != nil {
+		t.Fatalf("stat same-content replacement: %v", err)
+	}
+	if rootInitializationFileIdentity(target, committedInfo) == rootInitializationFileIdentity(target, replacementInfo) {
+		t.Fatal("same-content replacement retained the committed temporary identity")
+	}
+	abandonRootInitializationLease(t, transaction)
+
+	if report, err := CleanSession(sessionDir); err == nil || report != nil || !strings.Contains(err.Error(), "foreign") {
+		t.Fatalf("same-content pending replacement clean = %#v, %v", report, err)
+	}
+	if data, err := os.ReadFile(target); err != nil || string(data) != string(body) {
+		t.Fatalf("same-content pending replacement changed: %q, %v", data, err)
+	}
+	if err := os.Remove(target); err != nil {
+		t.Fatalf("remove same-content pending replacement: %v", err)
+	}
+	if report, err := CleanSession(sessionDir); err != nil || report["status"] != "deleted" {
+		t.Fatalf("cleanup after pending replacement removal = %#v, %v", report, err)
+	}
+}
+
+func TestInitializationPendingWorkspaceScopeRecoversVerifiedMaterialization(t *testing.T) {
+	launchRoot := newRootInitializationRepository(t)
+	sessionDir := filepath.Join(t.TempDir(), "session")
+	preflight, err := preflightRecipe(context.Background(), rootInitializationOptions(launchRoot, sessionDir))
+	if err != nil {
+		t.Fatalf("preflight: %v", err)
+	}
+	transaction, err := beginRootInitialization(preflight)
+	if err != nil {
+		t.Fatalf("begin initialization: %v", err)
+	}
+	if err := transaction.beginOwnedScope("workspace_materialization", "execution"); err != nil {
+		t.Fatalf("persist workspace operation intent: %v", err)
+	}
+	if _, err := workspace.Materialize(context.Background(), transaction.st, preflight.workspace); err != nil {
+		t.Fatalf("materialize workspace before simulated process death: %v", err)
+	}
+	// Do not call completeOwnedScope or advance: this is the precise crash
+	// window after the direct mutation returns and before phase persistence.
+	abandonRootInitializationLease(t, transaction)
+
+	report, err := CleanSession(sessionDir)
+	if err != nil || report["status"] != "deleted" {
+		t.Fatalf("recover verified pending workspace = %#v, %v", report, err)
+	}
+	worktreePath := filepath.Join(sessionDir, "execution", "worktree")
+	if output := rootInitializationGit(t, launchRoot, "worktree", "list", "--porcelain"); strings.Contains(output, worktreePath) {
+		t.Fatalf("pending workspace recovery retained registration:\n%s", output)
+	}
+}
+
+func TestInitializationPendingWorkspaceScopeRejectsForeignSiblingBeforeOwnershipCapture(t *testing.T) {
+	launchRoot := newRootInitializationRepository(t)
+	sessionDir := filepath.Join(t.TempDir(), "session")
+	preflight, err := preflightRecipe(context.Background(), rootInitializationOptions(launchRoot, sessionDir))
+	if err != nil {
+		t.Fatalf("preflight: %v", err)
+	}
+	transaction, err := beginRootInitialization(preflight)
+	if err != nil {
+		t.Fatalf("begin initialization: %v", err)
+	}
+	if err := transaction.beginOwnedScope("workspace_materialization", "execution"); err != nil {
+		t.Fatalf("persist workspace operation intent: %v", err)
+	}
+	if _, err := workspace.Materialize(context.Background(), transaction.st, preflight.workspace); err != nil {
+		t.Fatalf("materialize workspace before simulated process death: %v", err)
+	}
+	foreignPath := filepath.Join(sessionDir, "execution", "foreign.db")
+	if err := os.WriteFile(foreignPath, []byte("preserve foreign sibling\n"), 0o644); err != nil {
+		t.Fatalf("write foreign execution sibling: %v", err)
+	}
+	abandonRootInitializationLease(t, transaction)
+
+	if report, err := CleanSession(sessionDir); err == nil || report != nil || !strings.Contains(err.Error(), "foreign") {
+		t.Fatalf("pending workspace foreign-sibling clean = %#v, %v", report, err)
+	}
+	if data, err := os.ReadFile(foreignPath); err != nil || string(data) != "preserve foreign sibling\n" {
+		t.Fatalf("foreign execution sibling changed: %q, %v", data, err)
+	}
+	worktreePath := filepath.Join(sessionDir, "execution", "worktree")
+	if info, err := os.Stat(worktreePath); err != nil || !info.IsDir() {
+		t.Fatalf("foreign-sibling rejection removed worktree: %v", err)
+	}
+	if output := rootInitializationGit(t, launchRoot, "worktree", "list", "--porcelain"); !strings.Contains(output, worktreePath) {
+		t.Fatalf("foreign-sibling rejection removed worktree registration:\n%s", output)
+	}
+
+	if err := os.Remove(foreignPath); err != nil {
+		t.Fatalf("remove foreign execution sibling: %v", err)
+	}
+	if report, err := CleanSession(sessionDir); err != nil || report["status"] != "deleted" {
+		t.Fatalf("cleanup after foreign execution sibling removal = %#v, %v", report, err)
+	}
+}
+
+func TestInitialMetadataWriteFailureReleasesClaimJournalAndLease(t *testing.T) {
+	for _, preExisting := range []bool{false, true} {
+		name := "new root"
+		if preExisting {
+			name = "pre-existing root"
+		}
+		t.Run(name, func(t *testing.T) {
+			launchRoot := newRootInitializationRepository(t)
+			sessionDir := filepath.Join(t.TempDir(), "session")
+			if preExisting {
+				if err := os.MkdirAll(sessionDir, 0o755); err != nil {
+					t.Fatalf("create pre-existing root: %v", err)
+				}
+			}
+			preflight, err := preflightRecipe(context.Background(), rootInitializationOptions(launchRoot, sessionDir))
+			if err != nil {
+				t.Fatalf("preflight: %v", err)
+			}
+			injected := errors.New("reject initial metadata commit")
+			rootInitializationBeforeFileCommit = func(relative string) error {
+				if relative == "meta.json" {
+					return injected
+				}
+				return nil
+			}
+			defer func() { rootInitializationBeforeFileCommit = nil }()
+			transaction, err := beginRootInitialization(preflight)
+			if transaction != nil || !errors.Is(err, injected) {
+				t.Fatalf("initial metadata failure = %#v, %v", transaction, err)
+			}
+			rootInitializationBeforeFileCommit = nil
+
+			if preExisting {
+				entries, err := os.ReadDir(sessionDir)
+				if err != nil || len(entries) != 0 {
+					t.Fatalf("pre-existing root after bootstrap cleanup = %#v, %v", entries, err)
+				}
+			} else if _, err := os.Lstat(sessionDir); !os.IsNotExist(err) {
+				t.Fatalf("new root remained after bootstrap cleanup: %v", err)
+			}
+
+			retryPreflight, err := preflightRecipe(context.Background(), rootInitializationOptions(launchRoot, sessionDir))
+			if err != nil {
+				t.Fatalf("retry preflight: %v", err)
+			}
+			retry, err := beginRootInitialization(retryPreflight)
+			if err != nil {
+				t.Fatalf("retry initialization after metadata failure: %v", err)
+			}
+			if err := retry.compensate(); err != nil {
+				t.Fatalf("compensate retry initialization: %v", err)
+			}
+		})
+	}
+}
+
+func TestInitializationOwnershipRejectsSamePathRegularFileReplacement(t *testing.T) {
+	launchRoot := newRootInitializationRepository(t)
+	sessionDir := filepath.Join(t.TempDir(), "session")
+	preflight, err := preflightRecipe(context.Background(), rootInitializationOptions(launchRoot, sessionDir))
+	if err != nil {
+		t.Fatalf("preflight: %v", err)
+	}
+	transaction, err := beginRootInitialization(preflight)
+	if err != nil {
+		t.Fatalf("begin initialization: %v", err)
+	}
+	target := filepath.Join(transaction.sessionRoot, "transcript.json")
+	body := []byte("owned transcript bytes\n")
+	if err := transaction.st.WriteFileAtomically(target, body, 0o600); err != nil {
+		t.Fatalf("write transaction-owned file: %v", err)
+	}
+	before, err := os.Lstat(target)
+	if err != nil {
+		t.Fatalf("stat owned file: %v", err)
+	}
+	if err := store.AtomicWriteFile(target, body); err != nil {
+		t.Fatalf("replace owned file at the same lexical path: %v", err)
+	}
+	after, err := os.Lstat(target)
+	if err != nil {
+		t.Fatalf("stat replacement file: %v", err)
+	}
+	if rootInitializationFileIdentity(target, before) == rootInitializationFileIdentity(target, after) {
+		t.Fatal("test replacement retained the original file identity")
+	}
+	abandonRootInitializationLease(t, transaction)
+
+	if report, err := CleanSession(sessionDir); err == nil || report != nil || !strings.Contains(err.Error(), "foreign") {
+		t.Fatalf("same-path replacement clean = %#v, %v", report, err)
+	}
+	if data, err := os.ReadFile(target); err != nil || string(data) != string(body) {
+		t.Fatalf("same-path replacement was changed: %q, %v", data, err)
+	}
+	if err := os.Remove(target); err != nil {
+		t.Fatalf("remove replacement after preservation proof: %v", err)
+	}
+	if report, err := CleanSession(sessionDir); err != nil || report["status"] != "deleted" {
+		t.Fatalf("cleanup after replacement removal = %#v, %v", report, err)
+	}
+}
+
+func TestInitializationOwnedScopeRejectsReplacementBeforeCapture(t *testing.T) {
+	launchRoot := newRootInitializationRepository(t)
+	sessionDir := filepath.Join(t.TempDir(), "session")
+	preflight, err := preflightRecipe(context.Background(), rootInitializationOptions(launchRoot, sessionDir))
+	if err != nil {
+		t.Fatalf("preflight: %v", err)
+	}
+	transaction, err := beginRootInitialization(preflight)
+	if err != nil {
+		t.Fatalf("begin initialization: %v", err)
+	}
+	if err := transaction.beginOwnedScope(
+		"retained_input_materialization",
+		filepath.Join("execution", "inputs"),
+	); err != nil {
+		t.Fatalf("begin retained-input ownership scope: %v", err)
+	}
+	target := filepath.Join(transaction.sessionRoot, "execution", "inputs", "000001")
+	body := []byte("transaction-owned input\n")
+	if err := transaction.st.WriteFileAtomically(target, body, 0o444); err != nil {
+		t.Fatalf("write transaction-owned input: %v", err)
+	}
+	before, err := os.Lstat(target)
+	if err != nil {
+		t.Fatalf("stat transaction-owned input: %v", err)
+	}
+	if err := store.AtomicWriteFile(target, body); err != nil {
+		t.Fatalf("replace transaction-owned input: %v", err)
+	}
+	after, err := os.Lstat(target)
+	if err != nil {
+		t.Fatalf("stat replacement input: %v", err)
+	}
+	if rootInitializationFileIdentity(target, before) == rootInitializationFileIdentity(target, after) {
+		t.Fatal("test replacement retained the original file identity")
+	}
+	if err := transaction.completeOwnedScope(); err == nil || !strings.Contains(err.Error(), "replaced") {
+		t.Fatalf("scope completion accepted replacement: %v", err)
+	}
+	abandonRootInitializationLease(t, transaction)
+
+	if report, err := CleanSession(sessionDir); err == nil || report != nil || !strings.Contains(err.Error(), "foreign") {
+		t.Fatalf("pre-capture replacement clean = %#v, %v", report, err)
+	}
+	if data, err := os.ReadFile(target); err != nil || string(data) != string(body) {
+		t.Fatalf("pre-capture replacement changed: %q, %v", data, err)
+	}
+	if err := os.Remove(target); err != nil {
+		t.Fatalf("remove preserved replacement: %v", err)
+	}
+	if report, err := CleanSession(sessionDir); err != nil || report["status"] != "deleted" {
+		t.Fatalf("cleanup after pre-capture replacement removal = %#v, %v", report, err)
+	}
+}
+
+func TestInitializationCleanupRetriesAfterInterruptionFollowingWorktreeRemoval(t *testing.T) {
+	launchRoot := newRootInitializationRepository(t)
+	sessionDir := filepath.Join(t.TempDir(), "session")
+	preflight, err := preflightRecipe(context.Background(), rootInitializationOptions(launchRoot, sessionDir))
+	if err != nil {
+		t.Fatalf("preflight: %v", err)
+	}
+	transaction, err := beginRootInitialization(preflight)
+	if err != nil {
+		t.Fatalf("begin initialization: %v", err)
+	}
+	if _, err := transaction.materializeWorkspace(context.Background(), preflight.workspace); err != nil {
+		t.Fatalf("materialize interrupted worktree: %v", err)
+	}
+	if err := transaction.advance("workspace_materialized"); err != nil {
+		t.Fatalf("record materialized workspace: %v", err)
+	}
+	injected := errors.New("interrupt after exact worktree removal")
+	rootInitializationAfterWorktreeRemoval = func() error { return injected }
+	defer func() { rootInitializationAfterWorktreeRemoval = nil }()
+	if err := transaction.compensate(); !errors.Is(err, injected) {
+		t.Fatalf("first compensation error = %v, want injected interruption", err)
+	}
+	rootInitializationAfterWorktreeRemoval = nil
+
+	worktreePath := filepath.Join(sessionDir, "execution", "worktree")
+	if _, err := os.Lstat(worktreePath); !os.IsNotExist(err) {
+		t.Fatalf("interrupted compensation retained worktree path: %v", err)
+	}
+	if output := rootInitializationGit(t, launchRoot, "worktree", "list", "--porcelain"); strings.Contains(output, worktreePath) {
+		t.Fatalf("interrupted compensation retained worktree registration:\n%s", output)
+	}
+	report, err := CleanSession(sessionDir)
+	if err != nil || report["status"] != "deleted" {
+		t.Fatalf("retry compensation after worktree removal = %#v, %v", report, err)
+	}
 }
 
 func TestCleanRejectsNestedForeignInitializationEntriesBeforeWorktreeRemoval(t *testing.T) {
@@ -263,7 +714,7 @@ func TestCleanRejectsNestedForeignInitializationEntriesBeforeWorktreeRemoval(t *
 			if err != nil {
 				t.Fatalf("begin initialization: %v", err)
 			}
-			if _, err := workspace.Materialize(context.Background(), transaction.st, preflight.workspace); err != nil {
+			if _, err := transaction.materializeWorkspace(context.Background(), preflight.workspace); err != nil {
 				t.Fatalf("materialize interrupted worktree: %v", err)
 			}
 			if err := transaction.advance("workspace_materialized"); err != nil {
@@ -273,6 +724,7 @@ func TestCleanRejectsNestedForeignInitializationEntriesBeforeWorktreeRemoval(t *
 			if err := os.WriteFile(foreignPath, []byte("foreign"), 0o644); err != nil {
 				t.Fatalf("write nested foreign entry: %v", err)
 			}
+			abandonRootInitializationLease(t, transaction)
 
 			if report, err := CleanSession(sessionDir); err == nil || report != nil || !strings.Contains(err.Error(), "foreign") {
 				t.Fatalf("nested-foreign clean = %#v, %v", report, err)
@@ -291,8 +743,8 @@ func TestCleanRejectsNestedForeignInitializationEntriesBeforeWorktreeRemoval(t *
 			if err := os.Remove(foreignPath); err != nil {
 				t.Fatalf("remove nested foreign entry: %v", err)
 			}
-			if err := transaction.compensate(); err != nil {
-				t.Fatalf("cleanup after removing nested foreign entry: %v", err)
+			if report, err := CleanSession(sessionDir); err != nil || report["status"] != "deleted" {
+				t.Fatalf("cleanup after removing nested foreign entry = %#v, %v", report, err)
 			}
 		})
 	}
@@ -423,7 +875,7 @@ func TestCleanRejectsTamperedInitializationJournalIdentities(t *testing.T) {
 			if err != nil {
 				t.Fatalf("begin initialization: %v", err)
 			}
-			if _, err := workspace.Materialize(context.Background(), transaction.st, preflight.workspace); err != nil {
+			if _, err := transaction.materializeWorkspace(context.Background(), preflight.workspace); err != nil {
 				t.Fatalf("materialize interrupted worktree: %v", err)
 			}
 			if err := transaction.advance("workspace_materialized"); err != nil {
@@ -442,6 +894,7 @@ func TestCleanRejectsTamperedInitializationJournalIdentities(t *testing.T) {
 			original := mutateRootInitializationJournal(t, journalPath, func(payload map[string]any) {
 				payload[test.field] = test.value(sessionDir, outsidePath)
 			})
+			abandonRootInitializationLease(t, transaction)
 
 			if report, err := CleanSession(sessionDir); err == nil || report != nil {
 				t.Fatalf("tampered %s cleanup = %#v, %v", test.field, report, err)
@@ -551,6 +1004,48 @@ func rootInitializationOptions(launchRoot string, sessionDir string) RecipeOptio
 		RuntimeConfig:      rootRecipeRuntimeConfig(""),
 		ReadinessCheck:     readyRootRecipeCheck,
 		backendFactory:     successfulRootBackendFactory(),
+	}
+}
+
+func abandonRootInitializationLease(t *testing.T, transaction *rootInitializationTransaction) {
+	t.Helper()
+	if transaction == nil {
+		t.Fatal("root initialization transaction is required")
+	}
+	if err := transaction.releaseMutationLock(); err != nil {
+		t.Fatalf("release root initialization mutation lease: %v", err)
+	}
+}
+
+func commitPendingInitializationWrite(
+	t *testing.T,
+	plan store.FileMutationPlan,
+	target string,
+	body []byte,
+	mode os.FileMode,
+) {
+	t.Helper()
+	handle, err := os.OpenFile(plan.TemporaryPath, os.O_WRONLY|os.O_TRUNC, mode.Perm())
+	if err != nil {
+		t.Fatalf("open pending temporary file: %v", err)
+	}
+	if err := handle.Chmod(mode.Perm()); err != nil {
+		_ = handle.Close()
+		t.Fatalf("chmod pending temporary file: %v", err)
+	}
+	if _, err := handle.Write(body); err != nil {
+		_ = handle.Close()
+		t.Fatalf("write pending temporary file: %v", err)
+	}
+	if err := handle.Sync(); err != nil {
+		_ = handle.Close()
+		t.Fatalf("sync pending temporary file: %v", err)
+	}
+	if err := handle.Close(); err != nil {
+		t.Fatalf("close pending temporary file: %v", err)
+	}
+	if err := os.Rename(plan.TemporaryPath, target); err != nil {
+		t.Fatalf("commit pending target write: %v", err)
 	}
 }
 

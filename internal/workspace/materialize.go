@@ -16,6 +16,10 @@ import (
 
 const executionWorkspaceCategory = contracts.RootArtifactKindExecutionWorkspace
 
+// materializationBeforeFailureRollback is a test-only failpoint used to prove
+// that failure cleanup never follows a replacement path component.
+var materializationBeforeFailureRollback func(string) error
+
 // Materialized is the verified workspace boundary consumed by execution.
 // Artifact and ArtifactRef are cloned so callers cannot mutate persisted state.
 type Materialized struct {
@@ -476,6 +480,11 @@ func parseWorktreeRegistrations(data []byte) ([]worktreeRegistration, error) {
 
 func materializationFailure(repository *repositorySnapshot, worktreePath string, created bool, cause error, message string) error {
 	if created {
+		if materializationBeforeFailureRollback != nil {
+			if hookErr := materializationBeforeFailureRollback(worktreePath); hookErr != nil {
+				cause = errors.Join(cause, fmt.Errorf("before worktree rollback: %w", hookErr))
+			}
+		}
 		if rollbackErr := rollbackMaterializedWorktreeAfterFailure(repository, worktreePath); rollbackErr != nil {
 			cause = errors.Join(cause, fmt.Errorf("worktree rollback failed: %w", rollbackErr))
 		}
@@ -494,30 +503,15 @@ func materializationFailure(repository *repositorySnapshot, worktreePath string,
 }
 
 func rollbackMaterializedWorktreeAfterFailure(repository *repositorySnapshot, worktreePath string) error {
-	cleanupContext, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-	return rollbackMaterializedWorktree(cleanupContext, repository, worktreePath)
-}
-
-func rollbackMaterializedWorktree(ctx context.Context, repository *repositorySnapshot, worktreePath string) error {
 	if repository == nil || strings.TrimSpace(worktreePath) == "" {
 		return nil
 	}
-	var failures []error
-	registered, err := repositoryWorktreeRegistered(ctx, repository, worktreePath)
-	if err != nil {
-		failures = append(failures, err)
-	} else if registered {
-		if _, err := runGit(ctx, repository.gitBinary, repository.root, "worktree", "remove", "--force", worktreePath); err != nil {
-			failures = append(failures, err)
-		}
-	}
-	if _, err := os.Lstat(worktreePath); err == nil {
-		if removeErr := os.RemoveAll(worktreePath); removeErr != nil {
-			failures = append(failures, removeErr)
-		}
-	} else if !os.IsNotExist(err) {
-		failures = append(failures, err)
-	}
-	return errors.Join(failures...)
+	cleanupContext, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	return CleanupInitializationWorktree(
+		cleanupContext,
+		repository.root,
+		worktreePath,
+		repository.headCommit,
+	)
 }

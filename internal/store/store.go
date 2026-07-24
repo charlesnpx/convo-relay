@@ -27,11 +27,40 @@ func (e NotFoundError) Error() string {
 }
 
 type Store struct {
-	Root string
+	Root             string
+	mutationObserver FileMutationObserver
 }
 
 func New(root string) *Store {
 	return &Store{Root: root}
+}
+
+// FileMutationObserver lets a transaction persist an exact write intent
+// before Store changes a session file. The observer is intentionally generic:
+// Store does not interpret transaction state, and ordinary stores have no
+// observer.
+type FileMutationObserver interface {
+	BeforeFileMutation(path string, body []byte, mode os.FileMode) (FileMutationPlan, error)
+	AfterFileMutation(plan FileMutationPlan, committed bool) error
+}
+
+// FileMutationPlan identifies the exact transaction-created temporary file
+// reserved by an observer. Store writes through that existing file rather than
+// creating an unjournaled inode of its own.
+type FileMutationPlan struct {
+	ID            string
+	TemporaryPath string
+}
+
+func NewWithFileMutationObserver(root string, observer FileMutationObserver) *Store {
+	return &Store{Root: root, mutationObserver: observer}
+}
+
+func (s *Store) SetFileMutationObserver(observer FileMutationObserver) {
+	if s == nil {
+		return
+	}
+	s.mutationObserver = observer
 }
 
 func (s *Store) SessionID() string {

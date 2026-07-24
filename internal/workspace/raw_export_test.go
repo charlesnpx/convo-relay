@@ -147,6 +147,10 @@ func TestRawExportMaterializesGitlinksAsCountedEmptyDirectories(t *testing.T) {
 }
 
 func TestValidateRawTreeEntriesRejectsUnsafeTargetsAndModes(t *testing.T) {
+	caseInsensitive, err := filesystemCaseInsensitive(t.TempDir())
+	if err != nil {
+		t.Fatalf("probe test filesystem case semantics: %v", err)
+	}
 	tests := []struct {
 		name    string
 		entries []headEntry
@@ -165,7 +169,7 @@ func TestValidateRawTreeEntriesRejectsUnsafeTargetsAndModes(t *testing.T) {
 			{path: "same", mode: "100644", objectType: "blob", oid: "b"},
 		}},
 	}
-	if runtime.GOOS == "darwin" || runtime.GOOS == "windows" {
+	if caseInsensitive {
 		tests = append(tests, struct {
 			name    string
 			entries []headEntry
@@ -179,7 +183,7 @@ func TestValidateRawTreeEntriesRejectsUnsafeTargetsAndModes(t *testing.T) {
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			if _, err := validateRawTreeEntries(test.entries); err == nil {
+			if _, err := validateRawTreeEntries(test.entries, caseInsensitive); err == nil {
 				t.Fatalf("unsafe entries accepted: %#v", test.entries)
 			}
 		})

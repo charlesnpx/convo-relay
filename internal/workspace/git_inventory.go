@@ -220,7 +220,15 @@ func inspectRepositoryPass(
 	}
 	launchSubpath = filepath.ToSlash(launchSubpath)
 
-	indexOutput, err := runGit(ctx, gitBinary, root, "ls-files", "--stage", "-z", "--")
+	indexRecordLimit := limitsIndexRecordCeiling(accounting.limits.maxFiles)
+	indexOutput, err := runGitNULRecords(
+		ctx,
+		gitBinary,
+		root,
+		indexRecordLimit,
+		accounting.limits.maxFiles,
+		"ls-files", "--stage", "-z", "--",
+	)
 	if err != nil {
 		return nil, err
 	}
@@ -228,7 +236,14 @@ func inspectRepositoryPass(
 	if err != nil {
 		return nil, err
 	}
-	headTreeOutput, err := runGit(ctx, gitBinary, root, "ls-tree", "-r", "-z", "--full-tree", "HEAD")
+	headTreeOutput, err := runGitNULRecords(
+		ctx,
+		gitBinary,
+		root,
+		accounting.limits.maxFiles,
+		accounting.limits.maxFiles,
+		"ls-tree", "-r", "-z", "--full-tree", "HEAD",
+	)
 	if err != nil {
 		return nil, err
 	}
@@ -236,7 +251,14 @@ func inspectRepositoryPass(
 	if err != nil {
 		return nil, err
 	}
-	untrackedOutput, err := runGit(ctx, gitBinary, root, "ls-files", "--others", "--exclude-standard", "-z", "--")
+	untrackedOutput, err := runGitNULRecords(
+		ctx,
+		gitBinary,
+		root,
+		accounting.limits.maxFiles,
+		accounting.limits.maxFiles,
+		"ls-files", "--others", "--exclude-standard", "-z", "--",
+	)
 	if err != nil {
 		return nil, err
 	}
@@ -359,6 +381,45 @@ func verifyCommittedLaunchSubpath(ctx context.Context, repository *repositorySna
 
 func runGit(ctx context.Context, gitBinary string, cwd string, args ...string) ([]byte, error) {
 	return gitexec.Run(ctx, gitBinary, cwd, nil, args...)
+}
+
+func runGitNULRecords(
+	ctx context.Context,
+	gitBinary string,
+	cwd string,
+	recordLimit int64,
+	repositoryFileLimit int64,
+	args ...string,
+) ([]byte, error) {
+	output, err := gitexec.RunNULRecords(ctx, gitBinary, cwd, nil, recordLimit, args...)
+	if err == nil {
+		return output, nil
+	}
+	var recordErr *gitexec.OutputRecordLimitError
+	if errors.As(err, &recordErr) {
+		observed := repositoryFileLimit
+		if observed < int64(^uint64(0)>>1) {
+			observed++
+		}
+		return nil, &contracts.ResourceLimitError{
+			Code:     contracts.DiagnosticCodeRepositoryInventoryMaxFiles,
+			Resource: "repository inventory files",
+			Limit:    repositoryFileLimit,
+			Observed: observed,
+		}
+	}
+	return nil, err
+}
+
+func limitsIndexRecordCeiling(fileLimit int64) int64 {
+	if fileLimit <= 0 {
+		return fileLimit
+	}
+	const maximumInt64 = int64(^uint64(0) >> 1)
+	if fileLimit > maximumInt64/4 {
+		return maximumInt64
+	}
+	return fileLimit * 4
 }
 
 func diffFilesWithUnhintedIndex(
@@ -595,22 +656,22 @@ func inspectFilesystemEntry(
 		return filesystemEntry{}, err
 	}
 	fullPath := filepath.Join(root, filepath.FromSlash(gitPath))
-	before, err := os.Lstat(fullPath)
+	before, obstruction, err := lstatGitPathNoFollow(root, gitPath)
 	if err != nil {
-		if os.IsNotExist(err) || errors.Is(err, syscall.ENOTDIR) {
-			if err := accounting.addEntry(0); err != nil {
-				return filesystemEntry{}, err
-			}
-			entry := filesystemEntry{path: gitPath, present: false}
-			if errors.Is(err, syscall.ENOTDIR) {
-				entry.obstruction = "ancestor_not_directory"
-			}
-			if expectedGitlink {
-				entry.gitlinkState = "uninitialized"
-			}
-			return entry, nil
-		}
 		return filesystemEntry{}, err
+	}
+	if obstruction != "" {
+		if err := accounting.addEntry(0); err != nil {
+			return filesystemEntry{}, err
+		}
+		entry := filesystemEntry{path: gitPath, present: false}
+		if obstruction != "missing" {
+			entry.obstruction = obstruction
+		}
+		if expectedGitlink {
+			entry.gitlinkState = "uninitialized"
+		}
+		return entry, nil
 	}
 	entry := filesystemEntry{path: gitPath, present: true, permissions: fmt.Sprintf("%04o", before.Mode().Perm())}
 	if before.Mode()&os.ModeSymlink != 0 {
@@ -658,9 +719,14 @@ func inspectFilesystemEntry(
 		return filesystemEntry{}, fmt.Errorf("file changed before inventory read")
 	}
 	hasher := sha256.New()
-	size, err := io.Copy(hasher, &contextReader{ctx: ctx, reader: handle})
-	if err != nil {
-		return filesystemEntry{}, err
+	size, readErr := io.CopyN(hasher, &contextReader{ctx: ctx, reader: handle}, opened.Size())
+	var extra [1]byte
+	extraCount, extraErr := (&contextReader{ctx: ctx, reader: handle}).Read(extra[:])
+	if extraErr != nil && !errors.Is(extraErr, io.EOF) {
+		readErr = errors.Join(readErr, extraErr)
+	}
+	if readErr != nil || size != opened.Size() || extraCount != 0 {
+		return filesystemEntry{}, errors.Join(readErr, errors.New("file changed during bounded inventory read"))
 	}
 	after, err := handle.Stat()
 	if err != nil || after.Size() != opened.Size() || after.Mode() != opened.Mode() || !after.ModTime().Equal(opened.ModTime()) {
@@ -678,6 +744,39 @@ func inspectFilesystemEntry(
 	entry.sizeBytes = size
 	entry.rawDigest = "sha256:" + hex.EncodeToString(hasher.Sum(nil))
 	return entry, nil
+}
+
+func lstatGitPathNoFollow(root string, gitPath string) (os.FileInfo, string, error) {
+	if err := validateGitPath(gitPath); err != nil {
+		return nil, "", err
+	}
+	components := strings.Split(gitPath, "/")
+	current := root
+	for index, component := range components {
+		current = filepath.Join(current, filepath.FromSlash(component))
+		info, err := os.Lstat(current)
+		if os.IsNotExist(err) {
+			return nil, "missing", nil
+		}
+		if errors.Is(err, syscall.ENOTDIR) {
+			return nil, "ancestor_not_directory", nil
+		}
+		if err != nil {
+			return nil, "", err
+		}
+		if index < len(components)-1 {
+			if info.Mode()&os.ModeSymlink != 0 {
+				return nil, "ancestor_symlink", nil
+			}
+			if !info.IsDir() {
+				return nil, "ancestor_not_directory", nil
+			}
+		}
+		if index == len(components)-1 {
+			return info, "", nil
+		}
+	}
+	return nil, "missing", nil
 }
 
 func inspectGitlinkEntry(
@@ -783,6 +882,11 @@ func contextError(ctx context.Context) error {
 func validateGitPath(path string) error {
 	if path == "" || strings.IndexByte(path, 0) >= 0 || filepath.IsAbs(filepath.FromSlash(path)) {
 		return fmt.Errorf("invalid Git path")
+	}
+	for _, component := range strings.Split(path, "/") {
+		if component == "" || component == "." || component == ".." {
+			return fmt.Errorf("invalid Git path")
+		}
 	}
 	cleaned := filepath.Clean(filepath.FromSlash(path))
 	if cleaned == ".." || strings.HasPrefix(cleaned, ".."+string(filepath.Separator)) {
