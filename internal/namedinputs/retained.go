@@ -248,7 +248,18 @@ func VerifyRetained(
 		return retainedMismatchError(mismatch, nil)
 	}
 	if len(actual) < len(entries) {
-		mismatch := retainedMismatch(role, boundary, entries, len(actual), IntegrityMismatchMissing)
+		actualNames := make(map[string]bool, len(actual))
+		for _, entry := range actual {
+			actualNames[entry.Name()] = true
+		}
+		missingIndex := 0
+		for index, entry := range entries {
+			if !actualNames[entry.filename] {
+				missingIndex = index
+				break
+			}
+		}
+		mismatch := retainedMismatch(role, boundary, entries, missingIndex, IntegrityMismatchMissing)
 		return retainedMismatchError(mismatch, nil)
 	}
 	for index, entry := range entries {
@@ -320,6 +331,9 @@ func VerifyRetained(
 		closeErr := handle.Close()
 		if statErr != nil || closeErr != nil {
 			return errors.Join(readErr, statErr, closeErr)
+		}
+		if contextErr := retainedContextError(ctx); contextErr != nil {
+			return contextErr
 		}
 		pathAfter, pathErr := os.Lstat(target)
 		if pathErr != nil || !after.Mode().IsRegular() || !os.SameFile(opened, after) ||
@@ -465,7 +479,7 @@ func retainedMismatchError(mismatch IntegrityMismatch, cause error) error {
 		details["cause_type"] = fmt.Sprintf("%T", cause)
 		diagnostic.Details = details
 	}
-	return contracts.NewDiagnosticError("Retained named input integrity verification failed.", diagnostic)
+	return contracts.WrapDiagnosticError(cause, "Retained named input integrity verification failed.", diagnostic)
 }
 
 func retainedFilenamePresent(entries []os.DirEntry, filename string) bool {

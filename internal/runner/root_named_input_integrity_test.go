@@ -190,6 +190,15 @@ func TestRootRetainedInputIntegrityWinsOverEveryProviderOutcomeAndPreventsRetry(
 			cancelOuter:     true,
 		},
 		{
+			name: "outer cancellation after provider success",
+			outcome: func(_ context.Context, call rootBackendCall, output string) (TurnResult, error) {
+				return successfulRootTurn(call.Backend, output), nil
+			},
+			wantCause:       RootFailureCauseProviderCanceled,
+			wantCanceledErr: true,
+			cancelOuter:     true,
+		},
+		{
 			name: "retryable failure",
 			outcome: func(_ context.Context, call rootBackendCall, output string) (TurnResult, error) {
 				return successfulRootTurn(call.Backend, output), RetryableProviderError{

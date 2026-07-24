@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 
 	"github.com/charlesnpx/convo-relay/internal/contracts"
@@ -132,6 +133,10 @@ func TestVerifyRetainedRejectsEveryExactLayoutMismatchWithoutContents(t *testing
 				diagnostic.Details["attempt_boundary"] != IntegrityBoundaryBeforeAttempt {
 				t.Fatalf("retained mismatch diagnostic = %#v", diagnostic)
 			}
+			if test.name == "missing" &&
+				(diagnostic.Details["input_name"] != "value" || diagnostic.Details["input_ordinal"] != 1) {
+				t.Fatalf("early missing input diagnostic = %#v", diagnostic)
+			}
 			if containsKeyRecursive(diagnostic.ToMap(), "bytes") ||
 				containsKeyRecursive(diagnostic.ToMap(), "content") {
 				t.Fatalf("retained mismatch diagnostic exposed contents: %#v", diagnostic)
@@ -142,8 +147,7 @@ func TestVerifyRetainedRejectsEveryExactLayoutMismatchWithoutContents(t *testing
 
 func TestVerifyRetainedObservesCancellationWhileHashing(t *testing.T) {
 	st, materialized := retainedFixture(t)
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
+	ctx := newCancelAfterDoneChecksContext(3)
 	if err := VerifyRetained(ctx, st, materialized.DescriptorRef, "initialization", IntegrityBoundaryInitialization); !errors.Is(err, context.Canceled) {
 		t.Fatalf("canceled retained verification = %v", err)
 	}
@@ -281,4 +285,42 @@ func saveRetainedDescriptor(t *testing.T, st *store.Store, descriptor map[string
 		t.Fatalf("save retained descriptor: %v", err)
 	}
 	return ref
+}
+
+type cancelAfterDoneChecksContext struct {
+	context.Context
+
+	mu          sync.Mutex
+	done        chan struct{}
+	checks      int
+	cancelAfter int
+	canceled    bool
+}
+
+func newCancelAfterDoneChecksContext(cancelAfter int) *cancelAfterDoneChecksContext {
+	return &cancelAfterDoneChecksContext{
+		Context:     context.Background(),
+		done:        make(chan struct{}),
+		cancelAfter: cancelAfter,
+	}
+}
+
+func (c *cancelAfterDoneChecksContext) Done() <-chan struct{} {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.checks++
+	if !c.canceled && c.checks >= c.cancelAfter {
+		close(c.done)
+		c.canceled = true
+	}
+	return c.done
+}
+
+func (c *cancelAfterDoneChecksContext) Err() error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.canceled {
+		return context.Canceled
+	}
+	return nil
 }

@@ -89,6 +89,9 @@ func runRootProviderTurnWithRetainedIntegrity(
 		}
 
 		providerCause := rootProviderSecondaryCause(actor, result, providerErr)
+		if providerCause == nil {
+			providerCause = ctx.Err()
+		}
 		var providerFailure map[string]any
 		if providerCause != nil {
 			providerFailure = providerFailurePayload(
