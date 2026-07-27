@@ -14,6 +14,7 @@ import (
 	"github.com/charlesnpx/convo-relay/internal/contracts"
 	"github.com/charlesnpx/convo-relay/internal/graph"
 	"github.com/charlesnpx/convo-relay/internal/inspect"
+	"github.com/charlesnpx/convo-relay/internal/integration"
 	"github.com/charlesnpx/convo-relay/internal/model"
 	"github.com/charlesnpx/convo-relay/internal/recipes"
 	"github.com/charlesnpx/convo-relay/internal/store"
@@ -694,6 +695,92 @@ func TestRunRecipeProviderRetryForbidLaunchesEachInvocationOnce(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestRunRecipeAppliesCompleteTraceOnlyPromptProjection(t *testing.T) {
+	bundleObject, err := contracts.DecodeStrictJSONObjectBytes([]byte(rootRecipeTestBundleWithoutInputs))
+	if err != nil {
+		t.Fatalf("decode projection fixture: %v", err)
+	}
+	bundleObject["schema_version"] = integration.BundleSchemaVersionV2
+	contract := bundleObject["contracts"].(map[string]any)["neutral/contract-v1"].(map[string]any)
+	contract["turns"].([]any)[0].(map[string]any)["instructions"] = "TURN_1_ONLY"
+	contract["turns"].([]any)[1].(map[string]any)["instructions"] = "TURN_2_ONLY"
+	contract["reducer"] = map[string]any{"instructions": "Return one JSON object."}
+	contract["prompt_context"] = map[string]any{
+		"participant_transcript": integration.ParticipantTranscriptComplete,
+		"facilitator_ledger":     integration.FacilitatorLedgerTraceOnly,
+	}
+	bundleBytes, _ := contracts.CanonicalJSONBytes(bundleObject)
+	bundle, err := integration.DecodeBundleBytes(bundleBytes)
+	if err != nil {
+		t.Fatalf("decode projection bundle: %v", err)
+	}
+	config := rootRecipeRuntimeConfig("neutral/contract-v1")
+	recipe := config.RelayRecipes["neutral-root"]
+	recipe["result_source"] = integration.ResultSourceReducer
+	recorder := &rootBackendRecorder{}
+	participantOrdinal := 0
+	facilitatorOrdinal := 0
+	recorder.handler = func(_ context.Context, call rootBackendCall) (TurnResult, error) {
+		switch call.SlotID {
+		case "facilitator":
+			facilitatorOrdinal++
+			return successfulRootTurn(call.Backend, fmt.Sprintf(`{"settled":[],"contested":["FACILITATOR_SECRET_%d"],"withdrawn":[]}`, facilitatorOrdinal)), nil
+		case "reducer":
+			return successfulRootTurn(call.Backend, `{}`), nil
+		default:
+			participantOrdinal++
+			return successfulRootTurn(call.Backend, strings.Repeat("history ", 170)+fmt.Sprintf("TAIL_%d", participantOrdinal)), nil
+		}
+	}
+	sessionDir := filepath.Join(t.TempDir(), "session")
+	result, err := RunRecipe(context.Background(), RecipeOptions{
+		SessionDir:        sessionDir,
+		Task:              "Project complete participant history",
+		RecipeID:          "neutral-root",
+		LaunchCWD:         t.TempDir(),
+		RuntimeConfig:     config,
+		IntegrationBundle: bundle,
+		ReadinessCheck:    readyRootRecipeCheck,
+		backendFactory:    recorder.factory(),
+	})
+	if err != nil {
+		t.Fatalf("RunRecipe: %v", err)
+	}
+	projection := result["prompt_context"].(map[string]any)
+	if result["schema_version"] != 2 || result["provider_retry"] != recipes.ProviderRetryAllow || projection["facilitator_ledger"] != integration.FacilitatorLedgerTraceOnly {
+		t.Fatalf("projection result = %#v", result)
+	}
+	participantPrompts := []string{}
+	var reducerPrompt string
+	for _, call := range recorder.snapshotCalls() {
+		if call.SlotID == "reducer" {
+			reducerPrompt = call.Prompt
+		} else if call.SlotID != "facilitator" {
+			participantPrompts = append(participantPrompts, call.Prompt)
+		}
+		if call.SlotID != "facilitator" && strings.Contains(call.Prompt, "FACILITATOR_SECRET_") {
+			t.Fatalf("trace-only facilitator content reached %s prompt", call.SlotID)
+		}
+	}
+	if len(participantPrompts) != 2 || strings.Contains(participantPrompts[0], "TURN_2_ONLY") || !strings.Contains(participantPrompts[1], "TAIL_1") {
+		t.Fatalf("participant prompt projection is incomplete or leaked future instructions")
+	}
+	for _, marker := range []string{"TAIL_1", "TAIL_2"} {
+		if !strings.Contains(reducerPrompt, marker) {
+			t.Fatalf("reducer prompt omitted %s", marker)
+		}
+	}
+	refs := result["facilitator_output_refs"].([]any)
+	lastTrace, err := store.New(sessionDir).LoadArtifact(refs[len(refs)-1].(map[string]any))
+	if err != nil || !strings.Contains(stringFromAny(lastTrace["content"]), "FACILITATOR_SECRET_2") {
+		t.Fatalf("retained facilitator trace = %#v, %v", lastTrace, err)
+	}
+	report := inspect.BuildRootInspectionReport(sessionDir, result, false)
+	if report["prompt_context"].(map[string]any)["facilitator_ledger"] != integration.FacilitatorLedgerTraceOnly {
+		t.Fatalf("projection inspection = %#v", report)
 	}
 }
 

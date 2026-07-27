@@ -9,6 +9,7 @@ import (
 
 	"github.com/charlesnpx/convo-relay/internal/contracts"
 	"github.com/charlesnpx/convo-relay/internal/graph"
+	"github.com/charlesnpx/convo-relay/internal/integration"
 	"github.com/charlesnpx/convo-relay/internal/model"
 	"github.com/charlesnpx/convo-relay/internal/store"
 )
@@ -500,8 +501,10 @@ func (s *rootExecutionState) participantPrompt(ordinal int, slot Backend, steeri
 		fmt.Fprintf(&builder, "\n--- Available Capabilities ---\n%s\n", strings.TrimSpace(BuildSkillsPromptText(s.preflight.launchSkills)))
 	}
 
-	fmt.Fprintf(&builder, "\n--- Prior Participant Transcript ---\n%s\n", summarizeRecentTranscript(s.transcript))
-	fmt.Fprintf(&builder, "\n--- Current Facilitator Ledger ---\n%s\n", mustJSON(s.meta.Ledger().ToMap()))
+	fmt.Fprintf(&builder, "\n--- Prior Participant Transcript ---\n%s\n", s.participantTranscriptPrompt(s.transcript, false))
+	if s.includeFacilitatorLedgerInConsumerPrompt() {
+		fmt.Fprintf(&builder, "\n--- Current Facilitator Ledger ---\n%s\n", mustJSON(s.meta.Ledger().ToMap()))
+	}
 	if policy := strings.TrimSpace(promptPolicyFragment(s.preflight.promptPolicy)); policy != "" {
 		fmt.Fprintf(&builder, "\n--- Evidence Policy ---\n%s\n", policy)
 	}
@@ -546,10 +549,35 @@ func (s *rootExecutionState) facilitatorPrompt(latestResponse string, speaker st
 		"%s\n\nCurrent ledger:\n%s\n\nRecent participant transcript:\n%s\n\nLatest response from %s:\n---\n%s\n---\n\nReturn the updated ledger as JSON.",
 		facilitatorSystem,
 		mustJSON(s.meta.Ledger().ToMap()),
-		summarizeRecentTranscript(priorTranscript),
+		s.participantTranscriptPrompt(priorTranscript, true),
 		speaker,
 		latestResponse,
 	)
+}
+
+func (s *rootExecutionState) participantTranscriptPrompt(transcript model.Transcript, facilitatorConsumer bool) string {
+	if s.preflight.selectedContract == nil {
+		return summarizeRecentTranscript(transcript)
+	}
+	items := transcript.ToSlice()
+	if !facilitatorConsumer && s.preflight.selectedContract.PromptContext().FacilitatorLedger == integration.FacilitatorLedgerTraceOnly {
+		for index, raw := range items {
+			entry, _ := raw.(map[string]any)
+			entry = cloneMap(entry)
+			delete(entry, "ledger")
+			for key := range entry {
+				if strings.HasPrefix(key, "facilitator_") {
+					delete(entry, key)
+				}
+			}
+			items[index] = entry
+		}
+	}
+	return mustJSON(map[string]any{"entries": items})
+}
+
+func (s *rootExecutionState) includeFacilitatorLedgerInConsumerPrompt() bool {
+	return s.preflight.selectedContract == nil || s.preflight.selectedContract.PromptContext().FacilitatorLedger != integration.FacilitatorLedgerTraceOnly
 }
 
 func appendRootSteeringBlock(prompt string, ordinal int, steering []map[string]any) string {

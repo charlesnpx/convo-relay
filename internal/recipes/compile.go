@@ -70,7 +70,14 @@ func CompileRecipe(
 	if diagnostics := validateRecipeRecord(recipe, "/recipe"); len(diagnostics) > 0 {
 		return nil, contracts.NewDiagnosticError("Relay recipe configuration is invalid.", diagnostics...)
 	}
+	contractID := stringValue(recipe["integration_contract"])
 	recipePayload := normalizeRecipePayload(recipe)
+	if strings.TrimSpace(contractID) != "" && options.IntegrationBundle != nil && options.IntegrationBundle.SchemaVersion() == integration.BundleSchemaVersionV2 {
+		if _, represented := recipePayload["provider_retry"]; !represented {
+			recipePayload["provider_retry"] = ProviderRetryAllow
+			recipePayload["schema_version"] = 2
+		}
+	}
 	var compiled map[string]any
 	var err error
 	if target == CompileTargetChild {
@@ -367,6 +374,7 @@ func compileRootPlan(
 	}
 
 	recipePayload := normalizeRecipePayload(recipe)
+	contractID := stringValue(recipePayload["integration_contract"])
 	recipeRef, err := contracts.ArtifactRefForPayload("recipe:"+stringValue(recipePayload["id"]), recipePayload)
 	if err != nil {
 		return nil, err
@@ -397,7 +405,6 @@ func compileRootPlan(
 		planFields["reducer"] = reducerProfile
 	}
 
-	contractID := stringValue(recipePayload["integration_contract"])
 	if strings.TrimSpace(contractID) != "" {
 		selected, err := integration.SelectContract(options.IntegrationBundle, contractID, integration.ScheduleRequirement{
 			Turns:        scheduledTurns,
@@ -406,11 +413,7 @@ func compileRootPlan(
 		if err != nil {
 			return nil, err
 		}
-		bundleArtifact, err := contracts.NormalizeRootArtifact(contracts.RootArtifactKindIntegrationBundle, map[string]any{
-			"bundle_id":     options.IntegrationBundle.ID(),
-			"bundle_digest": options.IntegrationBundle.Digest(),
-			"bundle":        options.IntegrationBundle.ToMap(),
-		})
+		bundleArtifact, err := options.IntegrationBundle.ArtifactPayload()
 		if err != nil {
 			return nil, err
 		}
@@ -418,11 +421,7 @@ func compileRootPlan(
 		if err != nil {
 			return nil, err
 		}
-		contractArtifact, err := contracts.NormalizeRootArtifact(contracts.RootArtifactKindIntegrationContract, map[string]any{
-			"contract_id":     selected.ID(),
-			"contract_digest": selected.Digest(),
-			"contract":        selected.ToMap(),
-		})
+		contractArtifact, err := selected.ArtifactPayload()
 		if err != nil {
 			return nil, err
 		}
@@ -435,6 +434,9 @@ func compileRootPlan(
 		planFields["integration_contract_ref"] = contractRef
 		planFields["integration_contract_id"] = selected.ID()
 		planFields["integration_contract_digest"] = selected.Digest()
+		if selected.BundleVersion() == integration.BundleSchemaVersionV2 {
+			planFields["prompt_context"] = selected.PromptContext().ToMap()
+		}
 	}
 	if providerRetryRepresented {
 		return contracts.NormalizeRootArtifactVersion(contracts.RootArtifactKindRootRecipePlan, contracts.RootArtifactSchemaVersionV2, planFields)
@@ -519,10 +521,19 @@ func BuildCompileReport(
 		return nil, err
 	}
 	var recipePayload map[string]any
+	effectiveRecipe := recipe
 	if target == CompileTargetChild {
 		recipePayload = ChildRecipeContractPayload(recipe)
 	} else {
 		recipePayload = RecipeContractPayload(recipe)
+		if providerRetry, successor := compiled["provider_retry"]; successor {
+			if _, represented := recipePayload["provider_retry"]; !represented {
+				effectiveRecipe = cloneObject(recipe)
+				effectiveRecipe["schema_version"] = 2
+				effectiveRecipe["provider_retry"] = providerRetry
+				recipePayload = RecipeContractPayload(effectiveRecipe)
+			}
+		}
 	}
 	recipeDigest, err := contracts.ContractDigest(recipePayload)
 	if err != nil {
@@ -536,7 +547,7 @@ func BuildCompileReport(
 		"recipe_id":            recipeID,
 		"target":               string(target),
 		"settings_path":        config.SettingsPath,
-		"recipe":               recipe,
+		"recipe":               effectiveRecipe,
 		"recipe_digest":        recipeDigest,
 		"compiled_plan":        compiled,
 		"compiled_plan_digest": compiledDigest,

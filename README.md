@@ -343,6 +343,10 @@ Root recipes may set `provider_retry = "forbid"` to permit only one runner
 launch per provider invocation; omission preserves the legacy `allow` policy.
 Retries performed internally by a provider remain outside runner accounting.
 
+Integration bundle v2 adds a `prompt_context` projection. Participant history
+is complete; `facilitator_ledger = "trace_only"` retains facilitator artifacts
+while excluding that ledger from later participant and reducer prompts.
+
 Provider CLIs are trusted same-user processes. They run with the invoking user's authority and are not a sandbox or security boundary: they can access any source, session, credential, network, or other path the user can access. Named inputs are copied into the session and integrity-checked before and after every provider attempt, during recovery, and before result validation. Those copies are snapshots, not immutable or filesystem read-only objects; a provider can change them between checks, and orchestration detects that change at the next boundary.
 
 The `read_only` and `ephemeral` workspace policy names are compatibility and lifecycle values. Both execute in a writable, session-managed detached worktree. They neither make the filesystem read-only nor protect the source repository or session state from a same-user provider. Failed or interrupted worktrees remain registered for inspection until cleanup succeeds.

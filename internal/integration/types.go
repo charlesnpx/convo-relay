@@ -162,6 +162,18 @@ func (b *Bundle) Digest() string {
 	return b.digest
 }
 
+func (b *Bundle) ArtifactPayload() (map[string]any, error) {
+	fields := map[string]any{
+		"bundle_id":     b.ID(),
+		"bundle_digest": b.Digest(),
+		"bundle":        b.ToMap(),
+	}
+	if b.SchemaVersion() == BundleSchemaVersionV2 {
+		return contracts.NormalizeRootArtifactVersion(contracts.RootArtifactKindIntegrationBundle, contracts.RootArtifactSchemaVersionV2, fields)
+	}
+	return contracts.NormalizeRootArtifact(contracts.RootArtifactKindIntegrationBundle, fields)
+}
+
 func (b *Bundle) Contract(id string) (*Contract, bool) {
 	if b == nil {
 		return nil, false
@@ -291,6 +303,18 @@ func (s *SelectedContract) Digest() string {
 		return ""
 	}
 	return s.digest
+}
+
+func (s *SelectedContract) ArtifactPayload() (map[string]any, error) {
+	fields := map[string]any{
+		"contract_id":     s.ID(),
+		"contract_digest": s.Digest(),
+		"contract":        s.ToMap(),
+	}
+	if s.BundleVersion() == BundleSchemaVersionV2 {
+		return contracts.NormalizeRootArtifactVersion(contracts.RootArtifactKindIntegrationContract, contracts.RootArtifactSchemaVersionV2, fields)
+	}
+	return contracts.NormalizeRootArtifact(contracts.RootArtifactKindIntegrationContract, fields)
 }
 
 func assertionMaps(assertions []AssertionDeclaration) []any {

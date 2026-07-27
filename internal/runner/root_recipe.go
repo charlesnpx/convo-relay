@@ -180,16 +180,6 @@ func preflightRecipe(ctx context.Context, opts RecipeOptions) (*recipePreflight,
 	if err != nil {
 		return nil, err
 	}
-	runtimeSnapshot, err := prepareRuntimeConfigSnapshot(runtimeConfig)
-	if err != nil {
-		return nil, rootRecipeDiagnostic(
-			diagnosticCodeRuntimeConfigInvalid,
-			contracts.DiagnosticPhasePreflight,
-			"/runtime_config",
-			"The effective runtime configuration must be persistable JSON.",
-			map[string]any{"cause": err.Error()},
-		)
-	}
 	recipeID := strings.TrimSpace(opts.RecipeID)
 	recipe, exists := runtimeConfig.RelayRecipes[recipeID]
 	if !exists || recipe == nil {
@@ -227,6 +217,24 @@ func preflightRecipe(ctx context.Context, opts RecipeOptions) (*recipePreflight,
 	}
 	if _, err := contracts.ValidateRootArtifact(rootPlan, contracts.RootArtifactKindRootRecipePlan); err != nil {
 		return nil, err
+	}
+	if providerRetry, successor := rootPlan["provider_retry"]; successor {
+		if _, represented := recipes.RecipeContractPayload(recipe)["provider_retry"]; !represented {
+			recipe = cloneMap(recipe)
+			recipe["schema_version"] = 2
+			recipe["provider_retry"] = providerRetry
+			runtimeConfig.RelayRecipes[recipeID] = recipe
+		}
+	}
+	runtimeSnapshot, err := prepareRuntimeConfigSnapshot(runtimeConfig)
+	if err != nil {
+		return nil, rootRecipeDiagnostic(
+			diagnosticCodeRuntimeConfigInvalid,
+			contracts.DiagnosticPhasePreflight,
+			"/runtime_config",
+			"The effective runtime configuration must be persistable JSON.",
+			map[string]any{"cause": err.Error()},
+		)
 	}
 	transientRecipes, err := prepareRootTransientRecipes(transientFiles, runtimeConfig, recipeID, rootPlan)
 	if err != nil {
@@ -514,11 +522,7 @@ func persistRecipePreflight(
 	var bundleRef map[string]any
 	var contractRef map[string]any
 	if preflight.selectedContract != nil {
-		bundleArtifact, err := contracts.NormalizeRootArtifact(contracts.RootArtifactKindIntegrationBundle, map[string]any{
-			"bundle_id":     preflight.bundle.ID(),
-			"bundle_digest": preflight.bundle.Digest(),
-			"bundle":        preflight.bundle.ToMap(),
-		})
+		bundleArtifact, err := preflight.bundle.ArtifactPayload()
 		if err != nil {
 			return nil, err
 		}
@@ -529,11 +533,7 @@ func persistRecipePreflight(
 		if err := requireMatchingArtifactRef(mapFromAny(preflight.rootPlan["integration_bundle_ref"]), bundleRef, "integration bundle"); err != nil {
 			return nil, err
 		}
-		contractArtifact, err := contracts.NormalizeRootArtifact(contracts.RootArtifactKindIntegrationContract, map[string]any{
-			"contract_id":     preflight.selectedContract.ID(),
-			"contract_digest": preflight.selectedContract.Digest(),
-			"contract":        preflight.selectedContract.ToMap(),
-		})
+		contractArtifact, err := preflight.selectedContract.ArtifactPayload()
 		if err != nil {
 			return nil, err
 		}
@@ -759,6 +759,9 @@ func rootRecipeMeta(preflight *recipePreflight, persisted *persistedRecipeRun) (
 	}
 	if providerRetry, represented := preflight.rootPlan["provider_retry"]; represented {
 		meta["provider_retry"] = providerRetry
+	}
+	if promptContext, represented := preflight.rootPlan["prompt_context"]; represented {
+		meta["prompt_context"] = promptContext
 	}
 	return model.NewSessionMeta(meta), nil
 }

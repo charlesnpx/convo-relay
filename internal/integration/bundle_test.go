@@ -211,6 +211,14 @@ func TestBundleVersionDispatchPreservesV1AndNormalizesV2PromptContext(t *testing
 	if selected.BundleVersion() != BundleSchemaVersionV2 || selected.PromptContext().FacilitatorLedger != FacilitatorLedgerTraceOnly {
 		t.Fatalf("selected v2 projection = %#v", selected.PromptContext())
 	}
+	bundleArtifact, err := bundle.ArtifactPayload()
+	if err != nil || bundleArtifact["schema_version"] != 2 {
+		t.Fatalf("v2 bundle artifact = %#v, %v", bundleArtifact, err)
+	}
+	contractArtifact, err := selected.ArtifactPayload()
+	if err != nil || contractArtifact["schema_version"] != 2 {
+		t.Fatalf("v2 selected-contract artifact = %#v, %v", contractArtifact, err)
+	}
 
 	for field, value := range map[string]any{
 		"participant_transcript": "summary",

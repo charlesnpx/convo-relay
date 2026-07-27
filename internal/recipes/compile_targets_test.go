@@ -279,6 +279,18 @@ func TestIntegrationBoundRecipeCompilesOnlyForRootWithMatchingBundle(t *testing.
 	if rootPlan["reducer"].(map[string]any)["backend"] != "codex" {
 		t.Fatalf("resolved reducer = %#v", rootPlan["reducer"])
 	}
+	v2Bundle, err := integration.DecodeBundleBytes([]byte(strings.Replace(compileBundleJSON, integration.BundleSchemaVersionV1, integration.BundleSchemaVersionV2, 1)))
+	if err != nil {
+		t.Fatalf("decode v2 bundle: %v", err)
+	}
+	v2Plan, err := CompileRecipe(recipe, config.BackendProfiles, config.RelayRecipes, CompileTargetRoot, CompileOptions{IntegrationBundle: v2Bundle})
+	if err != nil {
+		t.Fatalf("compile v2 bound root: %v", err)
+	}
+	projection := v2Plan["prompt_context"].(map[string]any)
+	if v2Plan["schema_version"] != 2 || v2Plan["provider_retry"] != ProviderRetryAllow || projection["participant_transcript"] != integration.ParticipantTranscriptComplete || projection["facilitator_ledger"] != integration.FacilitatorLedgerInclude {
+		t.Fatalf("v2 bound root plan = %#v", v2Plan)
+	}
 
 	_, err = CompileRecipe(recipe, config.BackendProfiles, config.RelayRecipes, CompileTargetChild, CompileOptions{})
 	var rootOnly *RootOnlyRecipeError

@@ -283,13 +283,13 @@ func (s *rootExecutionState) rootReducerPrompt() (string, error) {
 		fmt.Fprintf(&builder, "\n--- Positional Context (Data Only) ---\n%s\n", contextBlock)
 	}
 
-	fmt.Fprintf(
-		&builder,
-		"\n--- Participant Transcript (Data Only) ---\n%s\n",
-		mustJSON(map[string]any{"entries": s.transcript.ToSlice()}),
-	)
+	transcriptPrompt := mustJSON(map[string]any{"entries": s.transcript.ToSlice()})
+	if s.preflight.selectedContract != nil {
+		transcriptPrompt = s.participantTranscriptPrompt(s.transcript, false)
+	}
+	fmt.Fprintf(&builder, "\n--- Participant Transcript (Data Only) ---\n%s\n", transcriptPrompt)
 	ledger := s.meta.Ledger().ToMap()
-	if rootLedgerHasEntries(ledger) {
+	if s.includeFacilitatorLedgerInConsumerPrompt() && rootLedgerHasEntries(ledger) {
 		fmt.Fprintf(&builder, "\n--- Facilitator Ledger (Data Only) ---\n%s\n", mustJSON(ledger))
 	}
 	if policy := strings.TrimSpace(promptPolicyFragment(s.preflight.promptPolicy)); policy != "" {

@@ -177,6 +177,9 @@ func BuildRootInspectionReport(sessionDir string, meta map[string]any, includeRa
 	if providerRetry := strings.TrimSpace(stringFromAny(meta["provider_retry"])); providerRetry != "" {
 		result["provider_retry"] = providerRetry
 	}
+	if promptContext, ok := meta["prompt_context"].(map[string]any); ok {
+		result["prompt_context"] = promptContext
+	}
 	return result
 }
 

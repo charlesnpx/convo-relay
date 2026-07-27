@@ -1155,6 +1155,13 @@ func loadRootRecoveryIntegration(st *store.Store, plan map[string]any, refs map[
 	if err := requireMatchingArtifactRef(refs["integration_contract_ref"], mapFromAny(plan["integration_contract_ref"]), "integration contract"); err != nil {
 		return nil, nil, err
 	}
+	if selected.BundleVersion() == integration.BundleSchemaVersionV2 {
+		wantProjection, _ := contracts.CanonicalJSONBytes(selected.PromptContext().ToMap())
+		gotProjection, _ := contracts.CanonicalJSONBytes(plan["prompt_context"])
+		if string(wantProjection) != string(gotProjection) {
+			return nil, nil, persistenceIntegrityError("Persisted prompt context differs from the selected integration contract.", nil)
+		}
+	}
 	return bundle, selected, nil
 }
 
