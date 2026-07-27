@@ -29,10 +29,12 @@ var rootParticipantCompletionAfterWrite func(string) error
 type rootBackendFactory func(string, string, string, string, string, SlotConfig) (Backend, error)
 
 type rootProviderConstructionError struct {
-	role    string
-	actor   string
-	backend string
-	cause   error
+	role               string
+	actor              string
+	backend            string
+	participantOrdinal int
+	profile            map[string]any
+	cause              error
 }
 
 func (e rootProviderConstructionError) Error() string {
@@ -126,7 +128,14 @@ func newRootExecutionState(
 			rootProfileSlotConfig(preflight, profile),
 		)
 		if err != nil {
-			return nil, rootProviderConstructionError{role: "participant", actor: labels[index], backend: backendNames[index], cause: err}
+			return nil, rootProviderConstructionError{
+				role:               "participant",
+				actor:              labels[index],
+				backend:            backendNames[index],
+				participantOrdinal: index + 1,
+				profile:            profile,
+				cause:              err,
+			}
 		}
 		slots = append(slots, backend)
 	}
@@ -148,7 +157,14 @@ func newRootExecutionState(
 		rootProfileSlotConfig(preflight, facilitatorProfile),
 	)
 	if err != nil {
-		return nil, rootProviderConstructionError{role: "facilitator", actor: facilitatorLabel(facilitatorBackend), backend: facilitatorBackend, cause: err}
+		return nil, rootProviderConstructionError{
+			role:               "facilitator",
+			actor:              facilitatorLabel(facilitatorBackend),
+			backend:            facilitatorBackend,
+			participantOrdinal: 1,
+			profile:            facilitatorProfile,
+			cause:              err,
+		}
 	}
 	return &rootExecutionState{
 		st:                 persisted.st,
@@ -192,16 +208,31 @@ func (s *rootExecutionState) run(ctx context.Context) (map[string]any, error) {
 		if intFromAny(schedule["participant_turn"], 0) != ordinal || slotID != wantSlotID {
 			return s.markFailed("participant_schedule", persistenceIntegrityError("Compiled root participant schedule does not alternate from slot_0.", map[string]any{"participant_turn": ordinal, "slot": slotID}))
 		}
+		slot := s.slots[(ordinal-1)%len(s.slots)]
+		invocation := rootInvocationSpec{
+			phase:              "participant",
+			actor:              slot.Label(),
+			participantOrdinal: ordinal,
+			backend:            slot,
+			backendName:        slot.Name(),
+			profile:            s.participantProfile(ordinal),
+		}
 		steering, updatedMeta, err := claimRootParticipantSteering(s.preflight.sessionDir, ordinal)
 		if err != nil {
+			if recordErr := s.recordUnlaunchedInvocation(invocation, "prompt_construction", err); recordErr != nil {
+				err = errors.Join(err, recordErr)
+			}
 			return s.markFailed("participant_prompt", err)
 		}
 		s.meta = updatedMeta
-		prompt, err := s.participantPrompt(ordinal, s.slots[(ordinal-1)%len(s.slots)], steering)
+		prompt, err := s.participantPrompt(ordinal, slot, steering)
 		if err != nil {
+			if recordErr := s.recordUnlaunchedInvocation(invocation, "prompt_construction", err); recordErr != nil {
+				err = errors.Join(err, recordErr)
+			}
 			return s.markFailed("participant_prompt", err)
 		}
-		if err := s.runParticipantTurn(ctx, ordinal, s.slots[(ordinal-1)%len(s.slots)], prompt, steering); err != nil {
+		if err := s.runParticipantTurn(ctx, ordinal, slot, prompt, steering); err != nil {
 			if _, integrityFailure := asRootNamedInputIntegrityError(err); integrityFailure {
 				return s.markNamedInputIntegrityFailed(err)
 			}
@@ -227,7 +258,16 @@ func (s *rootExecutionState) runParticipantTurn(
 ) error {
 	var participantResult TurnResult
 	var err error
-	participantResult, err = runRootProviderTurnWithRetainedIntegrity(ctx, s, "participant", slot.Label(), slot.Name(), func() (TurnResult, error) {
+	participantResult, err = runRootProviderTurnWithRetainedIntegrity(ctx, s, rootInvocationSpec{
+		phase:              "participant",
+		actor:              slot.Label(),
+		participantOrdinal: ordinal,
+		backend:            slot,
+		backendName:        slot.Name(),
+		profile:            s.participantProfile(ordinal),
+		prompt:             prompt,
+		promptAvailable:    true,
+	}, func() (TurnResult, error) {
 		return slot.RunTurn(ctx, prompt, TurnOptions{
 			TimeoutSeconds:      s.preflight.options.TimeoutSeconds,
 			StallTimeoutSeconds: s.preflight.options.StallTimeoutSeconds,
@@ -248,8 +288,18 @@ func (s *rootExecutionState) runParticipantTurn(
 	}
 
 	var facilitatorResult TurnResult
-	facilitatorResult, err = runRootProviderTurnWithRetainedIntegrity(ctx, s, "facilitator", s.facilitator.Label(), s.facilitator.Name(), func() (TurnResult, error) {
-		return s.facilitator.RunTurn(ctx, s.facilitatorPrompt(participantResult.Content, slot.Label()), TurnOptions{
+	facilitatorPrompt := s.facilitatorPrompt(participantResult.Content, slot.Label())
+	facilitatorResult, err = runRootProviderTurnWithRetainedIntegrity(ctx, s, rootInvocationSpec{
+		phase:              "facilitator",
+		actor:              s.facilitator.Label(),
+		participantOrdinal: ordinal,
+		backend:            s.facilitator,
+		backendName:        s.facilitator.Name(),
+		profile:            s.facilitatorProfile,
+		prompt:             facilitatorPrompt,
+		promptAvailable:    true,
+	}, func() (TurnResult, error) {
+		return s.facilitator.RunTurn(ctx, facilitatorPrompt, TurnOptions{
 			TimeoutSeconds:      s.preflight.options.TimeoutSeconds,
 			StallTimeoutSeconds: s.preflight.options.StallTimeoutSeconds,
 		})
@@ -795,6 +845,18 @@ func failRootExecutionSetup(
 	var providerFailure map[string]any
 	var constructionErr rootProviderConstructionError
 	if errors.As(runErr, &constructionErr) {
+		state := &rootExecutionState{st: persisted.st, preflight: preflight, persisted: persisted, meta: meta, transcript: transcript}
+		recordErr := state.recordUnlaunchedInvocation(rootInvocationSpec{
+			phase:              constructionErr.role,
+			actor:              constructionErr.actor,
+			participantOrdinal: constructionErr.participantOrdinal,
+			backendName:        constructionErr.backend,
+			profile:            constructionErr.profile,
+		}, "provider_construction", constructionErr)
+		meta = state.meta
+		if recordErr != nil {
+			runErr = errors.Join(runErr, recordErr)
+		}
 		providerFailure = providerFailurePayload("participant_setup", constructionErr.actor, constructionErr.backend, runErr, ProviderResult{Backend: constructionErr.backend})
 		durableErr = durableProviderFailureError(providerFailure)
 	}

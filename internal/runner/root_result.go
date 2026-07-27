@@ -124,7 +124,16 @@ func (s *rootExecutionState) runFreshRootReducer(ctx context.Context) (rootCandi
 			role:    "reducer",
 			actor:   providerRoleLabel("reducer"),
 			backend: backendName,
+			profile: profile,
 			cause:   err,
+		}
+		if recordErr := s.recordUnlaunchedInvocation(rootInvocationSpec{
+			phase:       "reducer",
+			actor:       providerRoleLabel("reducer"),
+			backendName: backendName,
+			profile:     profile,
+		}, "provider_construction", constructionErr); recordErr != nil {
+			constructionErr.cause = errors.Join(constructionErr.cause, recordErr)
 		}
 		failure := providerFailurePayload("reducer", providerRoleLabel("reducer"), backendName, constructionErr, ProviderResult{Backend: backendName})
 		s.lastProviderFailure = cloneMap(failure)
@@ -136,9 +145,26 @@ func (s *rootExecutionState) runFreshRootReducer(ctx context.Context) (rootCandi
 
 	prompt, err := s.rootReducerPrompt()
 	if err != nil {
+		if recordErr := s.recordUnlaunchedInvocation(rootInvocationSpec{
+			phase:       "reducer",
+			actor:       reducer.Label(),
+			backend:     reducer,
+			backendName: reducer.Name(),
+			profile:     profile,
+		}, "prompt_construction", err); recordErr != nil {
+			err = errors.Join(err, recordErr)
+		}
 		return rootCandidate{}, err
 	}
-	result, runErr := runRootProviderTurnWithRetainedIntegrity(ctx, s, "reducer", reducer.Label(), reducer.Name(), func() (TurnResult, error) {
+	result, runErr := runRootProviderTurnWithRetainedIntegrity(ctx, s, rootInvocationSpec{
+		phase:           "reducer",
+		actor:           reducer.Label(),
+		backend:         reducer,
+		backendName:     reducer.Name(),
+		profile:         profile,
+		prompt:          prompt,
+		promptAvailable: true,
+	}, func() (TurnResult, error) {
 		return reducer.RunTurn(ctx, prompt, TurnOptions{
 			TimeoutSeconds:      s.preflight.options.TimeoutSeconds,
 			StallTimeoutSeconds: s.preflight.options.StallTimeoutSeconds,

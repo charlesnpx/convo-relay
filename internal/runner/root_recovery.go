@@ -596,6 +596,9 @@ func prepareRootRecovery(ctx context.Context, sessionDir string, opts ResumeOpti
 	if err != nil {
 		return nil, err
 	}
+	if err := validatePersistedRootInvocationRecords(st, meta); err != nil {
+		return nil, err
+	}
 	candidateArtifact, candidateFound, err := loadLatestRootRecoveryArtifact(st, contracts.RootArtifactKindRawResult, 0)
 	if err != nil {
 		return nil, err

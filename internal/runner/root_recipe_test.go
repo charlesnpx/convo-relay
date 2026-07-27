@@ -269,6 +269,31 @@ func TestRunRecipeContextOnlyUsesPersistedNamedInputAuthority(t *testing.T) {
 	if report["prompt_policy"].(map[string]any)["schema_version"] != PromptPolicyVersionV2 {
 		t.Fatalf("inspection prompt policy = %#v", report["prompt_policy"])
 	}
+
+	calls := recorder.snapshotCalls()
+	invocationRefs := result["invocation_refs"].([]any)
+	promptRefs := result["rendered_prompt_refs"].([]any)
+	wantIDs := []string{"participant:000001", "facilitator:000001", "participant:000002", "facilitator:000002", "reducer:000001"}
+	if len(calls) != len(wantIDs) || len(invocationRefs) != len(wantIDs) || len(promptRefs) != len(wantIDs) {
+		t.Fatalf("provider accounting = calls %d invocations %d prompts %d", len(calls), len(invocationRefs), len(promptRefs))
+	}
+	st := store.New(sessionDir)
+	for index, rawRef := range invocationRefs {
+		payload := assertRootRecipeArtifact(t, st, rawRef, contracts.RootArtifactKindProviderInvocation, index+1)
+		invocation, err := contracts.ValidateProviderInvocationRecord(payload["invocation"])
+		if err != nil {
+			t.Fatalf("invocation %d: %v", index+1, err)
+		}
+		promptPayload := assertRootRecipeArtifact(t, st, promptRefs[index], contracts.RootArtifactKindRenderedPrompt, index+1)
+		if _, err := contracts.ValidateRenderedPromptRecord(promptPayload["rendered_prompt"]); err != nil {
+			t.Fatalf("rendered prompt %d: %v", index+1, err)
+		}
+		if invocation["invocation_id"] != wantIDs[index] || invocation["runner_attempt"] != 1 ||
+			invocation["provider_launch_attempted"] != true || invocation["provider_retry"] != recipes.ProviderRetryAllow ||
+			invocation["outcome"] != "completed" || invocation["rendered_prompt_digest"] != contracts.RawBytesDigest([]byte(calls[index].Prompt)) {
+			t.Fatalf("invocation %d = %#v", index+1, invocation)
+		}
+	}
 }
 
 func TestRunRecipeContextOnlyWithoutBoundAuthorityFailsPurePreflight(t *testing.T) {

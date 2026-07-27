@@ -126,6 +126,11 @@ func BuildRootInspectionReport(sessionDir string, meta map[string]any, includeRa
 	inspected = append(inspected, latestReducerAttempt)
 	refs["latest_reducer_attempt_ref"] = latestReducerAttempt.status
 
+	renderedPromptItems, renderedPromptInspected := inspectRootRefList(st, "rendered_prompt_ref", meta["rendered_prompt_refs"], contracts.RootArtifactKindRenderedPrompt, includeRaw)
+	invocationItems, invocationInspected := inspectRootRefList(st, "invocation_ref", meta["invocation_refs"], contracts.RootArtifactKindProviderInvocation, includeRaw)
+	inspected = append(inspected, renderedPromptInspected...)
+	inspected = append(inspected, invocationInspected...)
+
 	checkpoints := rootCheckpointSummary(checkpointItems, checkpointInspected, latestCheckpoint)
 	inputs := namedInputIntegrity(st, manifestRef, contractID)
 	inputs["retained_materialization_ref"] = retainedInputRef.status
@@ -179,6 +184,10 @@ func BuildRootInspectionReport(sessionDir string, meta map[string]any, includeRa
 	}
 	if promptContext, ok := meta["prompt_context"].(map[string]any); ok {
 		result["prompt_context"] = promptContext
+	}
+	if _, exists := meta["invocation_refs"]; exists {
+		result["rendered_prompts"] = map[string]any{"count": len(renderedPromptItems), "refs": renderedPromptItems}
+		result["invocations"] = map[string]any{"count": len(invocationItems), "refs": invocationItems}
 	}
 	return result
 }

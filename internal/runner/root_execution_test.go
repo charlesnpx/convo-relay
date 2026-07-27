@@ -402,6 +402,7 @@ func TestRunRecipeProviderConstructionFailureFinalizesManagedWorkspace(t *testin
 	runTestGit(t, sourceRoot, "commit", "-m", "fixture")
 
 	config := rootRecipeRuntimeConfig("")
+	config.RelayRecipes["neutral-root"]["provider_retry"] = recipes.ProviderRetryAllow
 	lifecycle := config.RelayRecipes["neutral-root"]["lifecycle"].(map[string]any)
 	lifecycle["workspace_isolation"] = "ephemeral"
 	recorder := &rootBackendRecorder{}
@@ -432,6 +433,12 @@ func TestRunRecipeProviderConstructionFailureFinalizesManagedWorkspace(t *testin
 	after := strings.TrimSpace(stringFromAny(result["source_after_digest"]))
 	if before == "" || after != before {
 		t.Fatalf("terminal source digests = before %q after %q", before, after)
+	}
+	invocationRefs := result["invocation_refs"].([]any)
+	payload := assertRootRecipeArtifact(t, store.New(stringFromAny(result["session_dir"])), invocationRefs[0], contracts.RootArtifactKindProviderInvocation, 1)
+	invocation, invocationErr := contracts.ValidateProviderInvocationRecord(payload["invocation"])
+	if invocationErr != nil || invocation["phase"] != "facilitator" || invocation["provider_launch_attempted"] != false || invocation["failure_stage"] != "provider_construction" || invocation["rendered_prompt_ref"] != nil {
+		t.Fatalf("construction invocation = %#v, %v", invocation, invocationErr)
 	}
 	executionCWD := strings.TrimSpace(stringFromAny(result["execution_cwd"]))
 	if executionCWD == "" {
@@ -678,6 +685,12 @@ func TestRunRecipeProviderRetryForbidLaunchesEachInvocationOnce(t *testing.T) {
 			if launches != 1 {
 				t.Fatalf("%s launches = %d, calls %#v", phase, launches, recorder.snapshotCalls())
 			}
+			invocationRefs := result["invocation_refs"].([]any)
+			invocationPayload := assertRootRecipeArtifact(t, store.New(sessionDir), invocationRefs[len(invocationRefs)-1], contracts.RootArtifactKindProviderInvocation, len(invocationRefs))
+			invocation, invocationErr := contracts.ValidateProviderInvocationRecord(invocationPayload["invocation"])
+			if invocationErr != nil || invocation["phase"] != phase || invocation["runner_attempt"] != 1 || invocation["provider_launch_attempted"] != true {
+				t.Fatalf("%s invocation = %#v, %v", phase, invocation, invocationErr)
+			}
 			failures := result["provider_failures"].([]any)
 			failure := failures[len(failures)-1].(map[string]any)
 			if failure["category"] != "transient" || failure["retryable"] != true || failure["attempts"] != 1 {
@@ -695,6 +708,46 @@ func TestRunRecipeProviderRetryForbidLaunchesEachInvocationOnce(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestRunRecipeRecordsEachAllowedRunnerAttempt(t *testing.T) {
+	withFakeRetryBackoff(t, func(context.Context, time.Duration) error { return nil })
+	config := rootRecipeRuntimeConfig("")
+	recipe := config.RelayRecipes["neutral-root"]
+	recipe["provider_retry"] = recipes.ProviderRetryAllow
+	recipe["participant_turns"] = 1
+	recipe["max_rounds"] = 1
+	recorder := &rootBackendRecorder{}
+	recorder.handler = func(_ context.Context, call rootBackendCall) (TurnResult, error) {
+		if call.SlotID == "slot_0" && call.Call == 1 {
+			return TurnResult{ProviderResult: ProviderResult{Backend: call.Backend, RetryableError: "temporary network error"}}, RetryableProviderError{Label: call.Label, Detail: "temporary network error"}
+		}
+		if call.SlotID == "facilitator" {
+			return successfulRootTurn(call.Backend, `{"settled":[],"contested":[],"withdrawn":[]}`), nil
+		}
+		return successfulRootTurn(call.Backend, "completed"), nil
+	}
+	sessionDir := filepath.Join(t.TempDir(), "session")
+	result, err := RunRecipe(context.Background(), RecipeOptions{
+		SessionDir: sessionDir, Task: "Record retries", RecipeID: "neutral-root", LaunchCWD: t.TempDir(),
+		RuntimeConfig: config, ReadinessCheck: readyRootRecipeCheck, backendFactory: recorder.factory(),
+	})
+	if err != nil {
+		t.Fatalf("RunRecipe: %v", err)
+	}
+	refs := result["invocation_refs"].([]any)
+	if len(refs) != 3 || len(result["rendered_prompt_refs"].([]any)) != 2 {
+		t.Fatalf("retry accounting = invocations %d prompts %d", len(refs), len(result["rendered_prompt_refs"].([]any)))
+	}
+	st := store.New(sessionDir)
+	firstPayload := assertRootRecipeArtifact(t, st, refs[0], contracts.RootArtifactKindProviderInvocation, 1)
+	secondPayload := assertRootRecipeArtifact(t, st, refs[1], contracts.RootArtifactKindProviderInvocation, 2)
+	first, _ := contracts.ValidateProviderInvocationRecord(firstPayload["invocation"])
+	second, _ := contracts.ValidateProviderInvocationRecord(secondPayload["invocation"])
+	if first["invocation_id"] != second["invocation_id"] || first["runner_attempt"] != 1 || second["runner_attempt"] != 2 ||
+		first["rendered_prompt_ref"].(map[string]any)["digest"] != second["rendered_prompt_ref"].(map[string]any)["digest"] {
+		t.Fatalf("retry invocation records = %#v / %#v", first, second)
 	}
 }
 
