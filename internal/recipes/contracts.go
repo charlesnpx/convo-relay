@@ -6,6 +6,11 @@ import (
 	"github.com/charlesnpx/convo-relay/internal/contracts"
 )
 
+const (
+	ProviderRetryAllow  = "allow"
+	ProviderRetryForbid = "forbid"
+)
+
 func normalizeRecipePayload(data map[string]any) map[string]any {
 	payload := normalizeLegacyRecipePayload(data)
 	participantTurns := positiveInt(data["participant_turns"], intFromAny(payload["max_rounds"], 1))
@@ -14,6 +19,10 @@ func normalizeRecipePayload(data map[string]any) map[string]any {
 	payload["lifecycle"] = normalizeLifecyclePayload(data["lifecycle"])
 	if integrationContract := stringValue(data["integration_contract"]); strings.TrimSpace(integrationContract) != "" {
 		payload["integration_contract"] = integrationContract
+	}
+	if _, represented := data["provider_retry"]; represented {
+		payload["schema_version"] = 2
+		payload["provider_retry"] = EffectiveProviderRetry(data)
 	}
 	return payload
 }
@@ -73,6 +82,13 @@ func normalizeResultSource(value any) string {
 	default:
 		return "last_turn"
 	}
+}
+
+func EffectiveProviderRetry(recipe map[string]any) string {
+	if strings.TrimSpace(stringValue(recipe["provider_retry"])) == ProviderRetryForbid {
+		return ProviderRetryForbid
+	}
+	return ProviderRetryAllow
 }
 
 func normalizeLifecyclePayload(value any) map[string]any {

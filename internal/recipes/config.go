@@ -250,7 +250,7 @@ func normalizeRelayRecipesWithDefaults(rawRecipes map[string]any, defaults map[s
 		if reducer == "" {
 			reducer = facilitator
 		}
-		normalized[recipeID] = normalizeRecipePayload(map[string]any{
+		payload := map[string]any{
 			"id":                    recipeID,
 			"purpose":               strings.TrimSpace(stringValue(recipe["purpose"])),
 			"participants":          participants,
@@ -270,7 +270,11 @@ func normalizeRelayRecipesWithDefaults(rawRecipes map[string]any, defaults map[s
 			"generated_from_ref":    recipe["generated_from_ref"],
 			"generated_source":      recipe["generated_source"],
 			"generated_recipe_id":   recipe["generated_recipe_id"],
-		})
+		}
+		if _, represented := recipe["provider_retry"]; represented {
+			payload["provider_retry"] = recipe["provider_retry"]
+		}
+		normalized[recipeID] = normalizeRecipePayload(payload)
 	}
 	return normalized
 }

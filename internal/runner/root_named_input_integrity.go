@@ -70,7 +70,7 @@ func runRootProviderTurnWithRetainedIntegrity(
 		ctx = context.Background()
 	}
 	providerAttempt := 0
-	return runWithRetryableProviderErrors(ctx, actor, func() (TurnResult, error) {
+	return runWithProviderRetryPolicy(ctx, actor, state.meta.String("provider_retry"), func() (TurnResult, error) {
 		providerAttempt++
 		currentAttempt := providerAttempt
 		attemptRef := &currentAttempt

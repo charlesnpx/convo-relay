@@ -13,7 +13,9 @@ import (
 
 	"github.com/charlesnpx/convo-relay/internal/contracts"
 	"github.com/charlesnpx/convo-relay/internal/graph"
+	"github.com/charlesnpx/convo-relay/internal/inspect"
 	"github.com/charlesnpx/convo-relay/internal/model"
+	"github.com/charlesnpx/convo-relay/internal/recipes"
 	"github.com/charlesnpx/convo-relay/internal/store"
 	"github.com/charlesnpx/convo-relay/internal/workspace"
 )
@@ -621,6 +623,77 @@ func TestRunRecipePersistsParticipantBeforeFacilitatorFailure(t *testing.T) {
 	attempt, loadErr := store.New(stringFromAny(result["session_dir"])).LoadArtifact(ref)
 	if loadErr != nil || attempt["content"] != "partial facilitator output" || attempt["status"] != "failed" {
 		t.Fatalf("facilitator attempt = %#v, %v", attempt, loadErr)
+	}
+}
+
+func TestRunRecipeProviderRetryForbidLaunchesEachInvocationOnce(t *testing.T) {
+	for phase, targetSlot := range map[string]string{
+		"participant": "slot_0",
+		"facilitator": "facilitator",
+		"reducer":     "reducer",
+	} {
+		t.Run(phase, func(t *testing.T) {
+			withFakeRetryBackoff(t, func(context.Context, time.Duration) error {
+				t.Fatal("provider_retry=forbid entered retry backoff")
+				return nil
+			})
+			config := rootRecipeRuntimeConfig("")
+			recipe := config.RelayRecipes["neutral-root"]
+			recipe["provider_retry"] = recipes.ProviderRetryForbid
+			recipe["participant_turns"] = 1
+			recipe["max_rounds"] = 1
+			if phase == "reducer" {
+				recipe["result_source"] = "reducer"
+			}
+			recorder := &rootBackendRecorder{}
+			recorder.handler = func(_ context.Context, call rootBackendCall) (TurnResult, error) {
+				if call.SlotID == targetSlot {
+					return TurnResult{ProviderResult: ProviderResult{Backend: call.Backend, RetryableError: "temporary network error"}}, RetryableProviderError{Label: call.Label, Detail: "temporary network error"}
+				}
+				if call.SlotID == "facilitator" {
+					return successfulRootTurn(call.Backend, `{"settled":[],"contested":[],"withdrawn":[]}`), nil
+				}
+				return successfulRootTurn(call.Backend, "completed"), nil
+			}
+			sessionDir := filepath.Join(t.TempDir(), "session")
+			result, err := RunRecipe(context.Background(), RecipeOptions{
+				SessionDir:     sessionDir,
+				Task:           "Forbid runner retries",
+				RecipeID:       "neutral-root",
+				LaunchCWD:      t.TempDir(),
+				RuntimeConfig:  config,
+				ReadinessCheck: readyRootRecipeCheck,
+				backendFactory: recorder.factory(),
+			})
+			if err == nil || result["provider_retry"] != recipes.ProviderRetryForbid || result["schema_version"] != 2 {
+				t.Fatalf("forbidden retry result = %#v, err %v", result, err)
+			}
+			launches := 0
+			for _, call := range recorder.snapshotCalls() {
+				if call.SlotID == targetSlot {
+					launches++
+				}
+			}
+			if launches != 1 {
+				t.Fatalf("%s launches = %d, calls %#v", phase, launches, recorder.snapshotCalls())
+			}
+			failures := result["provider_failures"].([]any)
+			failure := failures[len(failures)-1].(map[string]any)
+			if failure["category"] != "transient" || failure["retryable"] != true || failure["attempts"] != 1 {
+				t.Fatalf("%s provider failure = %#v", phase, failure)
+			}
+			if phase == "reducer" {
+				report := inspect.BuildRootInspectionReport(sessionDir, result, false)
+				if report["provider_retry"] != recipes.ProviderRetryForbid {
+					t.Fatalf("provider retry inspection = %#v", report)
+				}
+				_, resumeErr := Resume(context.Background(), sessionDir, ResumeOptions{})
+				assertRootRecipeDiagnostic(t, resumeErr, "provider_retry_forbidden_terminal")
+				if len(recorder.snapshotCalls()) != 3 {
+					t.Fatalf("resume relaunched provider: %#v", recorder.snapshotCalls())
+				}
+			}
+		})
 	}
 }
 

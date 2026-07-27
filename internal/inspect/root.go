@@ -174,6 +174,9 @@ func BuildRootInspectionReport(sessionDir string, meta map[string]any, includeRa
 		"artifact_refs":       refs,
 		"artifact_validation": rootArtifactValidationSummary(inspected, len(checkpointItems) > 0),
 	}
+	if providerRetry := strings.TrimSpace(stringFromAny(meta["provider_retry"])); providerRetry != "" {
+		result["provider_retry"] = providerRetry
+	}
 	return result
 }
 

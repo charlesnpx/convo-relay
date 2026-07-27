@@ -22,6 +22,7 @@ func TestNormalizeRelayRecipeDefaultsAndExplicitRootFields(t *testing.T) {
 			"max_rounds":           8,
 			"participant_turns":    4,
 			"result_source":        "reducer",
+			"provider_retry":       "forbid",
 			"integration_contract": "opaque contract/id",
 			"max_depth":            1,
 			"lifecycle": map[string]any{
@@ -43,7 +44,7 @@ func TestNormalizeRelayRecipeDefaultsAndExplicitRootFields(t *testing.T) {
 	}
 
 	explicit := normalized["explicit"]
-	if explicit["participant_turns"] != 4 || explicit["result_source"] != "reducer" || explicit["integration_contract"] != "opaque contract/id" {
+	if explicit["schema_version"] != 2 || explicit["participant_turns"] != 4 || explicit["result_source"] != "reducer" || explicit["provider_retry"] != "forbid" || explicit["integration_contract"] != "opaque contract/id" {
 		t.Fatalf("explicit root fields = %#v", explicit)
 	}
 	explicitLifecycle := explicit["lifecycle"].(map[string]any)
@@ -70,6 +71,17 @@ mystery_policy = "allow"
 `,
 			wantCode: DiagnosticCodeUnknownRecipeField,
 			wantPath: "/relay_recipes/invalid/mystery_policy",
+		},
+		{
+			name: "v1 provider retry field",
+			body: `
+[relay_recipes.invalid]
+schema_version = 1
+participants = ["codex-deep", "codex-fast"]
+provider_retry = "forbid"
+`,
+			wantCode: DiagnosticCodeInvalidRecipeField,
+			wantPath: "/relay_recipes/invalid/provider_retry",
 		},
 		{
 			name: "unknown lifecycle field",

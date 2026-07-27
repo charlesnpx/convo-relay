@@ -63,6 +63,9 @@ func resumeRootRecipe(ctx context.Context, sessionDir string, opts ResumeOptions
 	if err := rejectNamedInputIntegrityTerminal(initialMeta); err != nil {
 		return nil, err
 	}
+	if err := rejectForbiddenProviderRetryTerminal(initialMeta); err != nil {
+		return nil, err
+	}
 	if err := guardRootLifecycleMeta(initialMeta, rootLifecycleActionResume); err != nil {
 		return nil, err
 	}
@@ -281,6 +284,19 @@ func rejectNamedInputIntegrityTerminal(meta model.SessionMeta) error {
 			"stop_reason":     meta.String("stop_reason"),
 			"execution_phase": meta.String("execution_phase"),
 		},
+	)
+}
+
+func rejectForbiddenProviderRetryTerminal(meta model.SessionMeta) error {
+	if meta.String("provider_retry") != recipes.ProviderRetryForbid || len(meta.Slice("provider_failures")) == 0 {
+		return nil
+	}
+	return rootRecipeDiagnostic(
+		"provider_retry_forbidden_terminal",
+		contracts.DiagnosticPhasePolicy,
+		"/resume",
+		"A root session with provider_retry=forbid cannot relaunch a failed provider invocation.",
+		nil,
 	)
 }
 
@@ -1026,8 +1042,22 @@ func requireOptionalMatchingArtifactRef(left map[string]any, right map[string]an
 }
 
 func validatePersistedRootRecipe(recipe map[string]any, recipeRef map[string]any, plan map[string]any, meta model.SessionMeta) error {
-	if strings.TrimSpace(stringFromAny(recipe["kind"])) != "recipe" || intFromAny(recipe["schema_version"], 0) != 1 {
+	if strings.TrimSpace(stringFromAny(recipe["kind"])) != "recipe" {
 		return persistenceIntegrityError("Persisted root recipe artifact is invalid.", nil)
+	}
+	version, err := contracts.RequireNumericVersion(recipe, contracts.ContractRecipe)
+	if err != nil {
+		return persistenceIntegrityError("Persisted root recipe artifact is invalid.", map[string]any{"cause": err.Error()})
+	}
+	providerRetry, represented := recipe["provider_retry"]
+	if (version == 1 && represented) || (version == 2 && !represented) {
+		return persistenceIntegrityError("Persisted root recipe provider retry policy does not match its schema version.", nil)
+	}
+	if represented {
+		effective := recipes.EffectiveProviderRetry(recipe)
+		if providerRetry != effective || plan["provider_retry"] != effective || meta.String("provider_retry") != effective {
+			return persistenceIntegrityError("Persisted provider retry policy differs across recipe, plan, and session.", nil)
+		}
 	}
 	recipeID := strings.TrimSpace(stringFromAny(recipe["id"]))
 	if recipeID == "" || recipeID != strings.TrimSpace(stringFromAny(plan["recipe_id"])) || recipeID != meta.String("recipe_id") {

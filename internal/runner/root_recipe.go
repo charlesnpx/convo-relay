@@ -757,6 +757,9 @@ func rootRecipeMeta(preflight *recipePreflight, persisted *persistedRecipeRun) (
 		meta["retained_input_materialization_ref"] = persisted.retainedInputRef
 		meta["provider_inputs"] = persisted.providerInputs
 	}
+	if providerRetry, represented := preflight.rootPlan["provider_retry"]; represented {
+		meta["provider_retry"] = providerRetry
+	}
 	return model.NewSessionMeta(meta), nil
 }
 

@@ -11,6 +11,7 @@ import (
 	"github.com/charlesnpx/convo-relay/internal/integration"
 	"github.com/charlesnpx/convo-relay/internal/model"
 	"github.com/charlesnpx/convo-relay/internal/namedinputs"
+	"github.com/charlesnpx/convo-relay/internal/recipes"
 	"github.com/charlesnpx/convo-relay/internal/store"
 	"github.com/charlesnpx/convo-relay/internal/workspace"
 )
@@ -757,7 +758,9 @@ func (s *rootExecutionState) markReducerFailed(runErr error) (map[string]any, er
 		With("stop_reason", rootReducerFailedStatus).
 		With("actual_participant_turns", s.transcript.Len()).
 		With("participant_turns_completed", s.transcript.Len())
-	s.meta = s.meta.With("root_recovery_pending", true)
+	if s.meta.String("provider_retry") != recipes.ProviderRetryForbid {
+		s.meta = s.meta.With("root_recovery_pending", true)
+	}
 	if err := s.saveProgress(); err != nil {
 		return s.result(), errors.Join(runErr, err)
 	}

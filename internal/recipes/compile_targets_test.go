@@ -375,6 +375,13 @@ func TestRootAndChildDigestsRetainTargetSpecificFields(t *testing.T) {
 	if mustContractDigest(t, rootFirst) == mustContractDigest(t, mustCompileTarget(t, resultChanged, config, CompileTargetRoot)) {
 		t.Fatal("root plan digest ignored result_source and used reducer")
 	}
+	retryChanged := cloneObject(base)
+	retryChanged["schema_version"] = 2
+	retryChanged["provider_retry"] = ProviderRetryForbid
+	retryPlan := mustCompileTarget(t, retryChanged, config, CompileTargetRoot)
+	if retryPlan["schema_version"] != 2 || retryPlan["provider_retry"] != ProviderRetryForbid || mustContractDigest(t, rootFirst) == mustContractDigest(t, retryPlan) {
+		t.Fatalf("root plan did not bind provider retry policy: %#v", retryPlan)
+	}
 	rootRecipeRef := rootFirst["recipe_ref"].(map[string]any)
 	if rootRecipeRef["digest"] != mustContractDigest(t, RecipeContractPayload(base)) {
 		t.Fatalf("root recipe ref does not bind the full normalized payload: %#v", rootRecipeRef)
@@ -383,6 +390,9 @@ func TestRootAndChildDigestsRetainTargetSpecificFields(t *testing.T) {
 	childSecond := mustCompileTarget(t, changed, config, CompileTargetChild)
 	if mustContractDigest(t, childFirst) != mustContractDigest(t, childSecond) {
 		t.Fatal("compiled_plan/v1 digest changed for root-only participant_turns")
+	}
+	if mustContractDigest(t, childFirst) != mustContractDigest(t, mustCompileTarget(t, retryChanged, config, CompileTargetChild)) {
+		t.Fatal("compiled_plan/v1 digest changed for root-only provider retry policy")
 	}
 
 	childRounds := cloneObject(changed)

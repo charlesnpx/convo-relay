@@ -41,7 +41,7 @@ func TestEveryDefaultRecipeRecordPassesGenericRegistryChecks(t *testing.T) {
 		if recipe == nil {
 			t.Fatalf("default recipe %q was not normalized", recipeID)
 		}
-		if recipe["participant_turns"] != 4 || recipe["result_source"] != integration.ResultSourceReducer || recipe["max_depth"] != 1 || recipe["auto_approval"] != "never" {
+		if recipe["participant_turns"] != 4 || recipe["result_source"] != integration.ResultSourceReducer || recipe["provider_retry"] != ProviderRetryForbid || recipe["max_depth"] != 1 || recipe["auto_approval"] != "never" {
 			t.Fatalf("default recipe %q execution fields = %#v", recipeID, recipe)
 		}
 		lifecycle, _ := recipe["lifecycle"].(map[string]any)
@@ -57,7 +57,7 @@ func TestEveryDefaultRecipeRecordPassesGenericRegistryChecks(t *testing.T) {
 		if err != nil {
 			t.Fatalf("compile default recipe %q for root: %v", recipeID, err)
 		}
-		if rootPlan["kind"] != contracts.RootArtifactKindRootRecipePlan || rootPlan["integration_contract_id"] != contractID || rootPlan["participant_turns"] != recipe["participant_turns"] {
+		if rootPlan["kind"] != contracts.RootArtifactKindRootRecipePlan || rootPlan["schema_version"] != 2 || rootPlan["provider_retry"] != ProviderRetryForbid || rootPlan["integration_contract_id"] != contractID || rootPlan["participant_turns"] != recipe["participant_turns"] {
 			t.Fatalf("default recipe %q root plan = %#v", recipeID, rootPlan)
 		}
 

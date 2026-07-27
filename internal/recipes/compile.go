@@ -389,6 +389,10 @@ func compileRootPlan(
 			"max_graph_depth": recipePayload["max_depth"],
 		},
 	}
+	_, providerRetryRepresented := recipePayload["provider_retry"]
+	if providerRetryRepresented {
+		planFields["provider_retry"] = EffectiveProviderRetry(recipePayload)
+	}
 	if reducerProfile != nil {
 		planFields["reducer"] = reducerProfile
 	}
@@ -431,6 +435,9 @@ func compileRootPlan(
 		planFields["integration_contract_ref"] = contractRef
 		planFields["integration_contract_id"] = selected.ID()
 		planFields["integration_contract_digest"] = selected.Digest()
+	}
+	if providerRetryRepresented {
+		return contracts.NormalizeRootArtifactVersion(contracts.RootArtifactKindRootRecipePlan, contracts.RootArtifactSchemaVersionV2, planFields)
 	}
 	return contracts.NormalizeRootArtifact(contracts.RootArtifactKindRootRecipePlan, planFields)
 }
