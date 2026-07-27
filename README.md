@@ -581,7 +581,7 @@ Then read /tmp/auth-review.md and summarize what each agent found.
 | `-s, --stream` | run | Stream live subprocess stdout to stderr |
 | `-o, --output` | run, resume, export | Write an export to a specific file. Required for `export`; optional for `run` and `resume` |
 | `--portable` | export | Write a complete terminal successor root session as a new portable directory |
-| `--json` | run, show, export, health, recipes, compile-recipe, backends, resume, contracts | Use JSON instead of markdown |
+| `--json` | run, show, export, health, recipes, compile-recipe, backends, capabilities, resume, contracts | Use JSON instead of markdown |
 | `--status {usable,requires_integration,unavailable,invalid,skipped,all}` | recipes list | Filter recipes by catalog status |
 | `--view {all,declared,resolved}` | recipes show | Select declared and/or resolved recipe details |
 | `--target {root,child}` | compile-recipe | Select a recipe compile target; defaults to `child` |

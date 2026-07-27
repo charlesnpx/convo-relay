@@ -23,10 +23,17 @@ also the source for `convo-relay capabilities --json`.
 | workspace isolation report | `relay-workspace-isolation-v1` |
 | portable export | `relay-root-portable-export-v1` |
 | capability advertisement | `relay-capabilities-v1` |
+| workspace mechanisms | `inherited`, `detached_writable_git_worktree` |
 
 Existing v1 payloads retain their released field sets and digest meanings.
 Successor-only fields are rejected when placed under a v1 identifier. Unknown
 versions fail with the typed `unsupported_contract_version` diagnostic.
+
+`convo-relay capabilities --json` projects this registry without inspecting
+sessions, provider executables, authentication, or backend readiness. Its
+`build_platform` identifies the exact `GOOS`/`GOARCH` target of the running
+binary; it is build metadata, not a runtime-certification claim. Runtime
+availability remains the separate concern of `backends status`.
 
 ## `relay-root-digests-v1`
 

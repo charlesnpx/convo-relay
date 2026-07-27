@@ -56,6 +56,8 @@ func main() {
 		runRecipes(os.Args[2:])
 	case "backends":
 		runBackends(os.Args[2:])
+	case "capabilities":
+		runCapabilities(os.Args[2:])
 	case "compile-recipe":
 		runCompileRecipe(os.Args[2:])
 	case "create-session":
@@ -112,6 +114,30 @@ func runBackends(args []string) {
 		return
 	}
 	fmt.Println(readiness.FormatReport(report))
+}
+
+func runCapabilities(args []string) {
+	flags := flag.NewFlagSet("capabilities", flag.ExitOnError)
+	jsonOutput := flags.Bool("json", false, "Emit the machine-readable capability record")
+	schemaVersion := flags.String("schema-version", contracts.CapabilitiesV1, "Capability output schema")
+	if err := parseFlags(flags, args); err != nil {
+		os.Exit(2)
+	}
+	if len(flags.Args()) > 0 {
+		fmt.Fprintf(os.Stderr, "error: capabilities does not accept positional arguments: %s\n", strings.Join(flags.Args(), " "))
+		os.Exit(2)
+	}
+	report, err := contracts.BuildCapabilityAdvertisement(cliVersion, runtime.GOOS, runtime.GOARCH, *schemaVersion)
+	if err != nil {
+		var diagnosticErr *contracts.DiagnosticError
+		if *jsonOutput && errors.As(err, &diagnosticErr) {
+			writeJSON(diagnosticErr.ToMap())
+		} else {
+			fmt.Fprintf(os.Stderr, "error: %s\n", err)
+		}
+		os.Exit(1)
+	}
+	writeJSON(report)
 }
 
 func runContracts(args []string) {
@@ -1768,6 +1794,7 @@ func usage() {
 	fmt.Fprintln(os.Stderr, "  convo-relay recipes show review-panel")
 	fmt.Fprintln(os.Stderr, "  convo-relay recipes doctor")
 	fmt.Fprintln(os.Stderr, "  convo-relay backends status [--probe-auth] [--json]")
+	fmt.Fprintln(os.Stderr, "  convo-relay capabilities --json")
 	fmt.Fprintln(os.Stderr, "  convo-relay show <session-id-prefix> --graph --json")
 	fmt.Fprintln(os.Stderr, "  convo-relay show <session-id-prefix> --trace <node-id>")
 	fmt.Fprintln(os.Stderr, "  convo-relay contracts <session-id-prefix> --json")

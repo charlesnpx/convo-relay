@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -131,6 +132,56 @@ esac`)
 		t.Fatalf("relay record = %#v", relay)
 	}
 	assertBackendProbeLog(t, logPath, []string{"claude:--version", "codex:--version", "gemini:--version"})
+}
+
+func TestCapabilitiesJSONMatchesRegistryWithoutProviderProbes(t *testing.T) {
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "provider.log")
+	t.Setenv("BACKENDS_TEST_LOG", logPath)
+	for _, backend := range []string{"claude", "codex", "gemini"} {
+		writeBackendProbeExecutable(t, dir, backend, "exit 99")
+	}
+	t.Setenv("PATH", dir)
+
+	oldArgs := os.Args
+	os.Args = []string{"convo-relay", "capabilities", "--json"}
+	defer func() { os.Args = oldArgs }()
+	output := captureStdout(t, main)
+	want := map[string]any{
+		"schema_version":      contracts.CapabilitiesV1,
+		"convo_relay_version": cliVersion,
+		"build_platform":      map[string]any{"goos": runtime.GOOS, "goarch": runtime.GOARCH},
+		"contracts": map[string]any{
+			"recipe":                        []int{1, 2},
+			"root_recipe_plan":              []int{1, 2},
+			"integration_bundle":            []string{contracts.IntegrationBundleV1, contracts.IntegrationBundleV2},
+			"selected_integration_contract": []int{1, 2},
+			"root_artifact":                 []int{1, 2},
+			"execution_workspace":           []int{1, 2},
+			"root_session_result":           []int{1, 2},
+		},
+		"prompt_policy":             []string{contracts.PromptPolicyV1, contracts.PromptPolicyV2},
+		"prompt_context_projection": []string{contracts.PromptContextProjectionV1},
+		"provider_retry_policy":     []string{contracts.ProviderRetryPolicyV1},
+		"provider_invocation":       []string{contracts.ProviderInvocationV1},
+		"rendered_prompt":           []string{contracts.RenderedPromptV1},
+		"portable_export":           []string{contracts.PortableExportV1},
+		"digest_profile":            []string{contracts.DigestProfileV1},
+		"workspace_mechanisms":      []string{"inherited", "detached_writable_git_worktree"},
+		"isolation_report":          []string{contracts.WorkspaceIsolationReportV1},
+	}
+	wantBody, err := json.MarshalIndent(want, "", "  ")
+	if err != nil || output != string(wantBody)+"\n" {
+		t.Fatalf("capabilities output = %s, want %s, marshal error %v", output, wantBody, err)
+	}
+	if _, err := os.Stat(logPath); !os.IsNotExist(err) {
+		t.Fatalf("capabilities probed a provider: %v", err)
+	}
+	_, err = contracts.BuildCapabilityAdvertisement(cliVersion, runtime.GOOS, runtime.GOARCH, "relay-capabilities-v2")
+	var diagnosticErr *contracts.DiagnosticError
+	if !errors.As(err, &diagnosticErr) || diagnosticErr.Diagnostics[0].Code != contracts.DiagnosticCodeUnsupportedContractVersion {
+		t.Fatalf("unsupported schema error = %T %v", err, err)
+	}
 }
 
 func TestBackendsStatusProbeAuthHumanOutput(t *testing.T) {
