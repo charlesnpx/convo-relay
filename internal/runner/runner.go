@@ -1290,6 +1290,10 @@ func stampMissingTranscriptModes(transcript []map[string]any, mode string) {
 
 func sessionResult(sessionDir string, meta model.SessionMeta, transcript model.Transcript) map[string]any {
 	result := meta.ToMap()
+	if meta.String("execution_kind") == "recipe" && meta.String("prompt_policy_version") == PromptPolicyVersionV2 {
+		result["kind"] = "root_session_result"
+		result["schema_version"] = 2
+	}
 	result["session_id"] = sessionIDFromDir(sessionDir)
 	result["session_dir"] = sessionDir
 	result["transcript"] = transcript.ToSlice()

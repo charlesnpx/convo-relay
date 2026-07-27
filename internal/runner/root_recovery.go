@@ -556,6 +556,10 @@ func prepareRootRecovery(ctx context.Context, sessionDir string, opts ResumeOpti
 	if retainedInputs != nil {
 		baseRefs["retained_input_materialization_ref"] = cloneMap(retainedInputs.DescriptorRef)
 	}
+	promptPolicy, err := recoverRootPromptPolicy(st, meta, baseRefs["named_input_manifest_ref"])
+	if err != nil {
+		return nil, err
+	}
 
 	workspaceState, err := workspace.Recover(ctx, st)
 	if err != nil {
@@ -634,7 +638,7 @@ func prepareRootRecovery(ctx context.Context, sessionDir string, opts ResumeOpti
 		selectedContract:   selectedContract,
 		assertionEvaluator: assertionEvaluator,
 		launchContexts:     launchContexts,
-		promptPolicy:       promptPolicyFromMeta(meta.ToMap()),
+		promptPolicy:       promptPolicy,
 	}
 	persisted := &persistedRecipeRun{
 		st:                    st,
@@ -668,6 +672,43 @@ func prepareRootRecovery(ctx context.Context, sessionDir string, opts ResumeOpti
 		canonical:                   canonical,
 		legacyRetainedInputsMissing: legacyRetainedInputsMissing,
 	}, nil
+}
+
+func recoverRootPromptPolicy(
+	st *store.Store,
+	meta model.SessionMeta,
+	manifestRef map[string]any,
+) (PromptPolicy, error) {
+	metaMap := meta.ToMap()
+	policyMap, _ := metaMap["prompt_policy"].(map[string]any)
+	version := firstNonEmpty(
+		stringFromAny(policyMap["schema_version"]),
+		stringFromAny(policyMap["version"]),
+		stringFromAny(metaMap["prompt_policy_version"]),
+	)
+	if version != "" && version != PromptPolicyVersion && version != PromptPolicyVersionV2 {
+		return PromptPolicy{}, persistenceIntegrityError("Persisted prompt policy version is unsupported.", map[string]any{"schema_version": version})
+	}
+	policy := promptPolicyFromMeta(metaMap)
+	if policy.Version != PromptPolicyVersionV2 {
+		return policy, nil
+	}
+	if manifestRef == nil {
+		return PromptPolicy{}, persistenceIntegrityError("Persisted v2 prompt policy requires its named input manifest ref.", nil)
+	}
+	manifest, err := st.LoadArtifactPayloadRaw(manifestRef)
+	if err != nil {
+		return PromptPolicy{}, persistenceIntegrityError("Persisted v2 prompt policy manifest could not be loaded.", map[string]any{"cause": err.Error()})
+	}
+	manifest, err = contracts.ValidateRootArtifact(manifest, contracts.RootArtifactKindNamedInputManifest)
+	if err != nil {
+		return PromptPolicy{}, persistenceIntegrityError("Persisted v2 prompt policy manifest is invalid.", map[string]any{"cause": err.Error()})
+	}
+	if _, err := contracts.ValidateRootArtifactRef(manifestRef, contracts.RootArtifactKindNamedInputManifest, 0, manifest); err != nil {
+		return PromptPolicy{}, persistenceIntegrityError("Persisted v2 prompt policy manifest ref is invalid.", map[string]any{"cause": err.Error()})
+	}
+	policy.Sources = nil
+	return finalizeNamedInputPromptPolicy(policy, manifestRef, manifest)
 }
 
 func (prepared *preparedRootRecovery) run(ctx context.Context) (map[string]any, error) {

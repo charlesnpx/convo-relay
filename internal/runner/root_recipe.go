@@ -176,11 +176,6 @@ func preflightRecipe(ctx context.Context, opts RecipeOptions) (*recipePreflight,
 	if err != nil {
 		return nil, err
 	}
-	promptPolicy, err := BuildPromptPolicy(opts.InvestigationMode, len(launchContexts) > 0)
-	if err != nil {
-		return nil, err
-	}
-
 	runtimeConfig, transientFiles, err := loadEffectiveRuntimeConfig(settingsPath, opts.RuntimeConfig, nil, nil, opts.TransientSources)
 	if err != nil {
 		return nil, err
@@ -262,6 +257,20 @@ func preflightRecipe(ctx context.Context, opts RecipeOptions) (*recipePreflight,
 		NamedInputMaxBytes:      runtimeConfig.EffectiveLimits().NamedInputMaxBytes,
 		NamedInputTotalMaxBytes: runtimeConfig.EffectiveLimits().NamedInputTotalMaxBytes,
 	})
+	if err != nil {
+		return nil, err
+	}
+	declaresNamedInputs := false
+	if selectedContract != nil {
+		contract := selectedContract.Contract()
+		declaresNamedInputs = contract != nil && len(contract.Inputs) > 0
+	}
+	promptPolicy, err := BuildRootPromptPolicy(
+		opts.InvestigationMode,
+		len(launchContexts) > 0,
+		declaresNamedInputs,
+		preparedInputNames(preparedInputs),
+	)
 	if err != nil {
 		return nil, err
 	}
@@ -555,6 +564,14 @@ func persistRecipePreflight(
 			return nil, err
 		}
 		inputManifestRef = persistedInputs.ManifestRef
+		preflight.promptPolicy, err = finalizeNamedInputPromptPolicy(
+			preflight.promptPolicy,
+			persistedInputs.ManifestRef,
+			persistedInputs.Manifest,
+		)
+		if err != nil {
+			return nil, err
+		}
 	}
 	materializedWorkspace, err := transaction.materializeWorkspace(ctx, preflight.workspace)
 	if err != nil {
@@ -784,6 +801,15 @@ func rootCheckpointFields(preflight *recipePreflight, persisted *persistedRecipe
 		"execution_workspace_ref":            persisted.workspaceRef,
 		"created_at":                         utcNow(),
 	}
+}
+
+func preparedInputNames(prepared *namedinputs.Prepared) []string {
+	items := prepared.Items()
+	names := make([]string, 0, len(items))
+	for _, item := range items {
+		names = append(names, item.Name)
+	}
+	return names
 }
 
 func selectedContractForRootPlan(bundle *integration.Bundle, rootPlan map[string]any) (*integration.SelectedContract, error) {

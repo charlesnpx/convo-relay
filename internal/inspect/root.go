@@ -156,6 +156,7 @@ func BuildRootInspectionReport(sessionDir string, meta map[string]any, includeRa
 			"configured": valueOr(meta["participant_turns"], meta["rounds"]),
 			"completed":  valueOr(meta["participant_turns_completed"], meta["actual_participant_turns"]),
 		},
+		"prompt_policy": meta["prompt_policy"],
 		"result": map[string]any{
 			"source":                meta["result_source"],
 			"validation_status":     valueOr(meta["validation_status"], "pending"),

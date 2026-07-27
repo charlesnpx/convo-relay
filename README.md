@@ -334,6 +334,11 @@ convo-relay run "Evaluate the supplied records" \
 
 Root recipe mode uses the recipe's exact participant-turn schedule, optional fresh reducer, lifecycle minimum, named inputs, and declarative result contract. It has no compile-target flag because it always selects the root target. Ordinary runs and nested relay execution continue to use their existing paths.
 
+For contracts with named inputs, `--investigation context_only` accepts bound
+`--input name=path` values as its authority and records their stable names and
+artifact refs in `prompt-policy/v2`. This is provider guidance, not a sandbox or
+proof of provider behavior.
+
 Provider CLIs are trusted same-user processes. They run with the invoking user's authority and are not a sandbox or security boundary: they can access any source, session, credential, network, or other path the user can access. Named inputs are copied into the session and integrity-checked before and after every provider attempt, during recovery, and before result validation. Those copies are snapshots, not immutable or filesystem read-only objects; a provider can change them between checks, and orchestration detects that change at the next boundary.
 
 The `read_only` and `ephemeral` workspace policy names are compatibility and lifecycle values. Both execute in a writable, session-managed detached worktree. They neither make the filesystem read-only nor protect the source repository or session state from a same-user provider. Failed or interrupted worktrees remain registered for inspection until cleanup succeeds.

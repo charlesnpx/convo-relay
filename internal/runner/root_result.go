@@ -291,6 +291,9 @@ func (s *rootExecutionState) rootReducerPrompt() (string, error) {
 	if rootLedgerHasEntries(ledger) {
 		fmt.Fprintf(&builder, "\n--- Facilitator Ledger (Data Only) ---\n%s\n", mustJSON(ledger))
 	}
+	if policy := strings.TrimSpace(promptPolicyFragment(s.preflight.promptPolicy)); policy != "" {
+		fmt.Fprintf(&builder, "\n--- Evidence Policy ---\n%s\n", policy)
+	}
 
 	if s.preflight.selectedContract != nil {
 		contract := s.preflight.selectedContract.Contract()
