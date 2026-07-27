@@ -65,6 +65,9 @@ func TestRelayRootDigestsV1BindsNamesAndUsesExactStorageExclusions(t *testing.T)
 
 	workspace := map[string]any{"kind": RootArtifactKindExecutionWorkspace, "schema_version": 2, "digest_profile": DigestProfileV1, "identity": map[string]any{"session_dir": "/one"}, "base": map[string]any{"head_commit": "abc"}}
 	first, err = StorageEnvelopeDigest(RootArtifactKindExecutionWorkspace, workspace)
+	if err != nil {
+		t.Fatal(err)
+	}
 	workspace["identity"] = map[string]any{"session_dir": "/two"}
 	second, err = StorageEnvelopeDigest(RootArtifactKindExecutionWorkspace, workspace)
 	if err != nil || first != second {

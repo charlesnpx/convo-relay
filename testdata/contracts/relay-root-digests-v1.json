@@ -43,6 +43,23 @@
       },
       "canonical": "{\"base\":{\"head_commit\":\"0123456789abcdef\",\"object_format\":\"sha1\"},\"digest_profile\":\"relay-root-digests-v1\",\"kind\":\"execution_workspace\",\"schema_version\":2,\"source\":{\"launch_subpath\":\"subdir\"}}",
       "digest": "sha256:d00f450ac2a42ec0cdf2d51fb3198bb99b4f1d6524667d22752dc4c69c99f3c2"
+    },
+    {
+      "id": "semantic-exact-numbers-and-surrogates",
+      "class": "semantic-json",
+      "value": {
+        "numbers": [1.0000000000000000001, 12345678901234567890123],
+        "strings": {
+          "valid_astral": "\ud83d\ude00",
+          "escaped_lone_high": "\ud800",
+          "escaped_lone_low": "\udc00",
+          "line_separator": "\u2028",
+          "paragraph_separator": "\u2029"
+        },
+        "control": ["\b", "\f", "\u0001"]
+      },
+      "canonical": "{\"control\":[\"\\b\",\"\\f\",\"\\u0001\"],\"numbers\":[1.0000000000000000001,1.2345678901234567890123e22],\"strings\":{\"escaped_lone_high\":\"�\",\"escaped_lone_low\":\"�\",\"line_separator\":\"\\u2028\",\"paragraph_separator\":\"\\u2029\",\"valid_astral\":\"😀\"}}",
+      "digest": "sha256:e63a456ffc4e27aa756de708d5116f4bade8cd44263fb4aa5b92c585a832d01c"
     }
   ],
   "equivalent_numbers": {

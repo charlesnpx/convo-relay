@@ -5,7 +5,46 @@ import { readFileSync } from "node:fs";
 
 const fixturePath = process.argv[2];
 if (!fixturePath) throw new Error("fixture path is required");
-const fixtures = JSON.parse(readFileSync(fixturePath, "utf8"));
+
+const rawNumber = Symbol("rawNumber");
+
+function supportsReviverSource() {
+  let supported = false;
+  JSON.parse("1", (_key, _value, context) => {
+    supported = context?.source === "1";
+  });
+  return supported;
+}
+
+if (!supportsReviverSource()) {
+  throw new Error("JSON.parse reviver source context is required for exact digest verification");
+}
+
+function rawJSONNumber(source) {
+  return { [rawNumber]: source };
+}
+
+function isRawJSONNumber(value) {
+  return value != null && typeof value === "object" && Object.hasOwn(value, rawNumber);
+}
+
+function rawJSONNumberSource(value) {
+  return value[rawNumber];
+}
+
+function parseExactJSON(text) {
+  return JSON.parse(text, (_key, value, context) => {
+    if (typeof value === "number") {
+      if (typeof context?.source !== "string") {
+        throw new Error("JSON.parse did not provide numeric source text");
+      }
+      return rawJSONNumber(context.source);
+    }
+    return value;
+  });
+}
+
+const fixtures = parseExactJSON(readFileSync(fixturePath, "utf8"));
 
 const sha256 = bytes => `sha256:${createHash("sha256").update(bytes).digest("hex")}`;
 
@@ -23,21 +62,55 @@ function normalizeNumber(raw) {
 }
 
 function canonical(value) {
+  if (isRawJSONNumber(value)) return normalizeNumber(rawJSONNumberSource(value));
   if (value === null || typeof value === "boolean") return JSON.stringify(value);
   if (typeof value === "string") {
-    return JSON.stringify(value).replaceAll("\u2028", "\\u2028").replaceAll("\u2029", "\\u2029");
+    return JSON.stringify(normalizeString(value)).replaceAll("\u2028", "\\u2028").replaceAll("\u2029", "\\u2029");
   }
   if (typeof value === "number") {
-    if (!Number.isFinite(value)) throw new Error("numbers must be finite");
-    return normalizeNumber(Object.is(value, -0) ? "-0" : value.toString());
+    throw new Error("unexpected JavaScript number; exact raw JSON number source was lost");
   }
   if (Array.isArray(value)) return `[${value.map(canonical).join(",")}]`;
   const keys = Object.keys(value).sort((left, right) => Buffer.compare(Buffer.from(left), Buffer.from(right)));
   return `{${keys.map(key => `${canonical(key)}:${canonical(value[key])}`).join(",")}}`;
 }
 
+function normalizeString(value) {
+  let result = "";
+  for (let index = 0; index < value.length; index++) {
+    const code = value.charCodeAt(index);
+    if (code >= 0xd800 && code <= 0xdbff) {
+      const next = value.charCodeAt(index + 1);
+      if (next >= 0xdc00 && next <= 0xdfff) {
+        result += value[index] + value[index + 1];
+        index++;
+      } else {
+        result += "\ufffd";
+      }
+      continue;
+    }
+    if (code >= 0xdc00 && code <= 0xdfff) {
+      result += "\ufffd";
+      continue;
+    }
+    result += value[index];
+  }
+  return result;
+}
+
+function cloneExactJSON(value) {
+  if (isRawJSONNumber(value)) return rawJSONNumber(rawJSONNumberSource(value));
+  if (Array.isArray(value)) return value.map(cloneExactJSON);
+  if (value != null && typeof value === "object") {
+    const result = {};
+    for (const key of Object.keys(value)) result[key] = cloneExactJSON(value[key]);
+    return result;
+  }
+  return value;
+}
+
 function withoutPointer(value, pointer) {
-  const result = structuredClone(value);
+  const result = cloneExactJSON(value);
   const segments = pointer.slice(1).split("/").map(segment => segment.replaceAll("~1", "/").replaceAll("~0", "~"));
   let parent = result;
   for (const segment of segments.slice(0, -1)) {
@@ -73,7 +146,7 @@ for (const fixture of fixtures.cases) {
   }
 }
 
-const numberCanonicals = fixtures.equivalent_numbers.json.map(text => canonical(JSON.parse(text)));
+const numberCanonicals = fixtures.equivalent_numbers.json.map(text => canonical(parseExactJSON(text)));
 if (numberCanonicals.some(value => value !== fixtures.equivalent_numbers.canonical)) {
   console.error(`equivalent_numbers canonical: ${JSON.stringify(numberCanonicals)}`);
   failed = true;

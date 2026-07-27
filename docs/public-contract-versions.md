@@ -45,6 +45,8 @@ The successor digest profile has three classes:
   object members or trailing value. Objects are ordered by UTF-8 key bytes;
   arrays retain order. Strings use JSON escaping without HTML escaping (the
   Unicode line and paragraph separators are written as `\u2028` and `\u2029`).
+  Valid surrogate pairs retain their Unicode scalar value; escaped unpaired
+  high or low surrogates normalize to U+FFFD before JSON string escaping.
   Exact decimal numbers use a minimal significand and an optional lowercase
   base-10 exponent, so `1`, `1.0`, and `1e0` are identical and negative zero
   is `0`. The canonical bytes have no trailing newline.
