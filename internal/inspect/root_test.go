@@ -77,6 +77,35 @@ func TestRootInspectionProjectionIsSharedDigestCheckedAndPayloadRedacted(t *test
 	}
 }
 
+func TestRootInspectionShowsRenderedPromptsWithoutInvocations(t *testing.T) {
+	sessionDir, meta := writeRootInspectionFixture(t)
+	st := store.New(sessionDir)
+	rendered, err := contracts.NormalizeRootArtifactVersion(
+		contracts.RootArtifactKindRenderedPrompt,
+		contracts.RootArtifactSchemaVersionV2,
+		map[string]any{"rendered_prompt": contracts.RenderedPromptRecord([]byte("interrupted prompt"))},
+	)
+	if err != nil {
+		t.Fatalf("normalize rendered prompt: %v", err)
+	}
+	identity, err := contracts.RootArtifactIdentityFor(contracts.RootArtifactKindRenderedPrompt, 1)
+	if err != nil {
+		t.Fatalf("rendered prompt identity: %v", err)
+	}
+	renderedRef := saveInspectionContractArtifact(t, st, contracts.RootArtifactKindRenderedPrompt, identity.ArtifactID, identity.RefID, rendered)
+	meta["rendered_prompt_refs"] = []any{renderedRef}
+	if err := st.SaveMetaMap(meta); err != nil {
+		t.Fatalf("save interrupted prompt meta: %v", err)
+	}
+
+	report := BuildRootInspectionReport(sessionDir, meta, false)
+	renderedPrompts := mapFromAny(report["rendered_prompts"])
+	invocations := mapFromAny(report["invocations"])
+	if renderedPrompts["count"] != 1 || invocations["count"] != 0 {
+		t.Fatalf("prompt-only inspection = rendered %#v invocations %#v", renderedPrompts, invocations)
+	}
+}
+
 func TestRootDisplaySeparatesReducerAndCanonicalResultsThroughValidatedRefs(t *testing.T) {
 	sessionDir, meta := writeRootInspectionFixture(t)
 	html, err := BuildDisplayHTML(sessionDir)

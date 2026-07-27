@@ -291,6 +291,20 @@ func TestIntegrationBoundRecipeCompilesOnlyForRootWithMatchingBundle(t *testing.
 	if v2Plan["schema_version"] != 2 || v2Plan["provider_retry"] != ProviderRetryAllow || projection["participant_transcript"] != integration.ParticipantTranscriptComplete || projection["facilitator_ledger"] != integration.FacilitatorLedgerInclude {
 		t.Fatalf("v2 bound root plan = %#v", v2Plan)
 	}
+	config.RelayRecipes["bound-review"] = recipe
+	v2Report, err := BuildCompileReport("bound-review", config, CompileTargetRoot, CompileOptions{IntegrationBundle: v2Bundle})
+	if err != nil {
+		t.Fatalf("compile v2 bound report: %v", err)
+	}
+	reportPlan := v2Report["compiled_plan"].(map[string]any)
+	reportRecipeRef := reportPlan["recipe_ref"].(map[string]any)
+	if v2Report["recipe_digest"] != reportRecipeRef["digest"] {
+		t.Fatalf("v2 report recipe digest = %v, plan ref = %#v", v2Report["recipe_digest"], reportRecipeRef)
+	}
+	effectiveRecipe := v2Report["recipe"].(map[string]any)
+	if effectiveRecipe["schema_version"] != 2 || effectiveRecipe["provider_retry"] != ProviderRetryAllow {
+		t.Fatalf("v2 report effective recipe = %#v", effectiveRecipe)
+	}
 
 	_, err = CompileRecipe(recipe, config.BackendProfiles, config.RelayRecipes, CompileTargetChild, CompileOptions{})
 	var rootOnly *RootOnlyRecipeError

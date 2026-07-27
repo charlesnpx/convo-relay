@@ -535,7 +535,7 @@ func BuildCompileReport(
 			}
 		}
 	}
-	recipeDigest, err := contracts.ContractDigest(recipePayload)
+	recipeDigest, err := contracts.PayloadDigest(recipePayload)
 	if err != nil {
 		return nil, err
 	}

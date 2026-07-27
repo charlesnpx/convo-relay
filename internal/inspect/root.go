@@ -186,7 +186,9 @@ func BuildRootInspectionReport(sessionDir string, meta map[string]any, includeRa
 	if promptContext, ok := meta["prompt_context"].(map[string]any); ok {
 		result["prompt_context"] = promptContext
 	}
-	if _, exists := meta["invocation_refs"]; exists {
+	_, renderedPromptRefsExist := meta["rendered_prompt_refs"]
+	_, invocationRefsExist := meta["invocation_refs"]
+	if renderedPromptRefsExist || invocationRefsExist {
 		result["rendered_prompts"] = map[string]any{"count": len(renderedPromptItems), "refs": renderedPromptItems}
 		result["invocations"] = map[string]any{"count": len(invocationItems), "refs": invocationItems}
 	}
