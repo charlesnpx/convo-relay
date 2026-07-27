@@ -298,6 +298,11 @@ func TestBuildAndRestoreSlotsSupportClaude(t *testing.T) {
 	if err := restored[0].RestoreState(map[string]any{"started": true}, SlotConfig{}); err == nil {
 		t.Fatalf("missing session_id state unexpectedly restored")
 	}
+	for _, sessionID := range []string{".", "..", "../outside", `..\outside`, "nested/session", "session id"} {
+		if err := restored[0].RestoreState(map[string]any{"session_id": sessionID}, SlotConfig{}); err == nil || !strings.Contains(err.Error(), "safe path component") {
+			t.Fatalf("unsafe session_id %q restore error = %v", sessionID, err)
+		}
+	}
 }
 
 func TestRunResumeAndCleanClaudeSessions(t *testing.T) {

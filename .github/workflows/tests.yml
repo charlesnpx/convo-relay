@@ -4,7 +4,7 @@ on:
   push:
     branches: [main]
   pull_request:
-    branches: [main]
+    branches: [main, feature/root-recipe-integration, feature/root-recipe-remediation]
 
 jobs:
   go:
@@ -22,6 +22,9 @@ jobs:
       - name: Test Go
         run: go test ./... -count=1
 
+      - name: Test without optional recipe defaults
+        run: make test-without-optional-defaults
+
       - name: Smoke fake provider matrix
         run: make smoke-fake-providers
 
@@ -36,3 +39,32 @@ jobs:
 
       - name: Smoke display help
         run: go run ./cmd/convo-relay display --help
+
+  race:
+    name: Targeted Linux race tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.23.x"
+
+      - name: Race targeted stateful packages
+        run: make test-race
+
+  cross-compile:
+    name: Darwin and Windows cross-compilation
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.23.x"
+
+      - name: Cross-compile production packages
+        run: make cross-compile
+
+      - name: Cross-compile test packages
+        run: make cross-compile-tests

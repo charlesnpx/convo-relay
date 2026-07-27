@@ -73,12 +73,7 @@ func runChildRelay(ctx context.Context, spec childRelaySpec) (*childRelayResult,
 	compiledPlan := spec.CompiledPlan
 	if compiledPlan == nil {
 		var err error
-		compiledPlan, err = recipes.CompileRecipeToChildPlan(spec.Recipe, spec.Profiles, spec.Recipes, recipes.CompileOptions{
-			CompositionPath:      compositionPath,
-			RelayBackendDepth:    intFromAny(spec.DepthPolicy["relay_backend_depth"], 0),
-			MaxRelayBackendDepth: intFromAny(spec.DepthPolicy["max_relay_backend_depth"], 1),
-			ValidateExecutable:   true,
-		})
+		compiledPlan, err = compileChildRelayPlan(spec, compositionPath)
 		if err != nil {
 			return nil, childRelayConfigError(err)
 		}
@@ -150,6 +145,15 @@ func runChildRelay(ctx context.Context, spec childRelaySpec) (*childRelayResult,
 	return result, err
 }
 
+func compileChildRelayPlan(spec childRelaySpec, compositionPath string) (map[string]any, error) {
+	return recipes.CompileRecipe(spec.Recipe, spec.Profiles, spec.Recipes, recipes.CompileTargetChild, recipes.CompileOptions{
+		CompositionPath:      compositionPath,
+		RelayBackendDepth:    intFromAny(spec.DepthPolicy["relay_backend_depth"], 0),
+		MaxRelayBackendDepth: intFromAny(spec.DepthPolicy["max_relay_backend_depth"], 1),
+		ValidateExecutable:   true,
+	})
+}
+
 func runtimeConfigForChildSpec(spec childRelaySpec) recipes.RuntimeConfig {
 	if runtimeConfigProvided(spec.RuntimeConfig) {
 		return cloneRuntimeConfig(spec.RuntimeConfig)
@@ -157,6 +161,7 @@ func runtimeConfigForChildSpec(spec childRelaySpec) recipes.RuntimeConfig {
 	return recipes.RuntimeConfig{
 		BackendProfiles: mapStringObjectMap(spec.Profiles),
 		RelayRecipes:    mapStringObjectMap(spec.Recipes),
+		Limits:          recipes.DefaultRuntimeLimits(),
 		SettingsPath:    spec.SettingsPath,
 	}
 }
@@ -284,7 +289,7 @@ func saveChildContractArtifacts(st *store.Store, artifactID string, result *chil
 	if result == nil {
 		return refs, nil
 	}
-	recipePayload := recipes.RecipeContractPayload(recipe)
+	recipePayload := recipes.ChildRecipeContractPayload(recipe)
 	if recipeRef, ok := result.CompiledPlanContract["recipe_ref"].(map[string]any); ok {
 		ref, err := st.SaveContractArtifact("recipes", stringFromAny(recipePayload["id"]), recipePayload, stringFromAny(recipeRef["id"]))
 		if err != nil {

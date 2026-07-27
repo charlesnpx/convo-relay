@@ -11,14 +11,24 @@ func BuildShowGraphReport(sessionDir string) (map[string]any, error) {
 	if err != nil {
 		return nil, err
 	}
-	return map[string]any{
+	report := map[string]any{
 		"graph":      repairedGraph,
 		"events":     events,
 		"validation": StrictValidationResult(st),
-	}, nil
+	}
+	if meta, loadErr := LoadMeta(sessionDir); loadErr == nil {
+		if root := BuildRootInspectionReport(sessionDir, meta, false); root != nil {
+			report["root"] = root
+		}
+	}
+	return report, nil
 }
 
 func FormatGraphSummary(report map[string]any) string {
 	graphData, _ := report["graph"].(map[string]any)
-	return graph.Summary(graphData)
+	summary := graph.Summary(graphData)
+	if root, ok := report["root"].(map[string]any); ok {
+		summary += "\n" + FormatRootSummary(root)
+	}
+	return summary
 }

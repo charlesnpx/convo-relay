@@ -7,7 +7,6 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
-	"syscall"
 	"time"
 
 	"github.com/charlesnpx/convo-relay/internal/graph"
@@ -75,6 +74,19 @@ type ResumeOptions struct {
 	FacilitatorEffort   string
 	RelayBackendDepth   int
 	MaxRelayDepth       int
+
+	// ExplicitFields identifies CLI/API fields that the caller deliberately
+	// supplied. Root-recipe recovery uses it to distinguish flag defaults from
+	// forbidden structural overrides. Direct API callers may omit it; non-zero
+	// structural values are then treated as explicit.
+	ExplicitFields map[string]bool
+
+	// backendFactory is a test seam for root recovery. Ordinary resume keeps
+	// using the established slot restoration path.
+	backendFactory rootBackendFactory
+
+	retainedInputVerifier            rootRetainedInputVerifier
+	retainedInputVerificationTimeout time.Duration
 }
 
 type StopOptions struct {
@@ -306,11 +318,14 @@ func Resume(ctx context.Context, sessionDir string, opts ResumeOptions) (map[str
 	if strings.TrimSpace(sessionDir) == "" {
 		return nil, fmt.Errorf("--session-dir is required")
 	}
-	opts = normalizeResumeOptions(opts)
 	meta, err := loadSessionMeta(sessionDir)
 	if err != nil {
 		return nil, err
 	}
+	if meta.String("execution_kind") == "recipe" {
+		return resumeRootRecipe(ctx, sessionDir, opts, meta)
+	}
+	opts = normalizeResumeOptions(opts)
 	transcript, err := loadSessionTranscript(sessionDir)
 	if err != nil {
 		return nil, err
@@ -477,8 +492,22 @@ func Resume(ctx context.Context, sessionDir string, opts ResumeOptions) (map[str
 }
 
 func Stop(sessionDir string, opts StopOptions) (map[string]any, error) {
+	return stopWithProcessOperations(sessionDir, opts, stopProcessOperations{
+		alive:       processAlive,
+		requestStop: requestProcessStop,
+	})
+}
+
+func stopWithProcessOperations(
+	sessionDir string,
+	opts StopOptions,
+	operations stopProcessOperations,
+) (map[string]any, error) {
 	if strings.TrimSpace(sessionDir) == "" {
 		return nil, fmt.Errorf("--session-dir is required")
+	}
+	if operations.alive == nil || operations.requestStop == nil {
+		return nil, errors.New("process control is unavailable")
 	}
 	meta, err := loadSessionMeta(sessionDir)
 	if err != nil {
@@ -493,21 +522,24 @@ func Stop(sessionDir string, opts StopOptions) (map[string]any, error) {
 		return nil, fmt.Errorf("no tracked relay process for session %s", sessionIDFromDir(sessionDir))
 	}
 	st := store.New(sessionDir)
-	if !processAlive(pid) {
+	if !operations.alive(pid) {
 		meta = meta.WithStatus("orphaned").
 			WithActualRounds(transcript.Len()).
 			With("orphaned_at", utcNow())
+		meta, err = finalizeAdministrativeTerminal(st, meta)
+		if err != nil {
+			if saveErr := st.SaveMeta(meta); saveErr != nil {
+				return nil, errors.Join(err, saveErr)
+			}
+			return nil, err
+		}
 		if err := st.SaveMeta(meta); err != nil {
 			return nil, err
 		}
 		removePID(sessionDir)
-		return map[string]any{"session_id": sessionIDFromDir(sessionDir), "status": "orphaned", "pid": pid}, nil
+		return map[string]any{"session_id": sessionIDFromDir(sessionDir), "status": meta.String("status"), "pid": pid}, nil
 	}
-	sig := syscall.SIGTERM
-	if opts.ForceKill {
-		sig = syscall.SIGKILL
-	}
-	if err := signalProcess(pid, sig); err != nil {
+	if err := operations.requestStop(pid, opts.ForceKill); err != nil {
 		return nil, err
 	}
 	if opts.ForceKill {
@@ -515,11 +547,18 @@ func Stop(sessionDir string, opts StopOptions) (map[string]any, error) {
 			WithActualRounds(transcript.Len()).
 			With("killed_at", utcNow()).
 			With("stop_reason", "killed")
+		meta, err = finalizeAdministrativeTerminal(st, meta)
+		if err != nil {
+			if saveErr := st.SaveMeta(meta); saveErr != nil {
+				return nil, errors.Join(err, saveErr)
+			}
+			return nil, err
+		}
 		if err := st.SaveMeta(meta); err != nil {
 			return nil, err
 		}
 		removePID(sessionDir)
-		return map[string]any{"session_id": sessionIDFromDir(sessionDir), "status": "killed", "pid": pid}, nil
+		return map[string]any{"session_id": sessionIDFromDir(sessionDir), "status": meta.String("status"), "pid": pid}, nil
 	}
 	return map[string]any{"session_id": sessionIDFromDir(sessionDir), "status": "signaled", "pid": pid}, nil
 }
@@ -684,7 +723,7 @@ func (s *runState) finalizeTurn(ctx context.Context, roundNum int, slot Backend,
 	}
 	lineages := updateContestedLineages(s.meta.Get("contested_lineages"), previousLedger.ToMap(), ledger.ToMap(), roundNum, stringFromAny(event["event_id"]))
 	if normalizeDynamicMode(s.dynamicMode) != defaultDynamicMode {
-		if _, err := maybeCreateSpawnProposals(s.st, s.dynamicMode, lineages, previousLedger.ToMap(), ledger.ToMap(), roundNum, stringFromAny(event["event_id"]), s.runtimeConfig.RelayRecipes); err != nil {
+		if _, err := maybeCreateSpawnProposals(s.st, s.dynamicMode, lineages, previousLedger.ToMap(), ledger.ToMap(), roundNum, stringFromAny(event["event_id"]), s.runtimeConfig.BackendProfiles, s.runtimeConfig.RelayRecipes); err != nil {
 			return err
 		}
 	}
@@ -785,6 +824,7 @@ func (s *runState) saveGraph() error {
 	}
 	repaired["backend_profiles"] = s.runtimeConfig.BackendProfiles
 	repaired["relay_recipes"] = s.runtimeConfig.RelayRecipes
+	repaired["runtime_limits"] = recipes.RuntimeLimitsMap(s.runtimeConfig.EffectiveLimits())
 	repaired["runtime_config_ref"] = s.meta.Get("runtime_config_ref")
 	nodes, _ := repaired["nodes"].(map[string]any)
 	if root, ok := nodes[graph.RootNodeID].(map[string]any); ok {
@@ -799,8 +839,26 @@ func (s *runState) saveGraph() error {
 
 func (s *runState) markCompleted(stopReason string) (map[string]any, error) {
 	s.meta = s.meta.WithCompleted(s.transcript.Len(), roundElapsed(s.startedAt), utcNow(), stopReason)
+	var terminalErr error
+	s.meta, _, terminalErr = finalizeTerminalWorkspace(context.Background(), s.st, s.meta)
+	if terminalErr != nil && !isSourceMutationError(terminalErr) {
+		s.meta = workspaceIntegrityFailureMeta(s.meta, terminalErr)
+	}
 	if err := s.saveProgress(); err != nil {
 		return nil, err
+	}
+	if terminalErr != nil {
+		if _, err := s.st.AppendSessionEventV1("node_failed", graph.RootNodeID, "Root relay failed: "+terminalErr.Error(), map[string]any{
+			"actual_rounds": s.transcript.Len(),
+			"error":         terminalErr.Error(),
+			"stop_reason":   s.meta.String("stop_reason"),
+		}, store.EventOptions{}); err != nil {
+			return nil, err
+		}
+		if err := s.saveGraph(); err != nil {
+			return nil, err
+		}
+		return s.result(), terminalErr
 	}
 	if _, err := s.st.AppendSessionEventV1("node_completed", graph.RootNodeID, "Root relay completed: "+stopReason, map[string]any{
 		"actual_rounds": s.transcript.Len(),
@@ -816,8 +874,22 @@ func (s *runState) markCompleted(stopReason string) (map[string]any, error) {
 
 func (s *runState) markInterrupted(reason string) (map[string]any, error) {
 	s.meta = s.meta.WithInterrupted(s.transcript.Len(), utcNow(), reason)
+	var terminalErr error
+	s.meta, _, terminalErr = finalizeTerminalWorkspace(context.Background(), s.st, s.meta)
+	if terminalErr != nil && !isSourceMutationError(terminalErr) {
+		s.meta = workspaceIntegrityFailureMeta(s.meta, terminalErr)
+	}
 	if err := s.saveProgress(); err != nil {
 		return nil, err
+	}
+	if terminalErr != nil {
+		_, _ = s.st.AppendSessionEventV1("node_failed", graph.RootNodeID, "Root relay failed: "+terminalErr.Error(), map[string]any{
+			"actual_rounds": s.transcript.Len(),
+			"error":         terminalErr.Error(),
+			"stop_reason":   s.meta.String("stop_reason"),
+		}, store.EventOptions{})
+		_ = s.saveGraph()
+		return s.result(), terminalErr
 	}
 	_, _ = s.st.AppendSessionEventV1("node_interrupted", graph.RootNodeID, "Root relay interrupted", map[string]any{
 		"actual_rounds": s.transcript.Len(),
@@ -829,15 +901,25 @@ func (s *runState) markInterrupted(reason string) (map[string]any, error) {
 
 func (s *runState) markFailed(err error) (map[string]any, error) {
 	s.meta = s.meta.WithFailed(s.transcript.Len(), utcNow(), err)
+	var terminalErr error
+	s.meta, _, terminalErr = finalizeTerminalWorkspace(context.Background(), s.st, s.meta)
+	if terminalErr != nil && !isSourceMutationError(terminalErr) {
+		s.meta = workspaceIntegrityFailureMeta(s.meta, terminalErr)
+	}
 	if saveErr := s.saveProgress(); saveErr != nil {
 		return nil, saveErr
 	}
-	_, _ = s.st.AppendSessionEventV1("node_failed", graph.RootNodeID, "Root relay failed: "+err.Error(), map[string]any{
+	effectiveErr := err
+	if terminalErr != nil {
+		effectiveErr = terminalErr
+	}
+	_, _ = s.st.AppendSessionEventV1("node_failed", graph.RootNodeID, "Root relay failed: "+effectiveErr.Error(), map[string]any{
 		"actual_rounds": s.transcript.Len(),
-		"error":         err.Error(),
+		"error":         effectiveErr.Error(),
+		"stop_reason":   s.meta.String("stop_reason"),
 	}, store.EventOptions{})
 	_ = s.saveGraph()
-	return s.result(), err
+	return s.result(), effectiveErr
 }
 
 func (s *runState) result() map[string]any {
@@ -938,7 +1020,7 @@ func persistTransientRecipeContractArtifacts(st *store.Store, files []recipes.Tr
 		if recipe == nil {
 			return nil, fmt.Errorf("transient recipe %q is missing from effective runtime config", recipeID)
 		}
-		ref, err := st.SaveContractArtifact("recipes", recipeID, recipes.RecipeContractPayload(recipe), "recipe:"+recipeID)
+		ref, err := st.SaveContractArtifact("recipes", recipeID, recipes.ChildRecipeContractPayload(recipe), "recipe:"+recipeID)
 		if err != nil {
 			return nil, err
 		}

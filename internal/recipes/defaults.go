@@ -50,7 +50,115 @@ var defaultBackendProfiles = map[string]map[string]any{
 	},
 }
 
-var defaultRelayRecipes = map[string]map[string]any{
+var defaultRelayRecipeRecords = map[string]map[string]any{
+	"witness-falsify": {
+		"purpose":              "Adversarially test filed defect witnesses against a frozen Charter.",
+		"participants":         []any{"claude-code", "codex-deep"},
+		"facilitator":          "codex-fast",
+		"reducer":              "codex-deep",
+		"mode":                 "adversarial",
+		"participant_turns":    4,
+		"result_source":        "reducer",
+		"integration_contract": "witnessed-review/witness-falsification-v1",
+		"max_depth":            1,
+		"auto_approval":        "never",
+		"lifecycle": map[string]any{
+			"resume":              "forbid",
+			"steering":            "forbid",
+			"dynamic":             "forbid",
+			"workspace_isolation": "ephemeral",
+		},
+	},
+	"witness-falsify-codex": {
+		"purpose":              "Adversarially test filed defect witnesses against a frozen Charter.",
+		"participants":         []any{"codex-deep", "codex-deep"},
+		"facilitator":          "codex-fast",
+		"reducer":              "codex-deep",
+		"mode":                 "adversarial",
+		"participant_turns":    4,
+		"result_source":        "reducer",
+		"integration_contract": "witnessed-review/witness-falsification-v1",
+		"max_depth":            1,
+		"auto_approval":        "never",
+		"lifecycle": map[string]any{
+			"resume":              "forbid",
+			"steering":            "forbid",
+			"dynamic":             "forbid",
+			"workspace_isolation": "ephemeral",
+		},
+	},
+	"witness-falsify-claude": {
+		"purpose":              "Adversarially test filed defect witnesses against a frozen Charter.",
+		"participants":         []any{"claude-code", "claude-code"},
+		"facilitator":          "claude-code",
+		"reducer":              "claude-code",
+		"mode":                 "adversarial",
+		"participant_turns":    4,
+		"result_source":        "reducer",
+		"integration_contract": "witnessed-review/witness-falsification-v1",
+		"max_depth":            1,
+		"auto_approval":        "never",
+		"lifecycle": map[string]any{
+			"resume":              "forbid",
+			"steering":            "forbid",
+			"dynamic":             "forbid",
+			"workspace_isolation": "ephemeral",
+		},
+	},
+	"economy-equivalence": {
+		"purpose":              "Adversarially test filed deletion and simplification equivalence witnesses.",
+		"participants":         []any{"claude-code", "codex-deep"},
+		"facilitator":          "codex-fast",
+		"reducer":              "codex-deep",
+		"mode":                 "adversarial",
+		"participant_turns":    4,
+		"result_source":        "reducer",
+		"integration_contract": "witnessed-review/economy-equivalence-v1",
+		"max_depth":            1,
+		"auto_approval":        "never",
+		"lifecycle": map[string]any{
+			"resume":              "forbid",
+			"steering":            "forbid",
+			"dynamic":             "forbid",
+			"workspace_isolation": "ephemeral",
+		},
+	},
+	"economy-equivalence-codex": {
+		"purpose":              "Adversarially test filed deletion and simplification equivalence witnesses.",
+		"participants":         []any{"codex-deep", "codex-deep"},
+		"facilitator":          "codex-fast",
+		"reducer":              "codex-deep",
+		"mode":                 "adversarial",
+		"participant_turns":    4,
+		"result_source":        "reducer",
+		"integration_contract": "witnessed-review/economy-equivalence-v1",
+		"max_depth":            1,
+		"auto_approval":        "never",
+		"lifecycle": map[string]any{
+			"resume":              "forbid",
+			"steering":            "forbid",
+			"dynamic":             "forbid",
+			"workspace_isolation": "ephemeral",
+		},
+	},
+	"economy-equivalence-claude": {
+		"purpose":              "Adversarially test filed deletion and simplification equivalence witnesses.",
+		"participants":         []any{"claude-code", "claude-code"},
+		"facilitator":          "claude-code",
+		"reducer":              "claude-code",
+		"mode":                 "adversarial",
+		"participant_turns":    4,
+		"result_source":        "reducer",
+		"integration_contract": "witnessed-review/economy-equivalence-v1",
+		"max_depth":            1,
+		"auto_approval":        "never",
+		"lifecycle": map[string]any{
+			"resume":              "forbid",
+			"steering":            "forbid",
+			"dynamic":             "forbid",
+			"workspace_isolation": "ephemeral",
+		},
+	},
 	"review-panel": {
 		"id":                    "review-panel",
 		"purpose":               "Use when an unresolved implementation or design risk needs a focused child relay.",
@@ -90,4 +198,17 @@ var defaultRelayRecipes = map[string]map[string]any{
 		"auto_approval":         "ask",
 		"match_keywords":        []any{},
 	},
+}
+
+var defaultRelayRecipes = selectedDefaultRelayRecipeRecords(defaultRelayRecipeRecords)
+
+func selectedDefaultRelayRecipeRecords(records map[string]map[string]any) map[string]map[string]any {
+	selected := make(map[string]map[string]any, len(records))
+	for recipeID, record := range records {
+		if !includeOptionalRelayRecipeDefaults && stringValue(record["integration_contract"]) != "" {
+			continue
+		}
+		selected[recipeID] = cloneObject(record)
+	}
+	return selected
 }

@@ -1,17 +1,35 @@
 package recipes
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"sort"
 	"strings"
+
+	"github.com/charlesnpx/convo-relay/internal/contracts"
+	"github.com/charlesnpx/convo-relay/internal/integration"
+	"github.com/charlesnpx/convo-relay/internal/readiness"
 )
 
 const (
-	RecipeStatusUsable      = "usable"
-	RecipeStatusUnavailable = "unavailable"
-	RecipeStatusInvalid     = "invalid"
-	RecipeStatusSkipped     = "skipped"
+	RecipeStatusUsable              = "usable"
+	RecipeStatusRequiresIntegration = "requires_integration"
+	RecipeStatusUnavailable         = "unavailable"
+	RecipeStatusInvalid             = "invalid"
+	RecipeStatusSkipped             = "skipped"
+
+	RecipeIntegrationStatusRequired = "required"
+	RecipeIntegrationStatusBound    = "bound"
 )
+
+type RecipeCatalogOptions struct {
+	Context           context.Context
+	TransientSources  []TransientRecipeSource
+	IntegrationBundle *integration.Bundle
+	ReadinessOptions  readiness.Options
+	ReadinessCheck    func(context.Context, []string, readiness.Options) ([]readiness.Record, error)
+}
 
 type RecipeCatalogReport struct {
 	Scope        string             `json:"scope"`
@@ -23,14 +41,24 @@ type RecipeCatalogReport struct {
 }
 
 type RecipeRecord struct {
-	ID           string             `json:"id"`
-	Status       string             `json:"status"`
-	Source       string             `json:"source"`
-	SourceDigest string             `json:"source_digest,omitempty"`
-	RecipeDigest string             `json:"recipe_digest,omitempty"`
-	Declared     map[string]any     `json:"declared,omitempty"`
-	Resolved     map[string]any     `json:"resolved,omitempty"`
-	Diagnostics  []ChildRecipeIssue `json:"diagnostics,omitempty"`
+	ID               string                    `json:"id"`
+	Status           string                    `json:"status"`
+	Source           string                    `json:"source"`
+	SourceDigest     string                    `json:"source_digest,omitempty"`
+	RecipeDigest     string                    `json:"recipe_digest,omitempty"`
+	Declared         map[string]any            `json:"declared,omitempty"`
+	Resolved         map[string]any            `json:"resolved,omitempty"`
+	Integration      *RecipeIntegrationBinding `json:"integration,omitempty"`
+	BackendReadiness []readiness.Record        `json:"backend_readiness,omitempty"`
+	Diagnostics      []ChildRecipeIssue        `json:"diagnostics,omitempty"`
+}
+
+type RecipeIntegrationBinding struct {
+	Status         string `json:"status"`
+	ContractID     string `json:"contract_id"`
+	ContractDigest string `json:"contract_digest,omitempty"`
+	BundleID       string `json:"bundle_id,omitempty"`
+	BundleDigest   string `json:"bundle_digest,omitempty"`
 }
 
 type RecipeIssueGroup struct {
@@ -41,10 +69,33 @@ type RecipeIssueGroup struct {
 }
 
 func BuildRecipeCatalogReport(settingsPath string) (RecipeCatalogReport, error) {
-	return BuildRecipeCatalogReportWithTransientSources(settingsPath, nil)
+	return BuildRecipeCatalogReportWithOptions(settingsPath, RecipeCatalogOptions{})
 }
 
 func BuildRecipeCatalogReportWithTransientSources(settingsPath string, sources []TransientRecipeSource) (RecipeCatalogReport, error) {
+	return BuildRecipeCatalogReportWithOptions(settingsPath, RecipeCatalogOptions{TransientSources: sources})
+}
+
+// LoadIntegrationBundle applies the settings-scoped bundle byte limit without
+// requiring every catalog recipe to be executable first.
+func LoadIntegrationBundle(settingsPath string, bundlePath string) (*integration.Bundle, error) {
+	bundlePath = strings.TrimSpace(bundlePath)
+	if bundlePath == "" {
+		return nil, nil
+	}
+	path := resolveSettingsPath(settingsPath)
+	settings, err := loadTOML(path)
+	if err != nil {
+		return nil, fmt.Errorf("load settings %s: %w", path, err)
+	}
+	limits, err := ParseRuntimeLimits(settings["limits"])
+	if err != nil {
+		return nil, err
+	}
+	return integration.LoadBundleFile(expandUser(bundlePath), limits.IntegrationBundleMaxBytes)
+}
+
+func BuildRecipeCatalogReportWithOptions(settingsPath string, options RecipeCatalogOptions) (RecipeCatalogReport, error) {
 	path := resolveSettingsPath(settingsPath)
 	settings, err := loadTOML(path)
 	if err != nil {
@@ -52,10 +103,15 @@ func BuildRecipeCatalogReportWithTransientSources(settingsPath string, sources [
 	}
 	rawProfileOverrides := asObject(settings["backend_profiles"])
 	rawRecipeOverrides := asObject(settings["relay_recipes"])
-	transientSources, err := loadTransientRecipeSources(sources, rawProfileOverrides, rawRecipeOverrides)
+	transientSources, err := loadTransientRecipeSources(options.TransientSources, rawProfileOverrides, rawRecipeOverrides)
 	if err != nil {
 		return RecipeCatalogReport{}, err
 	}
+	rawProfiles := mergeNamedRecords(defaultBackendProfiles, rawProfileOverrides)
+	rawRecipes := mergeNamedRecords(defaultRelayRecipes, rawRecipeOverrides)
+	normalizedProfiles := NormalizeBackendProfiles(rawProfileOverrides)
+	normalizedRecipes := NormalizeRelayRecipes(rawRecipeOverrides)
+	populateTransientRecipeDigests(transientSources, normalizedRecipes)
 	transientRecipeIDs := map[string]bool{}
 	for _, source := range transientSources {
 		for _, recipeID := range source.RecipeIDs {
@@ -63,13 +119,15 @@ func BuildRecipeCatalogReportWithTransientSources(settingsPath string, sources [
 		}
 	}
 	transientTraces := transientRecipeDigestTraces(transientSources)
-	rawProfiles := mergeNamedRecords(defaultBackendProfiles, rawProfileOverrides)
-	rawRecipes := mergeNamedRecords(defaultRelayRecipes, rawRecipeOverrides)
-	normalizedProfiles := NormalizeBackendProfiles(rawProfileOverrides)
-	normalizedRecipes := NormalizeRelayRecipes(rawRecipeOverrides)
 	profileIssues := profileDiagnostics(rawProfiles, normalizedProfiles, rawProfileOverrides)
 
+	type readinessCandidate struct {
+		recordIndex int
+		backends    []string
+	}
 	records := make([]RecipeRecord, 0, len(rawRecipes)+len(rawRecipeOverrides))
+	readinessCandidates := []readinessCandidate{}
+	allBackends := map[string]bool{}
 	for _, recipeID := range sortedObjectKeys(rawRecipes) {
 		rawRecipe := rawRecipes[recipeID]
 		record := RecipeRecord{
@@ -106,16 +164,91 @@ func BuildRecipeCatalogReportWithTransientSources(settingsPath string, sources [
 			records = append(records, record)
 			continue
 		}
-		issues := ExecutableIssues(recipe, normalizedProfiles, normalizedRecipes, DepthPolicy{}, "root")
+		participantTurns, turnErr := validatedRootParticipantTurns(recipe)
+		if turnErr != nil {
+			record.Status = RecipeStatusInvalid
+			record.Diagnostics = catalogDiagnosticIssues(turnErr, "invalid_config", "invalid_participant_turns")
+			records = append(records, record)
+			continue
+		}
+		issues := rootExecutableIssues(recipe, normalizedProfiles, normalizedRecipes, DepthPolicy{}, "root")
 		issues = annotateProfileReferenceIssues(issues, profileIssues)
 		record.Diagnostics = issues
 		record.Resolved = resolveRecipeView(recipe, normalizedProfiles, normalizedRecipes)
-		if len(issues) > 0 {
-			record.Status = RecipeStatusUnavailable
-		} else {
-			record.Status = RecipeStatusUsable
+		backends, closureErr := readiness.ResolveBackendClosure(recipe, normalizedProfiles, normalizedRecipes, readiness.ClosureOptions{
+			IncludeReducer:        normalizeResultSource(recipe["result_source"]) == integration.ResultSourceReducer,
+			IncludeNestedReducers: true,
+		})
+		if closureErr == nil {
+			record.Resolved["backends"] = cleanStringList(backends, false)
+		} else if len(issues) == 0 {
+			record.Diagnostics = append(record.Diagnostics, ChildRecipeIssue{
+				Category: "backend_readiness",
+				Code:     "backend_resolution_failed",
+				Message:  "Recipe backend closure could not be resolved.",
+				Path:     "relay_recipes." + recipeID,
+				Detail:   map[string]any{"cause": closureErr.Error()},
+			})
+		}
+		if len(record.Diagnostics) > 0 || closureErr != nil {
+			record.Status = RecipeStatusInvalid
+			records = append(records, record)
+			continue
+		}
+		record.Integration, issues = catalogIntegrationBinding(recipe, participantTurns, options.IntegrationBundle)
+		record.Diagnostics = append(record.Diagnostics, issues...)
+		switch {
+		case record.Integration != nil && record.Integration.Status != RecipeIntegrationStatusBound:
+			record.Status = RecipeStatusRequiresIntegration
+		default:
+			readinessCandidates = append(readinessCandidates, readinessCandidate{
+				recordIndex: len(records),
+				backends:    backends,
+			})
+			for _, backend := range backends {
+				allBackends[backend] = true
+			}
 		}
 		records = append(records, record)
+	}
+	if len(readinessCandidates) > 0 {
+		check := options.ReadinessCheck
+		if check == nil {
+			check = readiness.Check
+		}
+		ctx := options.Context
+		if ctx == nil {
+			ctx = context.Background()
+		}
+		readinessOptions := options.ReadinessOptions
+		readinessOptions.ProbeAuth = false
+		backendRecords, err := check(ctx, sortedObjectKeys(allBackends), readinessOptions)
+		if err != nil {
+			return RecipeCatalogReport{}, fmt.Errorf("check recipe backend readiness: %w", err)
+		}
+		readinessByBackend := map[string]readiness.Record{}
+		for _, backendRecord := range backendRecords {
+			readinessByBackend[backendRecord.Backend] = backendRecord
+		}
+		for _, candidate := range readinessCandidates {
+			record := &records[candidate.recordIndex]
+			for _, backend := range candidate.backends {
+				backendRecord, ok := readinessByBackend[backend]
+				if !ok {
+					record.Diagnostics = append(record.Diagnostics, missingBackendReadinessIssue(backend))
+					continue
+				}
+				record.BackendReadiness = append(record.BackendReadiness, backendRecord)
+				if !catalogBackendAvailable(backendRecord) {
+					record.Diagnostics = append(record.Diagnostics, backendUnavailableIssue(backendRecord))
+				}
+			}
+			if len(record.Diagnostics) > 0 {
+				record.Status = RecipeStatusUnavailable
+			} else {
+				record.Status = RecipeStatusUsable
+			}
+		}
 	}
 	for _, skipped := range skippedRecipeRecords(rawRecipeOverrides, rawRecipes) {
 		records = append(records, skipped)
@@ -148,6 +281,23 @@ func FilterRecipeRecords(records []RecipeRecord, status string) []RecipeRecord {
 	return filtered
 }
 
+func FilterRecipeRecordsByStatuses(records []RecipeRecord, statuses ...string) []RecipeRecord {
+	wanted := map[string]bool{}
+	for _, status := range statuses {
+		status = strings.TrimSpace(status)
+		if status != "" {
+			wanted[status] = true
+		}
+	}
+	filtered := make([]RecipeRecord, 0, len(records))
+	for _, record := range records {
+		if wanted[record.Status] {
+			filtered = append(filtered, record)
+		}
+	}
+	return filtered
+}
+
 func FindRecipeRecord(records []RecipeRecord, recipeID string) (RecipeRecord, bool) {
 	recipeID = strings.TrimSpace(recipeID)
 	for _, record := range records {
@@ -169,7 +319,7 @@ func FormatRecipeList(records []RecipeRecord) string {
 			participants = "-"
 		}
 		purpose := strings.TrimSpace(stringValue(record.Declared["purpose"]))
-		lines = append(lines, fmt.Sprintf("  %-18s %-11s %-8s participants=%s", record.ID, record.Status, record.Source, participants))
+		lines = append(lines, fmt.Sprintf("  %-18s %-20s %-8s participants=%s", record.ID, record.Status, record.Source, participants))
 		if purpose != "" {
 			lines = append(lines, "    "+purpose)
 		}
@@ -195,6 +345,12 @@ func FormatRecipeShow(record RecipeRecord, view string) string {
 	}
 	if record.RecipeDigest != "" {
 		lines = append(lines, fmt.Sprintf("Recipe digest: %s", record.RecipeDigest))
+	}
+	if record.Integration != nil {
+		lines = append(lines, fmt.Sprintf("Integration: %s contract=%s", record.Integration.Status, record.Integration.ContractID))
+		if record.Integration.BundleID != "" {
+			lines = append(lines, fmt.Sprintf("Integration bundle: %s digest=%s", record.Integration.BundleID, record.Integration.BundleDigest))
+		}
 	}
 	if view == "all" || view == "declared" {
 		lines = append(lines, "Declared:")
@@ -231,6 +387,12 @@ func FormatRecipeShow(record RecipeRecord, view string) string {
 					resolved["model"],
 					resolved["effort"],
 				))
+			}
+		}
+		if len(record.BackendReadiness) > 0 {
+			lines = append(lines, "  backend readiness:")
+			for _, backend := range record.BackendReadiness {
+				lines = append(lines, fmt.Sprintf("    %s: %s", backend.Backend, backend.Status))
 			}
 		}
 	}
@@ -297,33 +459,15 @@ func BuildRecipeIssueGroups(records []RecipeRecord, globalIssues []ChildRecipeIs
 }
 
 func recipeShapeIssues(recipeID string, recipe map[string]any) []ChildRecipeIssue {
-	issues := []ChildRecipeIssue{}
-	participants := cleanStringList(recipe["participants"], false)
-	if len(participants) != 2 {
+	diagnostics := validateRecipeRecord(recipe, appendRecipePointer("/relay_recipes", recipeID))
+	issues := make([]ChildRecipeIssue, 0, len(diagnostics))
+	for _, diagnostic := range diagnostics {
 		issues = append(issues, ChildRecipeIssue{
 			Category: "invalid_config",
-			Code:     "invalid_participants",
-			Message:  "Relay recipe must declare exactly two participants.",
-			Path:     "relay_recipes." + recipeID + ".participants",
-			Detail:   map[string]any{"participants": recipe["participants"]},
-		})
-	}
-	if _, ok := parseInt(recipe["max_rounds"]); recipe["max_rounds"] != nil && !ok {
-		issues = append(issues, ChildRecipeIssue{
-			Category: "invalid_config",
-			Code:     "invalid_max_rounds",
-			Message:  "Relay recipe max_rounds must be a positive integer.",
-			Path:     "relay_recipes." + recipeID + ".max_rounds",
-			Detail:   map[string]any{"max_rounds": recipe["max_rounds"]},
-		})
-	}
-	if _, ok := parseInt(recipe["max_depth"]); recipe["max_depth"] != nil && !ok {
-		issues = append(issues, ChildRecipeIssue{
-			Category: "invalid_config",
-			Code:     "invalid_max_depth",
-			Message:  "Relay recipe max_depth must be a positive integer.",
-			Path:     "relay_recipes." + recipeID + ".max_depth",
-			Detail:   map[string]any{"max_depth": recipe["max_depth"]},
+			Code:     diagnostic.Code,
+			Message:  diagnostic.Message,
+			Path:     diagnostic.Path,
+			Detail:   diagnostic.Details,
 		})
 	}
 	return issues
@@ -461,12 +605,116 @@ func flattenProfileDiagnostics(profileIssues map[string][]ChildRecipeIssue) []Ch
 	return issues
 }
 
+func catalogIntegrationBinding(recipe map[string]any, participantTurns int, bundle *integration.Bundle) (*RecipeIntegrationBinding, []ChildRecipeIssue) {
+	contractID := stringValue(recipe["integration_contract"])
+	if strings.TrimSpace(contractID) == "" {
+		return nil, nil
+	}
+	binding := &RecipeIntegrationBinding{
+		Status:     RecipeIntegrationStatusRequired,
+		ContractID: contractID,
+	}
+	if bundle == nil {
+		return binding, []ChildRecipeIssue{{
+			Category: "integration_binding",
+			Code:     "integration_required",
+			Message:  fmt.Sprintf("Recipe '%s' requires integration contract '%s'.", stringValue(recipe["id"]), contractID),
+			Path:     "recipe.integration_contract",
+			Detail:   map[string]any{"contract_id": contractID},
+		}}
+	}
+	binding.BundleID = bundle.ID()
+	binding.BundleDigest = bundle.Digest()
+	scheduledTurns, err := integration.AlternatingSchedule(participantTurns)
+	if err != nil {
+		return binding, []ChildRecipeIssue{{
+			Category: "integration_binding",
+			Code:     "integration_schedule_invalid",
+			Message:  "Recipe participant schedule cannot be matched to an integration contract.",
+			Path:     "recipe.participant_turns",
+			Detail:   map[string]any{"cause": err.Error()},
+		}}
+	}
+	selected, err := integration.SelectContract(bundle, contractID, integration.ScheduleRequirement{
+		Turns:        scheduledTurns,
+		ResultSource: normalizeResultSource(recipe["result_source"]),
+	})
+	if err != nil {
+		return binding, catalogIntegrationIssues(err)
+	}
+	binding.Status = RecipeIntegrationStatusBound
+	binding.ContractDigest = selected.Digest()
+	return binding, nil
+}
+
+func catalogIntegrationIssues(err error) []ChildRecipeIssue {
+	return catalogDiagnosticIssues(err, "integration_binding", "integration_binding_failed")
+}
+
+func catalogDiagnosticIssues(err error, category string, fallbackCode string) []ChildRecipeIssue {
+	var diagnosticError *contracts.DiagnosticError
+	if errors.As(err, &diagnosticError) && len(diagnosticError.Diagnostics) > 0 {
+		issues := make([]ChildRecipeIssue, 0, len(diagnosticError.Diagnostics))
+		for _, diagnostic := range diagnosticError.Diagnostics {
+			issues = append(issues, ChildRecipeIssue{
+				Category: category,
+				Code:     diagnostic.Code,
+				Message:  diagnostic.Message,
+				Path:     diagnostic.Path,
+				Detail:   diagnostic.Details,
+			})
+		}
+		return issues
+	}
+	return []ChildRecipeIssue{{
+		Category: category,
+		Code:     fallbackCode,
+		Message:  err.Error(),
+		Detail:   map[string]any{"cause": err.Error()},
+	}}
+}
+
+func catalogBackendAvailable(record readiness.Record) bool {
+	return record.Status == readiness.StatusInstalledAuthUnknown || record.Status == readiness.StatusReady
+}
+
+func backendUnavailableIssue(record readiness.Record) ChildRecipeIssue {
+	detail := map[string]any{
+		"backend":               record.Backend,
+		"status":                record.Status,
+		"authentication_status": record.AuthenticationStatus,
+	}
+	if record.ExecutablePath != "" {
+		detail["executable_path"] = record.ExecutablePath
+	}
+	if record.Version != "" {
+		detail["version"] = record.Version
+	}
+	return ChildRecipeIssue{
+		Category: "backend_readiness",
+		Code:     "backend_unavailable",
+		Message:  fmt.Sprintf("Backend '%s' is unavailable under the installation readiness policy (%s).", record.Backend, record.Status),
+		Path:     "backend:" + record.Backend,
+		Detail:   detail,
+	}
+}
+
+func missingBackendReadinessIssue(backend string) ChildRecipeIssue {
+	return ChildRecipeIssue{
+		Category: "backend_readiness",
+		Code:     "backend_readiness_missing",
+		Message:  fmt.Sprintf("Backend '%s' has no readiness result.", backend),
+		Path:     "backend:" + backend,
+		Detail:   map[string]any{"backend": backend},
+	}
+}
+
 func catalogStatus(records []RecipeRecord, profileIssues map[string][]ChildRecipeIssue) string {
 	if len(profileIssues) > 0 {
 		return "degraded"
 	}
 	for _, record := range records {
-		if record.Status != RecipeStatusUsable {
+		if record.Status != RecipeStatusUsable && record.Status != RecipeStatusRequiresIntegration {
 			return "degraded"
 		}
 	}

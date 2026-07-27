@@ -59,7 +59,24 @@ func Proposals(sessionDir string) (map[string]any, error) {
 }
 
 func RejectProposal(sessionDir string, opts RejectOptions) (map[string]any, error) {
+	if err := guardRootLifecycleSession(sessionDir, rootLifecycleActionProposalReject); err != nil {
+		return nil, err
+	}
+	lock, err := lockSessionMutation(sessionDir)
+	if err != nil {
+		return nil, err
+	}
+	defer func() {
+		_ = lock.Unlock()
+	}()
 	st := store.New(sessionDir)
+	meta, err := loadSessionMeta(sessionDir)
+	if err != nil {
+		return nil, err
+	}
+	if err := guardRootLifecycleMeta(meta, rootLifecycleActionProposalReject); err != nil {
+		return nil, err
+	}
 	proposal, err := st.LoadProposalMap(opts.ProposalID)
 	if err != nil {
 		return nil, err
@@ -93,6 +110,9 @@ func ApproveProposal(ctx context.Context, sessionDir string, opts ApproveOptions
 	if opts.StallTimeoutSeconds < 0 {
 		opts.StallTimeoutSeconds = 0
 	}
+	if err := guardRootLifecycleSession(sessionDir, rootLifecycleActionProposalApprove); err != nil {
+		return nil, err
+	}
 	lock, err := lockSessionMutation(sessionDir)
 	if err != nil {
 		return nil, err
@@ -103,6 +123,9 @@ func ApproveProposal(ctx context.Context, sessionDir string, opts ApproveOptions
 	st := store.New(sessionDir)
 	meta, err := loadMeta(sessionDir)
 	if err != nil {
+		return nil, err
+	}
+	if err := guardRootLifecycleMap(meta, rootLifecycleActionProposalApprove); err != nil {
 		return nil, err
 	}
 	if err := ensureSessionNotRunning(sessionDir, "approving proposals"); err != nil {
@@ -171,6 +194,7 @@ func ApproveProposal(ctx context.Context, sessionDir string, opts ApproveOptions
 		Recipe:             admitted.Recipe,
 		Profiles:           admitted.Profiles,
 		Recipes:            admitted.Recipes,
+		RuntimeConfig:      runtimeConfig,
 		AdmittedRounds:     admitted.AdmittedRounds,
 		Origin:             "dynamic-proposal",
 		RunContext:         admitted.RunContext,
@@ -265,9 +289,6 @@ func admitDynamicChild(st *store.Store, meta map[string]any, proposal map[string
 	admittedPlanID := store.NewGraphID("plan")
 	parentNodeID := firstNonEmpty(stringFromAny(proposal["parent_node_id"]), graph.RootNodeID)
 	decision := makeAdmissionDecision(proposal, "admit", []string{"operator approved"}, admittedRounds, stringFromAny(recipe["id"]), admittedPlanID, nil)
-	if err := st.RecordAdmissionDecisionMap(decision); err != nil {
-		return dynamicAdmittedChild{}, proposal, err
-	}
 	childTask := buildProposalChildTask(stringFromAny(meta["task"]), proposal, recipe)
 	node := map[string]any{
 		"node_id":          childNodeID,
@@ -302,20 +323,24 @@ func admitDynamicChild(st *store.Store, meta map[string]any, proposal map[string
 		"relay_backend_depth":     0,
 		"max_relay_backend_depth": effectiveRelayBackendMaxDepth(recipe),
 	}
-	compiledPlan, err := recipes.CompileRecipeToChildPlan(recipe, profiles, relayRecipes, recipes.CompileOptions{
-		CompositionPath:      stringFromAny(runContext["composition_path"]),
-		RelayBackendDepth:    0,
-		MaxRelayBackendDepth: intFromAny(depthPolicy["max_relay_backend_depth"], 1),
-		ValidateExecutable:   true,
-	})
+	compiledPlan, err := compileDynamicChildPlan(
+		recipe,
+		profiles,
+		relayRecipes,
+		stringFromAny(runContext["composition_path"]),
+		intFromAny(depthPolicy["max_relay_backend_depth"], 1),
+	)
 	if err != nil {
+		return dynamicAdmittedChild{}, proposal, err
+	}
+	if err := st.RecordAdmissionDecisionMap(decision); err != nil {
 		return dynamicAdmittedChild{}, proposal, err
 	}
 	compiledPlanRef, err := refForPayload("compiled_plan", compiledPlan)
 	if err != nil {
 		return dynamicAdmittedChild{}, proposal, err
 	}
-	recipePayload := recipes.RecipeContractPayload(recipe)
+	recipePayload := recipes.ChildRecipeContractPayload(recipe)
 	if recipeRef, ok := compiledPlan["recipe_ref"].(map[string]any); ok {
 		if _, err := st.SaveContractArtifact("recipes", stringFromAny(recipePayload["id"]), recipePayload, stringFromAny(recipeRef["id"])); err != nil {
 			return dynamicAdmittedChild{}, proposal, err
@@ -420,6 +445,21 @@ func admitDynamicChild(st *store.Store, meta map[string]any, proposal map[string
 		CompiledPlan:    compiledPlan,
 		CompiledPlanRef: compiledPlanRef,
 	}, proposal, nil
+}
+
+func compileDynamicChildPlan(
+	recipe map[string]any,
+	profiles map[string]map[string]any,
+	relayRecipes map[string]map[string]any,
+	compositionPath string,
+	maxRelayBackendDepth int,
+) (map[string]any, error) {
+	return recipes.CompileRecipe(recipe, profiles, relayRecipes, recipes.CompileTargetChild, recipes.CompileOptions{
+		CompositionPath:      compositionPath,
+		RelayBackendDepth:    0,
+		MaxRelayBackendDepth: maxRelayBackendDepth,
+		ValidateExecutable:   true,
+	})
 }
 
 func admittedFromProposal(proposal map[string]any, recipe map[string]any, profiles map[string]map[string]any, relayRecipes map[string]map[string]any, settingsPath string) dynamicAdmittedChild {

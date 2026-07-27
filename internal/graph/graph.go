@@ -115,7 +115,7 @@ func applyEvent(graph map[string]any, event map[string]any) {
 
 	switch eventType {
 	case "node_started":
-		nodes(graph)[nodeID] = setDefaultObject(nodes(graph), nodeID, map[string]any{
+		node := setDefaultObject(nodes(graph), nodeID, map[string]any{
 			"node_id":        nodeID,
 			"parent_node_id": nil,
 			"depth":          0,
@@ -126,6 +126,12 @@ func applyEvent(graph map[string]any, event map[string]any) {
 			"created_at":     timestamp,
 			"updated_at":     timestamp,
 		})
+		for _, key := range []string{"execution_kind", "recipe_id", "recipe_ref", "root_recipe_plan_ref", "root_checkpoint_ref"} {
+			if value, exists := payload[key]; exists && value != nil {
+				node[key] = value
+			}
+		}
+		nodes(graph)[nodeID] = node
 	case "node_completed", "node_interrupted", "node_failed":
 		node := setDefaultObject(nodes(graph), nodeID, map[string]any{"node_id": nodeID})
 		node["status"] = map[string]string{
@@ -236,6 +242,13 @@ func artifactGraphEntries(index map[string]any) map[string]any {
 		}
 		category := parts[1]
 		artifactID := strings.TrimSuffix(path.Base(parts[len(parts)-1]), path.Ext(parts[len(parts)-1]))
+		if ref, ok := entry["ref"].(map[string]any); ok {
+			if refID, ok := ref["id"].(string); ok && strings.HasPrefix(refID, category+":") {
+				if stableID := strings.TrimPrefix(refID, category+":"); stableID != "" && stableID != "." && stableID != ".." && !strings.ContainsAny(stableID, "/\\") {
+					artifactID = stableID
+				}
+			}
+		}
 		artifacts[category+"/"+artifactID] = map[string]any{
 			"artifact_id": artifactID,
 			"category":    category,

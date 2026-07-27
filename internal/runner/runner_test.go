@@ -137,6 +137,14 @@ func TestRunBuildsSlotsFromBackendProfiles(t *testing.T) {
 func TestRunPersistsRuntimeConfigSnapshot(t *testing.T) {
 	env := setupFakeCodex(t)
 	settingsPath := writeNestedRelaySettings(t, env)
+	settings, err := os.ReadFile(settingsPath)
+	if err != nil {
+		t.Fatalf("read settings: %v", err)
+	}
+	settings = append(settings, []byte("\n[limits]\nintegration_bundle_max_bytes = 2097152\n")...)
+	if err := os.WriteFile(settingsPath, settings, 0o644); err != nil {
+		t.Fatalf("write settings with limits: %v", err)
+	}
 	sessionDir := filepath.Join(env.relayHome, "sessions", "runtime-snapshot")
 
 	if _, err := Run(context.Background(), Options{
@@ -159,7 +167,8 @@ func TestRunPersistsRuntimeConfigSnapshot(t *testing.T) {
 	if meta["runtime_config_version"] != RuntimeConfigSnapshotVersion {
 		t.Fatalf("runtime_config_version = %v", meta["runtime_config_version"])
 	}
-	artifact, err := store.New(sessionDir).LoadArtifact(ref)
+	st := store.New(sessionDir)
+	artifact, err := st.LoadArtifact(ref)
 	if err != nil {
 		t.Fatalf("load runtime snapshot: %v", err)
 	}
@@ -167,6 +176,14 @@ func TestRunPersistsRuntimeConfigSnapshot(t *testing.T) {
 	relayRecipes := artifact["relay_recipes"].(map[string]any)
 	if profiles["codex-fast"] == nil || relayRecipes["outer-review"] == nil {
 		t.Fatalf("runtime snapshot missing resolved defaults/settings: %#v", artifact)
+	}
+	limits := artifact["limits"].(map[string]any)
+	if fmt.Sprint(limits["integration_bundle_max_bytes"]) != "2097152" {
+		t.Fatalf("runtime snapshot limits = %#v", limits)
+	}
+	graphLimits := st.LoadGraph()["runtime_limits"].(map[string]any)
+	if fmt.Sprint(graphLimits["integration_bundle_max_bytes"]) != "2097152" {
+		t.Fatalf("graph runtime limits = %#v", graphLimits)
 	}
 	report, err := inspect.BuildContractsReport(sessionDir, false, "", "")
 	if err != nil {
@@ -894,6 +911,11 @@ func TestRunRejectsOversizedTransientRecipeBeforeSessionCreation(t *testing.T) {
 func TestMutateSessionRuntimeConfigPersistsSnapshotGraphAndSupportsApproval(t *testing.T) {
 	env := setupFakeCodex(t)
 	sessionDir := filepath.Join(env.relayHome, "sessions", "runtime-config-mutation")
+	runtimeConfig, err := recipes.LoadRuntimeConfig(filepath.Join(env.relayHome, "missing-runtime-limits.toml"))
+	if err != nil {
+		t.Fatalf("load runtime config: %v", err)
+	}
+	runtimeConfig.Limits.IntegrationBundleMaxBytes = 2_097_152
 	if _, err := Run(context.Background(), Options{
 		SessionDir:     sessionDir,
 		Task:           "Runtime config mutation seed",
@@ -901,6 +923,7 @@ func TestMutateSessionRuntimeConfigPersistsSnapshotGraphAndSupportsApproval(t *t
 		Rounds:         1,
 		TimeoutSeconds: 5,
 		LaunchCWD:      env.projectDir,
+		RuntimeConfig:  runtimeConfig,
 	}); err != nil {
 		t.Fatalf("run seed: %v", err)
 	}
@@ -982,6 +1005,22 @@ max_depth = 1
 	}
 	if approval["status"] != "collapsed" {
 		t.Fatalf("approval = %#v", approval)
+	}
+	childSessionID := stringFromAny(approval["child_session_id"])
+	childDir := filepath.Join(env.relayHome, "sessions", childSessionID)
+	childStore := store.New(childDir)
+	childMeta := mustLoadMeta(t, childDir)
+	childSnapshot, err := childStore.LoadArtifact(childMeta["runtime_config_ref"].(map[string]any))
+	if err != nil {
+		t.Fatalf("load child runtime snapshot: %v", err)
+	}
+	childSnapshotLimits := childSnapshot["limits"].(map[string]any)
+	if fmt.Sprint(childSnapshotLimits["integration_bundle_max_bytes"]) != "2097152" {
+		t.Fatalf("child runtime snapshot limits = %#v", childSnapshotLimits)
+	}
+	childGraphLimits := childStore.LoadGraph()["runtime_limits"].(map[string]any)
+	if fmt.Sprint(childGraphLimits["integration_bundle_max_bytes"]) != "2097152" {
+		t.Fatalf("child graph runtime limits = %#v", childGraphLimits)
 	}
 }
 
@@ -1638,12 +1677,95 @@ func TestStopMarksOrphanedAndKillMarksKilled(t *testing.T) {
 	}
 }
 
+func TestStopUnsupportedGracefulPreservesStatePIDAndForceKillRemainsAvailable(t *testing.T) {
+	sessionDir := filepath.Join(t.TempDir(), "session")
+	st := store.New(sessionDir)
+	if err := st.EnsureSession(); err != nil {
+		t.Fatalf("ensure session: %v", err)
+	}
+	if err := st.SaveMetaMap(map[string]any{
+		"session_id":       "unsupported-graceful",
+		"status":           "running",
+		"cleanup_evidence": "retain",
+	}); err != nil {
+		t.Fatalf("save meta: %v", err)
+	}
+	if err := st.SaveTranscriptItems([]any{}); err != nil {
+		t.Fatalf("save transcript: %v", err)
+	}
+	pidPath := filepath.Join(sessionDir, "relay.pid")
+	if err := os.WriteFile(pidPath, []byte("4242\n"), 0o644); err != nil {
+		t.Fatalf("write pid: %v", err)
+	}
+	cleanupPath := filepath.Join(sessionDir, "cleanup.pending")
+	if err := os.WriteFile(cleanupPath, []byte("retain cleanup evidence\n"), 0o644); err != nil {
+		t.Fatalf("write cleanup evidence: %v", err)
+	}
+	metaPath := filepath.Join(sessionDir, "meta.json")
+	metaBefore, err := os.ReadFile(metaPath)
+	if err != nil {
+		t.Fatalf("read meta before stop: %v", err)
+	}
+	pidBefore, err := os.ReadFile(pidPath)
+	if err != nil {
+		t.Fatalf("read pid before stop: %v", err)
+	}
+
+	stopRequests := []bool{}
+	operations := stopProcessOperations{
+		alive: func(pid int) bool {
+			return pid == 4242
+		},
+		requestStop: func(pid int, force bool) error {
+			if pid != 4242 {
+				t.Fatalf("stop pid = %d, want 4242", pid)
+			}
+			stopRequests = append(stopRequests, force)
+			if !force {
+				return errGracefulStopUnsupported
+			}
+			return nil
+		},
+	}
+	report, err := stopWithProcessOperations(sessionDir, StopOptions{}, operations)
+	if report != nil || !errors.Is(err, errGracefulStopUnsupported) {
+		t.Fatalf("unsupported graceful stop = %#v, %v", report, err)
+	}
+	metaAfter, readErr := os.ReadFile(metaPath)
+	if readErr != nil || string(metaAfter) != string(metaBefore) {
+		t.Fatalf("unsupported graceful stop changed meta: err=%v\nbefore=%s\nafter=%s", readErr, metaBefore, metaAfter)
+	}
+	pidAfter, readErr := os.ReadFile(pidPath)
+	if readErr != nil || string(pidAfter) != string(pidBefore) {
+		t.Fatalf("unsupported graceful stop changed pid evidence: err=%v before=%q after=%q", readErr, pidBefore, pidAfter)
+	}
+	if body, readErr := os.ReadFile(cleanupPath); readErr != nil || string(body) != "retain cleanup evidence\n" {
+		t.Fatalf("unsupported graceful stop changed cleanup evidence: %q, %v", body, readErr)
+	}
+
+	report, err = stopWithProcessOperations(sessionDir, StopOptions{ForceKill: true}, operations)
+	if err != nil || report["status"] != "killed" {
+		t.Fatalf("force kill after unsupported graceful stop = %#v, %v", report, err)
+	}
+	if len(stopRequests) != 2 || stopRequests[0] || !stopRequests[1] {
+		t.Fatalf("process stop requests = %#v", stopRequests)
+	}
+	if _, statErr := os.Stat(pidPath); !os.IsNotExist(statErr) {
+		t.Fatalf("force kill left pid evidence: %v", statErr)
+	}
+	meta := mustLoadMeta(t, sessionDir)
+	if meta["status"] != "killed" || meta["stop_reason"] != "killed" {
+		t.Fatalf("force kill meta = %#v", meta)
+	}
+}
+
 func TestSessionAdminResolvesListsCleansAndCleansUp(t *testing.T) {
 	env := setupFakeCodex(t)
 	deadDir := filepath.Join(env.relayHome, "sessions", "phase7-dead")
 	liveDir := filepath.Join(env.relayHome, "sessions", "phase7-live")
 	cleanDir := filepath.Join(env.relayHome, "sessions", "phase7-clean")
 	liveCleanDir := filepath.Join(env.relayHome, "sessions", "phase7-clean-live")
+	rootDir := filepath.Join(env.relayHome, "sessions", "phase7-root")
 	saveAdminSession(t, deadDir, map[string]any{
 		"session_id":    "phase7-dead",
 		"title":         "Dead running session",
@@ -1676,6 +1798,21 @@ func TestSessionAdminResolvesListsCleansAndCleansUp(t *testing.T) {
 		"actual_rounds": 0,
 		"created_at":    "2026-05-19T00:04:00.000000+00:00",
 	})
+	saveAdminSession(t, rootDir, map[string]any{
+		"session_id":                  "phase7-root",
+		"title":                       "Root inspection session",
+		"status":                      "completed",
+		"mode":                        "cooperative",
+		"execution_kind":              "recipe",
+		"recipe_id":                   "neutral-root",
+		"participant_turns":           2,
+		"participant_turns_completed": 2,
+		"actual_participant_turns":    2,
+		"result_source":               "reducer",
+		"validation_status":           "not_required",
+		"facilitator_provider_state":  map[string]any{"backend": "codex", "state": map[string]any{"secret": "do-not-list"}},
+		"created_at":                  "2026-05-19T00:00:00.000000+00:00",
+	})
 	if err := os.WriteFile(filepath.Join(deadDir, "relay.pid"), []byte("99999999"), 0o644); err != nil {
 		t.Fatalf("write dead pid: %v", err)
 	}
@@ -1701,6 +1838,17 @@ func TestSessionAdminResolvesListsCleansAndCleansUp(t *testing.T) {
 	deadSummary := findSessionSummary(sessions, "phase7-dead")
 	if deadSummary["status"] != "orphaned" {
 		t.Fatalf("dead summary status = %#v", deadSummary)
+	}
+	rootSummary := findSessionSummary(sessions, "phase7-root")
+	if rootSummary["root"] == nil {
+		t.Fatalf("root list summary = %#v", rootSummary)
+	}
+	encodedRootSummary, err := json.Marshal(rootSummary)
+	if err != nil {
+		t.Fatalf("marshal root list summary: %v", err)
+	}
+	if strings.Contains(string(encodedRootSummary), "do-not-list") {
+		t.Fatalf("root list exposed provider state: %s", encodedRootSummary)
 	}
 
 	cleanup, err := CleanupSessions(env.relayHome, 10, false)

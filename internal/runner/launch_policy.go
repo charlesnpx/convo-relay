@@ -42,15 +42,26 @@ type PromptPolicy struct {
 }
 
 func PreflightLaunchContexts(paths []string) ([]LaunchContext, error) {
-	bundles, err := preflightInputBundles("context", "ctx", paths)
+	bundles, err := preflightInputBundles("context", "ctx", paths, "")
 	return bundles, err
 }
 
 func PreflightSkillInputs(paths []string) ([]InputBundle, error) {
-	return preflightInputBundles("skill", "skill", paths)
+	return preflightInputBundles("skill", "skill", paths, "")
 }
 
-func preflightInputBundles(kind string, labelPrefix string, paths []string) ([]InputBundle, error) {
+// preflightLaunchContextsAt and preflightSkillInputsAt preserve the ordinary
+// run wrappers above while allowing recipe-mode inputs to resolve from the
+// explicit launch CWD source anchor.
+func preflightLaunchContextsAt(paths []string, sourceAnchor string) ([]LaunchContext, error) {
+	return preflightInputBundles("context", "ctx", paths, sourceAnchor)
+}
+
+func preflightSkillInputsAt(paths []string, sourceAnchor string) ([]InputBundle, error) {
+	return preflightInputBundles("skill", "skill", paths, sourceAnchor)
+}
+
+func preflightInputBundles(kind string, labelPrefix string, paths []string, sourceAnchor string) ([]InputBundle, error) {
 	if len(paths) == 0 {
 		return nil, nil
 	}
@@ -69,7 +80,11 @@ func preflightInputBundles(kind string, labelPrefix string, paths []string) ([]I
 		if rawPath == "" {
 			return nil, fmt.Errorf("%s path is empty", kind)
 		}
-		absPath, err := filepath.Abs(rawPath)
+		inputPath := rawPath
+		if !filepath.IsAbs(inputPath) && strings.TrimSpace(sourceAnchor) != "" {
+			inputPath = filepath.Join(sourceAnchor, inputPath)
+		}
+		absPath, err := filepath.Abs(inputPath)
 		if err != nil {
 			return nil, fmt.Errorf("%s %q: %w", kind, rawPath, err)
 		}
