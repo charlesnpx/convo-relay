@@ -90,6 +90,7 @@ func TestRootRecoveryRetriesOnlyFailedReducerWithNextAttemptOrdinal(t *testing.T
 	config := rootRecipeRuntimeConfig("")
 	config.SettingsPath = settingsPath
 	config.RelayRecipes["neutral-root"]["result_source"] = integration.ResultSourceReducer
+	config.RelayRecipes["neutral-root"]["provider_retry"] = recipes.ProviderRetryAllow
 	sessionDir := filepath.Join(t.TempDir(), "session")
 	initial := &rootBackendRecorder{}
 	initial.handler = func(_ context.Context, call rootBackendCall) (TurnResult, error) {
@@ -147,6 +148,31 @@ func TestRootRecoveryRetriesOnlyFailedReducerWithNextAttemptOrdinal(t *testing.T
 	second := assertRootRecipeArtifact(t, st, attemptRefs[1], contracts.RootArtifactKindReducerAttempt, 2)
 	if first["status"] != "failed" || second["status"] != "completed" || second["content"] != "recovered reducer result" {
 		t.Fatalf("reducer attempts = %#v / %#v", first, second)
+	}
+	reducerInvocations := persistedRootInvocationRecordsForPhase(t, st, result["invocation_refs"], "reducer")
+	if len(reducerInvocations) != 2 ||
+		reducerInvocations[0]["invocation_id"] != "reducer:000001" ||
+		reducerInvocations[1]["invocation_id"] != "reducer:000001" ||
+		reducerInvocations[0]["runner_attempt"] != 1 ||
+		reducerInvocations[1]["runner_attempt"] != 2 {
+		t.Fatalf("reducer invocation attempts = %#v", reducerInvocations)
+	}
+	beforeRepeat := snapshotRootRecoverySession(t, sessionDir)
+	providerConstructions := 0
+	repeated, repeatErr := Resume(context.Background(), sessionDir, ResumeOptions{
+		backendFactory: func(string, string, string, string, string, SlotConfig) (Backend, error) {
+			providerConstructions++
+			return nil, errors.New("completed reducer recovery constructed a provider")
+		},
+	})
+	if repeatErr != nil || repeated["status"] != "completed" {
+		t.Fatalf("repeat completed recovery = %#v, %v", repeated, repeatErr)
+	}
+	if providerConstructions != 0 {
+		t.Fatalf("repeat recovery provider constructions = %d", providerConstructions)
+	}
+	if afterRepeat := snapshotRootRecoverySession(t, sessionDir); !equalRootRecoverySnapshots(beforeRepeat, afterRepeat) {
+		t.Fatal("repeat completed reducer recovery mutated the session")
 	}
 }
 
@@ -331,6 +357,79 @@ func TestRootRecoveryReusesSuccessfulReducerAttemptBeforeRawCandidate(t *testing
 	raw := assertRootRecipeArtifact(t, store.New(sessionDir), result["raw_result_ref"], contracts.RootArtifactKindRawResult, 0)
 	if raw["content"] != "durable reducer attempt" {
 		t.Fatalf("reused raw candidate = %#v", raw)
+	}
+}
+
+func TestRootRecoveryForbidRejectsAfterDurableReducerInvocationWithoutRelaunch(t *testing.T) {
+	config := rootRecipeRuntimeConfig("")
+	recipe := config.RelayRecipes["neutral-root"]
+	recipe["participant_turns"] = 1
+	recipe["max_rounds"] = 1
+	recipe["result_source"] = integration.ResultSourceReducer
+	recipe["provider_retry"] = recipes.ProviderRetryForbid
+	sessionDir := filepath.Join(t.TempDir(), "session")
+	initial := &rootBackendRecorder{}
+	initial.handler = func(_ context.Context, call rootBackendCall) (TurnResult, error) {
+		if call.SlotID == "reducer" {
+			return successfulRootTurn(call.Backend, "durable invocation without reducer attempt"), nil
+		}
+		if call.SlotID == "facilitator" {
+			return successfulRootTurn(call.Backend, `{"settled":[],"contested":[],"withdrawn":[]}`), nil
+		}
+		return successfulRootTurn(call.Backend, "participant result"), nil
+	}
+	interrupted := errors.New("after reducer invocation record")
+	fired := false
+	rootProviderInvocationAfterSave = func(spec rootInvocationSpec, attempt int) error {
+		if spec.phase == "reducer" && attempt == 1 && !fired {
+			fired = true
+			return interrupted
+		}
+		return nil
+	}
+	result, runErr := RunRecipe(context.Background(), RecipeOptions{
+		SessionDir:     sessionDir,
+		Task:           "Forbid reducer relaunch after durable invocation",
+		RecipeID:       "neutral-root",
+		LaunchCWD:      t.TempDir(),
+		RuntimeConfig:  config,
+		ReadinessCheck: readyRootRecipeCheck,
+		backendFactory: initial.factory(),
+	})
+	rootProviderInvocationAfterSave = nil
+	t.Cleanup(func() { rootProviderInvocationAfterSave = nil })
+	if !fired || !errors.Is(runErr, interrupted) {
+		t.Fatalf("reducer invocation interruption = %v, fired=%v", runErr, fired)
+	}
+	st := store.New(sessionDir)
+	reducerInvocations := persistedRootInvocationRecordsForPhase(t, st, result["invocation_refs"], "reducer")
+	if len(reducerInvocations) != 1 ||
+		reducerInvocations[0]["invocation_id"] != "reducer:000001" ||
+		reducerInvocations[0]["runner_attempt"] != 1 ||
+		reducerInvocations[0]["provider_launch_attempted"] != true {
+		t.Fatalf("durable reducer invocation = %#v", reducerInvocations)
+	}
+	meta, err := st.LoadMeta()
+	if err != nil {
+		t.Fatalf("load interrupted meta: %v", err)
+	}
+	if refs := meta.Slice("reducer_attempt_refs"); len(refs) != 0 {
+		t.Fatalf("unexpected reducer attempt refs = %#v", refs)
+	}
+	if attempt, found, err := loadLatestRootRecoveryArtifact(st, contracts.RootArtifactKindReducerAttempt, 1); err != nil || found {
+		t.Fatalf("unexpected reducer attempt artifact = %#v, found=%v, err=%v", attempt, found, err)
+	}
+
+	constructions := 0
+	_, resumeErr := Resume(context.Background(), sessionDir, ResumeOptions{
+		backendFactory: func(string, string, string, string, string, SlotConfig) (Backend, error) {
+			constructions++
+			return nil, errors.New("forbidden recovery constructed a provider")
+		},
+	})
+	assertRootRecipeDiagnostic(t, resumeErr, "provider_retry_forbidden_terminal")
+	if constructions != 0 || len(initial.snapshotCalls()) != 3 {
+		t.Fatalf("forbidden recovery reached providers: constructions=%d initial_calls=%#v", constructions, initial.snapshotCalls())
 	}
 }
 
@@ -767,6 +866,26 @@ func snapshotRootRecoverySession(t *testing.T, root string) map[string]string {
 		t.Fatalf("snapshot session: %v", err)
 	}
 	return snapshot
+}
+
+func persistedRootInvocationRecordsForPhase(t *testing.T, st *store.Store, rawRefs any, phase string) []map[string]any {
+	t.Helper()
+	refs, ok := rawRefs.([]any)
+	if !ok {
+		t.Fatalf("invocation refs = %#v", rawRefs)
+	}
+	records := []map[string]any{}
+	for index, rawRef := range refs {
+		payload := assertRootRecipeArtifact(t, st, rawRef, contracts.RootArtifactKindProviderInvocation, index+1)
+		record, err := contracts.ValidateProviderInvocationRecord(payload["invocation"])
+		if err != nil {
+			t.Fatalf("validate provider invocation %d: %v", index+1, err)
+		}
+		if record["phase"] == phase {
+			records = append(records, record)
+		}
+	}
+	return records
 }
 
 func equalRootRecoverySnapshots(left map[string]string, right map[string]string) bool {

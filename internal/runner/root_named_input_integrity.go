@@ -71,7 +71,11 @@ func runRootProviderTurnWithRetainedIntegrity(
 	if err != nil {
 		return TurnResult{}, rootInvocationPersistenceError{cause: err}
 	}
-	providerAttempt := 0
+	persistedProgress, err := state.providerInvocationProgress(spec)
+	if err != nil {
+		return TurnResult{}, rootInvocationPersistenceError{cause: err}
+	}
+	providerAttempt := persistedProgress.persistedAttempts
 	return runWithProviderRetryPolicy(ctx, spec.actor, state.meta.String("provider_retry"), func() (TurnResult, error) {
 		providerAttempt++
 		currentAttempt := providerAttempt
@@ -97,6 +101,9 @@ func runRootProviderTurnWithRetainedIntegrity(
 			}
 		}
 
+		if err := state.ensureProviderLaunchAllowed(spec); err != nil {
+			return TurnResult{}, err
+		}
 		result, providerErr := operation()
 		postBase := context.WithoutCancel(ctx)
 		postCtx, cancel := context.WithTimeout(postBase, state.retainedInputVerificationTimeout())

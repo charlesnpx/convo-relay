@@ -63,6 +63,9 @@ func (s *rootExecutionState) runRootResultPhases(ctx context.Context) (map[strin
 		if _, integrityFailure := asRootNamedInputIntegrityError(err); integrityFailure {
 			return s.markNamedInputIntegrityFailed(err)
 		}
+		if isProviderRetryForbiddenTerminal(err) {
+			return s.result(), err
+		}
 		if errors.Is(err, context.Canceled) || errors.Is(ctx.Err(), context.Canceled) {
 			return s.markRootPostParticipantInterrupted("reducer", "context canceled")
 		}
@@ -171,6 +174,10 @@ func (s *rootExecutionState) runFreshRootReducer(ctx context.Context) (rootCandi
 		})
 	})
 	if _, integrityFailure := asRootNamedInputIntegrityError(runErr); integrityFailure {
+		return rootCandidate{}, runErr
+	}
+	var invocationPersistence rootInvocationPersistenceError
+	if errors.As(runErr, &invocationPersistence) || isProviderRetryForbiddenTerminal(runErr) {
 		return rootCandidate{}, runErr
 	}
 	providerResult := providerResultForTurn(reducer.Name(), result)

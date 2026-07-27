@@ -24,11 +24,20 @@ type rootInvocationSpec struct {
 	promptAvailable    bool
 }
 
+type rootInvocationProgress struct {
+	persistedAttempts      int
+	providerLaunchAttempts int
+}
+
 type rootInvocationPersistenceError struct{ cause error }
 
 func (e rootInvocationPersistenceError) Error() string          { return e.cause.Error() }
 func (e rootInvocationPersistenceError) Unwrap() error          { return e.cause }
 func (e rootInvocationPersistenceError) suppressProviderRetry() {}
+
+// rootProviderInvocationAfterSave is a test-only failpoint after a provider
+// invocation ref is durable in metadata. Production leaves it nil.
+var rootProviderInvocationAfterSave func(rootInvocationSpec, int) error
 
 func (s *rootExecutionState) recordsProviderInvocations() bool {
 	if s == nil || s.preflight == nil {
@@ -79,12 +88,18 @@ func (s *rootExecutionState) persistProviderInvocation(
 	if !s.recordsProviderInvocations() {
 		return nil
 	}
-	policy := strings.TrimSpace(s.meta.String("provider_retry"))
-	if policy == "" {
-		policy = recipes.ProviderRetryAllow
+	progress, err := s.ensureInvocationProgress()
+	if err != nil {
+		return err
 	}
-	if policy == recipes.ProviderRetryForbid && runnerAttempt != 1 {
-		return contracts.NewValidationError("provider_retry=forbid permits only runner_attempt 1 for %s", logicalInvocationID(spec))
+	invocationID := logicalInvocationID(spec)
+	current := progress[invocationID]
+	if runnerAttempt != current.persistedAttempts+1 {
+		return contracts.NewValidationError("provider invocation runner_attempt must continue persisted sequence for %s", invocationID)
+	}
+	policy := rootProviderRetryPolicy(s.meta)
+	if policy == recipes.ProviderRetryForbid && providerLaunchAttempted && current.providerLaunchAttempts > 0 {
+		return providerRetryForbiddenTerminalDiagnostic()
 	}
 	providerResult := providerResultForTurn(spec.backendName, result)
 	outcome, classification := invocationOutcome(providerResult, runErr)
@@ -96,7 +111,7 @@ func (s *rootExecutionState) persistProviderInvocation(
 		manifestRefs = append(manifestRefs, cloneMap(s.persisted.inputManifestRef))
 	}
 	record, err := contracts.ProviderInvocationRecord(map[string]any{
-		"invocation_id":             logicalInvocationID(spec),
+		"invocation_id":             invocationID,
 		"phase":                     spec.phase,
 		"actor":                     spec.actor,
 		"slot":                      invocationSlot(spec),
@@ -141,14 +156,88 @@ func (s *rootExecutionState) persistProviderInvocation(
 		return err
 	}
 	s.meta = s.meta.AppendToSlice("invocation_refs", ref)
-	return s.saveProgress()
+	if err := s.saveProgress(); err != nil {
+		return err
+	}
+	current.persistedAttempts++
+	if providerLaunchAttempted {
+		current.providerLaunchAttempts++
+	}
+	progress[invocationID] = current
+	if rootProviderInvocationAfterSave != nil {
+		if err := rootProviderInvocationAfterSave(spec, runnerAttempt); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (s *rootExecutionState) recordUnlaunchedInvocation(spec rootInvocationSpec, failureStage string, cause error) error {
 	if !s.recordsProviderInvocations() {
 		return nil
 	}
-	return s.persistProviderInvocation(spec, 1, utcNow(), TurnResult{}, cause, false, failureStage, nil, "")
+	attempt, err := s.nextProviderInvocationAttempt(spec)
+	if err != nil {
+		return err
+	}
+	return s.persistProviderInvocation(spec, attempt, utcNow(), TurnResult{}, cause, false, failureStage, nil, "")
+}
+
+func (s *rootExecutionState) nextProviderInvocationAttempt(spec rootInvocationSpec) (int, error) {
+	progress, err := s.ensureInvocationProgress()
+	if err != nil {
+		return 0, err
+	}
+	return progress[logicalInvocationID(spec)].persistedAttempts + 1, nil
+}
+
+func (s *rootExecutionState) providerInvocationProgress(spec rootInvocationSpec) (rootInvocationProgress, error) {
+	progress, err := s.ensureInvocationProgress()
+	if err != nil {
+		return rootInvocationProgress{}, err
+	}
+	return progress[logicalInvocationID(spec)], nil
+}
+
+func (s *rootExecutionState) ensureProviderLaunchAllowed(spec rootInvocationSpec) error {
+	if rootProviderRetryPolicy(s.meta) != recipes.ProviderRetryForbid {
+		return nil
+	}
+	progress, err := s.providerInvocationProgress(spec)
+	if err != nil {
+		return err
+	}
+	if progress.providerLaunchAttempts > 0 {
+		return providerRetryForbiddenTerminalDiagnostic()
+	}
+	return nil
+}
+
+func (s *rootExecutionState) ensureInvocationProgress() (map[string]rootInvocationProgress, error) {
+	if s.invocationProgress != nil {
+		return s.invocationProgress, nil
+	}
+	progress, err := validatePersistedRootInvocationRecords(s.st, s.meta)
+	if err != nil {
+		return nil, err
+	}
+	s.invocationProgress = progress
+	return progress, nil
+}
+
+func cloneRootInvocationProgress(source map[string]rootInvocationProgress) map[string]rootInvocationProgress {
+	result := make(map[string]rootInvocationProgress, len(source))
+	for key, value := range source {
+		result[key] = value
+	}
+	return result
+}
+
+func rootProviderRetryPolicy(meta model.SessionMeta) string {
+	if strings.TrimSpace(meta.String("provider_retry")) == recipes.ProviderRetryForbid {
+		return recipes.ProviderRetryForbid
+	}
+	return recipes.ProviderRetryAllow
 }
 
 func (s *rootExecutionState) renderedPromptOrdinal(spec rootInvocationSpec) int {
@@ -257,56 +346,59 @@ func appendUniqueMetaRef(meta model.SessionMeta, field string, ref map[string]an
 	return meta.AppendToSlice(field, ref)
 }
 
-func validatePersistedRootInvocationRecords(st *store.Store, meta model.SessionMeta) error {
-	invocationRefs := meta.Slice("invocation_refs")
-	if len(invocationRefs) == 0 {
-		return nil
-	}
+func validatePersistedRootInvocationRecords(st *store.Store, meta model.SessionMeta) (map[string]rootInvocationProgress, error) {
+	progress := map[string]rootInvocationProgress{}
 	promptDigests := map[string]string{}
 	for index, raw := range meta.Slice("rendered_prompt_refs") {
 		ref, _ := raw.(map[string]any)
 		artifact, err := loadRootRecoveryArtifactRef(st, ref, contracts.RootArtifactKindRenderedPrompt, index+1)
 		if err != nil {
-			return err
+			return nil, err
 		}
 		record, err := contracts.ValidateRenderedPromptRecord(artifact.payload["rendered_prompt"])
 		if err != nil {
-			return persistenceIntegrityError("Persisted rendered prompt is invalid.", map[string]any{"ordinal": index + 1, "cause": err.Error()})
+			return nil, persistenceIntegrityError("Persisted rendered prompt is invalid.", map[string]any{"ordinal": index + 1, "cause": err.Error()})
 		}
 		promptDigests[artifactRefKey(ref)] = stringFromAny(record["raw_digest"])
 	}
-	attempts := map[string]int{}
-	for index, raw := range invocationRefs {
+	for index, raw := range meta.Slice("invocation_refs") {
 		ref, _ := raw.(map[string]any)
 		artifact, err := loadRootRecoveryArtifactRef(st, ref, contracts.RootArtifactKindProviderInvocation, index+1)
 		if err != nil {
-			return err
+			return nil, err
 		}
 		record, err := contracts.ValidateProviderInvocationRecord(artifact.payload["invocation"])
 		if err != nil {
-			return persistenceIntegrityError("Persisted provider invocation is invalid.", map[string]any{"ordinal": index + 1, "cause": err.Error()})
+			return nil, persistenceIntegrityError("Persisted provider invocation is invalid.", map[string]any{"ordinal": index + 1, "cause": err.Error()})
 		}
 		invocationID := stringFromAny(record["invocation_id"])
-		attempts[invocationID]++
-		if intFromAny(record["runner_attempt"], 0) != attempts[invocationID] ||
-			(record["provider_retry"] == recipes.ProviderRetryForbid && attempts[invocationID] != 1) {
-			return persistenceIntegrityError("Persisted provider invocation attempt sequence is invalid.", map[string]any{"invocation_id": invocationID})
+		current := progress[invocationID]
+		current.persistedAttempts++
+		if intFromAny(record["runner_attempt"], 0) != current.persistedAttempts {
+			return nil, persistenceIntegrityError("Persisted provider invocation attempt sequence is invalid.", map[string]any{"invocation_id": invocationID})
 		}
+		if record["provider_launch_attempted"] == true {
+			current.providerLaunchAttempts++
+			if rootProviderRetryPolicy(meta) == recipes.ProviderRetryForbid && current.providerLaunchAttempts > 1 {
+				return nil, persistenceIntegrityError("Persisted provider invocation attempt sequence is invalid.", map[string]any{"invocation_id": invocationID})
+			}
+		}
+		progress[invocationID] = current
 		promptRef, _ := record["rendered_prompt_ref"].(map[string]any)
 		if promptRef == nil {
 			if record["provider_launch_attempted"] == true {
-				return persistenceIntegrityError("Launched provider invocation is missing its rendered prompt ref.", map[string]any{"invocation_id": invocationID})
+				return nil, persistenceIntegrityError("Launched provider invocation is missing its rendered prompt ref.", map[string]any{"invocation_id": invocationID})
 			}
 			continue
 		}
 		if _, err := contracts.ValidateArtifactRef(promptRef); err != nil {
-			return persistenceIntegrityError("Provider invocation rendered prompt ref is invalid.", map[string]any{"invocation_id": invocationID, "cause": err.Error()})
+			return nil, persistenceIntegrityError("Provider invocation rendered prompt ref is invalid.", map[string]any{"invocation_id": invocationID, "cause": err.Error()})
 		}
 		if digest, ok := promptDigests[artifactRefKey(promptRef)]; !ok || digest != record["rendered_prompt_digest"] {
-			return persistenceIntegrityError("Provider invocation rendered prompt binding is invalid.", map[string]any{"invocation_id": invocationID})
+			return nil, persistenceIntegrityError("Provider invocation rendered prompt binding is invalid.", map[string]any{"invocation_id": invocationID})
 		}
 	}
-	return nil
+	return progress, nil
 }
 
 func artifactRefKey(ref map[string]any) string {

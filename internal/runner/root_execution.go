@@ -54,6 +54,7 @@ type rootExecutionState struct {
 	persisted           *persistedRecipeRun
 	meta                model.SessionMeta
 	transcript          model.Transcript
+	invocationProgress  map[string]rootInvocationProgress
 	slots               []Backend
 	facilitator         Backend
 	facilitatorProfile  map[string]any
@@ -172,6 +173,7 @@ func newRootExecutionState(
 		persisted:          persisted,
 		meta:               meta,
 		transcript:         transcript,
+		invocationProgress: map[string]rootInvocationProgress{},
 		slots:              slots,
 		facilitator:        facilitator,
 		facilitatorProfile: contracts.Materialize(facilitatorProfile).(map[string]any),

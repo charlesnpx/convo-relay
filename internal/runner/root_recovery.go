@@ -42,6 +42,7 @@ type preparedRootRecovery struct {
 	preflight                   *recipePreflight
 	persisted                   *persistedRecipeRun
 	workspace                   *workspace.Materialized
+	invocationProgress          map[string]rootInvocationProgress
 	checkpoints                 map[int]*persistedRootRecoveryArtifact
 	attempts                    []persistedRootReducerAttempt
 	candidate                   *rootCandidate
@@ -63,9 +64,6 @@ func resumeRootRecipe(ctx context.Context, sessionDir string, opts ResumeOptions
 	if err := rejectNamedInputIntegrityTerminal(initialMeta); err != nil {
 		return nil, err
 	}
-	if err := rejectForbiddenProviderRetryTerminal(initialMeta); err != nil {
-		return nil, err
-	}
 	if err := guardRootLifecycleMeta(initialMeta, rootLifecycleActionResume); err != nil {
 		return nil, err
 	}
@@ -76,6 +74,9 @@ func resumeRootRecipe(ctx context.Context, sessionDir string, opts ResumeOptions
 	sessionDir = canonicalSessionDir
 	preparedBeforeLock, err := prepareRootRecovery(ctx, sessionDir, opts)
 	if err != nil {
+		return nil, err
+	}
+	if err := rejectForbiddenProviderRetryTerminal(preparedBeforeLock); err != nil {
 		return nil, err
 	}
 	if complete, terminalErr := preparedBeforeLock.completedResult(); complete {
@@ -101,6 +102,9 @@ func resumeRootRecipe(ctx context.Context, sessionDir string, opts ResumeOptions
 		return nil, err
 	}
 	if err := rejectNamedInputIntegrityTerminal(prepared.meta); err != nil {
+		return nil, err
+	}
+	if err := rejectForbiddenProviderRetryTerminal(prepared); err != nil {
 		return nil, err
 	}
 	if complete, terminalErr := prepared.completedResult(); complete {
@@ -287,10 +291,21 @@ func rejectNamedInputIntegrityTerminal(meta model.SessionMeta) error {
 	)
 }
 
-func rejectForbiddenProviderRetryTerminal(meta model.SessionMeta) error {
-	if meta.String("provider_retry") != recipes.ProviderRetryForbid || len(meta.Slice("provider_failures")) == 0 {
+func rejectForbiddenProviderRetryTerminal(prepared *preparedRootRecovery) error {
+	if prepared == nil ||
+		rootProviderRetryPolicy(prepared.meta) != recipes.ProviderRetryForbid ||
+		strings.TrimSpace(prepared.meta.String("result_source")) != integration.ResultSourceReducer ||
+		prepared.candidate != nil ||
+		latestCompletedReducerAttempt(prepared.attempts) != nil {
 		return nil
 	}
+	if prepared.invocationProgress[logicalInvocationID(rootInvocationSpec{phase: "reducer"})].providerLaunchAttempts == 0 {
+		return nil
+	}
+	return providerRetryForbiddenTerminalDiagnostic()
+}
+
+func providerRetryForbiddenTerminalDiagnostic() error {
 	return rootRecipeDiagnostic(
 		"provider_retry_forbidden_terminal",
 		contracts.DiagnosticPhasePolicy,
@@ -298,6 +313,19 @@ func rejectForbiddenProviderRetryTerminal(meta model.SessionMeta) error {
 		"A root session with provider_retry=forbid cannot relaunch a failed provider invocation.",
 		nil,
 	)
+}
+
+func isProviderRetryForbiddenTerminal(err error) bool {
+	var diagnosticErr *contracts.DiagnosticError
+	if !errors.As(err, &diagnosticErr) {
+		return false
+	}
+	for _, diagnostic := range diagnosticErr.Diagnostics {
+		if diagnostic.Code == "provider_retry_forbidden_terminal" {
+			return true
+		}
+	}
+	return false
 }
 
 func rootResumeRuntimeConfigProvided(config recipes.RuntimeConfig) bool {
@@ -596,7 +624,8 @@ func prepareRootRecovery(ctx context.Context, sessionDir string, opts ResumeOpti
 	if err != nil {
 		return nil, err
 	}
-	if err := validatePersistedRootInvocationRecords(st, meta); err != nil {
+	invocationProgress, err := validatePersistedRootInvocationRecords(st, meta)
+	if err != nil {
 		return nil, err
 	}
 	candidateArtifact, candidateFound, err := loadLatestRootRecoveryArtifact(st, contracts.RootArtifactKindRawResult, 0)
@@ -684,6 +713,7 @@ func prepareRootRecovery(ctx context.Context, sessionDir string, opts ResumeOpti
 		preflight:                   preflight,
 		persisted:                   persisted,
 		workspace:                   workspaceState,
+		invocationProgress:          invocationProgress,
 		checkpoints:                 checkpoints,
 		attempts:                    attempts,
 		candidate:                   candidate,
@@ -732,12 +762,13 @@ func recoverRootPromptPolicy(
 
 func (prepared *preparedRootRecovery) run(ctx context.Context) (map[string]any, error) {
 	state := &rootExecutionState{
-		st:         prepared.st,
-		preflight:  prepared.preflight,
-		persisted:  prepared.persisted,
-		meta:       prepared.meta,
-		transcript: prepared.transcript,
-		startedAt:  time.Now(),
+		st:                 prepared.st,
+		preflight:          prepared.preflight,
+		persisted:          prepared.persisted,
+		meta:               prepared.meta,
+		transcript:         prepared.transcript,
+		invocationProgress: cloneRootInvocationProgress(prepared.invocationProgress),
+		startedAt:          time.Now(),
 	}
 	if prepared.legacyRetainedInputsMissing {
 		if err := state.materializeLegacyRootRecoveryInputs(ctx); err != nil {
