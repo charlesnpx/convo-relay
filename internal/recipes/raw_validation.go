@@ -32,6 +32,7 @@ var allowedRecipeFields = map[string]bool{
 	"max_rounds":            true,
 	"participant_turns":     true,
 	"result_source":         true,
+	"provider_retry":        true,
 	"integration_contract":  true,
 	"max_depth":             true,
 	"required_capabilities": true,
@@ -109,10 +110,21 @@ func validateRecipeRecord(recipe map[string]any, path string) []contracts.Diagno
 			diagnostics = append(diagnostics, invalidRecipeField(path, "kind", "must equal recipe"))
 		}
 	}
+	declaredVersion := int64(0)
 	if value, exists := recipe["schema_version"]; exists {
-		if integer, ok := strictInteger(value); !ok || integer != 1 {
-			diagnostics = append(diagnostics, invalidRecipeField(path, "schema_version", "must equal numeric version 1"))
+		integer, ok := strictInteger(value)
+		if !ok || (integer != 1 && integer != 2) {
+			diagnostics = append(diagnostics, invalidRecipeField(path, "schema_version", "must equal numeric version 1 or 2"))
+		} else {
+			declaredVersion = integer
 		}
+	}
+	_, providerRetryRepresented := recipe["provider_retry"]
+	if declaredVersion == 1 && providerRetryRepresented {
+		diagnostics = append(diagnostics, invalidRecipeField(path, "provider_retry", "is not allowed by recipe schema version 1"))
+	}
+	if declaredVersion == 2 && !providerRetryRepresented {
+		diagnostics = append(diagnostics, invalidRecipeField(path, "provider_retry", "is required by recipe schema version 2"))
 	}
 
 	if value, exists := recipe["participants"]; exists {
@@ -152,6 +164,7 @@ func validateRecipeRecord(recipe map[string]any, path string) []contracts.Diagno
 	validateRecipeChoice("mode", "cooperative", "adversarial", "steelman")
 	validateRecipeChoice("auto_approval", "ask", "auto-safe", "never")
 	validateRecipeChoice("result_source", "last_turn", "reducer")
+	validateRecipeChoice("provider_retry", ProviderRetryAllow, ProviderRetryForbid)
 
 	for _, field := range []string{"max_rounds", "max_depth"} {
 		if value, exists := recipe[field]; exists {

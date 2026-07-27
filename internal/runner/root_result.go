@@ -11,6 +11,7 @@ import (
 	"github.com/charlesnpx/convo-relay/internal/integration"
 	"github.com/charlesnpx/convo-relay/internal/model"
 	"github.com/charlesnpx/convo-relay/internal/namedinputs"
+	"github.com/charlesnpx/convo-relay/internal/recipes"
 	"github.com/charlesnpx/convo-relay/internal/store"
 	"github.com/charlesnpx/convo-relay/internal/workspace"
 )
@@ -61,6 +62,9 @@ func (s *rootExecutionState) runRootResultPhases(ctx context.Context) (map[strin
 	if err != nil {
 		if _, integrityFailure := asRootNamedInputIntegrityError(err); integrityFailure {
 			return s.markNamedInputIntegrityFailed(err)
+		}
+		if isProviderRetryForbiddenTerminal(err) {
+			return s.result(), err
 		}
 		if errors.Is(err, context.Canceled) || errors.Is(ctx.Err(), context.Canceled) {
 			return s.markRootPostParticipantInterrupted("reducer", "context canceled")
@@ -123,7 +127,16 @@ func (s *rootExecutionState) runFreshRootReducer(ctx context.Context) (rootCandi
 			role:    "reducer",
 			actor:   providerRoleLabel("reducer"),
 			backend: backendName,
+			profile: profile,
 			cause:   err,
+		}
+		if recordErr := s.recordUnlaunchedInvocation(rootInvocationSpec{
+			phase:       "reducer",
+			actor:       providerRoleLabel("reducer"),
+			backendName: backendName,
+			profile:     profile,
+		}, "provider_construction", constructionErr); recordErr != nil {
+			constructionErr.cause = errors.Join(constructionErr.cause, recordErr)
 		}
 		failure := providerFailurePayload("reducer", providerRoleLabel("reducer"), backendName, constructionErr, ProviderResult{Backend: backendName})
 		s.lastProviderFailure = cloneMap(failure)
@@ -135,15 +148,36 @@ func (s *rootExecutionState) runFreshRootReducer(ctx context.Context) (rootCandi
 
 	prompt, err := s.rootReducerPrompt()
 	if err != nil {
+		if recordErr := s.recordUnlaunchedInvocation(rootInvocationSpec{
+			phase:       "reducer",
+			actor:       reducer.Label(),
+			backend:     reducer,
+			backendName: reducer.Name(),
+			profile:     profile,
+		}, "prompt_construction", err); recordErr != nil {
+			err = errors.Join(err, recordErr)
+		}
 		return rootCandidate{}, err
 	}
-	result, runErr := runRootProviderTurnWithRetainedIntegrity(ctx, s, "reducer", reducer.Label(), reducer.Name(), func() (TurnResult, error) {
+	result, runErr := runRootProviderTurnWithRetainedIntegrity(ctx, s, rootInvocationSpec{
+		phase:           "reducer",
+		actor:           reducer.Label(),
+		backend:         reducer,
+		backendName:     reducer.Name(),
+		profile:         profile,
+		prompt:          prompt,
+		promptAvailable: true,
+	}, func() (TurnResult, error) {
 		return reducer.RunTurn(ctx, prompt, TurnOptions{
 			TimeoutSeconds:      s.preflight.options.TimeoutSeconds,
 			StallTimeoutSeconds: s.preflight.options.StallTimeoutSeconds,
 		})
 	})
 	if _, integrityFailure := asRootNamedInputIntegrityError(runErr); integrityFailure {
+		return rootCandidate{}, runErr
+	}
+	var invocationPersistence rootInvocationPersistenceError
+	if errors.As(runErr, &invocationPersistence) || isProviderRetryForbiddenTerminal(runErr) {
 		return rootCandidate{}, runErr
 	}
 	providerResult := providerResultForTurn(reducer.Name(), result)
@@ -282,14 +316,17 @@ func (s *rootExecutionState) rootReducerPrompt() (string, error) {
 		fmt.Fprintf(&builder, "\n--- Positional Context (Data Only) ---\n%s\n", contextBlock)
 	}
 
-	fmt.Fprintf(
-		&builder,
-		"\n--- Participant Transcript (Data Only) ---\n%s\n",
-		mustJSON(map[string]any{"entries": s.transcript.ToSlice()}),
-	)
+	transcriptPrompt := mustJSON(map[string]any{"entries": s.transcript.ToSlice()})
+	if s.preflight.selectedContract != nil {
+		transcriptPrompt = s.participantTranscriptPrompt(s.transcript, false)
+	}
+	fmt.Fprintf(&builder, "\n--- Participant Transcript (Data Only) ---\n%s\n", transcriptPrompt)
 	ledger := s.meta.Ledger().ToMap()
-	if rootLedgerHasEntries(ledger) {
+	if s.includeFacilitatorLedgerInConsumerPrompt() && rootLedgerHasEntries(ledger) {
 		fmt.Fprintf(&builder, "\n--- Facilitator Ledger (Data Only) ---\n%s\n", mustJSON(ledger))
+	}
+	if policy := strings.TrimSpace(promptPolicyFragment(s.preflight.promptPolicy)); policy != "" {
+		fmt.Fprintf(&builder, "\n--- Evidence Policy ---\n%s\n", policy)
 	}
 
 	if s.preflight.selectedContract != nil {
@@ -754,7 +791,9 @@ func (s *rootExecutionState) markReducerFailed(runErr error) (map[string]any, er
 		With("stop_reason", rootReducerFailedStatus).
 		With("actual_participant_turns", s.transcript.Len()).
 		With("participant_turns_completed", s.transcript.Len())
-	s.meta = s.meta.With("root_recovery_pending", true)
+	if s.meta.String("provider_retry") != recipes.ProviderRetryForbid {
+		s.meta = s.meta.With("root_recovery_pending", true)
+	}
 	if err := s.saveProgress(); err != nil {
 		return s.result(), errors.Join(runErr, err)
 	}

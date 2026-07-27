@@ -8,16 +8,20 @@ import (
 	"path/filepath"
 	"strings"
 	"unicode/utf8"
+
+	"github.com/charlesnpx/convo-relay/internal/contracts"
 )
 
 const (
-	PromptPolicyVersion          = "prompt-policy/v1"
-	MaxLaunchContextFileBytes    = int64(1 << 20)
-	MaxLaunchContextTotalBytes   = int64(2 << 20)
-	defaultInvestigationMode     = "auto"
-	investigationModeNormal      = "normal"
-	investigationModeAuto        = "auto"
-	investigationModeContextOnly = "context_only"
+	PromptPolicyVersion           = contracts.PromptPolicyV1
+	PromptPolicyVersionV2         = contracts.PromptPolicyV2
+	diagnosticCodePromptAuthority = "prompt_authority_unsatisfied"
+	MaxLaunchContextFileBytes     = int64(1 << 20)
+	MaxLaunchContextTotalBytes    = int64(2 << 20)
+	defaultInvestigationMode      = "auto"
+	investigationModeNormal       = "normal"
+	investigationModeAuto         = "auto"
+	investigationModeContextOnly  = "context_only"
 )
 
 type InputBundle struct {
@@ -39,6 +43,7 @@ type PromptPolicy struct {
 	EvidenceRequired     bool
 	AllowRepoInspection  bool
 	UseLaunchContextOnly bool
+	Sources              []map[string]any
 }
 
 func PreflightLaunchContexts(paths []string) ([]LaunchContext, error) {
@@ -268,6 +273,43 @@ func BuildPromptPolicy(rawMode string, hasLaunchContext bool) (PromptPolicy, err
 	}
 }
 
+func BuildRootPromptPolicy(rawMode string, hasLaunchContext bool, declaresNamedInputs bool, boundNames []string) (PromptPolicy, error) {
+	if !declaresNamedInputs {
+		return BuildPromptPolicy(rawMode, hasLaunchContext)
+	}
+	mode := strings.TrimSpace(rawMode)
+	if mode == "" {
+		mode = defaultInvestigationMode
+	}
+	if mode != investigationModeNormal && mode != investigationModeAuto && mode != investigationModeContextOnly {
+		return PromptPolicy{}, fmt.Errorf("--investigation must be normal, auto, or context_only")
+	}
+	if mode == investigationModeContextOnly && len(boundNames) == 0 {
+		diagnostic := contracts.NewDiagnostic(
+			diagnosticCodePromptAuthority,
+			contracts.DiagnosticPhasePolicy,
+			"/investigation",
+			"context_only requires at least one successfully bound authoritative named input.",
+			nil,
+		)
+		return PromptPolicy{}, contracts.NewDiagnosticError(diagnostic.Message, diagnostic)
+	}
+	policy := PromptPolicy{
+		Version:             PromptPolicyVersionV2,
+		InvestigationMode:   mode,
+		EvidenceRequired:    mode != investigationModeNormal,
+		AllowRepoInspection: mode == investigationModeAuto,
+	}
+	seen := map[string]bool{}
+	for _, name := range boundNames {
+		if !seen[name] {
+			policy.Sources = append(policy.Sources, map[string]any{"kind": "named_input", "label": name})
+			seen[name] = true
+		}
+	}
+	return policy, nil
+}
+
 func (p PromptPolicy) ToMap() map[string]any {
 	version := p.Version
 	if version == "" {
@@ -276,6 +318,19 @@ func (p PromptPolicy) ToMap() map[string]any {
 	mode := p.InvestigationMode
 	if mode == "" {
 		mode = investigationModeNormal
+	}
+	if version == PromptPolicyVersionV2 {
+		sources := make([]any, 0, len(p.Sources))
+		for _, source := range p.Sources {
+			sources = append(sources, cloneMap(source))
+		}
+		return map[string]any{
+			"schema_version":        version,
+			"investigation_mode":    mode,
+			"evidence_required":     p.EvidenceRequired,
+			"allow_repo_inspection": p.AllowRepoInspection,
+			"sources":               sources,
+		}
 	}
 	return map[string]any{
 		"version":                 version,
@@ -286,9 +341,76 @@ func (p PromptPolicy) ToMap() map[string]any {
 	}
 }
 
+func finalizeNamedInputPromptPolicy(policy PromptPolicy, manifestRef map[string]any, manifest map[string]any) (PromptPolicy, error) {
+	if policy.Version != PromptPolicyVersionV2 {
+		return policy, nil
+	}
+	validatedManifestRef, err := contracts.ValidateArtifactRef(manifestRef)
+	if err != nil {
+		return PromptPolicy{}, persistenceIntegrityError("Prompt policy requires a valid named input manifest ref.", map[string]any{"cause": err.Error()})
+	}
+	rawInputs, ok := manifest["inputs"].([]any)
+	if !ok {
+		return PromptPolicy{}, persistenceIntegrityError("Prompt policy requires an ordered named input manifest.", nil)
+	}
+	sources := make([]map[string]any, 0)
+	byLabel := map[string]int{}
+	for index, raw := range rawInputs {
+		entry, ok := raw.(map[string]any)
+		if !ok {
+			return PromptPolicy{}, persistenceIntegrityError("Prompt policy named input manifest entry is invalid.", map[string]any{"ordinal": index + 1})
+		}
+		label := stringFromAny(entry["name"])
+		contentRef, err := contracts.ValidateArtifactRef(entry["content_ref"])
+		if strings.TrimSpace(label) == "" || err != nil {
+			return PromptPolicy{}, persistenceIntegrityError("Prompt policy named input manifest entry is incomplete.", map[string]any{"ordinal": index + 1})
+		}
+		sourceIndex, exists := byLabel[label]
+		if !exists {
+			sourceIndex = len(sources)
+			byLabel[label] = sourceIndex
+			sources = append(sources, map[string]any{
+				"kind":         "named_input",
+				"label":        label,
+				"manifest_ref": cloneMap(validatedManifestRef),
+				"content_refs": []any{},
+			})
+		}
+		sources[sourceIndex]["content_refs"] = append(sources[sourceIndex]["content_refs"].([]any), cloneMap(contentRef))
+	}
+	policy.Sources = sources
+	return policy, nil
+}
+
 func promptPolicyFromMeta(meta map[string]any) PromptPolicy {
 	mode := stringFromAny(meta["investigation_mode"])
 	policyMap, _ := meta["prompt_policy"].(map[string]any)
+	version := stringFromAny(policyMap["schema_version"])
+	if version == "" {
+		version = firstNonEmpty(stringFromAny(policyMap["version"]), stringFromAny(meta["prompt_policy_version"]))
+	}
+	if version == PromptPolicyVersionV2 {
+		if mode == "" {
+			mode = stringFromAny(policyMap["investigation_mode"])
+		}
+		if mode == "" {
+			mode = investigationModeNormal
+		}
+		evidenceRequired, _ := policyMap["evidence_required"].(bool)
+		allowRepoInspection, _ := policyMap["allow_repo_inspection"].(bool)
+		policy := PromptPolicy{
+			Version:             version,
+			InvestigationMode:   mode,
+			EvidenceRequired:    evidenceRequired,
+			AllowRepoInspection: allowRepoInspection,
+		}
+		for _, raw := range asSlice(policyMap["sources"]) {
+			if source, ok := raw.(map[string]any); ok {
+				policy.Sources = append(policy.Sources, cloneMap(source))
+			}
+		}
+		return policy
+	}
 	if mode == "" {
 		mode = stringFromAny(policyMap["investigation_mode"])
 	}
@@ -316,6 +438,16 @@ func promptPolicyFragment(policy PromptPolicy) string {
 		return ""
 	}
 	if policy.InvestigationMode == investigationModeContextOnly {
+		if policy.Version == PromptPolicyVersionV2 {
+			labels := make([]string, 0, len(policy.Sources))
+			for _, source := range policy.Sources {
+				labels = append(labels, "["+stringFromAny(source["label"])+"]")
+			}
+			return fmt.Sprintf(
+				"- Evidence policy: use only the authoritative named inputs %s for empirical claims. Cite their stable names and retained artifact refs; do not inspect repositories, files, or data beyond those inputs.\n- Unsupported empirical claims should remain contested until grounded in a cited named input.\n",
+				strings.Join(labels, ", "),
+			)
+		}
 		return "- Evidence policy: use only the supplied launch context when making empirical claims. Cite launch context labels such as [ctx1] and do not inspect repositories, files, or data beyond that supplied context.\n- Unsupported empirical claims should remain contested until grounded in a cited context label.\n"
 	}
 	return "- Evidence policy: inspect relevant repository files, data, or supplied launch context before making empirical claims. Cite inspected file paths or launch context labels such as [ctx1].\n- Unsupported empirical claims should remain contested until grounded in cited evidence.\n"

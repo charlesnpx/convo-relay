@@ -22,6 +22,7 @@ import (
 	"github.com/charlesnpx/convo-relay/internal/graph"
 	"github.com/charlesnpx/convo-relay/internal/inspect"
 	"github.com/charlesnpx/convo-relay/internal/integration"
+	"github.com/charlesnpx/convo-relay/internal/portable"
 	"github.com/charlesnpx/convo-relay/internal/readiness"
 	"github.com/charlesnpx/convo-relay/internal/recipes"
 	"github.com/charlesnpx/convo-relay/internal/runner"
@@ -55,6 +56,8 @@ func main() {
 		runRecipes(os.Args[2:])
 	case "backends":
 		runBackends(os.Args[2:])
+	case "capabilities":
+		runCapabilities(os.Args[2:])
 	case "compile-recipe":
 		runCompileRecipe(os.Args[2:])
 	case "create-session":
@@ -111,6 +114,30 @@ func runBackends(args []string) {
 		return
 	}
 	fmt.Println(readiness.FormatReport(report))
+}
+
+func runCapabilities(args []string) {
+	flags := flag.NewFlagSet("capabilities", flag.ExitOnError)
+	jsonOutput := flags.Bool("json", false, "Emit the machine-readable capability record")
+	schemaVersion := flags.String("schema-version", contracts.CapabilitiesV1, "Capability output schema")
+	if err := parseFlags(flags, args); err != nil {
+		os.Exit(2)
+	}
+	if len(flags.Args()) > 0 {
+		fmt.Fprintf(os.Stderr, "error: capabilities does not accept positional arguments: %s\n", strings.Join(flags.Args(), " "))
+		os.Exit(2)
+	}
+	report, err := contracts.BuildCapabilityAdvertisement(cliVersion, runtime.GOOS, runtime.GOARCH, *schemaVersion)
+	if err != nil {
+		var diagnosticErr *contracts.DiagnosticError
+		if *jsonOutput && errors.As(err, &diagnosticErr) {
+			writeJSON(diagnosticErr.ToMap())
+		} else {
+			fmt.Fprintf(os.Stderr, "error: %s\n", err)
+		}
+		os.Exit(1)
+	}
+	writeJSON(report)
 }
 
 func runContracts(args []string) {
@@ -608,6 +635,7 @@ func runExport(args []string) {
 	sessionID := flags.String("session-id", "", "Session id or prefix under --home")
 	relayHome := flags.String("home", "", "Optional relay home; defaults to CODEX_CLAUDE_HOME or ~/.codex-claude")
 	jsonOutput := flags.Bool("json", false, "Write structured JSON instead of markdown")
+	portableOutput := flags.Bool("portable", false, "Write a complete portable root-session directory")
 	output := ""
 	flags.StringVar(&output, "output", "", "Output path")
 	flags.StringVar(&output, "o", "", "Alias for --output")
@@ -622,6 +650,24 @@ func runExport(args []string) {
 		os.Exit(2)
 	}
 	resolvedSessionDir := resolveSessionDirOrExit(*sessionDir, *sessionID, *relayHome)
+	if *portableOutput {
+		result, err := portable.Export(resolvedSessionDir, output, portable.Options{ConvoRelayVersion: cliVersion})
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "error: %s\n", err)
+			os.Exit(1)
+		}
+		if *jsonOutput {
+			writeJSON(map[string]any{
+				"output":          result.Directory,
+				"schema_version":  result.Manifest["schema_version"],
+				"manifest_digest": result.Manifest["manifest_digest"],
+				"terminal_status": result.Manifest["terminal_status"],
+			})
+			return
+		}
+		fmt.Printf("Exported portable root session to %s\n", result.Directory)
+		return
+	}
 	report, err := inspect.BuildExportReport(resolvedSessionDir, *jsonOutput)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error: %s\n", err)
@@ -1742,11 +1788,13 @@ func usage() {
 	fmt.Fprintln(os.Stderr, "  convo-relay list --home <relay-home> --json")
 	fmt.Fprintln(os.Stderr, "  convo-relay show <session-id-prefix> --json")
 	fmt.Fprintln(os.Stderr, "  convo-relay export <session-id-prefix> -o transcript.md")
+	fmt.Fprintln(os.Stderr, "  convo-relay export <session-id-prefix> --portable -o bundle-directory --json")
 	fmt.Fprintln(os.Stderr, "  convo-relay health [session-id-prefix] --json")
 	fmt.Fprintln(os.Stderr, "  convo-relay recipes list --json")
 	fmt.Fprintln(os.Stderr, "  convo-relay recipes show review-panel")
 	fmt.Fprintln(os.Stderr, "  convo-relay recipes doctor")
 	fmt.Fprintln(os.Stderr, "  convo-relay backends status [--probe-auth] [--json]")
+	fmt.Fprintln(os.Stderr, "  convo-relay capabilities --json")
 	fmt.Fprintln(os.Stderr, "  convo-relay show <session-id-prefix> --graph --json")
 	fmt.Fprintln(os.Stderr, "  convo-relay show <session-id-prefix> --trace <node-id>")
 	fmt.Fprintln(os.Stderr, "  convo-relay contracts <session-id-prefix> --json")

@@ -103,6 +103,12 @@ func (s *Store) ArtifactIndex() map[string]any {
 	return index
 }
 
+// LoadArtifactIndexStrict returns an error instead of replacing malformed or
+// missing index state with the ordinary empty projection.
+func (s *Store) LoadArtifactIndexStrict() (map[string]any, error) {
+	return s.loadArtifactIndexStrict()
+}
+
 func (s *Store) LoadGraph() map[string]any {
 	return s.loadGraph()
 }
@@ -302,7 +308,7 @@ func (s *Store) loadArtifactPayloadForRef(ref map[string]any) (map[string]any, e
 	if err != nil {
 		return nil, contracts.NewValidationError("artifact ref %s does not point to an object", artifactRef["id"])
 	}
-	digest, err := contracts.ContractDigest(payload)
+	digest, err := contracts.PayloadDigest(payload)
 	if err != nil {
 		return nil, err
 	}
@@ -383,7 +389,7 @@ func (s *Store) pathPayloadDigest(relPath string) (string, bool) {
 	if err != nil {
 		return "", false
 	}
-	digest, err := contracts.ContractDigest(payload)
+	digest, err := contracts.PayloadDigest(payload)
 	if err != nil {
 		return "", false
 	}

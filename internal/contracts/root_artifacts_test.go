@@ -7,9 +7,11 @@ import (
 
 func TestEveryRootArtifactKindRoundTripsWithSafeRefAndRejectsTampering(t *testing.T) {
 	ordinalKinds := map[string]bool{
-		RootArtifactKindNamedInputContent: true,
-		RootArtifactKindRootCheckpoint:    true,
-		RootArtifactKindReducerAttempt:    true,
+		RootArtifactKindNamedInputContent:  true,
+		RootArtifactKindRootCheckpoint:     true,
+		RootArtifactKindReducerAttempt:     true,
+		RootArtifactKindRenderedPrompt:     true,
+		RootArtifactKindProviderInvocation: true,
 	}
 	for _, kind := range RootArtifactKinds() {
 		t.Run(kind, func(t *testing.T) {
@@ -90,16 +92,28 @@ func TestRootArtifactEnvelopeRejectsKindAndVersionTampering(t *testing.T) {
 	}); err == nil {
 		t.Fatal("mismatched declared kind accepted")
 	}
-	if _, err := NormalizeRootArtifact(RootArtifactKindRawResult, map[string]any{
-		"schema_version": 2,
-	}); err == nil {
-		t.Fatal("unsupported schema version accepted")
+	v2, err := NormalizeRootArtifactVersion(RootArtifactKindRawResult, 2, map[string]any{"digest_profile": DigestProfileV1})
+	if err != nil {
+		t.Fatalf("normalize v2: %v", err)
+	}
+	if _, err := ValidateRootArtifact(v2, RootArtifactKindRawResult); err != nil {
+		t.Fatalf("validate v2: %v", err)
+	}
+	if _, err := NormalizeRootArtifact(RootArtifactKindRawResult, map[string]any{"digest_profile": DigestProfileV1}); err == nil {
+		t.Fatal("v1 writer accepted v2-only field")
 	}
 	if _, err := ValidateRootArtifact(map[string]any{
 		"kind":           RootArtifactKindRawResult,
-		"schema_version": 2,
+		"schema_version": 1,
+		"digest_profile": DigestProfileV1,
 	}, RootArtifactKindRawResult); err == nil {
-		t.Fatal("tampered persisted version accepted")
+		t.Fatal("v1 reader accepted v2-only field")
+	}
+	if _, err := ValidateRootArtifact(map[string]any{
+		"kind":           RootArtifactKindRawResult,
+		"schema_version": 3,
+	}, RootArtifactKindRawResult); err == nil {
+		t.Fatal("unknown persisted version accepted")
 	}
 	if _, err := ValidateRootArtifact(map[string]any{
 		"kind":           "consumer_specific_result",

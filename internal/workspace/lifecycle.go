@@ -495,6 +495,9 @@ func loadExecutionWorkspace(st *store.Store) (map[string]any, map[string]any, bo
 	if err := verifyWorkspaceIdentity(payload); err != nil {
 		return nil, nil, false, err
 	}
+	if err := validatePersistedIsolationReport(st, payload); err != nil {
+		return nil, nil, false, err
+	}
 	return cloneMap(payload), cloneMap(ref), true, nil
 }
 
@@ -722,7 +725,11 @@ func repositoryForCleanup(ctx context.Context, root string) (*repositorySnapshot
 }
 
 func persistExecutionWorkspace(st *store.Store, artifact map[string]any) (map[string]any, map[string]any, error) {
-	normalized, err := contracts.NormalizeRootArtifact(contracts.RootArtifactKindExecutionWorkspace, artifact)
+	version, err := contracts.RequireNumericVersion(artifact, contracts.ContractRootArtifact)
+	if err != nil {
+		return nil, nil, err
+	}
+	normalized, err := contracts.NormalizeRootArtifactVersion(contracts.RootArtifactKindExecutionWorkspace, version, artifact)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -745,6 +752,9 @@ func persistExecutionWorkspace(st *store.Store, artifact map[string]any) (map[st
 		return nil, nil, err
 	}
 	if err := verifyWorkspaceIdentity(persisted); err != nil {
+		return nil, nil, err
+	}
+	if err := validatePersistedIsolationReport(st, persisted); err != nil {
 		return nil, nil, err
 	}
 	return cloneMap(persisted), cloneMap(ref), nil

@@ -50,6 +50,27 @@ func TestResolveArtifactRefRequiresDigestForDuplicateIDs(t *testing.T) {
 	}
 }
 
+func TestSaveContractArtifactAcceptsExplicitRegisteredV2Envelope(t *testing.T) {
+	st := New(t.TempDir())
+	payload := map[string]any{
+		"kind":                  contracts.RootArtifactKindRootRecipePlan,
+		"schema_version":        2,
+		"digest_profile":        contracts.DigestProfileV1,
+		"prompt_policy_version": contracts.PromptPolicyV2,
+	}
+	ref, err := st.SaveContractArtifact("root_recipe_plan", "selected", payload, "root_recipe_plan:selected")
+	if err != nil {
+		t.Fatalf("save v2 contract artifact: %v", err)
+	}
+	loaded, err := st.LoadArtifactPayloadRaw(ref)
+	if err != nil {
+		t.Fatalf("load v2 contract artifact: %v", err)
+	}
+	if version, err := contracts.RequireNumericVersion(loaded, contracts.ContractRootArtifact); err != nil || version != 2 {
+		t.Fatalf("loaded schema_version = %#v, version=%d err=%v", loaded["schema_version"], version, err)
+	}
+}
+
 func writeArtifact(t *testing.T, sessionDir string, relPath string, refID string, payload map[string]any) map[string]any {
 	t.Helper()
 	digest, err := contracts.ContractDigest(payload)

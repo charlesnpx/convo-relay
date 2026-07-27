@@ -42,6 +42,7 @@ type preparedRootRecovery struct {
 	preflight                   *recipePreflight
 	persisted                   *persistedRecipeRun
 	workspace                   *workspace.Materialized
+	invocationProgress          map[string]rootInvocationProgress
 	checkpoints                 map[int]*persistedRootRecoveryArtifact
 	attempts                    []persistedRootReducerAttempt
 	candidate                   *rootCandidate
@@ -75,6 +76,9 @@ func resumeRootRecipe(ctx context.Context, sessionDir string, opts ResumeOptions
 	if err != nil {
 		return nil, err
 	}
+	if err := rejectForbiddenProviderRetryTerminal(preparedBeforeLock); err != nil {
+		return nil, err
+	}
 	if complete, terminalErr := preparedBeforeLock.completedResult(); complete {
 		return sessionResult(sessionDir, preparedBeforeLock.meta, preparedBeforeLock.transcript), terminalErr
 	}
@@ -98,6 +102,9 @@ func resumeRootRecipe(ctx context.Context, sessionDir string, opts ResumeOptions
 		return nil, err
 	}
 	if err := rejectNamedInputIntegrityTerminal(prepared.meta); err != nil {
+		return nil, err
+	}
+	if err := rejectForbiddenProviderRetryTerminal(prepared); err != nil {
 		return nil, err
 	}
 	if complete, terminalErr := prepared.completedResult(); complete {
@@ -282,6 +289,43 @@ func rejectNamedInputIntegrityTerminal(meta model.SessionMeta) error {
 			"execution_phase": meta.String("execution_phase"),
 		},
 	)
+}
+
+func rejectForbiddenProviderRetryTerminal(prepared *preparedRootRecovery) error {
+	if prepared == nil ||
+		rootProviderRetryPolicy(prepared.meta) != recipes.ProviderRetryForbid ||
+		strings.TrimSpace(prepared.meta.String("result_source")) != integration.ResultSourceReducer ||
+		prepared.candidate != nil ||
+		latestCompletedReducerAttempt(prepared.attempts) != nil {
+		return nil
+	}
+	if prepared.invocationProgress[logicalInvocationID(rootInvocationSpec{phase: "reducer"})].providerLaunchAttempts == 0 {
+		return nil
+	}
+	return providerRetryForbiddenTerminalDiagnostic()
+}
+
+func providerRetryForbiddenTerminalDiagnostic() error {
+	return rootRecipeDiagnostic(
+		"provider_retry_forbidden_terminal",
+		contracts.DiagnosticPhasePolicy,
+		"/resume",
+		"A root session with provider_retry=forbid cannot relaunch a failed provider invocation.",
+		nil,
+	)
+}
+
+func isProviderRetryForbiddenTerminal(err error) bool {
+	var diagnosticErr *contracts.DiagnosticError
+	if !errors.As(err, &diagnosticErr) {
+		return false
+	}
+	for _, diagnostic := range diagnosticErr.Diagnostics {
+		if diagnostic.Code == "provider_retry_forbidden_terminal" {
+			return true
+		}
+	}
+	return false
 }
 
 func rootResumeRuntimeConfigProvided(config recipes.RuntimeConfig) bool {
@@ -556,6 +600,10 @@ func prepareRootRecovery(ctx context.Context, sessionDir string, opts ResumeOpti
 	if retainedInputs != nil {
 		baseRefs["retained_input_materialization_ref"] = cloneMap(retainedInputs.DescriptorRef)
 	}
+	promptPolicy, err := recoverRootPromptPolicy(st, meta, baseRefs["named_input_manifest_ref"])
+	if err != nil {
+		return nil, err
+	}
 
 	workspaceState, err := workspace.Recover(ctx, st)
 	if err != nil {
@@ -573,6 +621,10 @@ func prepareRootRecovery(ctx context.Context, sessionDir string, opts ResumeOpti
 		return nil, err
 	}
 	attempts, err := loadPersistedRootReducerAttempts(st, meta)
+	if err != nil {
+		return nil, err
+	}
+	invocationProgress, err := validatePersistedRootInvocationRecords(st, meta)
 	if err != nil {
 		return nil, err
 	}
@@ -634,7 +686,7 @@ func prepareRootRecovery(ctx context.Context, sessionDir string, opts ResumeOpti
 		selectedContract:   selectedContract,
 		assertionEvaluator: assertionEvaluator,
 		launchContexts:     launchContexts,
-		promptPolicy:       promptPolicyFromMeta(meta.ToMap()),
+		promptPolicy:       promptPolicy,
 	}
 	persisted := &persistedRecipeRun{
 		st:                    st,
@@ -661,6 +713,7 @@ func prepareRootRecovery(ctx context.Context, sessionDir string, opts ResumeOpti
 		preflight:                   preflight,
 		persisted:                   persisted,
 		workspace:                   workspaceState,
+		invocationProgress:          invocationProgress,
 		checkpoints:                 checkpoints,
 		attempts:                    attempts,
 		candidate:                   candidate,
@@ -670,14 +723,52 @@ func prepareRootRecovery(ctx context.Context, sessionDir string, opts ResumeOpti
 	}, nil
 }
 
+func recoverRootPromptPolicy(
+	st *store.Store,
+	meta model.SessionMeta,
+	manifestRef map[string]any,
+) (PromptPolicy, error) {
+	metaMap := meta.ToMap()
+	policyMap, _ := metaMap["prompt_policy"].(map[string]any)
+	version := firstNonEmpty(
+		stringFromAny(policyMap["schema_version"]),
+		stringFromAny(policyMap["version"]),
+		stringFromAny(metaMap["prompt_policy_version"]),
+	)
+	if version != "" && version != PromptPolicyVersion && version != PromptPolicyVersionV2 {
+		return PromptPolicy{}, persistenceIntegrityError("Persisted prompt policy version is unsupported.", map[string]any{"schema_version": version})
+	}
+	policy := promptPolicyFromMeta(metaMap)
+	if policy.Version != PromptPolicyVersionV2 {
+		return policy, nil
+	}
+	if manifestRef == nil {
+		return PromptPolicy{}, persistenceIntegrityError("Persisted v2 prompt policy requires its named input manifest ref.", nil)
+	}
+	manifest, err := st.LoadArtifactPayloadRaw(manifestRef)
+	if err != nil {
+		return PromptPolicy{}, persistenceIntegrityError("Persisted v2 prompt policy manifest could not be loaded.", map[string]any{"cause": err.Error()})
+	}
+	manifest, err = contracts.ValidateRootArtifact(manifest, contracts.RootArtifactKindNamedInputManifest)
+	if err != nil {
+		return PromptPolicy{}, persistenceIntegrityError("Persisted v2 prompt policy manifest is invalid.", map[string]any{"cause": err.Error()})
+	}
+	if _, err := contracts.ValidateRootArtifactRef(manifestRef, contracts.RootArtifactKindNamedInputManifest, 0, manifest); err != nil {
+		return PromptPolicy{}, persistenceIntegrityError("Persisted v2 prompt policy manifest ref is invalid.", map[string]any{"cause": err.Error()})
+	}
+	policy.Sources = nil
+	return finalizeNamedInputPromptPolicy(policy, manifestRef, manifest)
+}
+
 func (prepared *preparedRootRecovery) run(ctx context.Context) (map[string]any, error) {
 	state := &rootExecutionState{
-		st:         prepared.st,
-		preflight:  prepared.preflight,
-		persisted:  prepared.persisted,
-		meta:       prepared.meta,
-		transcript: prepared.transcript,
-		startedAt:  time.Now(),
+		st:                 prepared.st,
+		preflight:          prepared.preflight,
+		persisted:          prepared.persisted,
+		meta:               prepared.meta,
+		transcript:         prepared.transcript,
+		invocationProgress: cloneRootInvocationProgress(prepared.invocationProgress),
+		startedAt:          time.Now(),
 	}
 	if prepared.legacyRetainedInputsMissing {
 		if err := state.materializeLegacyRootRecoveryInputs(ctx); err != nil {
@@ -985,8 +1076,22 @@ func requireOptionalMatchingArtifactRef(left map[string]any, right map[string]an
 }
 
 func validatePersistedRootRecipe(recipe map[string]any, recipeRef map[string]any, plan map[string]any, meta model.SessionMeta) error {
-	if strings.TrimSpace(stringFromAny(recipe["kind"])) != "recipe" || intFromAny(recipe["schema_version"], 0) != 1 {
+	if strings.TrimSpace(stringFromAny(recipe["kind"])) != "recipe" {
 		return persistenceIntegrityError("Persisted root recipe artifact is invalid.", nil)
+	}
+	version, err := contracts.RequireNumericVersion(recipe, contracts.ContractRecipe)
+	if err != nil {
+		return persistenceIntegrityError("Persisted root recipe artifact is invalid.", map[string]any{"cause": err.Error()})
+	}
+	providerRetry, represented := recipe["provider_retry"]
+	if (version == 1 && represented) || (version == 2 && !represented) {
+		return persistenceIntegrityError("Persisted root recipe provider retry policy does not match its schema version.", nil)
+	}
+	if represented {
+		effective := recipes.EffectiveProviderRetry(recipe)
+		if providerRetry != effective || plan["provider_retry"] != effective || meta.String("provider_retry") != effective {
+			return persistenceIntegrityError("Persisted provider retry policy differs across recipe, plan, and session.", nil)
+		}
 	}
 	recipeID := strings.TrimSpace(stringFromAny(recipe["id"]))
 	if recipeID == "" || recipeID != strings.TrimSpace(stringFromAny(plan["recipe_id"])) || recipeID != meta.String("recipe_id") {
@@ -1083,6 +1188,13 @@ func loadRootRecoveryIntegration(st *store.Store, plan map[string]any, refs map[
 	}
 	if err := requireMatchingArtifactRef(refs["integration_contract_ref"], mapFromAny(plan["integration_contract_ref"]), "integration contract"); err != nil {
 		return nil, nil, err
+	}
+	if selected.BundleVersion() == integration.BundleSchemaVersionV2 {
+		wantProjection, _ := contracts.CanonicalJSONBytes(selected.PromptContext().ToMap())
+		gotProjection, _ := contracts.CanonicalJSONBytes(plan["prompt_context"])
+		if string(wantProjection) != string(gotProjection) {
+			return nil, nil, persistenceIntegrityError("Persisted prompt context differs from the selected integration contract.", nil)
+		}
 	}
 	return bundle, selected, nil
 }

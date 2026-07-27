@@ -29,6 +29,9 @@ func finalizeTerminalWorkspace(ctx context.Context, st *store.Store, meta model.
 		With("source_mutated", finalized.SourceMutated).
 		With("workspace_effective_policy", finalized.EffectivePolicy).
 		With("workspace_achieved_policy", finalized.AchievedPolicy)
+	if isolationRef, represented := finalized.Artifact["isolation_report_ref"]; represented {
+		meta = meta.With("isolation_report_ref", isolationRef)
+	}
 	for key, value := range provenance {
 		meta = meta.With(key, value)
 	}

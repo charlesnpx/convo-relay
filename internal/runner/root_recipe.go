@@ -176,24 +176,9 @@ func preflightRecipe(ctx context.Context, opts RecipeOptions) (*recipePreflight,
 	if err != nil {
 		return nil, err
 	}
-	promptPolicy, err := BuildPromptPolicy(opts.InvestigationMode, len(launchContexts) > 0)
-	if err != nil {
-		return nil, err
-	}
-
 	runtimeConfig, transientFiles, err := loadEffectiveRuntimeConfig(settingsPath, opts.RuntimeConfig, nil, nil, opts.TransientSources)
 	if err != nil {
 		return nil, err
-	}
-	runtimeSnapshot, err := prepareRuntimeConfigSnapshot(runtimeConfig)
-	if err != nil {
-		return nil, rootRecipeDiagnostic(
-			diagnosticCodeRuntimeConfigInvalid,
-			contracts.DiagnosticPhasePreflight,
-			"/runtime_config",
-			"The effective runtime configuration must be persistable JSON.",
-			map[string]any{"cause": err.Error()},
-		)
 	}
 	recipeID := strings.TrimSpace(opts.RecipeID)
 	recipe, exists := runtimeConfig.RelayRecipes[recipeID]
@@ -233,6 +218,24 @@ func preflightRecipe(ctx context.Context, opts RecipeOptions) (*recipePreflight,
 	if _, err := contracts.ValidateRootArtifact(rootPlan, contracts.RootArtifactKindRootRecipePlan); err != nil {
 		return nil, err
 	}
+	if providerRetry, successor := rootPlan["provider_retry"]; successor {
+		if _, represented := recipes.RecipeContractPayload(recipe)["provider_retry"]; !represented {
+			recipe = cloneMap(recipe)
+			recipe["schema_version"] = 2
+			recipe["provider_retry"] = providerRetry
+			runtimeConfig.RelayRecipes[recipeID] = recipe
+		}
+	}
+	runtimeSnapshot, err := prepareRuntimeConfigSnapshot(runtimeConfig)
+	if err != nil {
+		return nil, rootRecipeDiagnostic(
+			diagnosticCodeRuntimeConfigInvalid,
+			contracts.DiagnosticPhasePreflight,
+			"/runtime_config",
+			"The effective runtime configuration must be persistable JSON.",
+			map[string]any{"cause": err.Error()},
+		)
+	}
 	transientRecipes, err := prepareRootTransientRecipes(transientFiles, runtimeConfig, recipeID, rootPlan)
 	if err != nil {
 		return nil, err
@@ -262,6 +265,20 @@ func preflightRecipe(ctx context.Context, opts RecipeOptions) (*recipePreflight,
 		NamedInputMaxBytes:      runtimeConfig.EffectiveLimits().NamedInputMaxBytes,
 		NamedInputTotalMaxBytes: runtimeConfig.EffectiveLimits().NamedInputTotalMaxBytes,
 	})
+	if err != nil {
+		return nil, err
+	}
+	declaresNamedInputs := false
+	if selectedContract != nil {
+		contract := selectedContract.Contract()
+		declaresNamedInputs = contract != nil && len(contract.Inputs) > 0
+	}
+	promptPolicy, err := BuildRootPromptPolicy(
+		opts.InvestigationMode,
+		len(launchContexts) > 0,
+		declaresNamedInputs,
+		preparedInputNames(preparedInputs),
+	)
 	if err != nil {
 		return nil, err
 	}
@@ -308,6 +325,7 @@ func preflightRecipe(ctx context.Context, opts RecipeOptions) (*recipePreflight,
 		AllowDirtySource:  opts.AllowDirtySource,
 		InventoryMaxFiles: runtimeConfig.EffectiveLimits().RepositoryInventoryMaxFiles,
 		InventoryMaxBytes: runtimeConfig.EffectiveLimits().RepositoryInventoryMaxBytes,
+		ArtifactVersion:   rootWorkspaceArtifactVersion(rootPlan, promptPolicy),
 	})
 	if err != nil {
 		return nil, err
@@ -505,11 +523,7 @@ func persistRecipePreflight(
 	var bundleRef map[string]any
 	var contractRef map[string]any
 	if preflight.selectedContract != nil {
-		bundleArtifact, err := contracts.NormalizeRootArtifact(contracts.RootArtifactKindIntegrationBundle, map[string]any{
-			"bundle_id":     preflight.bundle.ID(),
-			"bundle_digest": preflight.bundle.Digest(),
-			"bundle":        preflight.bundle.ToMap(),
-		})
+		bundleArtifact, err := preflight.bundle.ArtifactPayload()
 		if err != nil {
 			return nil, err
 		}
@@ -520,11 +534,7 @@ func persistRecipePreflight(
 		if err := requireMatchingArtifactRef(mapFromAny(preflight.rootPlan["integration_bundle_ref"]), bundleRef, "integration bundle"); err != nil {
 			return nil, err
 		}
-		contractArtifact, err := contracts.NormalizeRootArtifact(contracts.RootArtifactKindIntegrationContract, map[string]any{
-			"contract_id":     preflight.selectedContract.ID(),
-			"contract_digest": preflight.selectedContract.Digest(),
-			"contract":        preflight.selectedContract.ToMap(),
-		})
+		contractArtifact, err := preflight.selectedContract.ArtifactPayload()
 		if err != nil {
 			return nil, err
 		}
@@ -555,6 +565,14 @@ func persistRecipePreflight(
 			return nil, err
 		}
 		inputManifestRef = persistedInputs.ManifestRef
+		preflight.promptPolicy, err = finalizeNamedInputPromptPolicy(
+			preflight.promptPolicy,
+			persistedInputs.ManifestRef,
+			persistedInputs.Manifest,
+		)
+		if err != nil {
+			return nil, err
+		}
 	}
 	materializedWorkspace, err := transaction.materializeWorkspace(ctx, preflight.workspace)
 	if err != nil {
@@ -740,7 +758,24 @@ func rootRecipeMeta(preflight *recipePreflight, persisted *persistedRecipeRun) (
 		meta["retained_input_materialization_ref"] = persisted.retainedInputRef
 		meta["provider_inputs"] = persisted.providerInputs
 	}
+	if providerRetry, represented := preflight.rootPlan["provider_retry"]; represented {
+		meta["provider_retry"] = providerRetry
+	}
+	if promptContext, represented := preflight.rootPlan["prompt_context"]; represented {
+		meta["prompt_context"] = promptContext
+	}
+	if isolationRef, represented := persisted.workspaceArtifact["isolation_report_ref"]; represented {
+		meta["isolation_report_ref"] = isolationRef
+	}
 	return model.NewSessionMeta(meta), nil
+}
+
+func rootWorkspaceArtifactVersion(rootPlan map[string]any, promptPolicy PromptPolicy) int {
+	if intFromAny(rootPlan["schema_version"], contracts.RootArtifactSchemaVersion) == contracts.RootArtifactSchemaVersionV2 ||
+		promptPolicy.Version == PromptPolicyVersionV2 {
+		return contracts.RootArtifactSchemaVersionV2
+	}
+	return contracts.RootArtifactSchemaVersion
 }
 
 func rootRecipeStartEvent(preflight *recipePreflight, persisted *persistedRecipeRun) map[string]any {
@@ -784,6 +819,15 @@ func rootCheckpointFields(preflight *recipePreflight, persisted *persistedRecipe
 		"execution_workspace_ref":            persisted.workspaceRef,
 		"created_at":                         utcNow(),
 	}
+}
+
+func preparedInputNames(prepared *namedinputs.Prepared) []string {
+	items := prepared.Items()
+	names := make([]string, 0, len(items))
+	for _, item := range items {
+		names = append(names, item.Name)
+	}
+	return names
 }
 
 func selectedContractForRootPlan(bundle *integration.Bundle, rootPlan map[string]any) (*integration.SelectedContract, error) {

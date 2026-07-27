@@ -7,8 +7,10 @@ import (
 )
 
 const (
-	BundleSchemaVersion = "relay-integration-bundle-v1"
-	DefaultMediaType    = "application/octet-stream"
+	BundleSchemaVersion   = contracts.IntegrationBundleV1
+	BundleSchemaVersionV1 = contracts.IntegrationBundleV1
+	BundleSchemaVersionV2 = contracts.IntegrationBundleV2
+	DefaultMediaType      = "application/octet-stream"
 
 	CardinalityOne  = "one"
 	CardinalityMany = "many"
@@ -16,6 +18,11 @@ const (
 	ResultTransportJSON  = "json"
 	ResultSourceLastTurn = "last_turn"
 	ResultSourceReducer  = "reducer"
+
+	PromptContextPolicyVersion    = contracts.PromptContextProjectionV1
+	ParticipantTranscriptComplete = "complete"
+	FacilitatorLedgerInclude      = "include"
+	FacilitatorLedgerTraceOnly    = "trace_only"
 )
 
 const (
@@ -43,10 +50,17 @@ type Bundle struct {
 }
 
 type Contract struct {
-	Turns   []TurnDeclaration
-	Reducer *ReducerDeclaration
-	Inputs  map[string]*InputDeclaration
-	Result  ResultDeclaration
+	Turns         []TurnDeclaration
+	Reducer       *ReducerDeclaration
+	Inputs        map[string]*InputDeclaration
+	Result        ResultDeclaration
+	PromptContext PromptContextProjection
+}
+
+type PromptContextProjection struct {
+	SchemaVersion         string
+	ParticipantTranscript string
+	FacilitatorLedger     string
 }
 
 type TurnDeclaration struct {
@@ -102,15 +116,16 @@ type ScheduleRequirement struct {
 }
 
 type SelectedContract struct {
-	id       string
-	contract *Contract
-	digest   string
+	id            string
+	contract      *Contract
+	digest        string
+	bundleVersion string
 }
 
 func (b *Bundle) ToMap() map[string]any {
 	contractMaps := make(map[string]any, len(b.contracts))
 	for id, contract := range b.contracts {
-		contractMaps[id] = contract.ToMap()
+		contractMaps[id] = contract.toMap(b.schemaVersion)
 	}
 	return map[string]any{
 		"schema_version": b.schemaVersion,
@@ -147,6 +162,18 @@ func (b *Bundle) Digest() string {
 	return b.digest
 }
 
+func (b *Bundle) ArtifactPayload() (map[string]any, error) {
+	fields := map[string]any{
+		"bundle_id":     b.ID(),
+		"bundle_digest": b.Digest(),
+		"bundle":        b.ToMap(),
+	}
+	if b.SchemaVersion() == BundleSchemaVersionV2 {
+		return contracts.NormalizeRootArtifactVersion(contracts.RootArtifactKindIntegrationBundle, contracts.RootArtifactSchemaVersionV2, fields)
+	}
+	return contracts.NormalizeRootArtifact(contracts.RootArtifactKindIntegrationBundle, fields)
+}
+
 func (b *Bundle) Contract(id string) (*Contract, bool) {
 	if b == nil {
 		return nil, false
@@ -170,6 +197,10 @@ func (b *Bundle) Contracts() map[string]*Contract {
 }
 
 func (c *Contract) ToMap() map[string]any {
+	return c.toMap(BundleSchemaVersionV1)
+}
+
+func (c *Contract) toMap(bundleVersion string) map[string]any {
 	turns := make([]any, 0, len(c.Turns))
 	for _, turn := range c.Turns {
 		turns = append(turns, map[string]any{
@@ -195,7 +226,25 @@ func (c *Contract) ToMap() map[string]any {
 	if c.Reducer != nil {
 		payload["reducer"] = map[string]any{"instructions": c.Reducer.Instructions}
 	}
+	if bundleVersion == BundleSchemaVersionV2 {
+		payload["prompt_context"] = c.PromptContext.ToMap()
+	}
 	return payload
+}
+
+func (p PromptContextProjection) ToMap() map[string]any {
+	participantTranscript := p.ParticipantTranscript
+	if participantTranscript == "" {
+		participantTranscript = ParticipantTranscriptComplete
+	}
+	facilitatorLedger := p.FacilitatorLedger
+	if facilitatorLedger == "" {
+		facilitatorLedger = FacilitatorLedgerInclude
+	}
+	return map[string]any{
+		"participant_transcript": participantTranscript,
+		"facilitator_ledger":     facilitatorLedger,
+	}
 }
 
 func (d *InputDeclaration) ToMap() map[string]any {
@@ -212,9 +261,27 @@ func (d *InputDeclaration) ToMap() map[string]any {
 }
 
 func (s *SelectedContract) ToMap() map[string]any {
-	payload := s.contract.ToMap()
+	version := s.bundleVersion
+	if version == "" {
+		version = BundleSchemaVersionV1
+	}
+	payload := s.contract.toMap(version)
 	payload["id"] = s.id
 	return payload
+}
+
+func (s *SelectedContract) BundleVersion() string {
+	if s == nil {
+		return ""
+	}
+	return s.bundleVersion
+}
+
+func (s *SelectedContract) PromptContext() PromptContextProjection {
+	if s == nil || s.contract == nil {
+		return PromptContextProjection{}
+	}
+	return s.contract.PromptContext
 }
 
 func (s *SelectedContract) ID() string {
@@ -236,6 +303,18 @@ func (s *SelectedContract) Digest() string {
 		return ""
 	}
 	return s.digest
+}
+
+func (s *SelectedContract) ArtifactPayload() (map[string]any, error) {
+	fields := map[string]any{
+		"contract_id":     s.ID(),
+		"contract_digest": s.Digest(),
+		"contract":        s.ToMap(),
+	}
+	if s.BundleVersion() == BundleSchemaVersionV2 {
+		return contracts.NormalizeRootArtifactVersion(contracts.RootArtifactKindIntegrationContract, contracts.RootArtifactSchemaVersionV2, fields)
+	}
+	return contracts.NormalizeRootArtifact(contracts.RootArtifactKindIntegrationContract, fields)
 }
 
 func assertionMaps(assertions []AssertionDeclaration) []any {
@@ -298,9 +377,10 @@ func cloneContract(contract *Contract) *Contract {
 		return nil
 	}
 	cloned := &Contract{
-		Turns:  append([]TurnDeclaration(nil), contract.Turns...),
-		Inputs: make(map[string]*InputDeclaration, len(contract.Inputs)),
-		Result: contract.Result,
+		Turns:         append([]TurnDeclaration(nil), contract.Turns...),
+		Inputs:        make(map[string]*InputDeclaration, len(contract.Inputs)),
+		Result:        contract.Result,
+		PromptContext: contract.PromptContext,
 	}
 	if contract.Reducer != nil {
 		reducer := *contract.Reducer

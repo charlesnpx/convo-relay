@@ -279,6 +279,32 @@ func TestIntegrationBoundRecipeCompilesOnlyForRootWithMatchingBundle(t *testing.
 	if rootPlan["reducer"].(map[string]any)["backend"] != "codex" {
 		t.Fatalf("resolved reducer = %#v", rootPlan["reducer"])
 	}
+	v2Bundle, err := integration.DecodeBundleBytes([]byte(strings.Replace(compileBundleJSON, integration.BundleSchemaVersionV1, integration.BundleSchemaVersionV2, 1)))
+	if err != nil {
+		t.Fatalf("decode v2 bundle: %v", err)
+	}
+	v2Plan, err := CompileRecipe(recipe, config.BackendProfiles, config.RelayRecipes, CompileTargetRoot, CompileOptions{IntegrationBundle: v2Bundle})
+	if err != nil {
+		t.Fatalf("compile v2 bound root: %v", err)
+	}
+	projection := v2Plan["prompt_context"].(map[string]any)
+	if v2Plan["schema_version"] != 2 || v2Plan["provider_retry"] != ProviderRetryAllow || projection["participant_transcript"] != integration.ParticipantTranscriptComplete || projection["facilitator_ledger"] != integration.FacilitatorLedgerInclude {
+		t.Fatalf("v2 bound root plan = %#v", v2Plan)
+	}
+	config.RelayRecipes["bound-review"] = recipe
+	v2Report, err := BuildCompileReport("bound-review", config, CompileTargetRoot, CompileOptions{IntegrationBundle: v2Bundle})
+	if err != nil {
+		t.Fatalf("compile v2 bound report: %v", err)
+	}
+	reportPlan := v2Report["compiled_plan"].(map[string]any)
+	reportRecipeRef := reportPlan["recipe_ref"].(map[string]any)
+	if v2Report["recipe_digest"] != reportRecipeRef["digest"] {
+		t.Fatalf("v2 report recipe digest = %v, plan ref = %#v", v2Report["recipe_digest"], reportRecipeRef)
+	}
+	effectiveRecipe := v2Report["recipe"].(map[string]any)
+	if effectiveRecipe["schema_version"] != 2 || effectiveRecipe["provider_retry"] != ProviderRetryAllow {
+		t.Fatalf("v2 report effective recipe = %#v", effectiveRecipe)
+	}
 
 	_, err = CompileRecipe(recipe, config.BackendProfiles, config.RelayRecipes, CompileTargetChild, CompileOptions{})
 	var rootOnly *RootOnlyRecipeError
@@ -375,6 +401,13 @@ func TestRootAndChildDigestsRetainTargetSpecificFields(t *testing.T) {
 	if mustContractDigest(t, rootFirst) == mustContractDigest(t, mustCompileTarget(t, resultChanged, config, CompileTargetRoot)) {
 		t.Fatal("root plan digest ignored result_source and used reducer")
 	}
+	retryChanged := cloneObject(base)
+	retryChanged["schema_version"] = 2
+	retryChanged["provider_retry"] = ProviderRetryForbid
+	retryPlan := mustCompileTarget(t, retryChanged, config, CompileTargetRoot)
+	if retryPlan["schema_version"] != 2 || retryPlan["provider_retry"] != ProviderRetryForbid || mustContractDigest(t, rootFirst) == mustContractDigest(t, retryPlan) {
+		t.Fatalf("root plan did not bind provider retry policy: %#v", retryPlan)
+	}
 	rootRecipeRef := rootFirst["recipe_ref"].(map[string]any)
 	if rootRecipeRef["digest"] != mustContractDigest(t, RecipeContractPayload(base)) {
 		t.Fatalf("root recipe ref does not bind the full normalized payload: %#v", rootRecipeRef)
@@ -383,6 +416,9 @@ func TestRootAndChildDigestsRetainTargetSpecificFields(t *testing.T) {
 	childSecond := mustCompileTarget(t, changed, config, CompileTargetChild)
 	if mustContractDigest(t, childFirst) != mustContractDigest(t, childSecond) {
 		t.Fatal("compiled_plan/v1 digest changed for root-only participant_turns")
+	}
+	if mustContractDigest(t, childFirst) != mustContractDigest(t, mustCompileTarget(t, retryChanged, config, CompileTargetChild)) {
+		t.Fatal("compiled_plan/v1 digest changed for root-only provider retry policy")
 	}
 
 	childRounds := cloneObject(changed)

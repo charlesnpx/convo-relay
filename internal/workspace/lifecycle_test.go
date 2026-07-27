@@ -27,7 +27,7 @@ func TestFinalizePersistsSourceAfterAndRetainsIsolatedEvidence(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			root := newCommittedRepo(t)
 			sessionDir := filepath.Join(t.TempDir(), "session")
-			snapshot := mustPreflight(t, Options{LaunchCWD: root, SessionDir: sessionDir, MinimumPolicy: PolicyReadOnly})
+			snapshot := mustPreflight(t, Options{LaunchCWD: root, SessionDir: sessionDir, MinimumPolicy: PolicyReadOnly, ArtifactVersion: contracts.RootArtifactSchemaVersionV2})
 			st := store.New(sessionDir)
 			materialized, err := Materialize(context.Background(), st, snapshot)
 			if err != nil {
@@ -51,6 +51,9 @@ func TestFinalizePersistsSourceAfterAndRetainsIsolatedEvidence(t *testing.T) {
 			}
 			if !finalized.Managed || finalized.SourceBeforeDigest != snapshot.SourceDigest() || finalized.SourceAfterDigest == "" {
 				t.Fatalf("finalization = %#v", finalized)
+			}
+			if finalized.Artifact["isolation_report_ref"].(map[string]any)["digest"] != materialized.Artifact["isolation_report_ref"].(map[string]any)["digest"] {
+				t.Fatalf("finalization rewrote the isolation report")
 			}
 			if finalized.SourceChanged != test.wantChanged || finalized.SourceMutated != test.wantChanged {
 				t.Fatalf("source result changed=%v mutated=%v, want %v", finalized.SourceChanged, finalized.SourceMutated, test.wantChanged)

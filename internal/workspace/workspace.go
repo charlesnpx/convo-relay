@@ -56,6 +56,7 @@ type Options struct {
 	GitBinary         string
 	InventoryMaxFiles int64
 	InventoryMaxBytes int64
+	ArtifactVersion   int
 }
 
 // PolicyResolution records the recipe minimum, caller request, effective
@@ -78,6 +79,7 @@ type Snapshot struct {
 	gitBinary         string
 	policy            PolicyResolution
 	inventoryLimits   repositoryInventoryLimits
+	artifactVersion   int
 	allowDirtySource  bool
 	sourceChanges     SourceChanges
 	repository        *repositorySnapshot
@@ -173,6 +175,13 @@ func Preflight(ctx context.Context, options Options) (*Snapshot, error) {
 		maxFiles: options.InventoryMaxFiles,
 		maxBytes: options.InventoryMaxBytes,
 	}
+	artifactVersion := options.ArtifactVersion
+	if artifactVersion == 0 {
+		artifactVersion = contracts.RootArtifactSchemaVersion
+	}
+	if artifactVersion != contracts.RootArtifactSchemaVersion && artifactVersion != contracts.RootArtifactSchemaVersionV2 {
+		return nil, contracts.NewValidationError("execution workspace artifact version must be 1 or 2")
+	}
 	if inventoryLimits.maxFiles == 0 {
 		inventoryLimits.maxFiles = recipes.DefaultRepositoryInventoryMaxFiles
 	}
@@ -200,6 +209,7 @@ func Preflight(ctx context.Context, options Options) (*Snapshot, error) {
 		gitBinary:         gitBinary,
 		policy:            policy,
 		inventoryLimits:   inventoryLimits,
+		artifactVersion:   artifactVersion,
 		allowDirtySource:  options.AllowDirtySource,
 		exclusions:        emptyExclusions(),
 	}

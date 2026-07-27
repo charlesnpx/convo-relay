@@ -61,68 +61,84 @@ func (e *rootNamedInputIntegrityError) suppressProviderRetry() {}
 func runRootProviderTurnWithRetainedIntegrity(
 	ctx context.Context,
 	state *rootExecutionState,
-	role string,
-	actor string,
-	backend string,
+	spec rootInvocationSpec,
 	operation func() (TurnResult, error),
 ) (TurnResult, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	providerAttempt := 0
-	return runWithRetryableProviderErrors(ctx, actor, func() (TurnResult, error) {
+	promptRef, promptDigest, err := state.persistRenderedPrompt(spec)
+	if err != nil {
+		return TurnResult{}, rootInvocationPersistenceError{cause: err}
+	}
+	persistedProgress, err := state.providerInvocationProgress(spec)
+	if err != nil {
+		return TurnResult{}, rootInvocationPersistenceError{cause: err}
+	}
+	providerAttempt := persistedProgress.persistedAttempts
+	return runWithProviderRetryPolicy(ctx, spec.actor, state.meta.String("provider_retry"), func() (TurnResult, error) {
 		providerAttempt++
 		currentAttempt := providerAttempt
 		attemptRef := &currentAttempt
+		startedAt := utcNow()
 		if err := state.verifyRetainedInputs(
 			ctx,
-			role,
+			spec.phase,
 			namedinputs.IntegrityBoundaryBeforeAttempt,
 			attemptRef,
 		); err != nil {
+			if recordErr := state.persistProviderInvocation(spec, currentAttempt, startedAt, TurnResult{}, err, false, "pre_launch_integrity", promptRef, promptDigest); recordErr != nil {
+				return TurnResult{}, rootInvocationPersistenceError{cause: errors.Join(err, recordErr)}
+			}
 			if ctx.Err() != nil && errors.Is(err, ctx.Err()) {
 				return TurnResult{}, ctx.Err()
 			}
 			return TurnResult{}, &rootNamedInputIntegrityError{
 				cause:           err,
-				role:            role,
+				role:            spec.phase,
 				boundary:        namedinputs.IntegrityBoundaryBeforeAttempt,
 				providerAttempt: attemptRef,
 			}
 		}
 
+		if err := state.ensureProviderLaunchAllowed(spec); err != nil {
+			return TurnResult{}, err
+		}
 		result, providerErr := operation()
 		postBase := context.WithoutCancel(ctx)
 		postCtx, cancel := context.WithTimeout(postBase, state.retainedInputVerificationTimeout())
 		verifyErr := state.verifyRetainedInputs(
 			postCtx,
-			role,
+			spec.phase,
 			namedinputs.IntegrityBoundaryAfterAttempt,
 			attemptRef,
 		)
 		cancel()
 		if verifyErr == nil {
+			if recordErr := state.persistProviderInvocation(spec, currentAttempt, startedAt, result, providerErr, true, "", promptRef, promptDigest); recordErr != nil {
+				return TurnResult{}, rootInvocationPersistenceError{cause: recordErr}
+			}
 			return result, providerErr
 		}
 		verifyErr = normalizePostAttemptVerificationError(
 			verifyErr,
-			role,
+			spec.phase,
 			namedinputs.IntegrityBoundaryAfterAttempt,
 			attemptRef,
 		)
 
-		providerCause := rootProviderSecondaryCause(actor, result, providerErr)
+		providerCause := rootProviderSecondaryCause(spec.actor, result, providerErr)
 		if providerCause == nil {
 			providerCause = ctx.Err()
 		}
 		var providerFailure map[string]any
 		if providerCause != nil {
 			providerFailure = providerFailurePayload(
-				role,
-				actor,
-				backend,
+				spec.phase,
+				spec.actor,
+				spec.backendName,
 				providerCause,
-				providerResultForTurn(backend, result),
+				providerResultForTurn(spec.backendName, result),
 			)
 			if errors.Is(providerCause, context.Canceled) {
 				providerFailure["category"] = "canceled"
@@ -134,14 +150,18 @@ func runRootProviderTurnWithRetainedIntegrity(
 		// The provider result is deliberately replaced with its zero value. No
 		// caller can accidentally persist content rejected by the post-attempt
 		// integrity boundary.
-		return TurnResult{}, &rootNamedInputIntegrityError{
+		integrityErr := &rootNamedInputIntegrityError{
 			cause:           verifyErr,
-			role:            role,
+			role:            spec.phase,
 			boundary:        namedinputs.IntegrityBoundaryAfterAttempt,
 			providerAttempt: attemptRef,
 			providerCause:   providerCause,
 			providerFailure: providerFailure,
 		}
+		if recordErr := state.persistProviderInvocation(spec, currentAttempt, startedAt, result, integrityErr, true, "post_launch_integrity", promptRef, promptDigest); recordErr != nil {
+			return TurnResult{}, rootInvocationPersistenceError{cause: errors.Join(integrityErr, recordErr)}
+		}
+		return TurnResult{}, integrityErr
 	})
 }
 

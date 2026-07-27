@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/charlesnpx/convo-relay/internal/model"
+	"github.com/charlesnpx/convo-relay/internal/recipes"
 )
 
 const (
@@ -184,6 +185,13 @@ func classifyRetryableProviderError(text string) string {
 }
 
 func runWithRetryableProviderErrors[T any](ctx context.Context, label string, operation func() (T, error)) (T, error) {
+	return runWithProviderRetryPolicy(ctx, label, recipes.ProviderRetryAllow, operation)
+}
+
+func runWithProviderRetryPolicy[T any](ctx context.Context, label string, policy string, operation func() (T, error)) (T, error) {
+	if strings.TrimSpace(policy) == recipes.ProviderRetryForbid {
+		return operation()
+	}
 	delay := retryInitialBackoffSeconds
 	attempts := 0
 	for {

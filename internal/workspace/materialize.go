@@ -154,6 +154,21 @@ func Materialize(ctx context.Context, st *store.Store, snapshot *Snapshot) (*Mat
 	if err != nil {
 		return nil, materializationFailure(snapshot.repository, worktreePath, createdWorktree, createdWorktreeRoot, err, "The execution workspace artifact could not be constructed.")
 	}
+	if snapshot.artifactVersion == contracts.RootArtifactSchemaVersionV2 {
+		report, reportErr := isolationReportForWorkspace(artifact)
+		if reportErr != nil {
+			return nil, materializationFailure(snapshot.repository, worktreePath, createdWorktree, createdWorktreeRoot, reportErr, "The workspace isolation report could not be constructed.")
+		}
+		reportRef, reportErr := persistIsolationReport(st, report)
+		if reportErr != nil {
+			return nil, materializationFailure(snapshot.repository, worktreePath, createdWorktree, createdWorktreeRoot, reportErr, "The workspace isolation report could not be persisted.")
+		}
+		artifact["isolation_report_ref"] = reportRef
+		artifact, err = contracts.NormalizeRootArtifactVersion(contracts.RootArtifactKindExecutionWorkspace, contracts.RootArtifactSchemaVersionV2, artifact)
+		if err != nil {
+			return nil, materializationFailure(snapshot.repository, worktreePath, createdWorktree, createdWorktreeRoot, err, "The execution workspace artifact could not bind its isolation report.")
+		}
+	}
 	identity, err := contracts.RootArtifactIdentityFor(contracts.RootArtifactKindExecutionWorkspace, 0)
 	if err != nil {
 		return nil, materializationFailure(snapshot.repository, worktreePath, createdWorktree, createdWorktreeRoot, err, "The execution workspace artifact identity is invalid.")
@@ -171,6 +186,9 @@ func Materialize(ctx context.Context, st *store.Store, snapshot *Snapshot) (*Mat
 	}
 	if err := verifyWorkspaceIdentity(persisted); err != nil {
 		return nil, materializationFailure(snapshot.repository, worktreePath, createdWorktree, createdWorktreeRoot, err, "The persisted execution workspace identity failed validation.")
+	}
+	if err := validatePersistedIsolationReport(st, persisted); err != nil {
+		return nil, materializationFailure(snapshot.repository, worktreePath, createdWorktree, createdWorktreeRoot, err, "The persisted workspace isolation report failed validation.")
 	}
 	want, err := contracts.CanonicalJSONBytes(artifact)
 	if err != nil {
@@ -359,7 +377,7 @@ func workspaceArtifact(
 	if rawDescriptor != nil {
 		fields["committed_export"] = rawExportArtifactMap(rawDescriptor)
 	}
-	return contracts.NormalizeRootArtifact(contracts.RootArtifactKindExecutionWorkspace, fields)
+	return contracts.NormalizeRootArtifactVersion(contracts.RootArtifactKindExecutionWorkspace, snapshot.artifactVersion, fields)
 }
 
 func verifyWorkspaceIdentity(artifact map[string]any) error {

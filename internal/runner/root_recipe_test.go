@@ -13,6 +13,7 @@ import (
 	"github.com/charlesnpx/convo-relay/internal/contracts"
 	"github.com/charlesnpx/convo-relay/internal/inspect"
 	"github.com/charlesnpx/convo-relay/internal/integration"
+	"github.com/charlesnpx/convo-relay/internal/portable"
 	"github.com/charlesnpx/convo-relay/internal/readiness"
 	"github.com/charlesnpx/convo-relay/internal/recipes"
 	"github.com/charlesnpx/convo-relay/internal/store"
@@ -28,6 +29,7 @@ const rootRecipeTestBundle = `{
         {"participant_turn": 1, "slot": "slot_0", "instructions": "Present the input."},
         {"participant_turn": 2, "slot": "slot_1", "instructions": "Challenge the presentation."}
       ],
+	  "reducer": {"instructions": "Return one final JSON object."},
       "inputs": {
         "payload": {
           "required": true,
@@ -205,6 +207,165 @@ func TestRunRecipeUsesExplicitRootTargetAndPersistsDirectContractlessSession(t *
 	}
 	if _, err := os.Stat(filepath.Join(sessionDir, "relay.pid")); !os.IsNotExist(err) {
 		t.Fatalf("recipe execution left a tracked provider process, err = %v", err)
+	}
+}
+
+func TestRunRecipeContextOnlyUsesPersistedNamedInputAuthority(t *testing.T) {
+	launchCWD := t.TempDir()
+	writeRootRecipeTestFile(t, filepath.Join(launchCWD, "payload.json"), `{"value":"stable"}`)
+	config := rootRecipeRuntimeConfig("neutral/contract-v1")
+	config.RelayRecipes["neutral-root"]["result_source"] = integration.ResultSourceReducer
+	recorder := &rootBackendRecorder{}
+	recorder.handler = func(_ context.Context, call rootBackendCall) (TurnResult, error) {
+		if call.SlotID == "facilitator" {
+			return successfulRootTurn(call.Backend, `{"settled":[],"contested":[],"withdrawn":[]}`), nil
+		}
+		return successfulRootTurn(call.Backend, `{"value":"stable"}`), nil
+	}
+	sessionDir := filepath.Join(t.TempDir(), "session")
+	result, err := RunRecipe(context.Background(), RecipeOptions{
+		SessionDir:        sessionDir,
+		Task:              "Use only the bound input",
+		RecipeID:          "neutral-root",
+		InputBindings:     []string{"payload=payload.json"},
+		InvestigationMode: investigationModeContextOnly,
+		LaunchCWD:         launchCWD,
+		RuntimeConfig:     config,
+		IntegrationBundle: decodeRootRecipeTestBundle(t, rootRecipeTestBundle),
+		ReadinessCheck:    readyRootRecipeCheck,
+		backendFactory:    recorder.factory(),
+	})
+	if err != nil {
+		t.Fatalf("RunRecipe: %v", err)
+	}
+	if result["kind"] != "root_session_result" || intFromAny(result["schema_version"], 0) != 2 || result["prompt_policy_version"] != PromptPolicyVersionV2 {
+		t.Fatalf("successor root result = %#v", result)
+	}
+	policy := result["prompt_policy"].(map[string]any)
+	sources := policy["sources"].([]any)
+	if policy["schema_version"] != PromptPolicyVersionV2 || len(sources) != 1 {
+		t.Fatalf("prompt policy = %#v", policy)
+	}
+	source := sources[0].(map[string]any)
+	manifestRef := result["named_input_manifest_ref"].(map[string]any)
+	if source["kind"] != "named_input" || source["label"] != "payload" || len(source["content_refs"].([]any)) != 1 {
+		t.Fatalf("authority source = %#v", source)
+	}
+	policyManifestRef := source["manifest_ref"].(map[string]any)
+	if policyManifestRef["id"] != manifestRef["id"] || policyManifestRef["digest"] != manifestRef["digest"] {
+		t.Fatalf("authority manifest ref = %#v, want %#v", policyManifestRef, manifestRef)
+	}
+	contentRef := source["content_refs"].([]any)[0].(map[string]any)
+	for _, call := range recorder.snapshotCalls() {
+		if call.SlotID == "facilitator" {
+			continue
+		}
+		if !strings.Contains(call.Prompt, "[payload]") ||
+			!strings.Contains(call.Prompt, stringFromAny(manifestRef["digest"])) ||
+			!strings.Contains(call.Prompt, stringFromAny(contentRef["digest"])) {
+			t.Fatalf("%s prompt does not cite stable named input authority:\n%s", call.SlotID, call.Prompt)
+		}
+	}
+	report := inspect.BuildRootInspectionReport(sessionDir, result, false)
+	if report["prompt_policy"].(map[string]any)["schema_version"] != PromptPolicyVersionV2 {
+		t.Fatalf("inspection prompt policy = %#v", report["prompt_policy"])
+	}
+	isolation := report["isolation_report"].(map[string]any)
+	if result["isolation_report_ref"] == nil || isolation["mechanism"] != "inherited" || isolation["filesystem_containment"] != "none" {
+		t.Fatalf("successor isolation projection = %#v", isolation)
+	}
+
+	calls := recorder.snapshotCalls()
+	invocationRefs := result["invocation_refs"].([]any)
+	promptRefs := result["rendered_prompt_refs"].([]any)
+	wantIDs := []string{"participant:000001", "facilitator:000001", "participant:000002", "facilitator:000002", "reducer:000001"}
+	if len(calls) != len(wantIDs) || len(invocationRefs) != len(wantIDs) || len(promptRefs) != len(wantIDs) {
+		t.Fatalf("provider accounting = calls %d invocations %d prompts %d", len(calls), len(invocationRefs), len(promptRefs))
+	}
+	st := store.New(sessionDir)
+	for index, rawRef := range invocationRefs {
+		payload := assertRootRecipeArtifact(t, st, rawRef, contracts.RootArtifactKindProviderInvocation, index+1)
+		invocation, err := contracts.ValidateProviderInvocationRecord(payload["invocation"])
+		if err != nil {
+			t.Fatalf("invocation %d: %v", index+1, err)
+		}
+		promptPayload := assertRootRecipeArtifact(t, st, promptRefs[index], contracts.RootArtifactKindRenderedPrompt, index+1)
+		if _, err := contracts.ValidateRenderedPromptRecord(promptPayload["rendered_prompt"]); err != nil {
+			t.Fatalf("rendered prompt %d: %v", index+1, err)
+		}
+		if invocation["invocation_id"] != wantIDs[index] || invocation["runner_attempt"] != 1 ||
+			invocation["provider_launch_attempted"] != true || invocation["provider_retry"] != recipes.ProviderRetryAllow ||
+			invocation["outcome"] != "completed" || invocation["rendered_prompt_digest"] != contracts.RawBytesDigest([]byte(calls[index].Prompt)) {
+			t.Fatalf("invocation %d = %#v", index+1, invocation)
+		}
+	}
+
+	bundleDir := filepath.Join(t.TempDir(), "portable-bundle")
+	exported, err := portable.Export(sessionDir, bundleDir, portable.Options{ConvoRelayVersion: "test"})
+	if err != nil {
+		t.Fatalf("portable export: %v", err)
+	}
+	for _, raw := range exported.Manifest["payload_inventory"].([]any) {
+		entry := raw.(map[string]any)
+		body, readErr := os.ReadFile(filepath.Join(exported.Directory, filepath.FromSlash(entry["path"].(string))))
+		if readErr != nil || strings.Contains(string(body), sessionDir) || strings.Contains(string(body), launchCWD) {
+			t.Fatalf("portable payload retained a required absolute path: %s, %v", entry["path"], readErr)
+		}
+	}
+	relocated := filepath.Join(t.TempDir(), "relocated-bundle")
+	if err := os.Rename(exported.Directory, relocated); err != nil {
+		t.Fatalf("relocate portable export: %v", err)
+	}
+	if err := os.RemoveAll(sessionDir); err != nil {
+		t.Fatalf("remove source session: %v", err)
+	}
+	verified, err := portable.VerifyDirectory(relocated)
+	if err != nil || verified["status"] != "valid" || verified["terminal_status"] != "completed" {
+		t.Fatalf("post-clean portable verification = %#v, %v", verified, err)
+	}
+	firstPayload := exported.Manifest["payload_inventory"].([]any)[0].(map[string]any)["path"].(string)
+	if err := os.WriteFile(filepath.Join(relocated, filepath.FromSlash(firstPayload)), []byte("{}"), 0o644); err != nil {
+		t.Fatalf("tamper portable payload: %v", err)
+	}
+	if _, err := portable.VerifyDirectory(relocated); err == nil {
+		t.Fatal("tampered portable export verified")
+	}
+}
+
+func TestRunRecipeContextOnlyWithoutBoundAuthorityFailsPurePreflight(t *testing.T) {
+	object, err := contracts.DecodeStrictJSONObjectBytes([]byte(rootRecipeTestBundle))
+	if err != nil {
+		t.Fatalf("decode bundle object: %v", err)
+	}
+	input := object["contracts"].(map[string]any)["neutral/contract-v1"].(map[string]any)["inputs"].(map[string]any)["payload"].(map[string]any)
+	input["required"] = false
+	encoded, err := contracts.CanonicalJSONBytes(object)
+	if err != nil {
+		t.Fatalf("encode bundle: %v", err)
+	}
+	bundle, err := integration.DecodeBundleBytes(encoded)
+	if err != nil {
+		t.Fatalf("decode optional-input bundle: %v", err)
+	}
+	sessionDir := filepath.Join(t.TempDir(), "session")
+	recorder := &rootBackendRecorder{}
+	_, err = RunRecipe(context.Background(), RecipeOptions{
+		SessionDir:        sessionDir,
+		Task:              "Fail without authority",
+		RecipeID:          "neutral-root",
+		InvestigationMode: investigationModeContextOnly,
+		LaunchCWD:         t.TempDir(),
+		RuntimeConfig:     rootRecipeRuntimeConfig("neutral/contract-v1"),
+		IntegrationBundle: bundle,
+		ReadinessCheck:    readyRootRecipeCheck,
+		backendFactory:    recorder.factory(),
+	})
+	assertRootRecipeDiagnostic(t, err, diagnosticCodePromptAuthority)
+	if len(recorder.snapshotCalls()) != 0 {
+		t.Fatalf("provider launched after pure preflight failure: %#v", recorder.snapshotCalls())
+	}
+	if _, statErr := os.Stat(sessionDir); !os.IsNotExist(statErr) {
+		t.Fatalf("session created after pure preflight failure: %v", statErr)
 	}
 }
 

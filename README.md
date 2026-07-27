@@ -334,6 +334,19 @@ convo-relay run "Evaluate the supplied records" \
 
 Root recipe mode uses the recipe's exact participant-turn schedule, optional fresh reducer, lifecycle minimum, named inputs, and declarative result contract. It has no compile-target flag because it always selects the root target. Ordinary runs and nested relay execution continue to use their existing paths.
 
+For contracts with named inputs, `--investigation context_only` accepts bound
+`--input name=path` values as its authority and records their stable names and
+artifact refs in `prompt-policy/v2`. This is provider guidance, not a sandbox or
+proof of provider behavior.
+
+Root recipes may set `provider_retry = "forbid"` to permit only one runner
+launch per provider invocation; omission preserves the legacy `allow` policy.
+Retries performed internally by a provider remain outside runner accounting.
+
+Integration bundle v2 adds a `prompt_context` projection. Participant history
+is complete; `facilitator_ledger = "trace_only"` retains facilitator artifacts
+while excluding that ledger from later participant and reducer prompts.
+
 Provider CLIs are trusted same-user processes. They run with the invoking user's authority and are not a sandbox or security boundary: they can access any source, session, credential, network, or other path the user can access. Named inputs are copied into the session and integrity-checked before and after every provider attempt, during recovery, and before result validation. Those copies are snapshots, not immutable or filesystem read-only objects; a provider can change them between checks, and orchestration detects that change at the next boundary.
 
 The `read_only` and `ephemeral` workspace policy names are compatibility and lifecycle values. Both execute in a writable, session-managed detached worktree. They neither make the filesystem read-only nor protect the source repository or session state from a same-user provider. Failed or interrupted worktrees remain registered for inspection until cleanup succeeds.
@@ -393,9 +406,20 @@ convo-relay show a1b2c3d4 --graph --json
 ```bash
 convo-relay export a1b2c3d4 -o transcript.md
 convo-relay export a1b2c3d4 --json -o result.json
+convo-relay export a1b2c3d4 --portable -o evidence-bundle --json
 ```
 
 `export` requires an explicit `-o` / `--output` path. Markdown exports include session status, incomplete state, task, session id, final ledger details, compact per-turn ledger counts, and transcript turns. JSON exports include the same structured session report as `show --json`, including diagnostics, and succeed for incomplete sessions when the partial transcript can be read.
+
+`--portable` is separate from those display exports. It accepts a terminal
+successor root session, validates its complete artifact-ref closure, and
+atomically publishes a new `relay-root-portable-export-v1` directory. The
+manifest binds canonical JSON payloads for the root projection, transcript,
+diagnostics, and every transitively referenced artifact. Source-session refs
+are rewritten to directory-local payload refs, and required absolute source,
+relay-home, session, retained-input, and worktree paths are omitted. Running,
+recovery-pending, v1, tampered, incomplete, or out-of-root sessions fail
+without publishing the final target.
 
 ### Check health
 
@@ -556,7 +580,8 @@ Then read /tmp/auth-review.md and summarize what each agent found.
 | `-v, --verbose` | run, resume | Print progress to stderr |
 | `-s, --stream` | run | Stream live subprocess stdout to stderr |
 | `-o, --output` | run, resume, export | Write an export to a specific file. Required for `export`; optional for `run` and `resume` |
-| `--json` | run, show, export, health, recipes, compile-recipe, backends, resume, contracts | Use JSON instead of markdown |
+| `--portable` | export | Write a complete terminal successor root session as a new portable directory |
+| `--json` | run, show, export, health, recipes, compile-recipe, backends, capabilities, resume, contracts | Use JSON instead of markdown |
 | `--status {usable,requires_integration,unavailable,invalid,skipped,all}` | recipes list | Filter recipes by catalog status |
 | `--view {all,declared,resolved}` | recipes show | Select declared and/or resolved recipe details |
 | `--target {root,child}` | compile-recipe | Select a recipe compile target; defaults to `child` |
@@ -573,6 +598,12 @@ Session separation is an organizational and provider-state boundary, not a
 security boundary. Backend processes run as the current user and retain that
 user's filesystem and network authority, including access to source and
 session paths outside the slot-scoped directories.
+
+Successor root runs persist `relay-workspace-isolation-v1`. The report names
+the observed inherited or detached-writable-worktree mechanism and records
+source separation and post-run mutation detection independently. It always
+reports filesystem, network, process, and same-user containment as `none`;
+an `ephemeral` policy label does not imply any of those controls.
 
 Each session is stored under `~/.codex-claude/sessions/<uuid>/`:
 

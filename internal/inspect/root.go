@@ -110,6 +110,7 @@ func BuildRootInspectionReport(sessionDir string, meta map[string]any, includeRa
 		contractID != "",
 	)
 	workspaceRef := addRoot("execution_workspace_ref", meta["execution_workspace_ref"], contracts.RootArtifactKindExecutionWorkspace, 0, true)
+	isolationRef := addRoot("isolation_report_ref", meta["isolation_report_ref"], contracts.RootArtifactKindIsolationReport, 0, meta["isolation_report_ref"] != nil)
 	rawResultRef := addRoot("raw_result_ref", meta["raw_result_ref"], contracts.RootArtifactKindRawResult, 0, false)
 	validationRef := addRoot("result_validation_ref", meta["result_validation_ref"], contracts.RootArtifactKindResultValidation, 0, validationStatus != "")
 	canonicalRef := addRoot("canonical_result_ref", meta["canonical_result_ref"], contracts.RootArtifactKindCanonicalResult, 0, validationStatus == "validated")
@@ -125,6 +126,11 @@ func BuildRootInspectionReport(sessionDir string, meta map[string]any, includeRa
 	latestReducerAttempt := inspectTypedRootRef(st, "latest_reducer_attempt_ref", meta["latest_reducer_attempt_ref"], contracts.RootArtifactKindReducerAttempt, ordinalFromRootRef(meta["latest_reducer_attempt_ref"], contracts.RootArtifactKindReducerAttempt), false, includeRaw)
 	inspected = append(inspected, latestReducerAttempt)
 	refs["latest_reducer_attempt_ref"] = latestReducerAttempt.status
+
+	renderedPromptItems, renderedPromptInspected := inspectRootRefList(st, "rendered_prompt_ref", meta["rendered_prompt_refs"], contracts.RootArtifactKindRenderedPrompt, includeRaw)
+	invocationItems, invocationInspected := inspectRootRefList(st, "invocation_ref", meta["invocation_refs"], contracts.RootArtifactKindProviderInvocation, includeRaw)
+	inspected = append(inspected, renderedPromptInspected...)
+	inspected = append(inspected, invocationInspected...)
 
 	checkpoints := rootCheckpointSummary(checkpointItems, checkpointInspected, latestCheckpoint)
 	inputs := namedInputIntegrity(st, manifestRef, contractID)
@@ -156,6 +162,7 @@ func BuildRootInspectionReport(sessionDir string, meta map[string]any, includeRa
 			"configured": valueOr(meta["participant_turns"], meta["rounds"]),
 			"completed":  valueOr(meta["participant_turns_completed"], meta["actual_participant_turns"]),
 		},
+		"prompt_policy": meta["prompt_policy"],
 		"result": map[string]any{
 			"source":                meta["result_source"],
 			"validation_status":     valueOr(meta["validation_status"], "pending"),
@@ -172,6 +179,21 @@ func BuildRootInspectionReport(sessionDir string, meta map[string]any, includeRa
 		"named_inputs":        inputs,
 		"artifact_refs":       refs,
 		"artifact_validation": rootArtifactValidationSummary(inspected, len(checkpointItems) > 0),
+	}
+	if providerRetry := strings.TrimSpace(stringFromAny(meta["provider_retry"])); providerRetry != "" {
+		result["provider_retry"] = providerRetry
+	}
+	if promptContext, ok := meta["prompt_context"].(map[string]any); ok {
+		result["prompt_context"] = promptContext
+	}
+	_, renderedPromptRefsExist := meta["rendered_prompt_refs"]
+	_, invocationRefsExist := meta["invocation_refs"]
+	if renderedPromptRefsExist || invocationRefsExist {
+		result["rendered_prompts"] = map[string]any{"count": len(renderedPromptItems), "refs": renderedPromptItems}
+		result["invocations"] = map[string]any{"count": len(invocationItems), "refs": invocationItems}
+	}
+	if isolationRef.payload != nil {
+		result["isolation_report"] = isolationRef.payload["isolation_report"]
 	}
 	return result
 }

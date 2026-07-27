@@ -1,0 +1,70 @@
+{
+  "schema_version": "relay-root-digest-fixtures-v1",
+  "cases": [
+    {
+      "id": "raw-newline",
+      "class": "raw-bytes",
+      "utf8": "prompt\n",
+      "digest": "sha256:2934d46a57407eb0d71f0ffd9dc3773905a1150aa2fd2ecf8947cb29b4218028"
+    },
+    {
+      "id": "semantic-members-and-unicode",
+      "class": "semantic-json",
+      "value": {
+        "storage_id": "semantic",
+        "path": "/still/semantic",
+        "created_at": "bound",
+        "nested": [100, "café", "<tag>&value", "line\nnext"]
+      },
+      "canonical": "{\"created_at\":\"bound\",\"nested\":[1e2,\"café\",\"<tag>&value\",\"line\\nnext\"],\"path\":\"/still/semantic\",\"storage_id\":\"semantic\"}",
+      "digest": "sha256:8215f2555a93eb0536259e81e6edcbc4ee46083ef6b2b8f702a8812378ffc3d2"
+    },
+    {
+      "id": "workspace-storage-envelope",
+      "class": "storage-envelope",
+      "kind": "execution_workspace",
+      "value": {
+        "kind": "execution_workspace",
+        "schema_version": 2,
+        "digest_profile": "relay-root-digests-v1",
+        "identity": {
+          "session_dir": "/runtime/session",
+          "worktree_path": "/runtime/worktree"
+        },
+        "base": {
+          "object_format": "sha1",
+          "head_commit": "0123456789abcdef"
+        },
+        "source": {
+          "git_root": "/runtime/source",
+          "launch_cwd": "/runtime/source/subdir",
+          "launch_subpath": "subdir"
+        }
+      },
+      "canonical": "{\"base\":{\"head_commit\":\"0123456789abcdef\",\"object_format\":\"sha1\"},\"digest_profile\":\"relay-root-digests-v1\",\"kind\":\"execution_workspace\",\"schema_version\":2,\"source\":{\"launch_subpath\":\"subdir\"}}",
+      "digest": "sha256:d00f450ac2a42ec0cdf2d51fb3198bb99b4f1d6524667d22752dc4c69c99f3c2"
+    },
+    {
+      "id": "semantic-exact-numbers-and-surrogates",
+      "class": "semantic-json",
+      "value": {
+        "numbers": [1.0000000000000000001, 12345678901234567890123],
+        "strings": {
+          "valid_astral": "\ud83d\ude00",
+          "escaped_lone_high": "\ud800",
+          "escaped_lone_low": "\udc00",
+          "line_separator": "\u2028",
+          "paragraph_separator": "\u2029"
+        },
+        "control": ["\b", "\f", "\u0001"]
+      },
+      "canonical": "{\"control\":[\"\\b\",\"\\f\",\"\\u0001\"],\"numbers\":[1.0000000000000000001,1.2345678901234567890123e22],\"strings\":{\"escaped_lone_high\":\"�\",\"escaped_lone_low\":\"�\",\"line_separator\":\"\\u2028\",\"paragraph_separator\":\"\\u2029\",\"valid_astral\":\"😀\"}}",
+      "digest": "sha256:e63a456ffc4e27aa756de708d5116f4bade8cd44263fb4aa5b92c585a832d01c"
+    }
+  ],
+  "equivalent_numbers": {
+    "json": ["1", "1.0", "1e0", "10e-1"],
+    "canonical": "1",
+    "digest": "sha256:6b86b273ff34fce19d6b804eff5a3f5747ada4eaa22f1d49c01e52ddb7875b4b"
+  }
+}
