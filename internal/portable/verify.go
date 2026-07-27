@@ -40,11 +40,15 @@ func VerifyDirectory(directory string) (map[string]any, error) {
 		if err != nil || !info.Mode().IsRegular() {
 			return nil, contracts.NewValidationError("portable export payload %s is missing or not a regular file", relative)
 		}
+		declaredSize := int64(entry["size_bytes"].(int))
+		if info.Size() != declaredSize {
+			return nil, contracts.NewValidationError("portable export payload %s size or digest mismatch", relative)
+		}
 		body, err := os.ReadFile(filename)
 		if err != nil {
 			return nil, err
 		}
-		if int64(len(body)) != int64(entry["size_bytes"].(int)) || contracts.RawBytesDigest(body) != entry["digest"] {
+		if int64(len(body)) != declaredSize || contracts.RawBytesDigest(body) != entry["digest"] {
 			return nil, contracts.NewValidationError("portable export payload %s size or digest mismatch", relative)
 		}
 		value, err := contracts.DecodeStrictJSONBytes(body)
