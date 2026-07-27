@@ -406,9 +406,20 @@ convo-relay show a1b2c3d4 --graph --json
 ```bash
 convo-relay export a1b2c3d4 -o transcript.md
 convo-relay export a1b2c3d4 --json -o result.json
+convo-relay export a1b2c3d4 --portable -o evidence-bundle --json
 ```
 
 `export` requires an explicit `-o` / `--output` path. Markdown exports include session status, incomplete state, task, session id, final ledger details, compact per-turn ledger counts, and transcript turns. JSON exports include the same structured session report as `show --json`, including diagnostics, and succeed for incomplete sessions when the partial transcript can be read.
+
+`--portable` is separate from those display exports. It accepts a terminal
+successor root session, validates its complete artifact-ref closure, and
+atomically publishes a new `relay-root-portable-export-v1` directory. The
+manifest binds canonical JSON payloads for the root projection, transcript,
+diagnostics, and every transitively referenced artifact. Source-session refs
+are rewritten to directory-local payload refs, and required absolute source,
+relay-home, session, retained-input, and worktree paths are omitted. Running,
+recovery-pending, v1, tampered, incomplete, or out-of-root sessions fail
+without publishing the final target.
 
 ### Check health
 
@@ -569,6 +580,7 @@ Then read /tmp/auth-review.md and summarize what each agent found.
 | `-v, --verbose` | run, resume | Print progress to stderr |
 | `-s, --stream` | run | Stream live subprocess stdout to stderr |
 | `-o, --output` | run, resume, export | Write an export to a specific file. Required for `export`; optional for `run` and `resume` |
+| `--portable` | export | Write a complete terminal successor root session as a new portable directory |
 | `--json` | run, show, export, health, recipes, compile-recipe, backends, resume, contracts | Use JSON instead of markdown |
 | `--status {usable,requires_integration,unavailable,invalid,skipped,all}` | recipes list | Filter recipes by catalog status |
 | `--view {all,declared,resolved}` | recipes show | Select declared and/or resolved recipe details |

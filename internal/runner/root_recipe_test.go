@@ -13,6 +13,7 @@ import (
 	"github.com/charlesnpx/convo-relay/internal/contracts"
 	"github.com/charlesnpx/convo-relay/internal/inspect"
 	"github.com/charlesnpx/convo-relay/internal/integration"
+	"github.com/charlesnpx/convo-relay/internal/portable"
 	"github.com/charlesnpx/convo-relay/internal/readiness"
 	"github.com/charlesnpx/convo-relay/internal/recipes"
 	"github.com/charlesnpx/convo-relay/internal/store"
@@ -297,6 +298,37 @@ func TestRunRecipeContextOnlyUsesPersistedNamedInputAuthority(t *testing.T) {
 			invocation["outcome"] != "completed" || invocation["rendered_prompt_digest"] != contracts.RawBytesDigest([]byte(calls[index].Prompt)) {
 			t.Fatalf("invocation %d = %#v", index+1, invocation)
 		}
+	}
+
+	bundleDir := filepath.Join(t.TempDir(), "portable-bundle")
+	exported, err := portable.Export(sessionDir, bundleDir, portable.Options{ConvoRelayVersion: "test"})
+	if err != nil {
+		t.Fatalf("portable export: %v", err)
+	}
+	for _, raw := range exported.Manifest["payload_inventory"].([]any) {
+		entry := raw.(map[string]any)
+		body, readErr := os.ReadFile(filepath.Join(exported.Directory, filepath.FromSlash(entry["path"].(string))))
+		if readErr != nil || strings.Contains(string(body), sessionDir) || strings.Contains(string(body), launchCWD) {
+			t.Fatalf("portable payload retained a required absolute path: %s, %v", entry["path"], readErr)
+		}
+	}
+	relocated := filepath.Join(t.TempDir(), "relocated-bundle")
+	if err := os.Rename(exported.Directory, relocated); err != nil {
+		t.Fatalf("relocate portable export: %v", err)
+	}
+	if err := os.RemoveAll(sessionDir); err != nil {
+		t.Fatalf("remove source session: %v", err)
+	}
+	verified, err := portable.VerifyDirectory(relocated)
+	if err != nil || verified["status"] != "valid" || verified["terminal_status"] != "completed" {
+		t.Fatalf("post-clean portable verification = %#v, %v", verified, err)
+	}
+	firstPayload := exported.Manifest["payload_inventory"].([]any)[0].(map[string]any)["path"].(string)
+	if err := os.WriteFile(filepath.Join(relocated, filepath.FromSlash(firstPayload)), []byte("{}"), 0o644); err != nil {
+		t.Fatalf("tamper portable payload: %v", err)
+	}
+	if _, err := portable.VerifyDirectory(relocated); err == nil {
+		t.Fatal("tampered portable export verified")
 	}
 }
 

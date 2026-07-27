@@ -57,3 +57,34 @@ bytes and digest values.
 
 The Go tests and the small Node verifier consume the same fixture file at
 `testdata/contracts/relay-root-digests-v1.json`.
+
+## `relay-root-portable-export-v1`
+
+A portable export is a closed directory containing `manifest.json` and only
+the JSON files named by its ascending `payload_inventory` under
+`payloads/<kind>/<portable-id>.json`. Each inventory entry records its type,
+portable id, relative path, byte count, `raw-bytes` digest, media type, and the
+path-safe source artifact id when the payload originated in the session.
+
+The manifest records the relay version, digest profile, terminal status and
+stop reason, and the inventory paths for the portable root projection,
+participant transcript, and diagnostics. `inventory_digest` is the
+`semantic-json` digest of the complete ordered inventory. `manifest_digest`
+is the `semantic-json` digest of the manifest with only `manifest_digest`
+removed. Payload files use the released canonical JSON representation so
+legacy numeric spellings remain verifiable.
+
+Source artifact refs are resolved and digest-checked before export, then
+rewritten as `{ "kind": "portable_payload_ref", "portable_id": "..." }`.
+Portable payload identity omits these runtime-only fields:
+
+- execution-workspace identity, source Git root, and source launch CWD;
+- named-input source paths and retained-input directory/materialized paths;
+- runtime-snapshot settings path and input/transient-source paths; and
+- provider-state CWD and settings path.
+
+All other semantic content remains bound. A verifier rejects unknown manifest
+fields, unsupported versions or digest profiles, duplicate ids or paths,
+unlisted files, symlinks, missing payload links, source-session artifact refs,
+and byte-count or digest mismatches. Verification uses no source-session path,
+so relocation and source cleanup do not affect the result.

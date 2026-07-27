@@ -22,6 +22,7 @@ import (
 	"github.com/charlesnpx/convo-relay/internal/graph"
 	"github.com/charlesnpx/convo-relay/internal/inspect"
 	"github.com/charlesnpx/convo-relay/internal/integration"
+	"github.com/charlesnpx/convo-relay/internal/portable"
 	"github.com/charlesnpx/convo-relay/internal/readiness"
 	"github.com/charlesnpx/convo-relay/internal/recipes"
 	"github.com/charlesnpx/convo-relay/internal/runner"
@@ -608,6 +609,7 @@ func runExport(args []string) {
 	sessionID := flags.String("session-id", "", "Session id or prefix under --home")
 	relayHome := flags.String("home", "", "Optional relay home; defaults to CODEX_CLAUDE_HOME or ~/.codex-claude")
 	jsonOutput := flags.Bool("json", false, "Write structured JSON instead of markdown")
+	portableOutput := flags.Bool("portable", false, "Write a complete portable root-session directory")
 	output := ""
 	flags.StringVar(&output, "output", "", "Output path")
 	flags.StringVar(&output, "o", "", "Alias for --output")
@@ -622,6 +624,24 @@ func runExport(args []string) {
 		os.Exit(2)
 	}
 	resolvedSessionDir := resolveSessionDirOrExit(*sessionDir, *sessionID, *relayHome)
+	if *portableOutput {
+		result, err := portable.Export(resolvedSessionDir, output, portable.Options{ConvoRelayVersion: cliVersion})
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "error: %s\n", err)
+			os.Exit(1)
+		}
+		if *jsonOutput {
+			writeJSON(map[string]any{
+				"output":          result.Directory,
+				"schema_version":  result.Manifest["schema_version"],
+				"manifest_digest": result.Manifest["manifest_digest"],
+				"terminal_status": result.Manifest["terminal_status"],
+			})
+			return
+		}
+		fmt.Printf("Exported portable root session to %s\n", result.Directory)
+		return
+	}
 	report, err := inspect.BuildExportReport(resolvedSessionDir, *jsonOutput)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error: %s\n", err)
@@ -1742,6 +1762,7 @@ func usage() {
 	fmt.Fprintln(os.Stderr, "  convo-relay list --home <relay-home> --json")
 	fmt.Fprintln(os.Stderr, "  convo-relay show <session-id-prefix> --json")
 	fmt.Fprintln(os.Stderr, "  convo-relay export <session-id-prefix> -o transcript.md")
+	fmt.Fprintln(os.Stderr, "  convo-relay export <session-id-prefix> --portable -o bundle-directory --json")
 	fmt.Fprintln(os.Stderr, "  convo-relay health [session-id-prefix] --json")
 	fmt.Fprintln(os.Stderr, "  convo-relay recipes list --json")
 	fmt.Fprintln(os.Stderr, "  convo-relay recipes show review-panel")

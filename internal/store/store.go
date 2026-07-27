@@ -103,6 +103,12 @@ func (s *Store) ArtifactIndex() map[string]any {
 	return index
 }
 
+// LoadArtifactIndexStrict returns an error instead of replacing malformed or
+// missing index state with the ordinary empty projection.
+func (s *Store) LoadArtifactIndexStrict() (map[string]any, error) {
+	return s.loadArtifactIndexStrict()
+}
+
 func (s *Store) LoadGraph() map[string]any {
 	return s.loadGraph()
 }
