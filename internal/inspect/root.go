@@ -110,6 +110,7 @@ func BuildRootInspectionReport(sessionDir string, meta map[string]any, includeRa
 		contractID != "",
 	)
 	workspaceRef := addRoot("execution_workspace_ref", meta["execution_workspace_ref"], contracts.RootArtifactKindExecutionWorkspace, 0, true)
+	isolationRef := addRoot("isolation_report_ref", meta["isolation_report_ref"], contracts.RootArtifactKindIsolationReport, 0, meta["isolation_report_ref"] != nil)
 	rawResultRef := addRoot("raw_result_ref", meta["raw_result_ref"], contracts.RootArtifactKindRawResult, 0, false)
 	validationRef := addRoot("result_validation_ref", meta["result_validation_ref"], contracts.RootArtifactKindResultValidation, 0, validationStatus != "")
 	canonicalRef := addRoot("canonical_result_ref", meta["canonical_result_ref"], contracts.RootArtifactKindCanonicalResult, 0, validationStatus == "validated")
@@ -188,6 +189,9 @@ func BuildRootInspectionReport(sessionDir string, meta map[string]any, includeRa
 	if _, exists := meta["invocation_refs"]; exists {
 		result["rendered_prompts"] = map[string]any{"count": len(renderedPromptItems), "refs": renderedPromptItems}
 		result["invocations"] = map[string]any{"count": len(invocationItems), "refs": invocationItems}
+	}
+	if isolationRef.payload != nil {
+		result["isolation_report"] = isolationRef.payload["isolation_report"]
 	}
 	return result
 }

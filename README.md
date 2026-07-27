@@ -587,6 +587,12 @@ security boundary. Backend processes run as the current user and retain that
 user's filesystem and network authority, including access to source and
 session paths outside the slot-scoped directories.
 
+Successor root runs persist `relay-workspace-isolation-v1`. The report names
+the observed inherited or detached-writable-worktree mechanism and records
+source separation and post-run mutation detection independently. It always
+reports filesystem, network, process, and same-user containment as `none`;
+an `ephemeral` policy label does not imply any of those controls.
+
 Each session is stored under `~/.codex-claude/sessions/<uuid>/`:
 
 ```

@@ -63,6 +63,7 @@ var rootArtifactV2OnlyFields = map[string]bool{
 	"provider_retry":          true,
 	"prompt_context":          true,
 	"invocation":              true,
+	"isolation_report":        true,
 	"rendered_prompt":         true,
 	"rendered_prompt_refs":    true,
 	"root_session_result_ref": true,

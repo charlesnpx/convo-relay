@@ -325,6 +325,7 @@ func preflightRecipe(ctx context.Context, opts RecipeOptions) (*recipePreflight,
 		AllowDirtySource:  opts.AllowDirtySource,
 		InventoryMaxFiles: runtimeConfig.EffectiveLimits().RepositoryInventoryMaxFiles,
 		InventoryMaxBytes: runtimeConfig.EffectiveLimits().RepositoryInventoryMaxBytes,
+		ArtifactVersion:   rootWorkspaceArtifactVersion(rootPlan, promptPolicy),
 	})
 	if err != nil {
 		return nil, err
@@ -763,7 +764,18 @@ func rootRecipeMeta(preflight *recipePreflight, persisted *persistedRecipeRun) (
 	if promptContext, represented := preflight.rootPlan["prompt_context"]; represented {
 		meta["prompt_context"] = promptContext
 	}
+	if isolationRef, represented := persisted.workspaceArtifact["isolation_report_ref"]; represented {
+		meta["isolation_report_ref"] = isolationRef
+	}
 	return model.NewSessionMeta(meta), nil
+}
+
+func rootWorkspaceArtifactVersion(rootPlan map[string]any, promptPolicy PromptPolicy) int {
+	if intFromAny(rootPlan["schema_version"], contracts.RootArtifactSchemaVersion) == contracts.RootArtifactSchemaVersionV2 ||
+		promptPolicy.Version == PromptPolicyVersionV2 {
+		return contracts.RootArtifactSchemaVersionV2
+	}
+	return contracts.RootArtifactSchemaVersion
 }
 
 func rootRecipeStartEvent(preflight *recipePreflight, persisted *persistedRecipeRun) map[string]any {

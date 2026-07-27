@@ -269,6 +269,10 @@ func TestRunRecipeContextOnlyUsesPersistedNamedInputAuthority(t *testing.T) {
 	if report["prompt_policy"].(map[string]any)["schema_version"] != PromptPolicyVersionV2 {
 		t.Fatalf("inspection prompt policy = %#v", report["prompt_policy"])
 	}
+	isolation := report["isolation_report"].(map[string]any)
+	if result["isolation_report_ref"] == nil || isolation["mechanism"] != "inherited" || isolation["filesystem_containment"] != "none" {
+		t.Fatalf("successor isolation projection = %#v", isolation)
+	}
 
 	calls := recorder.snapshotCalls()
 	invocationRefs := result["invocation_refs"].([]any)

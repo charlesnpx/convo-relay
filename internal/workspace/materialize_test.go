@@ -32,6 +32,7 @@ func TestMaterializeRequiredPoliciesCreateVerifiedDetachedWorktreeAndArtifact(t 
 				SessionPathSource: SessionPathExplicit,
 				MinimumPolicy:     policy,
 				AllowDirtySource:  true,
+				ArtifactVersion:   contracts.RootArtifactSchemaVersionV2,
 			})
 			if snapshot.HeadCommit() != originalHead {
 				t.Fatalf("snapshot HEAD = %s, want %s", snapshot.HeadCommit(), originalHead)
@@ -113,6 +114,15 @@ func TestMaterializeRequiredPoliciesCreateVerifiedDetachedWorktreeAndArtifact(t 
 			if materialized.ArtifactRef["id"] != "execution_workspace:selected" {
 				t.Fatalf("artifact ref = %#v", materialized.ArtifactRef)
 			}
+			isolationRef := requireObjectField(t, materialized.Artifact, "isolation_report_ref")
+			isolationPayload, err := st.LoadArtifactPayloadRaw(isolationRef)
+			if err != nil {
+				t.Fatalf("load isolation report: %v", err)
+			}
+			report, err := contracts.ValidateWorkspaceIsolationReportRecord(isolationPayload["isolation_report"])
+			if err != nil || report["mechanism"] != "detached_writable_git_worktree" || report["source_copy_separation"] != "yes" || report["source_write_control"] != "post_run_detection" || report["filesystem_containment"] != "none" {
+				t.Fatalf("isolation report = %#v, %v", report, err)
+			}
 
 			// Returned maps are snapshots rather than aliases of store state.
 			materialized.Artifact["source_before_digest"] = "changed"
@@ -155,7 +165,7 @@ func TestMaterializeInheritedPersistsOrdinaryWorkspaceWithoutWorktree(t *testing
 	root := newCommittedRepo(t)
 	writeTestFile(t, filepath.Join(root, "committed.txt"), []byte("ordinary dirty bytes\n"), 0o644)
 	sessionDir := filepath.Join(t.TempDir(), "session")
-	snapshot := mustPreflight(t, Options{LaunchCWD: root, SessionDir: sessionDir})
+	snapshot := mustPreflight(t, Options{LaunchCWD: root, SessionDir: sessionDir, ArtifactVersion: contracts.RootArtifactSchemaVersionV2})
 
 	materialized, err := Materialize(context.Background(), store.New(sessionDir), snapshot)
 	if err != nil {
@@ -180,6 +190,15 @@ func TestMaterializeInheritedPersistsOrdinaryWorkspaceWithoutWorktree(t *testing
 	if err := verifyWorkspaceIdentity(materialized.Artifact); err != nil {
 		t.Fatalf("verify inherited identity: %v", err)
 	}
+	isolationRef := requireObjectField(t, materialized.Artifact, "isolation_report_ref")
+	isolationPayload, err := store.New(sessionDir).LoadArtifactPayloadRaw(isolationRef)
+	if err != nil {
+		t.Fatalf("load inherited isolation report: %v", err)
+	}
+	report, err := contracts.ValidateWorkspaceIsolationReportRecord(isolationPayload["isolation_report"])
+	if err != nil || report["mechanism"] != "inherited" || report["source_copy_separation"] != "no" || report["filesystem_containment"] != "none" {
+		t.Fatalf("inherited isolation report = %#v, %v", report, err)
+	}
 }
 
 func TestMaterializeInheritedAllowsNonGitWorkspace(t *testing.T) {
@@ -196,6 +215,9 @@ func TestMaterializeInheritedAllowsNonGitWorkspace(t *testing.T) {
 	base := requireObjectField(t, materialized.Artifact, "base")
 	if base["repository_state"] != "non_git" {
 		t.Fatalf("non-Git base = %#v", base)
+	}
+	if intFromWorkspaceAny(materialized.Artifact["schema_version"]) != contracts.RootArtifactSchemaVersion || materialized.Artifact["isolation_report_ref"] != nil {
+		t.Fatalf("ordinary workspace gained successor fields: %#v", materialized.Artifact)
 	}
 }
 
