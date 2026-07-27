@@ -147,7 +147,7 @@ func TestBundleEnvelopeAndNestedUnknownFieldsAreRejected(t *testing.T) {
 		code   string
 	}{
 		{name: "unknown envelope field", mutate: func(bundle map[string]any) { bundle["command"] = "run" }, code: DiagnosticCodeInvalidBundle},
-		{name: "wrong version", mutate: func(bundle map[string]any) { bundle["schema_version"] = "relay-integration-bundle-v2" }, code: DiagnosticCodeInvalidBundle},
+		{name: "unknown version", mutate: func(bundle map[string]any) { bundle["schema_version"] = "relay-integration-bundle-v3" }, code: contracts.DiagnosticCodeUnsupportedContractVersion},
 		{name: "empty id", mutate: func(bundle map[string]any) { bundle["id"] = " " }, code: DiagnosticCodeInvalidBundle},
 		{name: "empty contracts", mutate: func(bundle map[string]any) { bundle["contracts"] = map[string]any{} }, code: DiagnosticCodeInvalidBundle},
 		{name: "contracts array", mutate: func(bundle map[string]any) { bundle["contracts"] = []any{} }, code: DiagnosticCodeInvalidBundle},
@@ -162,6 +162,70 @@ func TestBundleEnvelopeAndNestedUnknownFieldsAreRejected(t *testing.T) {
 			test.mutate(object)
 			_, err := DecodeBundleBytes(encodeJSON(t, object))
 			assertDiagnostic(t, err, test.code, contracts.DiagnosticPhasePreflight)
+		})
+	}
+}
+
+func TestBundleVersionDispatchPreservesV1AndNormalizesV2PromptContext(t *testing.T) {
+	v1 := validBundleObject(t)
+	firstContract(v1)["prompt_context"] = map[string]any{
+		"participant_transcript": ParticipantTranscriptComplete,
+		"facilitator_ledger":     FacilitatorLedgerTraceOnly,
+	}
+	_, err := DecodeBundleBytes(encodeJSON(t, v1))
+	assertDiagnostic(t, err, DiagnosticCodeInvalidBundle, contracts.DiagnosticPhasePreflight)
+
+	v2Default := validBundleObject(t)
+	v2Default["schema_version"] = BundleSchemaVersionV2
+	bundle, err := DecodeBundleBytes(encodeJSON(t, v2Default))
+	if err != nil {
+		t.Fatalf("decode v2 defaults: %v", err)
+	}
+	if bundle.SchemaVersion() != BundleSchemaVersionV2 {
+		t.Fatalf("bundle version = %q", bundle.SchemaVersion())
+	}
+	projection := firstContract(bundle.ToMap())["prompt_context"].(map[string]any)
+	wantDefault := map[string]any{
+		"participant_transcript": ParticipantTranscriptComplete,
+		"facilitator_ledger":     FacilitatorLedgerInclude,
+	}
+	if !reflect.DeepEqual(projection, wantDefault) {
+		t.Fatalf("default prompt context = %#v, want %#v", projection, wantDefault)
+	}
+
+	v2Explicit := validBundleObject(t)
+	v2Explicit["schema_version"] = BundleSchemaVersionV2
+	firstContract(v2Explicit)["prompt_context"] = map[string]any{
+		"participant_transcript": ParticipantTranscriptComplete,
+		"facilitator_ledger":     FacilitatorLedgerTraceOnly,
+	}
+	bundle, err = DecodeBundleBytes(encodeJSON(t, v2Explicit))
+	if err != nil {
+		t.Fatalf("decode explicit v2: %v", err)
+	}
+	turns, _ := AlternatingSchedule(2)
+	selected, err := SelectContract(bundle, "neutral/contract-v1", ScheduleRequirement{Turns: turns, ResultSource: ResultSourceReducer})
+	if err != nil {
+		t.Fatalf("select explicit v2: %v", err)
+	}
+	if selected.BundleVersion() != BundleSchemaVersionV2 || selected.PromptContext().FacilitatorLedger != FacilitatorLedgerTraceOnly {
+		t.Fatalf("selected v2 projection = %#v", selected.PromptContext())
+	}
+
+	for field, value := range map[string]any{
+		"participant_transcript": "summary",
+		"facilitator_ledger":     "omit",
+	} {
+		t.Run("unknown_"+field, func(t *testing.T) {
+			invalid := validBundleObject(t)
+			invalid["schema_version"] = BundleSchemaVersionV2
+			firstContract(invalid)["prompt_context"] = map[string]any{
+				"participant_transcript": ParticipantTranscriptComplete,
+				"facilitator_ledger":     FacilitatorLedgerInclude,
+			}
+			firstContract(invalid)["prompt_context"].(map[string]any)[field] = value
+			_, err := DecodeBundleBytes(encodeJSON(t, invalid))
+			assertDiagnostic(t, err, DiagnosticCodeInvalidBundle, contracts.DiagnosticPhasePreflight)
 		})
 	}
 }

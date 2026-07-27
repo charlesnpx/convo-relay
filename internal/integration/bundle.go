@@ -3,7 +3,6 @@ package integration
 import (
 	"crypto/sha256"
 	"encoding/hex"
-	"fmt"
 	"math"
 	"path/filepath"
 	"sort"
@@ -66,7 +65,7 @@ func SelectContract(bundle *Bundle, contractID string, requirement ScheduleRequi
 	if err := validateContractSchedule(contractID, contract, requirement); err != nil {
 		return nil, err
 	}
-	selected := &SelectedContract{id: contractID, contract: contract}
+	selected := &SelectedContract{id: contractID, contract: contract, bundleVersion: bundle.schemaVersion}
 	if err := validateAssertionDeclarations(selected); err != nil {
 		return nil, err
 	}
@@ -88,16 +87,16 @@ func normalizeBundle(object map[string]any) (*Bundle, error) {
 	if err := rejectUnknownFields(object, []string{"schema_version", "id", "contracts"}, "", "integration bundle", DiagnosticCodeInvalidBundle); err != nil {
 		return nil, err
 	}
-	version, err := requireString(object, "schema_version", "", false, DiagnosticCodeInvalidBundle)
+	version, err := contracts.RequireStringVersion(object, contracts.ContractIntegrationBundle)
 	if err != nil {
-		return nil, err
-	}
-	if version != BundleSchemaVersion {
 		return nil, preflightError(
-			DiagnosticCodeInvalidBundle,
+			contracts.DiagnosticCodeUnsupportedContractVersion,
 			"/schema_version",
-			fmt.Sprintf("schema_version must be %s.", BundleSchemaVersion),
-			map[string]any{"schema_version": version},
+			"Unsupported integration bundle schema version.",
+			map[string]any{
+				"observed":  object["schema_version"],
+				"supported": []any{BundleSchemaVersionV1, BundleSchemaVersionV2},
+			},
 		)
 	}
 	bundleID, err := requireString(object, "id", "", false, DiagnosticCodeInvalidBundle)
@@ -113,7 +112,7 @@ func normalizeBundle(object map[string]any) (*Bundle, error) {
 	}
 
 	bundle := &Bundle{
-		schemaVersion: BundleSchemaVersion,
+		schemaVersion: version,
 		id:            bundleID,
 		contracts:     make(map[string]*Contract, len(contractObjects)),
 	}
@@ -126,7 +125,7 @@ func normalizeBundle(object map[string]any) (*Bundle, error) {
 		if !ok {
 			return nil, preflightError(DiagnosticCodeInvalidBundle, path, "Integration contract must be an object.", nil)
 		}
-		contract, err := normalizeContract(contractObject, path)
+		contract, err := normalizeContract(contractObject, path, version)
 		if err != nil {
 			return nil, err
 		}
@@ -140,8 +139,12 @@ func normalizeBundle(object map[string]any) (*Bundle, error) {
 	return bundle, nil
 }
 
-func normalizeContract(object map[string]any, path string) (*Contract, error) {
-	if err := rejectUnknownFields(object, []string{"turns", "reducer", "inputs", "result"}, path, "integration contract", DiagnosticCodeInvalidBundle); err != nil {
+func normalizeContract(object map[string]any, path string, bundleVersion string) (*Contract, error) {
+	allowed := []string{"turns", "reducer", "inputs", "result"}
+	if bundleVersion == BundleSchemaVersionV2 {
+		allowed = append(allowed, "prompt_context")
+	}
+	if err := rejectUnknownFields(object, allowed, path, "integration contract", DiagnosticCodeInvalidBundle); err != nil {
 		return nil, err
 	}
 	turnValues, err := requireArray(object, "turns", path, DiagnosticCodeInvalidBundle)
@@ -221,7 +224,60 @@ func normalizeContract(object map[string]any, path string) (*Contract, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Contract{Turns: turns, Reducer: reducer, Inputs: inputs, Result: result}, nil
+	promptContext := PromptContextProjection{
+		SchemaVersion:         PromptContextPolicyVersion,
+		ParticipantTranscript: ParticipantTranscriptComplete,
+		FacilitatorLedger:     FacilitatorLedgerInclude,
+	}
+	if rawProjection, exists := object["prompt_context"]; exists {
+		projectionObject, ok := rawProjection.(map[string]any)
+		if !ok {
+			return nil, preflightError(DiagnosticCodeInvalidBundle, appendPointer(path, "prompt_context"), "prompt_context must be an object.", nil)
+		}
+		promptContext, err = normalizePromptContext(projectionObject, appendPointer(path, "prompt_context"))
+		if err != nil {
+			return nil, err
+		}
+	}
+	return &Contract{Turns: turns, Reducer: reducer, Inputs: inputs, Result: result, PromptContext: promptContext}, nil
+}
+
+func normalizePromptContext(object map[string]any, path string) (PromptContextProjection, error) {
+	if err := rejectUnknownFields(object, []string{"participant_transcript", "facilitator_ledger"}, path, "prompt context projection", DiagnosticCodeInvalidBundle); err != nil {
+		return PromptContextProjection{}, err
+	}
+	version := PromptContextPolicyVersion
+	participantTranscript := ParticipantTranscriptComplete
+	if raw, exists := object["participant_transcript"]; exists {
+		value, ok := raw.(string)
+		if !ok || value != ParticipantTranscriptComplete {
+			return PromptContextProjection{}, preflightError(
+				DiagnosticCodeInvalidBundle,
+				appendPointer(path, "participant_transcript"),
+				"participant_transcript must be complete.",
+				map[string]any{"participant_transcript": raw},
+			)
+		}
+		participantTranscript = value
+	}
+	facilitatorLedger := FacilitatorLedgerInclude
+	if raw, exists := object["facilitator_ledger"]; exists {
+		value, ok := raw.(string)
+		if !ok || (value != FacilitatorLedgerInclude && value != FacilitatorLedgerTraceOnly) {
+			return PromptContextProjection{}, preflightError(
+				DiagnosticCodeInvalidBundle,
+				appendPointer(path, "facilitator_ledger"),
+				"facilitator_ledger must be include or trace_only.",
+				map[string]any{"facilitator_ledger": raw},
+			)
+		}
+		facilitatorLedger = value
+	}
+	return PromptContextProjection{
+		SchemaVersion:         version,
+		ParticipantTranscript: participantTranscript,
+		FacilitatorLedger:     facilitatorLedger,
+	}, nil
 }
 
 // integrationSemanticDigest hashes every field in a normalized integration

@@ -79,8 +79,11 @@ func (s *Store) SaveContractArtifact(category string, artifactID string, payload
 	if payload == nil {
 		return nil, contracts.NewValidationError("contract artifact payload must be an object")
 	}
-	if !schemaVersionOne(payload["schema_version"]) || payload["kind"] == nil {
-		return nil, contracts.NewValidationError("contract artifact payload must declare kind and schema_version 1")
+	if payload["kind"] == nil {
+		return nil, contracts.NewValidationError("contract artifact payload must declare kind")
+	}
+	if _, err := contracts.RequireNumericVersion(payload, contracts.ContractRootArtifact); err != nil {
+		return nil, err
 	}
 	return s.saveIndexedArtifact(category, artifactID, payload, refID)
 }
