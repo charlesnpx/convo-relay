@@ -102,7 +102,7 @@ func ContractDigest(value any) (string, error) {
 }
 
 func ArtifactRefForPayload(artifactID string, payload any) (map[string]any, error) {
-	digest, err := ContractDigest(payload)
+	digest, err := PayloadDigest(payload)
 	if err != nil {
 		return nil, err
 	}

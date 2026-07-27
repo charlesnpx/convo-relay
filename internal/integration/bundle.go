@@ -69,7 +69,7 @@ func SelectContract(bundle *Bundle, contractID string, requirement ScheduleRequi
 	if err := validateAssertionDeclarations(selected); err != nil {
 		return nil, err
 	}
-	digest, err := integrationSemanticDigest(selected.ToMap())
+	digest, err := integrationSemanticDigestForVersion(selected.ToMap(), selected.bundleVersion)
 	if err != nil {
 		return nil, wrapPreflightError(
 			err,
@@ -131,7 +131,7 @@ func normalizeBundle(object map[string]any) (*Bundle, error) {
 		}
 		bundle.contracts[contractID] = contract
 	}
-	digest, err := integrationSemanticDigest(bundle.ToMap())
+	digest, err := integrationSemanticDigestForVersion(bundle.ToMap(), bundle.schemaVersion)
 	if err != nil {
 		return nil, wrapPreflightError(err, DiagnosticCodeInvalidBundle, "", "Integration bundle could not be hashed.", nil)
 	}
@@ -291,6 +291,13 @@ func integrationSemanticDigest(value any) (string, error) {
 	}
 	sum := sha256.Sum256(canonical)
 	return contracts.DigestPrefix + hex.EncodeToString(sum[:]), nil
+}
+
+func integrationSemanticDigestForVersion(value any, version string) (string, error) {
+	if version == BundleSchemaVersionV2 {
+		return contracts.SemanticJSONDigest(value)
+	}
+	return integrationSemanticDigest(value)
 }
 
 func normalizeTurn(object map[string]any, path string) (TurnDeclaration, error) {

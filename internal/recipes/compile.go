@@ -231,7 +231,7 @@ func compileChildPlan(
 		return nil, err
 	}
 
-	recipeDigest, err := contracts.ContractDigest(recipePayload)
+	recipeDigest, err := contracts.PayloadDigest(recipePayload)
 	if err != nil {
 		return nil, err
 	}
@@ -539,7 +539,7 @@ func BuildCompileReport(
 	if err != nil {
 		return nil, err
 	}
-	compiledDigest, err := contracts.ContractDigest(compiled)
+	compiledDigest, err := contracts.PayloadDigest(compiled)
 	if err != nil {
 		return nil, err
 	}

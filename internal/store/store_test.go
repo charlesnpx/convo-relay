@@ -55,6 +55,7 @@ func TestSaveContractArtifactAcceptsExplicitRegisteredV2Envelope(t *testing.T) {
 	payload := map[string]any{
 		"kind":                  contracts.RootArtifactKindRootRecipePlan,
 		"schema_version":        2,
+		"digest_profile":        contracts.DigestProfileV1,
 		"prompt_policy_version": contracts.PromptPolicyV2,
 	}
 	ref, err := st.SaveContractArtifact("root_recipe_plan", "selected", payload, "root_recipe_plan:selected")

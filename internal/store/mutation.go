@@ -468,7 +468,7 @@ func (snapshot artifactWriteRollbackFile) restore(s *Store) error {
 
 func (s *Store) artifactWritePath(stableRelPath string, payload map[string]any) (string, error) {
 	stablePath := filepath.Join(s.Root, filepath.FromSlash(stableRelPath))
-	payloadDigest, err := contracts.ContractDigest(payload)
+	payloadDigest, err := contracts.PayloadDigest(payload)
 	if err != nil {
 		return "", err
 	}

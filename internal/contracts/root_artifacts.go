@@ -104,6 +104,11 @@ func NormalizeRootArtifactVersion(kind string, version int, fields map[string]an
 		if err := rejectRootArtifactV2Fields(kind, result); err != nil {
 			return nil, err
 		}
+	} else {
+		if declared, exists := result["digest_profile"]; exists && declared != DigestProfileV1 {
+			return nil, NewValidationError("%s schema_version 2 requires digest_profile %s", kind, DigestProfileV1)
+		}
+		result["digest_profile"] = DigestProfileV1
 	}
 	result["kind"] = kind
 	result["schema_version"] = version
@@ -133,6 +138,8 @@ func ValidateRootArtifact(value any, expectedKind string) (map[string]any, error
 		if err := rejectRootArtifactV2Fields(kind, object); err != nil {
 			return nil, err
 		}
+	} else if object["digest_profile"] != DigestProfileV1 {
+		return nil, NewValidationError("%s schema_version 2 requires digest_profile %s", kind, DigestProfileV1)
 	}
 	object["kind"] = kind
 	object["schema_version"] = version
@@ -187,7 +194,7 @@ func ValidateRootArtifactRef(ref any, kind string, ordinal int, payload any) (ma
 	if artifactRef["id"] != identity.RefID {
 		return nil, NewValidationError("root artifact ref id must be %s", identity.RefID)
 	}
-	digest, err := ContractDigest(normalized)
+	digest, err := PayloadDigest(normalized)
 	if err != nil {
 		return nil, err
 	}
