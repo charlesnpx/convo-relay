@@ -965,12 +965,15 @@ func (s *rootExecutionState) repairPendingProviderInvocations(markers []rootProv
 			return err
 		}
 		s.meta = withRootInvocationRef(s.meta, ref)
-		if marker.ProviderInvocationRef == nil {
-			if err := s.updateProviderAttemptMarkerByIdentity(marker.InvocationID, marker.RunnerAttempt, marker.ArtifactOrdinal, func(item *rootProviderAttemptMarker) {
-				item.ProviderInvocationRef = cloneMap(ref)
-			}); err != nil {
-				return err
-			}
+		if err := s.updateProviderAttemptMarkerByIdentity(marker.InvocationID, marker.RunnerAttempt, marker.ArtifactOrdinal, func(item *rootProviderAttemptMarker) {
+			item.CompletedAt = marker.CompletedAt
+			item.Outcome = marker.Outcome
+			item.FailureStage = marker.FailureStage
+			item.Classification = marker.Classification
+			item.ProviderResultRef = cloneMap(marker.ProviderResultRef)
+			item.ProviderInvocationRef = cloneMap(ref)
+		}); err != nil {
+			return err
 		}
 	}
 	progress, err := validatePersistedRootInvocationRecords(s.st, s.meta)

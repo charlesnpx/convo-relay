@@ -255,6 +255,32 @@ func TestVerifyExportJSONReportsPortableV2(t *testing.T) {
 	}
 }
 
+func TestVerifyExportJSONFailureIsMachineReadable(t *testing.T) {
+	binary := filepath.Join(t.TempDir(), "convo-relay")
+	build := exec.Command("go", "build", "-o", binary, ".")
+	if output, err := build.CombinedOutput(); err != nil {
+		t.Fatalf("build CLI: %v\n%s", err, output)
+	}
+
+	command := exec.Command(binary, "verify-export", t.TempDir(), "--json")
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	command.Stdout = &stdout
+	command.Stderr = &stderr
+	err := command.Run()
+	var exitErr *exec.ExitError
+	if !errors.As(err, &exitErr) || exitErr.ExitCode() != 1 {
+		t.Fatalf("verify-export invalid exit = %v, stdout=%q, stderr=%q", err, stdout.String(), stderr.String())
+	}
+	if stderr.Len() != 0 {
+		t.Fatalf("verify-export invalid stderr = %q", stderr.String())
+	}
+	report := decodeJSONObject(t, stdout.String())
+	if report["schema_version"] != contracts.PortableExportV2 || report["status"] != "invalid" || strings.TrimSpace(stringValue(report["error"])) == "" {
+		t.Fatalf("verify-export invalid report = %#v", report)
+	}
+}
+
 func TestBackendsStatusProbeAuthHumanOutput(t *testing.T) {
 	dir := t.TempDir()
 	logPath := filepath.Join(dir, "backends.log")

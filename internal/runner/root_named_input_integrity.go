@@ -114,6 +114,11 @@ func runRootProviderTurnWithRetainedIntegrity(
 			if err := state.recordProviderAttemptLaunchMarker(spec, currentAttempt, artifactOrdinal, startedAt); err != nil {
 				return TurnResult{}, rootInvocationPersistenceError{cause: err}
 			}
+			if rootProviderLaunchMarkerAfterSave != nil {
+				if err := rootProviderLaunchMarkerAfterSave(spec, currentAttempt); err != nil {
+					return TurnResult{}, rootInvocationPersistenceError{cause: err}
+				}
+			}
 		}
 		result, providerErr := operation()
 		postBase := context.WithoutCancel(ctx)

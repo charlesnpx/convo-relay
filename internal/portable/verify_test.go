@@ -1,6 +1,7 @@
 package portable
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"sort"
@@ -12,9 +13,10 @@ import (
 
 func TestVerifyDirectoryValidatesPortableExportClosure(t *testing.T) {
 	tests := []struct {
-		name    string
-		mutate  func(*testing.T, *portableVerifyFixture)
-		wantErr string
+		name             string
+		mutate           func(*testing.T, *portableVerifyFixture)
+		wantErr          string
+		wantPayloadCount int
 	}{
 		{name: "valid"},
 		{
@@ -87,6 +89,78 @@ func TestVerifyDirectoryValidatesPortableExportClosure(t *testing.T) {
 			},
 			wantErr: "retains a source-session artifact ref",
 		},
+		{
+			name: "source identity stripped from source payload",
+			mutate: func(t *testing.T, fixture *portableVerifyFixture) {
+				fixture.appendPayload(mustPortableVerifyPayloadWithSource(t, "recipe", "artifact-000001", map[string]any{
+					"kind":           "recipe",
+					"schema_version": 1,
+				}, portableTestSourceRef("recipe:neutral", 10)))
+				fixture.stripEntrySource(t, "recipe", "artifact-000001")
+				fixture.refresh(t)
+			},
+			wantErr: "requires source artifact identity",
+		},
+		{
+			name: "coordinated root kind relabeling",
+			mutate: func(t *testing.T, fixture *portableVerifyFixture) {
+				fixture.appendPayload(mustPortableVerifyPayloadWithSource(t, contracts.RootArtifactKindExecutionWorkspace, "artifact-000001", map[string]any{
+					"kind":           contracts.RootArtifactKindExecutionWorkspace,
+					"schema_version": contracts.RootArtifactSchemaVersionV2,
+					"digest_profile": contracts.DigestProfileV1,
+				}, portableTestSourceRef("execution_workspace:selected", 11)))
+				fixture.relabelPayload(t, contracts.RootArtifactKindExecutionWorkspace, "artifact-000001", contracts.RootArtifactKindRootRecipePlan, map[string]any{
+					"kind":           contracts.RootArtifactKindRootRecipePlan,
+					"schema_version": contracts.RootArtifactSchemaVersionV2,
+					"digest_profile": contracts.DigestProfileV1,
+				})
+				fixture.refresh(t)
+			},
+			wantErr: "kind does not match source artifact kind",
+		},
+		{
+			name: "malformed portable ref discriminator",
+			mutate: func(t *testing.T, fixture *portableVerifyFixture) {
+				fixture.replacePayload(t, "root_session", "session", map[string]any{
+					"kind": "portable_root_session",
+					"recipe_ref": map[string]any{
+						"kind":        "not_portable_payload_ref",
+						"portable_id": "artifact-000001",
+					},
+				})
+				fixture.refresh(t)
+			},
+			wantErr: "requires kind portable_payload_ref",
+		},
+		{
+			name: "duplicate exact source ref",
+			mutate: func(t *testing.T, fixture *portableVerifyFixture) {
+				source := portableTestSourceRef("recipe:neutral", 12)
+				for _, id := range []string{"artifact-000001", "artifact-000002"} {
+					fixture.appendPayload(mustPortableVerifyPayloadWithSource(t, "recipe", id, map[string]any{
+						"kind":           "recipe",
+						"schema_version": 1,
+					}, source))
+				}
+				fixture.refresh(t)
+			},
+			wantErr: "source artifact ref is duplicated",
+		},
+		{
+			name: "multiple immutable source revisions",
+			mutate: func(t *testing.T, fixture *portableVerifyFixture) {
+				for index, id := range []string{"artifact-000001", "artifact-000002"} {
+					fixture.appendPayload(mustPortableVerifyPayloadWithSource(t, contracts.RootArtifactKindExecutionWorkspace, id, map[string]any{
+						"kind":           contracts.RootArtifactKindExecutionWorkspace,
+						"schema_version": contracts.RootArtifactSchemaVersionV2,
+						"digest_profile": contracts.DigestProfileV1,
+						"revision":       index + 1,
+					}, portableTestSourceRef("execution_workspace:selected", 20+index)))
+				}
+				fixture.refresh(t)
+			},
+			wantPayloadCount: 5,
+		},
 	}
 
 	for _, test := range tests {
@@ -100,7 +174,11 @@ func TestVerifyDirectoryValidatesPortableExportClosure(t *testing.T) {
 				if err != nil {
 					t.Fatalf("verify valid export: %v", err)
 				}
-				if report["status"] != "valid" || report["payload_count"] != 3 {
+				wantCount := test.wantPayloadCount
+				if wantCount == 0 {
+					wantCount = 3
+				}
+				if report["status"] != "valid" || report["payload_count"] != wantCount {
 					t.Fatalf("valid report = %#v", report)
 				}
 				return
@@ -208,6 +286,59 @@ func TestVerifyDirectoryValidatesPortableProviderLineageV2(t *testing.T) {
 				})
 			},
 			wantErr: "does not target provider_result",
+		},
+		{
+			name: "orphan provider result",
+			mutate: func(t *testing.T, fixture *portableVerifyFixture) {
+				result, _ := portableProviderAttemptPayloads(t, fixture, 2, "artifact-000003", "artifact-000004", 2)
+				fixture.appendPayload(result)
+			},
+			wantErr: "is orphaned",
+		},
+		{
+			name: "duplicate provider result correlation",
+			mutate: func(t *testing.T, fixture *portableVerifyFixture) {
+				result, _ := portableProviderAttemptPayloads(t, fixture, 1, "artifact-000003", "artifact-000004", 2)
+				fixture.appendPayload(result)
+			},
+			wantErr: "duplicate invocation_id and runner_attempt",
+		},
+		{
+			name: "duplicate provider invocation correlation",
+			mutate: func(t *testing.T, fixture *portableVerifyFixture) {
+				_, invocation := portableProviderAttemptPayloads(t, fixture, 1, "artifact-000003", "artifact-000004", 2)
+				value, err := contracts.DecodeStrictJSONObjectBytes(invocation.body)
+				if err != nil {
+					t.Fatalf("decode duplicate invocation: %v", err)
+				}
+				record := value["invocation"].(map[string]any)
+				record["provider_launch_attempted"] = false
+				record["provider_result_ref"] = nil
+				fixture.appendPayload(mustPortableVerifyPayloadWithSource(t, contracts.RootArtifactKindProviderInvocation, "artifact-000004", value, portableTestSourceRef("provider_invocation:000002", 24)))
+			},
+			wantErr: "duplicate invocation_id and runner_attempt",
+		},
+		{
+			name: "shared provider result",
+			mutate: func(t *testing.T, fixture *portableVerifyFixture) {
+				invocation := fixture.payloadValue(contracts.RootArtifactKindProviderInvocation, "artifact-000002")
+				fixture.appendPayload(mustPortableVerifyPayloadWithSource(t, contracts.RootArtifactKindProviderInvocation, "artifact-000003", invocation, portableTestSourceRef("provider_invocation:000002", 25)))
+			},
+			wantErr: "multiple incoming invocation edges",
+		},
+		{
+			name: "attempt two only is valid",
+			mutate: func(t *testing.T, fixture *portableVerifyFixture) {
+				fixture.setProviderAttempt(t, 2)
+			},
+		},
+		{
+			name: "gapped attempts are valid",
+			mutate: func(t *testing.T, fixture *portableVerifyFixture) {
+				result, invocation := portableProviderAttemptPayloads(t, fixture, 3, "artifact-000003", "artifact-000004", 3)
+				fixture.appendPayload(result)
+				fixture.appendPayload(invocation)
+			},
 		},
 	}
 	for _, test := range tests {
@@ -398,6 +529,48 @@ func (f *portableVerifyFixture) replacePayload(t *testing.T, kind string, id str
 	t.Fatalf("payload %s/%s not found", kind, id)
 }
 
+func (f *portableVerifyFixture) appendPayload(payload exportPayload) {
+	f.payloads = append(f.payloads, payload)
+	sort.Slice(f.payloads, func(i, j int) bool {
+		return stringValue(f.payloads[i].entry["path"]) < stringValue(f.payloads[j].entry["path"])
+	})
+}
+
+func (f *portableVerifyFixture) relabelPayload(t *testing.T, kind string, id string, newKind string, value any) {
+	t.Helper()
+	for index, payload := range f.payloads {
+		if payload.entry["kind"] != kind || payload.entry["portable_id"] != id {
+			continue
+		}
+		oldPath := filepath.Join(f.dir, filepath.FromSlash(stringValue(payload.entry["path"])))
+		if err := os.Remove(oldPath); err != nil && !os.IsNotExist(err) {
+			t.Fatalf("remove relabeled payload: %v", err)
+		}
+		source := map[string]any{
+			"id":     payload.entry["source_artifact_id"],
+			"digest": payload.entry["source_artifact_digest"],
+		}
+		f.payloads[index] = mustPortableVerifyPayloadWithSource(t, newKind, id, value, source)
+		sort.Slice(f.payloads, func(i, j int) bool {
+			return stringValue(f.payloads[i].entry["path"]) < stringValue(f.payloads[j].entry["path"])
+		})
+		return
+	}
+	t.Fatalf("payload %s/%s not found", kind, id)
+}
+
+func (f *portableVerifyFixture) setProviderAttempt(t *testing.T, runnerAttempt int) {
+	t.Helper()
+	result := f.payloadValue(contracts.RootArtifactKindProviderResult, "artifact-000001").(map[string]any)
+	result["runner_attempt"] = runnerAttempt
+	result["invocation"].(map[string]any)["runner_attempt"] = runnerAttempt
+	f.replacePayload(t, contracts.RootArtifactKindProviderResult, "artifact-000001", result)
+
+	invocation := f.payloadValue(contracts.RootArtifactKindProviderInvocation, "artifact-000002").(map[string]any)
+	invocation["invocation"].(map[string]any)["runner_attempt"] = runnerAttempt
+	f.replacePayload(t, contracts.RootArtifactKindProviderInvocation, "artifact-000002", invocation)
+}
+
 func (f *portableVerifyFixture) stripEntrySource(t *testing.T, kind string, id string) {
 	t.Helper()
 	for _, payload := range f.payloads {
@@ -474,4 +647,41 @@ func tamperedDigest(digest string) string {
 		return digest[:len(digest)-1] + "1"
 	}
 	return digest[:len(digest)-1] + "0"
+}
+
+func portableTestSourceRef(id string, revision int) map[string]any {
+	return map[string]any{
+		"kind":           "artifact_ref",
+		"schema_version": 1,
+		"id":             id,
+		"digest":         fmt.Sprintf("sha256:%064x", revision),
+	}
+}
+
+func portableProviderAttemptPayloads(
+	t *testing.T,
+	fixture *portableVerifyFixture,
+	runnerAttempt int,
+	resultPortableID string,
+	invocationPortableID string,
+	sourceOrdinal int,
+) (exportPayload, exportPayload) {
+	t.Helper()
+	resultSource := portableTestSourceRef(fmt.Sprintf("provider_result:%06d", sourceOrdinal), sourceOrdinal*2+1)
+	invocationSource := portableTestSourceRef(fmt.Sprintf("provider_invocation:%06d", sourceOrdinal), sourceOrdinal*2+2)
+
+	result := fixture.payloadValue(contracts.RootArtifactKindProviderResult, "artifact-000001").(map[string]any)
+	result["runner_attempt"] = runnerAttempt
+	result["invocation"].(map[string]any)["runner_attempt"] = runnerAttempt
+
+	invocation := fixture.payloadValue(contracts.RootArtifactKindProviderInvocation, "artifact-000002").(map[string]any)
+	invocationRecord := invocation["invocation"].(map[string]any)
+	invocationRecord["runner_attempt"] = runnerAttempt
+	resultRef := invocationRecord["provider_result_ref"].(map[string]any)
+	resultRef["portable_id"] = resultPortableID
+	resultRef["source_artifact_id"] = resultSource["id"]
+	resultRef["source_artifact_digest"] = resultSource["digest"]
+
+	return mustPortableVerifyPayloadWithSource(t, contracts.RootArtifactKindProviderResult, resultPortableID, result, resultSource),
+		mustPortableVerifyPayloadWithSource(t, contracts.RootArtifactKindProviderInvocation, invocationPortableID, invocation, invocationSource)
 }

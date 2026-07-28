@@ -35,9 +35,13 @@ func VerifyDirectory(directory string) (map[string]any, error) {
 	}
 	expectedFiles := map[string]bool{"manifest.json": true}
 	inventoryByID := map[string]map[string]any{}
+	sourceRefs := map[string]string{}
 	payloads := make([]verifiedPortablePayload, 0, len(manifest["payload_inventory"].([]any)))
 	for _, raw := range manifest["payload_inventory"].([]any) {
 		entry := raw.(map[string]any)
+		if err := validatePortableInventorySource(entry, sourceRefs); err != nil {
+			return nil, err
+		}
 		inventoryByID[entry["portable_id"].(string)] = entry
 		relative := entry["path"].(string)
 		expectedFiles[relative] = true
@@ -90,9 +94,11 @@ func VerifyDirectory(directory string) (map[string]any, error) {
 }
 
 func validatePortablePayloadRefs(value any, inventoryByID map[string]map[string]any) error {
-	if object, ok := value.(map[string]any); ok && object["kind"] == "portable_payload_ref" {
-		_, err := validatePortablePayloadRefObject(object, inventoryByID)
-		return err
+	if object, ok := value.(map[string]any); ok {
+		if portablePayloadRefShaped(object) {
+			_, err := validatePortablePayloadRefObject(object, inventoryByID)
+			return err
+		}
 	}
 	switch typed := value.(type) {
 	case map[string]any:
@@ -113,15 +119,11 @@ func validatePortablePayloadRefs(value any, inventoryByID map[string]map[string]
 
 func validatePortablePayloadMatchesInventory(payload verifiedPortablePayload) error {
 	entryKind := payload.entry["kind"].(string)
-	sourceBacked := payload.entry["source_artifact_id"] != nil
-	if entryKind == contracts.RootArtifactKindProviderInvocation || entryKind == contracts.RootArtifactKindProviderResult {
-		if err := requirePortableEntrySourceIdentity(payload.entry, "portable "+entryKind+" payload"); err != nil {
-			return err
-		}
-		sourceBacked = true
-	}
-	if !sourceBacked {
+	if portableSyntheticEntry(payload.entry) {
 		return nil
+	}
+	if err := requirePortableEntrySourceIdentity(payload.entry, "portable "+entryKind+" payload"); err != nil {
+		return err
 	}
 	object, ok := payload.value.(map[string]any)
 	if !ok {
@@ -132,6 +134,63 @@ func validatePortablePayloadMatchesInventory(payload verifiedPortablePayload) er
 		return contracts.NewValidationError("portable export payload %s kind does not match inventory kind %s", payload.entry["portable_id"], entryKind)
 	}
 	return nil
+}
+
+func validatePortableInventorySource(entry map[string]any, seen map[string]string) error {
+	if !portableSyntheticEntry(entry) {
+		if err := requirePortableEntrySourceIdentity(entry, "portable "+stringValue(entry["kind"])+" payload"); err != nil {
+			return err
+		}
+	}
+	if entry["source_artifact_id"] == nil {
+		return nil
+	}
+	if err := requirePortableEntrySourceIdentity(entry, "portable "+stringValue(entry["kind"])+" payload"); err != nil {
+		return err
+	}
+	sourceID := stringValue(entry["source_artifact_id"])
+	sourceDigest := stringValue(entry["source_artifact_digest"])
+	sourceKey := sourceID + "\x00" + sourceDigest
+	if prior := seen[sourceKey]; prior != "" {
+		return contracts.NewValidationError("portable export source artifact ref is duplicated by %s and %s", prior, entry["portable_id"])
+	}
+	seen[sourceKey] = stringValue(entry["portable_id"])
+
+	entryKind := stringValue(entry["kind"])
+	sourceKind, _, _ := strings.Cut(sourceID, ":")
+	if (portableRootArtifactKind(entryKind) || portableRootArtifactKind(sourceKind)) && entryKind != sourceKind {
+		return contracts.NewValidationError("portable export payload %s kind does not match source artifact kind %s", entry["portable_id"], sourceKind)
+	}
+	return nil
+}
+
+func portableSyntheticEntry(entry map[string]any) bool {
+	kind := stringValue(entry["kind"])
+	id := stringValue(entry["portable_id"])
+	return kind == "root_session" && id == "session" ||
+		kind == "participant_transcript" && id == "transcript" ||
+		kind == "diagnostics" && id == "diagnostics"
+}
+
+func portableRootArtifactKind(value string) bool {
+	for _, kind := range contracts.RootArtifactKinds() {
+		if value == kind {
+			return true
+		}
+	}
+	return false
+}
+
+func portablePayloadRefShaped(object map[string]any) bool {
+	if object["kind"] == "portable_payload_ref" {
+		return true
+	}
+	for _, key := range []string{"portable_id", "source_artifact_id", "source_artifact_digest"} {
+		if _, ok := object[key]; ok {
+			return true
+		}
+	}
+	return false
 }
 
 func validatePortablePayloadRefObject(object map[string]any, inventoryByID map[string]map[string]any) (map[string]any, error) {
@@ -178,14 +237,40 @@ func validatePortablePayloadRefObject(object map[string]any, inventoryByID map[s
 }
 
 func validatePortableProviderLineage(payloads []verifiedPortablePayload, inventoryByID map[string]map[string]any) error {
-	payloadByID := map[string]verifiedPortablePayload{}
+	resultRecords := map[string]map[string]any{}
+	resultKeys := map[string]string{}
 	for _, payload := range payloads {
-		payloadByID[payload.entry["portable_id"].(string)] = payload
+		if payload.entry["kind"] != contracts.RootArtifactKindProviderResult {
+			continue
+		}
+		portableID := payload.entry["portable_id"].(string)
+		object, _ := payload.value.(map[string]any)
+		if object == nil {
+			return contracts.NewValidationError("portable provider result payload must be an object")
+		}
+		rootArtifact, err := contracts.ValidateRootArtifact(object, contracts.RootArtifactKindProviderResult)
+		if err != nil {
+			return contracts.NewValidationError("portable provider result root artifact is invalid: %v", err)
+		}
+		record, err := contracts.ValidateProviderResultRecord(rootArtifact)
+		if err != nil {
+			return err
+		}
+		key := portableProviderAttemptKey(record)
+		if prior := resultKeys[key]; prior != "" {
+			return contracts.NewValidationError("portable provider results %s and %s duplicate invocation_id and runner_attempt", prior, portableID)
+		}
+		resultKeys[key] = portableID
+		resultRecords[portableID] = record
 	}
+
+	invocationKeys := map[string]string{}
+	resultIncomingEdges := map[string]int{}
 	for _, payload := range payloads {
 		if payload.entry["kind"] != contracts.RootArtifactKindProviderInvocation {
 			continue
 		}
+		portableID := payload.entry["portable_id"].(string)
 		object, _ := payload.value.(map[string]any)
 		if object == nil {
 			return contracts.NewValidationError("portable provider invocation payload must be an object")
@@ -205,10 +290,16 @@ func validatePortableProviderLineage(payloads []verifiedPortablePayload, invento
 		if err != nil {
 			return contracts.NewValidationError("portable provider invocation is invalid: %v", err)
 		}
+		key := portableProviderAttemptKey(invocation)
+		priorInvocation := invocationKeys[key]
 		if invocation["provider_launch_attempted"] == false {
 			if resultRefValue != nil {
 				return contracts.NewValidationError("portable unlaunched provider invocation has provider_result_ref")
 			}
+			if priorInvocation != "" {
+				return contracts.NewValidationError("portable provider invocations %s and %s duplicate invocation_id and runner_attempt", priorInvocation, portableID)
+			}
+			invocationKeys[key] = portableID
 			continue
 		}
 		resultRef, ok := resultRefValue.(map[string]any)
@@ -219,16 +310,34 @@ func validatePortableProviderLineage(payloads []verifiedPortablePayload, invento
 		if err != nil {
 			return err
 		}
-		resultPayload, ok := payloadByID[entry["portable_id"].(string)]
-		if !ok || resultPayload.entry["kind"] != contracts.RootArtifactKindProviderResult {
+		if entry["kind"] != contracts.RootArtifactKindProviderResult {
 			return contracts.NewValidationError("portable provider invocation result ref does not target provider_result")
 		}
-		resultObject, _ := resultPayload.value.(map[string]any)
-		if resultObject == nil {
+		resultPortableID := entry["portable_id"].(string)
+		resultRecord := resultRecords[resultPortableID]
+		if resultRecord == nil {
 			return contracts.NewValidationError("portable provider invocation result ref does not target provider_result")
 		}
-		if err := validatePortableProviderResultBinding(invocation, resultObject); err != nil {
+		resultIncomingEdges[resultPortableID]++
+		if resultIncomingEdges[resultPortableID] > 1 {
+			return contracts.NewValidationError("portable provider result %s has multiple incoming invocation edges", resultPortableID)
+		}
+		if err := validatePortableProviderResultBinding(invocation, resultRecord); err != nil {
 			return err
+		}
+		if priorInvocation != "" {
+			return contracts.NewValidationError("portable provider invocations %s and %s duplicate invocation_id and runner_attempt", priorInvocation, portableID)
+		}
+		invocationKeys[key] = portableID
+	}
+	for portableID := range resultRecords {
+		switch resultIncomingEdges[portableID] {
+		case 1:
+			continue
+		case 0:
+			return contracts.NewValidationError("portable provider result %s is orphaned", portableID)
+		default:
+			return contracts.NewValidationError("portable provider result %s has multiple incoming invocation edges", portableID)
 		}
 	}
 	return nil
@@ -251,20 +360,16 @@ func requirePortableEntrySourceIdentity(entry map[string]any, label string) erro
 	return nil
 }
 
-func validatePortableProviderResultBinding(invocation map[string]any, resultPayload map[string]any) error {
-	rootArtifact, err := contracts.ValidateRootArtifact(resultPayload, contracts.RootArtifactKindProviderResult)
-	if err != nil {
-		return contracts.NewValidationError("portable provider result root artifact is invalid: %v", err)
-	}
-	resultRecord, err := contracts.ValidateProviderResultRecord(rootArtifact)
-	if err != nil {
-		return err
-	}
+func validatePortableProviderResultBinding(invocation map[string]any, resultRecord map[string]any) error {
 	resultDraft, _ := resultRecord["invocation"].(map[string]any)
 	if !portableSemanticEqual(invocation, resultDraft) {
 		return contracts.NewValidationError("portable provider invocation/result identity mismatch")
 	}
 	return nil
+}
+
+func portableProviderAttemptKey(record map[string]any) string {
+	return stringValue(record["invocation_id"]) + "\x00" + fmt.Sprint(record["runner_attempt"])
 }
 
 func portableSemanticEqual(left any, right any) bool {

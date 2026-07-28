@@ -418,9 +418,16 @@ atomically publishes a new `relay-root-portable-export-v2` directory. The
 manifest binds canonical JSON payloads for the root projection, transcript,
 diagnostics, and every transitively referenced artifact. Source-session refs
 are rewritten to directory-local payload refs that retain source artifact id
-and digest, and required absolute source, relay-home, session, retained-input,
-and worktree paths are omitted. `verify-export` rechecks the closed file set,
-payload digests, portable source refs, and provider invocation/result lineage.
+and digest. Every payload except the exact root-session, transcript, and
+diagnostics projections requires that source identity; the same source id may
+appear with different immutable digests, but an exact id/digest pair may appear
+only once. Required absolute source, relay-home, session, retained-input, and
+worktree paths are omitted. `verify-export` rechecks the closed file set,
+payload digests, portable source refs, and one-to-one provider
+invocation/result lineage. Durable marker-only crashes can leave attempt gaps,
+so an export may begin with attempt 2 or omit an earlier attempt. With `--json`,
+an invalid export writes a structured `status: "invalid"` result to stdout and
+exits with status 1.
 Running, recovery-pending, v1, tampered, incomplete, or out-of-root sessions
 fail without publishing the final target.
 

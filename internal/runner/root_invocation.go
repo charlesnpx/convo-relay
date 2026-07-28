@@ -40,9 +40,13 @@ func (e rootInvocationPersistenceError) suppressProviderRetry() {}
 // invocation ref is durable in metadata. Production leaves it nil.
 var rootProviderInvocationAfterSave func(rootInvocationSpec, int) error
 
+// rootProviderLaunchMarkerAfterSave is a test-only failpoint after the durable
+// launch marker is written but before the provider call begins.
+var rootProviderLaunchMarkerAfterSave func(rootInvocationSpec, int) error
+
 // rootProviderResultAfterSave is a test-only failpoint after a provider result
-// ref is durable and recorded in provider_attempts.json but before the
-// invocation ref is added to metadata. Production leaves it nil.
+// is durable but before provider_attempts.json is completed. Production leaves
+// it nil.
 var rootProviderResultAfterSave func(rootInvocationSpec, int) error
 
 func (s *rootExecutionState) recordsProviderInvocations() bool {
@@ -159,13 +163,13 @@ func (s *rootExecutionState) persistProviderInvocation(
 			return result, err
 		}
 		result.ProviderResultRef = cloneMap(resultRef)
-		if err := s.completeProviderAttemptMarker(spec, runnerAttempt, artifactOrdinal, completedAt, outcome, failureStage, classification, resultRef); err != nil {
-			return result, err
-		}
 		if rootProviderResultAfterSave != nil {
 			if err := rootProviderResultAfterSave(spec, runnerAttempt); err != nil {
 				return result, err
 			}
+		}
+		if err := s.completeProviderAttemptMarker(spec, runnerAttempt, artifactOrdinal, completedAt, outcome, failureStage, classification, resultRef); err != nil {
+			return result, err
 		}
 		recordFields["provider_result_ref"] = cloneMap(resultRef)
 	}
@@ -674,6 +678,26 @@ func validatePersistedRootInvocationState(st *store.Store, meta model.SessionMet
 		if invocationOrdinals[marker.ArtifactOrdinal] {
 			continue
 		}
+		if marker.ProviderResultRef == nil {
+			resultArtifact, found, err := loadLatestRootRecoveryArtifact(st, contracts.RootArtifactKindProviderResult, marker.ArtifactOrdinal)
+			if err != nil {
+				return nil, persistenceIntegrityError("Durable provider result discovery failed.", map[string]any{"invocation_id": marker.InvocationID, "cause": err.Error()})
+			}
+			if found {
+				record, err := contracts.ValidateProviderResultRecord(resultArtifact.payload)
+				if err != nil {
+					return nil, persistenceIntegrityError("Discovered durable provider result is invalid.", map[string]any{"invocation_id": marker.InvocationID, "cause": err.Error()})
+				}
+				if err := validateProviderAttemptMarkerAgainstResult(marker, resultArtifact.payload); err != nil {
+					return nil, err
+				}
+				marker.ProviderResultRef = cloneMap(resultArtifact.ref)
+				marker.CompletedAt = stringFromAny(record["completed_at"])
+				marker.Outcome = stringFromAny(record["outcome"])
+				marker.FailureStage = stringFromAny(record["failure_stage"])
+				marker.Classification = stringFromAny(record["classification"])
+			}
+		}
 		if marker.ProviderInvocationRef != nil {
 			ordinal, err := rootArtifactOrdinalFromRef(marker.ProviderInvocationRef, contracts.RootArtifactKindProviderInvocation)
 			if err != nil || ordinal != marker.ArtifactOrdinal {
@@ -743,7 +767,8 @@ func validateProviderAttemptMarkerAgainstInvocation(marker rootProviderAttemptMa
 		marker.Actor != stringFromAny(invocation["actor"]) ||
 		marker.RunnerAttempt != intFromAny(invocation["runner_attempt"], 0) ||
 		marker.ProviderRetry != stringFromAny(invocation["provider_retry"]) ||
-		marker.Backend != stringFromAny(invocation["backend"]) {
+		marker.Backend != stringFromAny(invocation["backend"]) ||
+		marker.StartedAt != stringFromAny(invocation["started_at"]) {
 		return persistenceIntegrityError("Provider attempt marker does not match provider invocation.", map[string]any{"invocation_id": marker.InvocationID})
 	}
 	if invocation["provider_launch_attempted"] != true {
@@ -771,7 +796,8 @@ func validateProviderAttemptMarkerAgainstResult(marker rootProviderAttemptMarker
 		marker.Actor != stringFromAny(record["actor"]) ||
 		marker.RunnerAttempt != intFromAny(record["runner_attempt"], 0) ||
 		marker.ProviderRetry != stringFromAny(record["provider_retry"]) ||
-		marker.Backend != stringFromAny(record["backend"]) {
+		marker.Backend != stringFromAny(record["backend"]) ||
+		marker.StartedAt != stringFromAny(record["started_at"]) {
 		return persistenceIntegrityError("Provider attempt marker does not match provider result.", map[string]any{"invocation_id": marker.InvocationID})
 	}
 	return nil

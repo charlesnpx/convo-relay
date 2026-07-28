@@ -699,6 +699,14 @@ func runVerifyExport(args []string) {
 	}
 	report, err := portable.VerifyDirectory(flags.Args()[0])
 	if err != nil {
+		if *jsonOutput {
+			writeJSON(map[string]any{
+				"schema_version": contracts.PortableExportV2,
+				"status":         "invalid",
+				"error":          err.Error(),
+			})
+			os.Exit(1)
+		}
 		fmt.Fprintf(os.Stderr, "error: %s\n", err)
 		os.Exit(1)
 	}
