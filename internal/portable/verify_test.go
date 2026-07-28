@@ -144,13 +144,62 @@ func TestVerifyDirectoryValidatesPortableProviderLineageV2(t *testing.T) {
 			wantErr: "does not match invocation draft",
 		},
 		{
+			name: "invocation payload kind mismatch cannot skip lineage",
+			mutate: func(t *testing.T, fixture *portableVerifyFixture) {
+				invocation := fixture.payloadValue("provider_invocation", "artifact-000002").(map[string]any)
+				invocation["kind"] = "diagnostics"
+				fixture.replacePayload(t, "provider_invocation", "artifact-000002", invocation)
+			},
+			wantErr: "kind does not match inventory kind",
+		},
+		{
+			name: "result ref discriminator mismatch",
+			mutate: func(t *testing.T, fixture *portableVerifyFixture) {
+				invocation := fixture.payloadValue("provider_invocation", "artifact-000002").(map[string]any)
+				ref := invocation["invocation"].(map[string]any)["provider_result_ref"].(map[string]any)
+				ref["kind"] = "artifact_ref"
+				fixture.replacePayload(t, "provider_invocation", "artifact-000002", invocation)
+			},
+			wantErr: "requires kind portable_payload_ref",
+		},
+		{
+			name: "result ref and target stripped source identity",
+			mutate: func(t *testing.T, fixture *portableVerifyFixture) {
+				invocation := fixture.payloadValue("provider_invocation", "artifact-000002").(map[string]any)
+				ref := invocation["invocation"].(map[string]any)["provider_result_ref"].(map[string]any)
+				delete(ref, "source_artifact_id")
+				delete(ref, "source_artifact_digest")
+				fixture.replacePayload(t, "provider_invocation", "artifact-000002", invocation)
+				fixture.stripEntrySource(t, "provider_result", "artifact-000001")
+			},
+			wantErr: "requires source artifact identity",
+		},
+		{
+			name: "provider result value is not object",
+			mutate: func(t *testing.T, fixture *portableVerifyFixture) {
+				result := fixture.payloadValue("provider_result", "artifact-000001").(map[string]any)
+				result["provider_result"] = "completed"
+				fixture.replacePayload(t, "provider_result", "artifact-000001", result)
+			},
+			wantErr: "provider result provider_result must be an object",
+		},
+		{
+			name: "provider result backend mismatch",
+			mutate: func(t *testing.T, fixture *portableVerifyFixture) {
+				result := fixture.payloadValue("provider_result", "artifact-000001").(map[string]any)
+				result["provider_result"].(map[string]any)["backend"] = "claude"
+				fixture.replacePayload(t, "provider_result", "artifact-000001", result)
+			},
+			wantErr: "provider result backend does not match wrapper backend",
+		},
+		{
 			name: "invocation result target mismatch",
 			mutate: func(t *testing.T, fixture *portableVerifyFixture) {
 				invocation := fixture.payloadValue("provider_invocation", "artifact-000002").(map[string]any)["invocation"].(map[string]any)
 				ref := invocation["provider_result_ref"].(map[string]any)
-				ref["portable_id"] = "diagnostics"
-				ref["source_artifact_id"] = nil
-				ref["source_artifact_digest"] = nil
+				ref["portable_id"] = "artifact-000002"
+				ref["source_artifact_id"] = "provider_invocation:000001"
+				ref["source_artifact_digest"] = "sha256:2222222222222222222222222222222222222222222222222222222222222222"
 				fixture.replacePayload(t, "provider_invocation", "artifact-000002", map[string]any{
 					"kind":           contracts.RootArtifactKindProviderInvocation,
 					"schema_version": contracts.RootArtifactSchemaVersionV2,
@@ -343,6 +392,18 @@ func (f *portableVerifyFixture) replacePayload(t *testing.T, kind string, id str
 				}
 			}
 			f.payloads[index] = mustPortableVerifyPayloadWithSource(t, kind, id, value, sourceRef)
+			return
+		}
+	}
+	t.Fatalf("payload %s/%s not found", kind, id)
+}
+
+func (f *portableVerifyFixture) stripEntrySource(t *testing.T, kind string, id string) {
+	t.Helper()
+	for _, payload := range f.payloads {
+		if payload.entry["kind"] == kind && payload.entry["portable_id"] == id {
+			delete(payload.entry, "source_artifact_id")
+			delete(payload.entry, "source_artifact_digest")
 			return
 		}
 	}

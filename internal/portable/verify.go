@@ -6,6 +6,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"strings"
 
 	"github.com/charlesnpx/convo-relay/internal/contracts"
 )
@@ -63,6 +64,9 @@ func VerifyDirectory(directory string) (map[string]any, error) {
 		payloads = append(payloads, verifiedPortablePayload{entry: entry, value: value})
 	}
 	for _, payload := range payloads {
+		if err := validatePortablePayloadMatchesInventory(payload); err != nil {
+			return nil, err
+		}
 		if refs := contracts.FindArtifactRefs(payload.value); len(refs) > 0 {
 			return nil, contracts.NewValidationError("portable export retains a source-session artifact ref")
 		}
@@ -107,7 +111,33 @@ func validatePortablePayloadRefs(value any, inventoryByID map[string]map[string]
 	return nil
 }
 
+func validatePortablePayloadMatchesInventory(payload verifiedPortablePayload) error {
+	entryKind := payload.entry["kind"].(string)
+	sourceBacked := payload.entry["source_artifact_id"] != nil
+	if entryKind == contracts.RootArtifactKindProviderInvocation || entryKind == contracts.RootArtifactKindProviderResult {
+		if err := requirePortableEntrySourceIdentity(payload.entry, "portable "+entryKind+" payload"); err != nil {
+			return err
+		}
+		sourceBacked = true
+	}
+	if !sourceBacked {
+		return nil
+	}
+	object, ok := payload.value.(map[string]any)
+	if !ok {
+		return contracts.NewValidationError("portable export payload %s must be an object", payload.entry["portable_id"])
+	}
+	payloadKind, ok := object["kind"].(string)
+	if !ok || payloadKind != entryKind {
+		return contracts.NewValidationError("portable export payload %s kind does not match inventory kind %s", payload.entry["portable_id"], entryKind)
+	}
+	return nil
+}
+
 func validatePortablePayloadRefObject(object map[string]any, inventoryByID map[string]map[string]any) (map[string]any, error) {
+	if object["kind"] != "portable_payload_ref" {
+		return nil, contracts.NewValidationError("portable payload ref requires kind portable_payload_ref")
+	}
 	portableID, ok := object["portable_id"].(string)
 	if !ok || portableID == "" {
 		return nil, contracts.NewValidationError("portable payload ref requires portable_id")
@@ -123,10 +153,24 @@ func validatePortablePayloadRefObject(object map[string]any, inventoryByID map[s
 			return nil, contracts.NewValidationError("portable payload ref contains unsupported field %q", key)
 		}
 	}
-	refSourceID, _ := object["source_artifact_id"].(string)
-	refSourceDigest, _ := object["source_artifact_digest"].(string)
-	entrySourceID, _ := entry["source_artifact_id"].(string)
-	entrySourceDigest, _ := entry["source_artifact_digest"].(string)
+	refSourceID, refIDOK := object["source_artifact_id"].(string)
+	refSourceDigest, refDigestOK := object["source_artifact_digest"].(string)
+	if !refIDOK || strings.TrimSpace(refSourceID) == "" || !refDigestOK || strings.TrimSpace(refSourceDigest) == "" {
+		return nil, contracts.NewValidationError("portable payload ref requires source artifact identity")
+	}
+	if _, err := contracts.ValidateArtifactRef(map[string]any{
+		"kind":           "artifact_ref",
+		"schema_version": 1,
+		"id":             refSourceID,
+		"digest":         refSourceDigest,
+	}); err != nil {
+		return nil, contracts.NewValidationError("portable payload ref source artifact identity is invalid: %v", err)
+	}
+	entrySourceID, entryIDOK := entry["source_artifact_id"].(string)
+	entrySourceDigest, entryDigestOK := entry["source_artifact_digest"].(string)
+	if !entryIDOK || strings.TrimSpace(entrySourceID) == "" || !entryDigestOK || strings.TrimSpace(entrySourceDigest) == "" {
+		return nil, contracts.NewValidationError("portable payload ref target %s requires source artifact identity", portableID)
+	}
 	if refSourceID != entrySourceID || refSourceDigest != entrySourceDigest {
 		return nil, contracts.NewValidationError("portable payload ref source identity mismatch for %s", portableID)
 	}
@@ -134,29 +178,40 @@ func validatePortablePayloadRefObject(object map[string]any, inventoryByID map[s
 }
 
 func validatePortableProviderLineage(payloads []verifiedPortablePayload, inventoryByID map[string]map[string]any) error {
-	payloadByID := map[string]any{}
+	payloadByID := map[string]verifiedPortablePayload{}
 	for _, payload := range payloads {
-		payloadByID[payload.entry["portable_id"].(string)] = payload.value
+		payloadByID[payload.entry["portable_id"].(string)] = payload
 	}
 	for _, payload := range payloads {
-		object, _ := payload.value.(map[string]any)
-		if object == nil || object["kind"] != contracts.RootArtifactKindProviderInvocation {
+		if payload.entry["kind"] != contracts.RootArtifactKindProviderInvocation {
 			continue
 		}
-		invocation, _ := object["invocation"].(map[string]any)
-		if invocation == nil {
+		object, _ := payload.value.(map[string]any)
+		if object == nil {
+			return contracts.NewValidationError("portable provider invocation payload must be an object")
+		}
+		rootArtifact, err := contracts.ValidateRootArtifact(object, contracts.RootArtifactKindProviderInvocation)
+		if err != nil {
+			return contracts.NewValidationError("portable provider invocation root artifact is invalid: %v", err)
+		}
+		rawInvocation, _ := rootArtifact["invocation"].(map[string]any)
+		if rawInvocation == nil {
 			return contracts.NewValidationError("portable provider invocation payload is missing invocation")
 		}
-		if invocation["schema_version"] != contracts.ProviderInvocationV2 {
-			return contracts.NewValidationError("portable provider invocation requires %s", contracts.ProviderInvocationV2)
+		invocationDraft := contracts.Materialize(rawInvocation).(map[string]any)
+		resultRefValue := invocationDraft["provider_result_ref"]
+		invocationDraft["provider_result_ref"] = nil
+		invocation, err := contracts.ValidateProviderInvocationDraftRecord(invocationDraft)
+		if err != nil {
+			return contracts.NewValidationError("portable provider invocation is invalid: %v", err)
 		}
 		if invocation["provider_launch_attempted"] == false {
-			if invocation["provider_result_ref"] != nil {
+			if resultRefValue != nil {
 				return contracts.NewValidationError("portable unlaunched provider invocation has provider_result_ref")
 			}
 			continue
 		}
-		resultRef, ok := invocation["provider_result_ref"].(map[string]any)
+		resultRef, ok := resultRefValue.(map[string]any)
 		if !ok || resultRef == nil {
 			return contracts.NewValidationError("portable launched provider invocation requires provider_result_ref")
 		}
@@ -164,36 +219,49 @@ func validatePortableProviderLineage(payloads []verifiedPortablePayload, invento
 		if err != nil {
 			return err
 		}
-		resultPayload, _ := payloadByID[entry["portable_id"].(string)].(map[string]any)
-		if resultPayload == nil || resultPayload["kind"] != contracts.RootArtifactKindProviderResult {
+		resultPayload, ok := payloadByID[entry["portable_id"].(string)]
+		if !ok || resultPayload.entry["kind"] != contracts.RootArtifactKindProviderResult {
 			return contracts.NewValidationError("portable provider invocation result ref does not target provider_result")
 		}
-		if err := validatePortableProviderResultBinding(invocation, resultPayload); err != nil {
+		resultObject, _ := resultPayload.value.(map[string]any)
+		if resultObject == nil {
+			return contracts.NewValidationError("portable provider invocation result ref does not target provider_result")
+		}
+		if err := validatePortableProviderResultBinding(invocation, resultObject); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
+func requirePortableEntrySourceIdentity(entry map[string]any, label string) error {
+	sourceID, idOK := entry["source_artifact_id"].(string)
+	sourceDigest, digestOK := entry["source_artifact_digest"].(string)
+	if !idOK || strings.TrimSpace(sourceID) == "" || !digestOK || strings.TrimSpace(sourceDigest) == "" {
+		return contracts.NewValidationError("%s requires source artifact identity", label)
+	}
+	if _, err := contracts.ValidateArtifactRef(map[string]any{
+		"kind":           "artifact_ref",
+		"schema_version": 1,
+		"id":             sourceID,
+		"digest":         sourceDigest,
+	}); err != nil {
+		return contracts.NewValidationError("%s source artifact identity is invalid: %v", label, err)
+	}
+	return nil
+}
+
 func validatePortableProviderResultBinding(invocation map[string]any, resultPayload map[string]any) error {
-	resultDraft, _ := resultPayload["invocation"].(map[string]any)
-	if resultDraft == nil {
-		return contracts.NewValidationError("portable provider result is missing invocation draft")
+	rootArtifact, err := contracts.ValidateRootArtifact(resultPayload, contracts.RootArtifactKindProviderResult)
+	if err != nil {
+		return contracts.NewValidationError("portable provider result root artifact is invalid: %v", err)
 	}
-	if resultPayload["provider_result"] == nil {
-		return contracts.NewValidationError("portable provider result is missing provider_result")
+	resultRecord, err := contracts.ValidateProviderResultRecord(rootArtifact)
+	if err != nil {
+		return err
 	}
-	for _, key := range []string{
-		"invocation_id", "phase", "actor", "runner_attempt", "provider_retry", "backend",
-		"started_at", "completed_at", "outcome", "failure_stage", "classification",
-	} {
-		if !portableSemanticEqual(resultPayload[key], resultDraft[key]) {
-			return contracts.NewValidationError("portable provider result %s does not match invocation draft", key)
-		}
-	}
-	boundInvocation := contracts.Materialize(invocation).(map[string]any)
-	boundInvocation["provider_result_ref"] = nil
-	if !portableSemanticEqual(boundInvocation, resultDraft) {
+	resultDraft, _ := resultRecord["invocation"].(map[string]any)
+	if !portableSemanticEqual(invocation, resultDraft) {
 		return contracts.NewValidationError("portable provider invocation/result identity mismatch")
 	}
 	return nil
