@@ -233,8 +233,10 @@ func loadIndexedPayload(sessionRoot string, resolved string, ref map[string]any)
 
 func buildExportPayloads(meta map[string]any, transcript []any, diagnostics map[string]any, artifacts []sourceArtifact) ([]exportPayload, error) {
 	portableIDs := make(map[string]string, len(artifacts))
+	sourceRefs := make(map[string]map[string]any, len(artifacts))
 	for index, artifact := range artifacts {
 		portableIDs[refKey(artifact.ref)] = fmt.Sprintf("artifact-%06d", index+1)
+		sourceRefs[refKey(artifact.ref)] = artifact.ref
 	}
 	payloads := []exportPayload{}
 	for _, item := range []struct {
@@ -246,11 +248,11 @@ func buildExportPayloads(meta map[string]any, transcript []any, diagnostics map[
 		{kind: "participant_transcript", id: "transcript", data: transcript},
 		{kind: "diagnostics", id: "diagnostics", data: diagnostics},
 	} {
-		projected, err := replaceArtifactRefs(item.data, portableIDs)
+		projected, err := replaceArtifactRefs(item.data, portableIDs, sourceRefs)
 		if err != nil {
 			return nil, err
 		}
-		payload, err := newExportPayload(item.kind, item.id, projected, "")
+		payload, err := newExportPayload(item.kind, item.id, projected, nil)
 		if err != nil {
 			return nil, err
 		}
@@ -259,11 +261,11 @@ func buildExportPayloads(meta map[string]any, transcript []any, diagnostics map[
 	for _, artifact := range artifacts {
 		kind := portableKind(stringValue(artifact.payload["kind"]))
 		id := portableIDs[refKey(artifact.ref)]
-		projected, err := portableArtifactProjection(artifact.payload, portableIDs)
+		projected, err := portableArtifactProjection(artifact.payload, portableIDs, sourceRefs)
 		if err != nil {
 			return nil, err
 		}
-		payload, err := newExportPayload(kind, id, projected, stringValue(artifact.ref["id"]))
+		payload, err := newExportPayload(kind, id, projected, artifact.ref)
 		if err != nil {
 			return nil, err
 		}
@@ -275,7 +277,7 @@ func buildExportPayloads(meta map[string]any, transcript []any, diagnostics map[
 	return payloads, nil
 }
 
-func newExportPayload(kind string, id string, value any, sourceArtifactID string) (exportPayload, error) {
+func newExportPayload(kind string, id string, value any, sourceRef map[string]any) (exportPayload, error) {
 	body, err := contracts.CanonicalJSONBytes(value)
 	if err != nil {
 		return exportPayload{}, err
@@ -289,14 +291,15 @@ func newExportPayload(kind string, id string, value any, sourceArtifactID string
 		"digest_class": string(contracts.DigestClassRawBytes),
 		"digest":       contracts.RawBytesDigest(body),
 	}
-	if sourceArtifactID != "" {
-		entry["source_artifact_id"] = sourceArtifactID
+	if sourceRef != nil {
+		entry["source_artifact_id"] = stringValue(sourceRef["id"])
+		entry["source_artifact_digest"] = stringValue(sourceRef["digest"])
 	}
 	return exportPayload{entry: entry, body: body}, nil
 }
 
-func portableArtifactProjection(payload map[string]any, portableIDs map[string]string) (map[string]any, error) {
-	value, err := replaceArtifactRefs(payload, portableIDs)
+func portableArtifactProjection(payload map[string]any, portableIDs map[string]string, sourceRefs map[string]map[string]any) (map[string]any, error) {
+	value, err := replaceArtifactRefs(payload, portableIDs, sourceRefs)
 	if err != nil {
 		return nil, err
 	}
@@ -330,20 +333,25 @@ func portableArtifactProjection(payload map[string]any, portableIDs map[string]s
 	return projected, nil
 }
 
-func replaceArtifactRefs(value any, portableIDs map[string]string) (any, error) {
+func replaceArtifactRefs(value any, portableIDs map[string]string, sourceRefs map[string]map[string]any) (any, error) {
 	if contracts.IsArtifactRef(value) {
 		ref := value.(map[string]any)
 		portableID, ok := portableIDs[refKey(ref)]
 		if !ok {
 			return nil, contracts.NewValidationError("portable export projection is missing artifact ref %s", ref["id"])
 		}
-		return map[string]any{"kind": "portable_payload_ref", "portable_id": portableID}, nil
+		projected := map[string]any{"kind": "portable_payload_ref", "portable_id": portableID}
+		if sourceRef := sourceRefs[refKey(ref)]; sourceRef != nil {
+			projected["source_artifact_id"] = stringValue(sourceRef["id"])
+			projected["source_artifact_digest"] = stringValue(sourceRef["digest"])
+		}
+		return projected, nil
 	}
 	switch typed := value.(type) {
 	case map[string]any:
 		result := make(map[string]any, len(typed))
 		for key, item := range typed {
-			projected, err := replaceArtifactRefs(item, portableIDs)
+			projected, err := replaceArtifactRefs(item, portableIDs, sourceRefs)
 			if err != nil {
 				return nil, err
 			}
@@ -353,7 +361,7 @@ func replaceArtifactRefs(value any, portableIDs map[string]string) (any, error) 
 	case []any:
 		result := make([]any, 0, len(typed))
 		for _, item := range typed {
-			projected, err := replaceArtifactRefs(item, portableIDs)
+			projected, err := replaceArtifactRefs(item, portableIDs, sourceRefs)
 			if err != nil {
 				return nil, err
 			}

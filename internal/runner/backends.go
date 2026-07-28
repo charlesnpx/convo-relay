@@ -22,11 +22,12 @@ type TurnOptions struct {
 }
 
 type TurnResult struct {
-	Content        string
-	TimedOut       bool
-	Stalled        bool
-	Recovered      bool
-	ProviderResult ProviderResult
+	Content           string
+	TimedOut          bool
+	Stalled           bool
+	Recovered         bool
+	ProviderResult    ProviderResult
+	ProviderResultRef map[string]any
 }
 
 type SlotConfig struct {

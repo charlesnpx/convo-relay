@@ -433,6 +433,83 @@ func TestRootRecoveryForbidRejectsAfterDurableReducerInvocationWithoutRelaunch(t
 	}
 }
 
+func TestRootRecoveryRepairsProviderInvocationAfterResultBeforeMetadata(t *testing.T) {
+	config := rootRecipeRuntimeConfig("")
+	recipe := config.RelayRecipes["neutral-root"]
+	recipe["participant_turns"] = 1
+	recipe["max_rounds"] = 1
+	recipe["result_source"] = integration.ResultSourceReducer
+	recipe["provider_retry"] = recipes.ProviderRetryAllow
+	sessionDir := filepath.Join(t.TempDir(), "session")
+	initial := &rootBackendRecorder{}
+	initial.handler = func(_ context.Context, call rootBackendCall) (TurnResult, error) {
+		if call.SlotID == "reducer" {
+			return successfulRootTurn(call.Backend, "durable provider result without invocation metadata"), nil
+		}
+		if call.SlotID == "facilitator" {
+			return successfulRootTurn(call.Backend, `{"settled":[],"contested":[],"withdrawn":[]}`), nil
+		}
+		return successfulRootTurn(call.Backend, "participant result"), nil
+	}
+	interrupted := errors.New("after provider result before invocation metadata")
+	fired := false
+	rootProviderResultAfterSave = func(spec rootInvocationSpec, attempt int) error {
+		if spec.phase == "reducer" && attempt == 1 && !fired {
+			fired = true
+			return interrupted
+		}
+		return nil
+	}
+	result, runErr := RunRecipe(context.Background(), RecipeOptions{
+		SessionDir:     sessionDir,
+		Task:           "Repair provider result lineage",
+		RecipeID:       "neutral-root",
+		LaunchCWD:      t.TempDir(),
+		RuntimeConfig:  config,
+		ReadinessCheck: readyRootRecipeCheck,
+		backendFactory: initial.factory(),
+	})
+	rootProviderResultAfterSave = nil
+	t.Cleanup(func() { rootProviderResultAfterSave = nil })
+	if !fired || !errors.Is(runErr, interrupted) {
+		t.Fatalf("provider result interruption = %v, fired=%v", runErr, fired)
+	}
+	st := store.New(sessionDir)
+	markers, err := loadRootProviderAttemptMarkers(st)
+	if err != nil {
+		t.Fatalf("load markers: %v", err)
+	}
+	reducerMarker := markers[len(markers)-1]
+	if reducerMarker.Phase != "reducer" || reducerMarker.ProviderResultRef == nil || reducerMarker.ProviderInvocationRef != nil {
+		t.Fatalf("interrupted reducer marker = %#v", reducerMarker)
+	}
+	if refs := result["invocation_refs"].([]any); len(refs) != 2 {
+		t.Fatalf("interrupted invocation refs = %#v", refs)
+	}
+
+	recovery := &rootBackendRecorder{}
+	recovery.handler = func(_ context.Context, call rootBackendCall) (TurnResult, error) {
+		if call.SlotID != "reducer" {
+			return TurnResult{}, errors.New("recovery replayed participant or facilitator")
+		}
+		return successfulRootTurn(call.Backend, "recovered reducer result"), nil
+	}
+	resumed, err := Resume(context.Background(), sessionDir, ResumeOptions{backendFactory: recovery.factory()})
+	if err != nil {
+		t.Fatalf("resume provider result repair: %v", err)
+	}
+	reducerInvocations := persistedRootInvocationRecordsForPhase(t, st, resumed["invocation_refs"], "reducer")
+	if len(reducerInvocations) != 2 ||
+		reducerInvocations[0]["runner_attempt"] != 1 ||
+		reducerInvocations[1]["runner_attempt"] != 2 {
+		t.Fatalf("repaired reducer invocations = %#v", reducerInvocations)
+	}
+	repairedFirstRef := reducerInvocations[0]["provider_result_ref"].(map[string]any)
+	if requireMatchingArtifactRef(repairedFirstRef, reducerMarker.ProviderResultRef, "repaired reducer result") != nil {
+		t.Fatalf("repaired reducer result ref = %#v, want %#v", repairedFirstRef, reducerMarker.ProviderResultRef)
+	}
+}
+
 func TestRootRecoveryUsesPersistedBundleContractAndNamedInputSnapshots(t *testing.T) {
 	launchCWD := t.TempDir()
 	bundlePath := filepath.Join(launchCWD, "bundle.json")

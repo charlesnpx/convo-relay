@@ -25,11 +25,11 @@ const (
 	PromptPolicyV2             = "prompt-policy/v2"
 	PromptContextProjectionV1  = "relay-prompt-context-v1"
 	ProviderRetryPolicyV1      = "relay-provider-retry-policy-v1"
-	ProviderInvocationV1       = "relay-provider-invocation-v1"
+	ProviderInvocationV2       = "relay-provider-invocation-v2"
 	RenderedPromptV1           = "relay-rendered-prompt-v1"
 	DigestProfileV1            = "relay-root-digests-v1"
 	WorkspaceIsolationReportV1 = "relay-workspace-isolation-v1"
-	PortableExportV1           = "relay-root-portable-export-v1"
+	PortableExportV2           = "relay-root-portable-export-v2"
 	CapabilitiesV1             = "relay-capabilities-v1"
 )
 
@@ -55,9 +55,9 @@ var publicVersionRegistry = VersionRegistry{
 		"prompt_policy":             {PromptPolicyV1, PromptPolicyV2},
 		"prompt_context_projection": {PromptContextProjectionV1},
 		"provider_retry_policy":     {ProviderRetryPolicyV1},
-		"provider_invocation":       {ProviderInvocationV1},
+		"provider_invocation":       {ProviderInvocationV2},
 		"rendered_prompt":           {RenderedPromptV1},
-		"portable_export":           {PortableExportV1},
+		"portable_export":           {PortableExportV2},
 		"digest_profile":            {DigestProfileV1},
 		"isolation_report":          {WorkspaceIsolationReportV1},
 		"workspace_mechanisms":      {"inherited", "detached_writable_git_worktree"},

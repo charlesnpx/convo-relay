@@ -12,6 +12,7 @@ func TestEveryRootArtifactKindRoundTripsWithSafeRefAndRejectsTampering(t *testin
 		RootArtifactKindReducerAttempt:     true,
 		RootArtifactKindRenderedPrompt:     true,
 		RootArtifactKindProviderInvocation: true,
+		RootArtifactKindProviderResult:     true,
 	}
 	for _, kind := range RootArtifactKinds() {
 		t.Run(kind, func(t *testing.T) {

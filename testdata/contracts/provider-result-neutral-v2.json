@@ -1,0 +1,42 @@
+{
+  "actor": "Neutral Agent",
+  "backend": "codex",
+  "classification": null,
+  "completed_at": "2026-01-01T00:00:01Z",
+  "digest_profile": "relay-root-digests-v1",
+  "failure_stage": null,
+  "invocation": {
+    "actor": "Neutral Agent",
+    "backend": "codex",
+    "classification": null,
+    "completed_at": "2026-01-01T00:00:01Z",
+    "failure_stage": null,
+    "invocation_id": "participant:000001",
+    "mapped_working_directory": ".",
+    "outcome": "completed",
+    "participant_ordinal": 1,
+    "phase": "participant",
+    "provider_launch_attempted": true,
+    "provider_result_ref": null,
+    "provider_retry": "allow",
+    "runner_attempt": 1,
+    "schema_version": "relay-provider-invocation-v2",
+    "started_at": "2026-01-01T00:00:00Z"
+  },
+  "invocation_id": "participant:000001",
+  "kind": "provider_result",
+  "outcome": "completed",
+  "phase": "participant",
+  "provider_result": {
+    "backend": "codex",
+    "recovered": false,
+    "return_code": 0,
+    "stalled": false,
+    "timed_out": false,
+    "warnings": []
+  },
+  "provider_retry": "allow",
+  "runner_attempt": 1,
+  "schema_version": 2,
+  "started_at": "2026-01-01T00:00:00Z"
+}

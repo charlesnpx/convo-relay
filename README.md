@@ -407,19 +407,22 @@ convo-relay show a1b2c3d4 --graph --json
 convo-relay export a1b2c3d4 -o transcript.md
 convo-relay export a1b2c3d4 --json -o result.json
 convo-relay export a1b2c3d4 --portable -o evidence-bundle --json
+convo-relay verify-export evidence-bundle --json
 ```
 
 `export` requires an explicit `-o` / `--output` path. Markdown exports include session status, incomplete state, task, session id, final ledger details, compact per-turn ledger counts, and transcript turns. JSON exports include the same structured session report as `show --json`, including diagnostics, and succeed for incomplete sessions when the partial transcript can be read.
 
 `--portable` is separate from those display exports. It accepts a terminal
 successor root session, validates its complete artifact-ref closure, and
-atomically publishes a new `relay-root-portable-export-v1` directory. The
+atomically publishes a new `relay-root-portable-export-v2` directory. The
 manifest binds canonical JSON payloads for the root projection, transcript,
 diagnostics, and every transitively referenced artifact. Source-session refs
-are rewritten to directory-local payload refs, and required absolute source,
-relay-home, session, retained-input, and worktree paths are omitted. Running,
-recovery-pending, v1, tampered, incomplete, or out-of-root sessions fail
-without publishing the final target.
+are rewritten to directory-local payload refs that retain source artifact id
+and digest, and required absolute source, relay-home, session, retained-input,
+and worktree paths are omitted. `verify-export` rechecks the closed file set,
+payload digests, portable source refs, and provider invocation/result lineage.
+Running, recovery-pending, v1, tampered, incomplete, or out-of-root sessions
+fail without publishing the final target.
 
 ### Check health
 
@@ -540,7 +543,7 @@ Then read /tmp/auth-review.md and summarize what each agent found.
 | `export` | Write a Markdown or JSON transcript export |
 | `health` | Run shallow global or session health checks |
 | `recipes` | List, show, and diagnose relay recipes |
-| `contracts` | Inspect portable v1 event and artifact contracts |
+| `contracts` | Inspect event and artifact contracts |
 | `resume` | Continue a previous session until convergence or a round limit |
 | `steer` | Queue an operator prompt for a running session's next turn |
 | `proposals` | List dynamic spawn proposals for a session |

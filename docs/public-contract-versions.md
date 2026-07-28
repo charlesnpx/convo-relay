@@ -17,11 +17,11 @@ also the source for `convo-relay capabilities --json`.
 | prompt policy | `prompt-policy/v1`, `prompt-policy/v2` |
 | prompt-context projection | `relay-prompt-context-v1` |
 | provider retry policy | `relay-provider-retry-policy-v1` |
-| provider invocation | `relay-provider-invocation-v1` |
+| provider invocation | `relay-provider-invocation-v2` |
 | rendered prompt | `relay-rendered-prompt-v1` |
 | digest profile | `relay-root-digests-v1` |
 | workspace isolation report | `relay-workspace-isolation-v1` |
-| portable export | `relay-root-portable-export-v1` |
+| portable export | `relay-root-portable-export-v2` |
 | capability advertisement | `relay-capabilities-v1` |
 | workspace mechanisms | `inherited`, `detached_writable_git_worktree` |
 
@@ -67,13 +67,14 @@ bytes and digest values.
 The Go tests and the small Node verifier consume the same fixture file at
 `testdata/contracts/relay-root-digests-v1.json`.
 
-## `relay-root-portable-export-v1`
+## `relay-root-portable-export-v2`
 
 A portable export is a closed directory containing `manifest.json` and only
 the JSON files named by its ascending `payload_inventory` under
 `payloads/<kind>/<portable-id>.json`. Each inventory entry records its type,
 portable id, relative path, byte count, `raw-bytes` digest, media type, and the
-path-safe source artifact id when the payload originated in the session.
+path-safe source artifact id plus source digest when the payload originated in
+the session.
 
 The manifest records the relay version, digest profile, terminal status and
 stop reason, and the inventory paths for the portable root projection,
@@ -84,7 +85,11 @@ removed. Payload files use the released canonical JSON representation so
 legacy numeric spellings remain verifiable.
 
 Source artifact refs are resolved and digest-checked before export, then
-rewritten as `{ "kind": "portable_payload_ref", "portable_id": "..." }`.
+rewritten as portable payload refs carrying the directory-local portable id and
+the source artifact id/digest. Provider invocation v2 records must carry a
+non-null provider-result ref for launched attempts; unlaunched pre-launch
+failures keep that ref null. Verifiers reject provider invocation/result
+identity mismatches.
 Portable payload identity omits these runtime-only fields:
 
 - execution-workspace identity, source Git root, and source launch CWD;

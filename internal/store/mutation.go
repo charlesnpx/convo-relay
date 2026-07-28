@@ -67,7 +67,7 @@ func (s *Store) LoadArtifact(ref map[string]any) (map[string]any, error) {
 	if err != nil {
 		return nil, err
 	}
-	if payload["kind"] == "artifact_payload" && schemaVersionOne(payload["schema_version"]) {
+	if payload["kind"] == "artifact_payload" && artifactPayloadSchemaVersionOne(payload["schema_version"]) {
 		if inner, ok := payload["payload"].(map[string]any); ok {
 			return inner, nil
 		}

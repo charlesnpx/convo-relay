@@ -112,6 +112,76 @@ func TestVerifyDirectoryValidatesPortableExportClosure(t *testing.T) {
 	}
 }
 
+func TestVerifyDirectoryValidatesPortableProviderLineageV2(t *testing.T) {
+	tests := []struct {
+		name    string
+		mutate  func(*testing.T, *portableVerifyFixture)
+		wantErr string
+	}{
+		{name: "valid"},
+		{
+			name: "source identity mismatch",
+			mutate: func(t *testing.T, fixture *portableVerifyFixture) {
+				invocation := fixture.payloadValue("provider_invocation", "artifact-000002").(map[string]any)["invocation"].(map[string]any)
+				ref := invocation["provider_result_ref"].(map[string]any)
+				ref["source_artifact_digest"] = tamperedDigest(ref["source_artifact_digest"].(string))
+				fixture.replacePayload(t, "provider_invocation", "artifact-000002", map[string]any{
+					"kind":           contracts.RootArtifactKindProviderInvocation,
+					"schema_version": contracts.RootArtifactSchemaVersionV2,
+					"digest_profile": contracts.DigestProfileV1,
+					"invocation":     invocation,
+				})
+			},
+			wantErr: "source identity mismatch",
+		},
+		{
+			name: "result identity mismatch",
+			mutate: func(t *testing.T, fixture *portableVerifyFixture) {
+				result := fixture.payloadValue("provider_result", "artifact-000001").(map[string]any)
+				result["phase"] = "facilitator"
+				fixture.replacePayload(t, "provider_result", "artifact-000001", result)
+			},
+			wantErr: "does not match invocation draft",
+		},
+		{
+			name: "invocation result target mismatch",
+			mutate: func(t *testing.T, fixture *portableVerifyFixture) {
+				invocation := fixture.payloadValue("provider_invocation", "artifact-000002").(map[string]any)["invocation"].(map[string]any)
+				ref := invocation["provider_result_ref"].(map[string]any)
+				ref["portable_id"] = "diagnostics"
+				ref["source_artifact_id"] = nil
+				ref["source_artifact_digest"] = nil
+				fixture.replacePayload(t, "provider_invocation", "artifact-000002", map[string]any{
+					"kind":           contracts.RootArtifactKindProviderInvocation,
+					"schema_version": contracts.RootArtifactSchemaVersionV2,
+					"digest_profile": contracts.DigestProfileV1,
+					"invocation":     invocation,
+				})
+			},
+			wantErr: "does not target provider_result",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			fixture := newPortableProviderLineageFixture(t)
+			if test.mutate != nil {
+				test.mutate(t, fixture)
+				fixture.refresh(t)
+			}
+			report, err := VerifyDirectory(fixture.dir)
+			if test.wantErr == "" {
+				if err != nil || report["schema_version"] != contracts.PortableExportV2 {
+					t.Fatalf("verify provider lineage = %#v, %v", report, err)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), test.wantErr) {
+				t.Fatalf("verify error = %#v, %v; want %q", report, err, test.wantErr)
+			}
+		})
+	}
+}
+
 type portableVerifyFixture struct {
 	dir      string
 	payloads []exportPayload
@@ -143,20 +213,136 @@ func newPortableVerifyFixture(t *testing.T) *portableVerifyFixture {
 	return fixture
 }
 
+func newPortableProviderLineageFixture(t *testing.T) *portableVerifyFixture {
+	t.Helper()
+	fixture := &portableVerifyFixture{dir: filepath.Join(t.TempDir(), "portable")}
+	resultSource := map[string]any{
+		"kind":           "artifact_ref",
+		"schema_version": 1,
+		"id":             "provider_result:000001",
+		"digest":         "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+	}
+	invocationSource := map[string]any{
+		"kind":           "artifact_ref",
+		"schema_version": 1,
+		"id":             "provider_invocation:000001",
+		"digest":         "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+	}
+	invocationDraft := map[string]any{
+		"schema_version":            contracts.ProviderInvocationV2,
+		"invocation_id":             "participant:000001",
+		"phase":                     "participant",
+		"actor":                     "Agent A",
+		"participant_ordinal":       1,
+		"backend":                   "codex",
+		"mapped_working_directory":  ".",
+		"runner_attempt":            1,
+		"provider_launch_attempted": true,
+		"provider_retry":            "allow",
+		"started_at":                "2026-01-01T00:00:00Z",
+		"completed_at":              "2026-01-01T00:00:01Z",
+		"outcome":                   "completed",
+		"failure_stage":             nil,
+		"classification":            nil,
+		"provider_result_ref":       nil,
+	}
+	resultPayload := map[string]any{
+		"kind":           contracts.RootArtifactKindProviderResult,
+		"schema_version": contracts.RootArtifactSchemaVersionV2,
+		"digest_profile": contracts.DigestProfileV1,
+		"invocation_id":  invocationDraft["invocation_id"],
+		"phase":          invocationDraft["phase"],
+		"actor":          invocationDraft["actor"],
+		"runner_attempt": invocationDraft["runner_attempt"],
+		"provider_retry": invocationDraft["provider_retry"],
+		"backend":        invocationDraft["backend"],
+		"started_at":     invocationDraft["started_at"],
+		"completed_at":   invocationDraft["completed_at"],
+		"outcome":        invocationDraft["outcome"],
+		"failure_stage":  invocationDraft["failure_stage"],
+		"classification": invocationDraft["classification"],
+		"provider_result": map[string]any{
+			"backend":     "codex",
+			"return_code": 0,
+		},
+		"invocation": invocationDraft,
+	}
+	boundInvocation := contracts.Materialize(invocationDraft).(map[string]any)
+	boundInvocation["provider_result_ref"] = map[string]any{
+		"kind":                   "portable_payload_ref",
+		"portable_id":            "artifact-000001",
+		"source_artifact_id":     resultSource["id"],
+		"source_artifact_digest": resultSource["digest"],
+	}
+	invocationPayload := map[string]any{
+		"kind":           contracts.RootArtifactKindProviderInvocation,
+		"schema_version": contracts.RootArtifactSchemaVersionV2,
+		"digest_profile": contracts.DigestProfileV1,
+		"invocation":     boundInvocation,
+	}
+	fixture.payloads = []exportPayload{
+		mustPortableVerifyPayload(t, "root_session", "session", map[string]any{
+			"kind":            "portable_root_session",
+			"terminal_status": "completed",
+		}),
+		mustPortableVerifyPayload(t, "participant_transcript", "transcript", []any{}),
+		mustPortableVerifyPayload(t, "diagnostics", "diagnostics", map[string]any{
+			"execution_kind": "recipe",
+			"status":         "completed",
+		}),
+		mustPortableVerifyPayloadWithSource(t, "provider_result", "artifact-000001", resultPayload, resultSource),
+		mustPortableVerifyPayloadWithSource(t, "provider_invocation", "artifact-000002", invocationPayload, invocationSource),
+	}
+	sort.Slice(fixture.payloads, func(i, j int) bool {
+		return stringValue(fixture.payloads[i].entry["path"]) < stringValue(fixture.payloads[j].entry["path"])
+	})
+	fixture.refresh(t)
+	return fixture
+}
+
 func mustPortableVerifyPayload(t *testing.T, kind string, id string, value any) exportPayload {
 	t.Helper()
-	payload, err := newExportPayload(kind, id, value, "")
+	payload, err := newExportPayload(kind, id, value, nil)
 	if err != nil {
 		t.Fatalf("build payload %s/%s: %v", kind, id, err)
 	}
 	return payload
 }
 
+func mustPortableVerifyPayloadWithSource(t *testing.T, kind string, id string, value any, sourceRef map[string]any) exportPayload {
+	t.Helper()
+	payload, err := newExportPayload(kind, id, value, sourceRef)
+	if err != nil {
+		t.Fatalf("build payload %s/%s: %v", kind, id, err)
+	}
+	return payload
+}
+
+func (f *portableVerifyFixture) payloadValue(kind string, id string) any {
+	for _, payload := range f.payloads {
+		if payload.entry["kind"] == kind && payload.entry["portable_id"] == id {
+			value, err := contracts.DecodeStrictJSONBytes(payload.body)
+			if err != nil {
+				panic(err)
+			}
+			return value
+		}
+	}
+	return nil
+}
+
 func (f *portableVerifyFixture) replacePayload(t *testing.T, kind string, id string, value any) {
 	t.Helper()
 	for index, payload := range f.payloads {
 		if payload.entry["kind"] == kind && payload.entry["portable_id"] == id {
-			f.payloads[index] = mustPortableVerifyPayload(t, kind, id, value)
+			var sourceRef map[string]any
+			if payload.entry["source_artifact_id"] != nil {
+				sourceRef = map[string]any{
+					"id":     payload.entry["source_artifact_id"],
+					"digest": payload.entry["source_artifact_digest"],
+				}
+			}
+			f.payloads[index] = mustPortableVerifyPayloadWithSource(t, kind, id, value, sourceRef)
 			return
 		}
 	}

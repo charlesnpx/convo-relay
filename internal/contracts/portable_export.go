@@ -10,7 +10,7 @@ func PortableExportManifest(fields map[string]any) (map[string]any, error) {
 	if manifest == nil {
 		manifest = map[string]any{}
 	}
-	manifest["schema_version"] = PortableExportV1
+	manifest["schema_version"] = PortableExportV2
 	manifest["digest_profile"] = DigestProfileV1
 	inventoryDigest, err := SemanticJSONDigest(manifest["payload_inventory"])
 	if err != nil {
@@ -103,7 +103,7 @@ func validatePortableInventoryEntry(value any, index int) (map[string]any, error
 		return nil, err
 	}
 	if err := validateAllowedKeys("portable export inventory entry", entry, []string{
-		"kind", "portable_id", "path", "media_type", "size_bytes", "digest_class", "digest", "source_artifact_id",
+		"kind", "portable_id", "path", "media_type", "size_bytes", "digest_class", "digest", "source_artifact_id", "source_artifact_digest",
 	}); err != nil {
 		return nil, err
 	}
@@ -146,6 +146,15 @@ func validatePortableInventoryEntry(value any, index int) (map[string]any, error
 		if !refIDRE.MatchString(value) {
 			return nil, NewValidationError("portable export source_artifact_id contains unsupported characters")
 		}
+		digest, err := requireString(entry, "source_artifact_digest", false)
+		if err != nil {
+			return nil, err
+		}
+		if _, err := ValidateArtifactRef(map[string]any{"kind": "artifact_ref", "schema_version": 1, "id": value, "digest": digest}); err != nil {
+			return nil, NewValidationError("portable export source_artifact_digest is invalid")
+		}
+	} else if entry["source_artifact_digest"] != nil {
+		return nil, NewValidationError("portable export source_artifact_digest requires source_artifact_id")
 	}
 	return entry, nil
 }

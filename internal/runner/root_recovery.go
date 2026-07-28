@@ -43,6 +43,7 @@ type preparedRootRecovery struct {
 	persisted                   *persistedRecipeRun
 	workspace                   *workspace.Materialized
 	invocationProgress          map[string]rootInvocationProgress
+	pendingProviderInvocations  []rootProviderAttemptMarker
 	checkpoints                 map[int]*persistedRootRecoveryArtifact
 	attempts                    []persistedRootReducerAttempt
 	candidate                   *rootCandidate
@@ -624,7 +625,7 @@ func prepareRootRecovery(ctx context.Context, sessionDir string, opts ResumeOpti
 	if err != nil {
 		return nil, err
 	}
-	invocationProgress, err := validatePersistedRootInvocationRecords(st, meta)
+	invocationState, err := validatePersistedRootInvocationState(st, meta)
 	if err != nil {
 		return nil, err
 	}
@@ -713,7 +714,8 @@ func prepareRootRecovery(ctx context.Context, sessionDir string, opts ResumeOpti
 		preflight:                   preflight,
 		persisted:                   persisted,
 		workspace:                   workspaceState,
-		invocationProgress:          invocationProgress,
+		invocationProgress:          invocationState.progress,
+		pendingProviderInvocations:  invocationState.pendingProviderInvocations,
 		checkpoints:                 checkpoints,
 		attempts:                    attempts,
 		candidate:                   candidate,
@@ -776,6 +778,9 @@ func (prepared *preparedRootRecovery) run(ctx context.Context) (map[string]any, 
 		}
 	}
 	state.adoptRootRecoveryArtifacts(prepared)
+	if err := state.repairPendingProviderInvocations(prepared.pendingProviderInvocations); err != nil {
+		return state.result(), err
+	}
 	if err := state.saveProgress(); err != nil {
 		return state.result(), err
 	}
@@ -802,6 +807,10 @@ func (prepared *preparedRootRecovery) run(ctx context.Context) (map[string]any, 
 				content:        stringFromAny(completed.payload["content"]),
 				source:         integration.ResultSourceReducer,
 				reducerAttempt: cloneMap(completed.ref),
+				providerResultRef: func() map[string]any {
+					ref, _ := completed.payload["provider_result_ref"].(map[string]any)
+					return cloneMap(ref)
+				}(),
 			}
 			if err := state.persistRootCandidate(&candidate); err != nil {
 				return state.markRootRecoveryPending("result_candidate_persistence", err)
@@ -910,6 +919,66 @@ func (s *rootExecutionState) adoptRootRecoveryArtifacts(prepared *preparedRootRe
 			s.meta = s.meta.With("canonical_result_ref", prepared.canonical.ref)
 		}
 	}
+}
+
+func (s *rootExecutionState) repairPendingProviderInvocations(markers []rootProviderAttemptMarker) error {
+	for _, marker := range markers {
+		ref := cloneMap(marker.ProviderInvocationRef)
+		if ref == nil {
+			resultArtifact, err := validateRootProviderResultRef(s.st, marker.ProviderResultRef, marker.ArtifactOrdinal)
+			if err != nil {
+				return err
+			}
+			record, err := contracts.ValidateProviderResultRecord(resultArtifact.payload)
+			if err != nil {
+				return err
+			}
+			draft, _ := record["invocation"].(map[string]any)
+			invocation := cloneMap(draft)
+			invocation["provider_result_ref"] = cloneMap(marker.ProviderResultRef)
+			bound, err := contracts.ProviderInvocationRecord(invocation)
+			if err != nil {
+				return err
+			}
+			payload, err := contracts.NormalizeRootArtifactVersion(
+				contracts.RootArtifactKindProviderInvocation,
+				contracts.RootArtifactSchemaVersionV2,
+				map[string]any{"invocation": bound},
+			)
+			if err != nil {
+				return err
+			}
+			ref, err = saveRootArtifact(s.st, contracts.RootArtifactKindProviderInvocation, marker.ArtifactOrdinal, payload)
+			if err != nil {
+				return err
+			}
+		}
+		artifact, err := loadRootRecoveryArtifactRef(s.st, ref, contracts.RootArtifactKindProviderInvocation, marker.ArtifactOrdinal)
+		if err != nil {
+			return err
+		}
+		record, err := contracts.ValidateProviderInvocationRecord(artifact.payload["invocation"])
+		if err != nil {
+			return err
+		}
+		if err := validateProviderAttemptMarkerAgainstInvocation(marker, record, ref); err != nil {
+			return err
+		}
+		s.meta = withRootInvocationRef(s.meta, ref)
+		if marker.ProviderInvocationRef == nil {
+			if err := s.updateProviderAttemptMarkerByIdentity(marker.InvocationID, marker.RunnerAttempt, marker.ArtifactOrdinal, func(item *rootProviderAttemptMarker) {
+				item.ProviderInvocationRef = cloneMap(ref)
+			}); err != nil {
+				return err
+			}
+		}
+	}
+	progress, err := validatePersistedRootInvocationRecords(s.st, s.meta)
+	if err != nil {
+		return err
+	}
+	s.invocationProgress = progress
+	return nil
 }
 
 func (s *rootExecutionState) materializeLegacyRootRecoveryInputs(ctx context.Context) error {
@@ -1342,6 +1411,12 @@ func rootCandidateFromArtifact(artifact *persistedRootRecoveryArtifact, plan map
 		return nil, persistenceIntegrityError("Persisted root candidate content is invalid.", nil)
 	}
 	candidate := &rootCandidate{content: content, source: source, rawResultRef: cloneMap(artifact.ref)}
+	if ref, ok := artifact.payload["provider_result_ref"].(map[string]any); ok && ref != nil {
+		if _, err := contracts.ValidateArtifactRef(ref); err != nil {
+			return nil, persistenceIntegrityError("Persisted root candidate provider result ref is invalid.", map[string]any{"cause": err.Error()})
+		}
+		candidate.providerResultRef = cloneMap(ref)
+	}
 	switch source {
 	case integration.ResultSourceLastTurn:
 		candidate.participantTurn = intFromAny(artifact.payload["participant_turn"], 0)
@@ -1356,6 +1431,10 @@ func rootCandidateFromArtifact(artifact *persistedRootRecoveryArtifact, plan map
 		matched := false
 		for _, attempt := range attempts {
 			if requireMatchingArtifactRef(ref, attempt.ref, "reducer attempt") == nil && strings.TrimSpace(stringFromAny(attempt.payload["status"])) == "completed" && stringFromAny(attempt.payload["content"]) == content {
+				attemptProviderRef, _ := attempt.payload["provider_result_ref"].(map[string]any)
+				if candidate.providerResultRef != nil && requireMatchingArtifactRef(candidate.providerResultRef, attemptProviderRef, "reducer provider result") != nil {
+					return nil, persistenceIntegrityError("Persisted reducer candidate provider result ref does not match its reducer attempt.", nil)
+				}
 				matched = true
 				candidate.reducerAttempt = cloneMap(attempt.ref)
 				break

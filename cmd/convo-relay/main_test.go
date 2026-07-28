@@ -10,6 +10,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strings"
 	"testing"
 
@@ -163,9 +164,9 @@ func TestCapabilitiesJSONMatchesRegistryWithoutProviderProbes(t *testing.T) {
 		"prompt_policy":             []string{contracts.PromptPolicyV1, contracts.PromptPolicyV2},
 		"prompt_context_projection": []string{contracts.PromptContextProjectionV1},
 		"provider_retry_policy":     []string{contracts.ProviderRetryPolicyV1},
-		"provider_invocation":       []string{contracts.ProviderInvocationV1},
+		"provider_invocation":       []string{contracts.ProviderInvocationV2},
 		"rendered_prompt":           []string{contracts.RenderedPromptV1},
-		"portable_export":           []string{contracts.PortableExportV1},
+		"portable_export":           []string{contracts.PortableExportV2},
 		"digest_profile":            []string{contracts.DigestProfileV1},
 		"workspace_mechanisms":      []string{"inherited", "detached_writable_git_worktree"},
 		"isolation_report":          []string{contracts.WorkspaceIsolationReportV1},
@@ -181,6 +182,76 @@ func TestCapabilitiesJSONMatchesRegistryWithoutProviderProbes(t *testing.T) {
 	var diagnosticErr *contracts.DiagnosticError
 	if !errors.As(err, &diagnosticErr) || diagnosticErr.Diagnostics[0].Code != contracts.DiagnosticCodeUnsupportedContractVersion {
 		t.Fatalf("unsupported schema error = %T %v", err, err)
+	}
+}
+
+func TestVerifyExportJSONReportsPortableV2(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "portable")
+	payloads := []struct {
+		kind  string
+		id    string
+		value any
+	}{
+		{kind: "root_session", id: "session", value: map[string]any{"kind": "portable_root_session", "terminal_status": "completed"}},
+		{kind: "participant_transcript", id: "transcript", value: []any{}},
+		{kind: "diagnostics", id: "diagnostics", value: map[string]any{"execution_kind": "recipe", "status": "completed"}},
+	}
+	inventory := make([]any, 0, len(payloads))
+	for _, payload := range payloads {
+		body, err := contracts.CanonicalJSONBytes(payload.value)
+		if err != nil {
+			t.Fatalf("encode payload: %v", err)
+		}
+		relative := filepath.ToSlash(filepath.Join("payloads", payload.kind, payload.id+".json"))
+		if err := os.MkdirAll(filepath.Dir(filepath.Join(dir, relative)), 0o755); err != nil {
+			t.Fatalf("mkdir payload: %v", err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, relative), body, 0o644); err != nil {
+			t.Fatalf("write payload: %v", err)
+		}
+		inventory = append(inventory, map[string]any{
+			"kind":         payload.kind,
+			"portable_id":  payload.id,
+			"path":         relative,
+			"media_type":   "application/json",
+			"size_bytes":   len(body),
+			"digest_class": string(contracts.DigestClassRawBytes),
+			"digest":       contracts.RawBytesDigest(body),
+		})
+	}
+	sort.Slice(inventory, func(left int, right int) bool {
+		return inventory[left].(map[string]any)["path"].(string) < inventory[right].(map[string]any)["path"].(string)
+	})
+	manifest, err := contracts.PortableExportManifest(map[string]any{
+		"convo_relay_version": "test",
+		"terminal_status":     "completed",
+		"stop_reason":         nil,
+		"session_payload":     "payloads/root_session/session.json",
+		"transcript_payload":  "payloads/participant_transcript/transcript.json",
+		"diagnostics_payload": "payloads/diagnostics/diagnostics.json",
+		"payload_inventory":   inventory,
+	})
+	if err != nil {
+		t.Fatalf("portable manifest: %v", err)
+	}
+	body, err := contracts.CanonicalJSONBytes(manifest)
+	if err != nil {
+		t.Fatalf("encode manifest: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "manifest.json"), body, 0o644); err != nil {
+		t.Fatalf("write manifest: %v", err)
+	}
+
+	oldArgs := os.Args
+	os.Args = []string{"convo-relay", "verify-export", dir, "--json"}
+	defer func() { os.Args = oldArgs }()
+	output := captureStdout(t, main)
+	var report map[string]any
+	if err := json.Unmarshal([]byte(output), &report); err != nil {
+		t.Fatalf("decode verify-export output %q: %v", output, err)
+	}
+	if report["status"] != "valid" || report["schema_version"] != contracts.PortableExportV2 {
+		t.Fatalf("verify-export report = %#v", report)
 	}
 }
 
