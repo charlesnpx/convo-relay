@@ -280,8 +280,8 @@ func (s *Store) VerifyArtifactRef(ref map[string]any, seen map[string]bool) erro
 	if err != nil {
 		return err
 	}
-	if !schemaVersionOne(payload["schema_version"]) {
-		return contracts.NewValidationError("artifact ref %s payload lacks schema_version 1", artifactRef["id"])
+	if !supportedArtifactSchemaVersion(payload) {
+		return contracts.NewValidationError("artifact ref %s payload has unsupported schema_version", artifactRef["id"])
 	}
 	kind, ok := payload["kind"].(string)
 	if !ok || kind == "" {
@@ -466,7 +466,18 @@ func collectionLen(value any) int {
 	}
 }
 
-func schemaVersionOne(value any) bool {
+func supportedArtifactSchemaVersion(payload map[string]any) bool {
+	if payload["kind"] == "artifact_payload" {
+		return artifactPayloadSchemaVersionOne(payload["schema_version"])
+	}
+	if artifactPayloadSchemaVersionOne(payload["schema_version"]) {
+		return true
+	}
+	_, err := contracts.ValidateRootArtifact(payload, "")
+	return err == nil
+}
+
+func artifactPayloadSchemaVersionOne(value any) bool {
 	ref := map[string]any{
 		"kind":           "artifact_ref",
 		"schema_version": value,

@@ -258,6 +258,69 @@ func TestRunRecipeExecutesExactAlternatingParticipantsAndFacilitator(t *testing.
 	}
 }
 
+func TestRunRecipePersistsProviderResultLineageRefs(t *testing.T) {
+	config := rootRecipeRuntimeConfig("")
+	config.RelayRecipes["neutral-root"]["participant_turns"] = 1
+	config.RelayRecipes["neutral-root"]["max_rounds"] = 1
+	config.RelayRecipes["neutral-root"]["provider_retry"] = recipes.ProviderRetryAllow
+	recorder := &rootBackendRecorder{}
+	sessionDir := filepath.Join(t.TempDir(), "session")
+	result, err := RunRecipe(context.Background(), RecipeOptions{
+		SessionDir:     sessionDir,
+		Task:           "Persist provider result lineage",
+		RecipeID:       "neutral-root",
+		LaunchCWD:      t.TempDir(),
+		RuntimeConfig:  config,
+		ReadinessCheck: readyRootRecipeCheck,
+		backendFactory: recorder.factory(),
+	})
+	if err != nil {
+		t.Fatalf("RunRecipe: %v", err)
+	}
+	st := store.New(sessionDir)
+	invocationRefs := result["invocation_refs"].([]any)
+	if len(invocationRefs) != 2 {
+		t.Fatalf("invocation refs = %#v", invocationRefs)
+	}
+	markers, err := loadRootProviderAttemptMarkers(st)
+	if err != nil {
+		t.Fatalf("load provider attempt markers: %v", err)
+	}
+	if len(markers) != len(invocationRefs) {
+		t.Fatalf("provider attempt markers = %#v", markers)
+	}
+	transcript := result["transcript"].([]any)
+	entry := transcript[0].(map[string]any)
+	participantResultRef := entry["provider_result_ref"].(map[string]any)
+	facilitatorResultRef := entry["facilitator_provider_result_ref"].(map[string]any)
+	for index, rawRef := range invocationRefs {
+		invocationPayload := assertRootRecipeArtifact(t, st, rawRef, contracts.RootArtifactKindProviderInvocation, index+1)
+		invocation := invocationPayload["invocation"].(map[string]any)
+		resultRef := invocation["provider_result_ref"].(map[string]any)
+		resultPayload := assertRootRecipeArtifact(t, st, resultRef, contracts.RootArtifactKindProviderResult, index+1)
+		if _, _, err := contracts.ValidateProviderInvocationResultBinding(invocation, resultPayload); err != nil {
+			t.Fatalf("provider lineage binding %d: %v", index+1, err)
+		}
+		if markers[index].Phase != invocation["phase"] ||
+			markers[index].ProviderResultRef["id"] != resultRef["id"] ||
+			markers[index].ProviderInvocationRef["id"] != rawRef.(map[string]any)["id"] {
+			t.Fatalf("provider attempt marker %d = %#v, invocation %#v", index+1, markers[index], invocation)
+		}
+		switch invocation["phase"] {
+		case "participant":
+			if requireMatchingArtifactRef(participantResultRef, resultRef, "participant result ref") != nil {
+				t.Fatalf("participant transcript result ref = %#v, want %#v", participantResultRef, resultRef)
+			}
+		case "facilitator":
+			if requireMatchingArtifactRef(facilitatorResultRef, resultRef, "facilitator result ref") != nil {
+				t.Fatalf("facilitator transcript result ref = %#v, want %#v", facilitatorResultRef, resultRef)
+			}
+		default:
+			t.Fatalf("unexpected invocation phase = %#v", invocation)
+		}
+	}
+}
+
 func TestRunRecipeScopesContractInstructionsAndProviderInputsPerTurn(t *testing.T) {
 	launchCWD := t.TempDir()
 	if err := os.WriteFile(filepath.Join(launchCWD, "payload.json"), []byte("{\"value\":\"scoped\"}"), 0o644); err != nil {

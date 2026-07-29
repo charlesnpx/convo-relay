@@ -46,6 +46,8 @@ func main() {
 		runShow(os.Args[2:])
 	case "export":
 		runExport(os.Args[2:])
+	case "verify-export":
+		runVerifyExport(os.Args[2:])
 	case "health":
 		runHealth(os.Args[2:])
 	case "contracts":
@@ -683,6 +685,36 @@ func runExport(args []string) {
 		return
 	}
 	fmt.Printf("Exported %s to %s\n", stringValue(report["session_id"]), outputPath)
+}
+
+func runVerifyExport(args []string) {
+	flags := flag.NewFlagSet("verify-export", flag.ExitOnError)
+	jsonOutput := flags.Bool("json", false, "Write structured JSON instead of markdown")
+	if err := parseFlags(flags, args); err != nil {
+		os.Exit(2)
+	}
+	if len(flags.Args()) != 1 {
+		fmt.Fprintln(os.Stderr, "error: verify-export requires a portable export directory")
+		os.Exit(2)
+	}
+	report, err := portable.VerifyDirectory(flags.Args()[0])
+	if err != nil {
+		if *jsonOutput {
+			writeJSON(map[string]any{
+				"schema_version": contracts.PortableExportV2,
+				"status":         "invalid",
+				"error":          err.Error(),
+			})
+			os.Exit(1)
+		}
+		fmt.Fprintf(os.Stderr, "error: %s\n", err)
+		os.Exit(1)
+	}
+	if *jsonOutput {
+		writeJSON(report)
+		return
+	}
+	fmt.Printf("Portable export %s: %s\n", flags.Args()[0], report["status"])
 }
 
 func runHealth(args []string) {
@@ -1789,6 +1821,7 @@ func usage() {
 	fmt.Fprintln(os.Stderr, "  convo-relay show <session-id-prefix> --json")
 	fmt.Fprintln(os.Stderr, "  convo-relay export <session-id-prefix> -o transcript.md")
 	fmt.Fprintln(os.Stderr, "  convo-relay export <session-id-prefix> --portable -o bundle-directory --json")
+	fmt.Fprintln(os.Stderr, "  convo-relay verify-export <bundle-directory> --json")
 	fmt.Fprintln(os.Stderr, "  convo-relay health [session-id-prefix] --json")
 	fmt.Fprintln(os.Stderr, "  convo-relay recipes list --json")
 	fmt.Fprintln(os.Stderr, "  convo-relay recipes show review-panel")

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"path"
+	"sort"
 	"strings"
 
 	"github.com/charlesnpx/convo-relay/internal/contracts"
@@ -38,6 +39,15 @@ func (e rootInvocationPersistenceError) suppressProviderRetry() {}
 // rootProviderInvocationAfterSave is a test-only failpoint after a provider
 // invocation ref is durable in metadata. Production leaves it nil.
 var rootProviderInvocationAfterSave func(rootInvocationSpec, int) error
+
+// rootProviderLaunchMarkerAfterSave is a test-only failpoint after the durable
+// launch marker is written but before the provider call begins.
+var rootProviderLaunchMarkerAfterSave func(rootInvocationSpec, int) error
+
+// rootProviderResultAfterSave is a test-only failpoint after a provider result
+// is durable but before provider_attempts.json is completed. Production leaves
+// it nil.
+var rootProviderResultAfterSave func(rootInvocationSpec, int) error
 
 func (s *rootExecutionState) recordsProviderInvocations() bool {
 	if s == nil || s.preflight == nil {
@@ -82,35 +92,43 @@ func (s *rootExecutionState) persistProviderInvocation(
 	runErr error,
 	providerLaunchAttempted bool,
 	failureStage string,
+	artifactOrdinal int,
 	promptRef map[string]any,
 	promptDigest string,
-) error {
+) (TurnResult, error) {
 	if !s.recordsProviderInvocations() {
-		return nil
+		return result, nil
 	}
 	progress, err := s.ensureInvocationProgress()
 	if err != nil {
-		return err
+		return result, err
 	}
 	invocationID := logicalInvocationID(spec)
 	current := progress[invocationID]
 	if runnerAttempt != current.persistedAttempts+1 {
-		return contracts.NewValidationError("provider invocation runner_attempt must continue persisted sequence for %s", invocationID)
+		return result, contracts.NewValidationError("provider invocation runner_attempt must continue persisted sequence for %s", invocationID)
 	}
 	policy := rootProviderRetryPolicy(s.meta)
 	if policy == recipes.ProviderRetryForbid && providerLaunchAttempted && current.providerLaunchAttempts > 0 {
-		return providerRetryForbiddenTerminalDiagnostic()
+		return result, providerRetryForbiddenTerminalDiagnostic()
 	}
 	providerResult := providerResultForTurn(spec.backendName, result)
 	outcome, classification := invocationOutcome(providerResult, runErr)
 	if failureStage == "" && runErr != nil {
 		failureStage = "provider"
 	}
+	completedAt := utcNow()
 	manifestRefs := []any{}
 	if s.persisted.inputManifestRef != nil {
 		manifestRefs = append(manifestRefs, cloneMap(s.persisted.inputManifestRef))
 	}
-	record, err := contracts.ProviderInvocationRecord(map[string]any{
+	if artifactOrdinal < 1 {
+		artifactOrdinal, err = s.nextProviderInvocationArtifactOrdinal()
+		if err != nil {
+			return result, err
+		}
+	}
+	recordFields := map[string]any{
 		"invocation_id":             invocationID,
 		"phase":                     spec.phase,
 		"actor":                     spec.actor,
@@ -133,14 +151,31 @@ func (s *rootExecutionState) persistProviderInvocation(
 		"provider_launch_attempted": providerLaunchAttempted,
 		"provider_retry":            policy,
 		"started_at":                startedAt,
-		"completed_at":              utcNow(),
+		"completed_at":              completedAt,
 		"outcome":                   outcome,
 		"failure_stage":             emptyStringAsNil(failureStage),
 		"classification":            emptyStringAsNil(classification),
 		"provider_result_ref":       nil,
-	})
+	}
+	if providerLaunchAttempted {
+		resultRef, err := s.persistProviderResult(artifactOrdinal, recordFields, providerResult)
+		if err != nil {
+			return result, err
+		}
+		result.ProviderResultRef = cloneMap(resultRef)
+		if rootProviderResultAfterSave != nil {
+			if err := rootProviderResultAfterSave(spec, runnerAttempt); err != nil {
+				return result, err
+			}
+		}
+		if err := s.completeProviderAttemptMarker(spec, runnerAttempt, artifactOrdinal, completedAt, outcome, failureStage, classification, resultRef); err != nil {
+			return result, err
+		}
+		recordFields["provider_result_ref"] = cloneMap(resultRef)
+	}
+	record, err := contracts.ProviderInvocationRecord(recordFields)
 	if err != nil {
-		return err
+		return result, err
 	}
 	payload, err := contracts.NormalizeRootArtifactVersion(
 		contracts.RootArtifactKindProviderInvocation,
@@ -148,16 +183,20 @@ func (s *rootExecutionState) persistProviderInvocation(
 		map[string]any{"invocation": record},
 	)
 	if err != nil {
-		return err
+		return result, err
 	}
-	ordinal := len(s.meta.Slice("invocation_refs")) + 1
-	ref, err := saveRootArtifact(s.st, contracts.RootArtifactKindProviderInvocation, ordinal, payload)
+	ref, err := saveRootArtifact(s.st, contracts.RootArtifactKindProviderInvocation, artifactOrdinal, payload)
 	if err != nil {
-		return err
+		return result, err
 	}
-	s.meta = s.meta.AppendToSlice("invocation_refs", ref)
+	s.meta = withRootInvocationRef(s.meta, ref)
 	if err := s.saveProgress(); err != nil {
-		return err
+		return result, err
+	}
+	if providerLaunchAttempted {
+		if err := s.bindProviderAttemptInvocationRef(spec, runnerAttempt, artifactOrdinal, ref); err != nil {
+			return result, err
+		}
 	}
 	current.persistedAttempts++
 	if providerLaunchAttempted {
@@ -166,10 +205,10 @@ func (s *rootExecutionState) persistProviderInvocation(
 	progress[invocationID] = current
 	if rootProviderInvocationAfterSave != nil {
 		if err := rootProviderInvocationAfterSave(spec, runnerAttempt); err != nil {
-			return err
+			return result, err
 		}
 	}
-	return nil
+	return result, nil
 }
 
 func (s *rootExecutionState) recordUnlaunchedInvocation(spec rootInvocationSpec, failureStage string, cause error) error {
@@ -180,7 +219,8 @@ func (s *rootExecutionState) recordUnlaunchedInvocation(spec rootInvocationSpec,
 	if err != nil {
 		return err
 	}
-	return s.persistProviderInvocation(spec, attempt, utcNow(), TurnResult{}, cause, false, failureStage, nil, "")
+	_, err = s.persistProviderInvocation(spec, attempt, utcNow(), TurnResult{}, cause, false, failureStage, 0, nil, "")
+	return err
 }
 
 func (s *rootExecutionState) nextProviderInvocationAttempt(spec rootInvocationSpec) (int, error) {
@@ -336,6 +376,163 @@ func emptyMapAsNil(value map[string]any) any {
 	return cloneMap(value)
 }
 
+func (s *rootExecutionState) persistProviderResult(
+	artifactOrdinal int,
+	invocationDraft map[string]any,
+	providerResult ProviderResult,
+) (map[string]any, error) {
+	draft := cloneMap(invocationDraft)
+	draft["schema_version"] = contracts.ProviderInvocationV2
+	draft["provider_result_ref"] = nil
+	record, err := contracts.ProviderResultRecord(map[string]any{
+		"invocation_id":   draft["invocation_id"],
+		"phase":           draft["phase"],
+		"actor":           draft["actor"],
+		"runner_attempt":  draft["runner_attempt"],
+		"provider_retry":  draft["provider_retry"],
+		"backend":         draft["backend"],
+		"started_at":      draft["started_at"],
+		"completed_at":    draft["completed_at"],
+		"outcome":         draft["outcome"],
+		"failure_stage":   draft["failure_stage"],
+		"classification":  draft["classification"],
+		"provider_result": sanitizedProviderResultMap(providerResult),
+		"invocation":      draft,
+	})
+	if err != nil {
+		return nil, err
+	}
+	payload, err := contracts.NormalizeRootArtifactVersion(
+		contracts.RootArtifactKindProviderResult,
+		contracts.RootArtifactSchemaVersionV2,
+		record,
+	)
+	if err != nil {
+		return nil, err
+	}
+	ref, err := saveRootArtifact(s.st, contracts.RootArtifactKindProviderResult, artifactOrdinal, payload)
+	if err != nil {
+		return nil, err
+	}
+	persisted, err := s.st.LoadArtifactPayloadRaw(ref)
+	if err != nil {
+		return nil, err
+	}
+	if _, err := contracts.ValidateProviderResultRecord(persisted); err != nil {
+		return nil, err
+	}
+	return ref, nil
+}
+
+func (s *rootExecutionState) nextProviderInvocationArtifactOrdinal() (int, error) {
+	maximum := 0
+	for _, raw := range s.meta.Slice("invocation_refs") {
+		ref, _ := raw.(map[string]any)
+		ordinal, err := rootArtifactOrdinalFromRef(ref, contracts.RootArtifactKindProviderInvocation)
+		if err == nil && ordinal > maximum {
+			maximum = ordinal
+		}
+	}
+	markers, err := loadRootProviderAttemptMarkers(s.st)
+	if err != nil {
+		return 0, err
+	}
+	for _, marker := range markers {
+		if marker.ArtifactOrdinal > maximum {
+			maximum = marker.ArtifactOrdinal
+		}
+	}
+	return maximum + 1, nil
+}
+
+func (s *rootExecutionState) recordProviderAttemptLaunchMarker(
+	spec rootInvocationSpec,
+	runnerAttempt int,
+	artifactOrdinal int,
+	startedAt string,
+) error {
+	markers, err := loadRootProviderAttemptMarkers(s.st)
+	if err != nil {
+		return err
+	}
+	marker := rootProviderAttemptMarker{
+		ArtifactOrdinal: artifactOrdinal,
+		InvocationID:    logicalInvocationID(spec),
+		Phase:           spec.phase,
+		Actor:           spec.actor,
+		RunnerAttempt:   runnerAttempt,
+		ProviderRetry:   rootProviderRetryPolicy(s.meta),
+		Backend:         spec.backendName,
+		StartedAt:       startedAt,
+	}
+	for _, existing := range markers {
+		if existing.ArtifactOrdinal == artifactOrdinal || providerAttemptKey(existing.InvocationID, existing.RunnerAttempt) == providerAttemptKey(marker.InvocationID, marker.RunnerAttempt) {
+			return contracts.NewValidationError("provider attempt marker already exists for %s attempt %d", marker.InvocationID, marker.RunnerAttempt)
+		}
+	}
+	markers = append(markers, marker)
+	return saveRootProviderAttemptMarkers(s.st, markers)
+}
+
+func (s *rootExecutionState) completeProviderAttemptMarker(
+	spec rootInvocationSpec,
+	runnerAttempt int,
+	artifactOrdinal int,
+	completedAt string,
+	outcome string,
+	failureStage string,
+	classification string,
+	resultRef map[string]any,
+) error {
+	return s.updateProviderAttemptMarker(spec, runnerAttempt, artifactOrdinal, func(marker *rootProviderAttemptMarker) {
+		marker.CompletedAt = completedAt
+		marker.Outcome = outcome
+		marker.FailureStage = failureStage
+		marker.Classification = classification
+		marker.ProviderResultRef = cloneMap(resultRef)
+	})
+}
+
+func (s *rootExecutionState) bindProviderAttemptInvocationRef(
+	spec rootInvocationSpec,
+	runnerAttempt int,
+	artifactOrdinal int,
+	invocationRef map[string]any,
+) error {
+	return s.updateProviderAttemptMarker(spec, runnerAttempt, artifactOrdinal, func(marker *rootProviderAttemptMarker) {
+		marker.ProviderInvocationRef = cloneMap(invocationRef)
+	})
+}
+
+func (s *rootExecutionState) updateProviderAttemptMarker(
+	spec rootInvocationSpec,
+	runnerAttempt int,
+	artifactOrdinal int,
+	update func(*rootProviderAttemptMarker),
+) error {
+	return s.updateProviderAttemptMarkerByIdentity(logicalInvocationID(spec), runnerAttempt, artifactOrdinal, update)
+}
+
+func (s *rootExecutionState) updateProviderAttemptMarkerByIdentity(
+	invocationID string,
+	runnerAttempt int,
+	artifactOrdinal int,
+	update func(*rootProviderAttemptMarker),
+) error {
+	markers, err := loadRootProviderAttemptMarkers(s.st)
+	if err != nil {
+		return err
+	}
+	key := providerAttemptKey(invocationID, runnerAttempt)
+	for index := range markers {
+		if markers[index].ArtifactOrdinal == artifactOrdinal && providerAttemptKey(markers[index].InvocationID, markers[index].RunnerAttempt) == key {
+			update(&markers[index])
+			return saveRootProviderAttemptMarkers(s.st, markers)
+		}
+	}
+	return contracts.NewValidationError("provider attempt marker is missing for %s attempt %d", invocationID, runnerAttempt)
+}
+
 func appendUniqueMetaRef(meta model.SessionMeta, field string, ref map[string]any) model.SessionMeta {
 	for _, raw := range meta.Slice(field) {
 		existing, _ := raw.(map[string]any)
@@ -346,8 +543,57 @@ func appendUniqueMetaRef(meta model.SessionMeta, field string, ref map[string]an
 	return meta.AppendToSlice(field, ref)
 }
 
+func withRootInvocationRef(meta model.SessionMeta, ref map[string]any) model.SessionMeta {
+	if ref == nil {
+		return meta
+	}
+	wantID := strings.TrimSpace(stringFromAny(ref["id"]))
+	refs := append([]any{}, meta.Slice("invocation_refs")...)
+	replaced := false
+	for index, raw := range refs {
+		candidate, _ := raw.(map[string]any)
+		if strings.TrimSpace(stringFromAny(candidate["id"])) == wantID {
+			refs[index] = cloneMap(ref)
+			replaced = true
+		}
+	}
+	if !replaced {
+		refs = append(refs, cloneMap(ref))
+	}
+	sort.SliceStable(refs, func(left int, right int) bool {
+		leftRef, _ := refs[left].(map[string]any)
+		rightRef, _ := refs[right].(map[string]any)
+		leftOrdinal, leftErr := rootArtifactOrdinalFromRef(leftRef, contracts.RootArtifactKindProviderInvocation)
+		rightOrdinal, rightErr := rootArtifactOrdinalFromRef(rightRef, contracts.RootArtifactKindProviderInvocation)
+		if leftErr != nil || rightErr != nil {
+			return stringFromAny(leftRef["id"]) < stringFromAny(rightRef["id"])
+		}
+		return leftOrdinal < rightOrdinal
+	})
+	return meta.With("invocation_refs", refs)
+}
+
+type rootInvocationValidationState struct {
+	progress                   map[string]rootInvocationProgress
+	pendingProviderInvocations []rootProviderAttemptMarker
+}
+
+type rootInvocationFact struct {
+	invocationID  string
+	runnerAttempt int
+	launched      bool
+	ordinal       int
+}
+
 func validatePersistedRootInvocationRecords(st *store.Store, meta model.SessionMeta) (map[string]rootInvocationProgress, error) {
-	progress := map[string]rootInvocationProgress{}
+	state, err := validatePersistedRootInvocationState(st, meta)
+	if err != nil {
+		return nil, err
+	}
+	return state.progress, nil
+}
+
+func validatePersistedRootInvocationState(st *store.Store, meta model.SessionMeta) (*rootInvocationValidationState, error) {
 	promptDigests := map[string]string{}
 	for index, raw := range meta.Slice("rendered_prompt_refs") {
 		ref, _ := raw.(map[string]any)
@@ -361,46 +607,242 @@ func validatePersistedRootInvocationRecords(st *store.Store, meta model.SessionM
 		}
 		promptDigests[artifactRefKey(ref)] = stringFromAny(record["raw_digest"])
 	}
-	for index, raw := range meta.Slice("invocation_refs") {
+
+	markers, err := loadRootProviderAttemptMarkers(st)
+	if err != nil {
+		return nil, err
+	}
+	markerByOrdinal := map[int]rootProviderAttemptMarker{}
+	for _, marker := range markers {
+		markerByOrdinal[marker.ArtifactOrdinal] = marker
+	}
+
+	facts := []rootInvocationFact{}
+	invocationOrdinals := map[int]bool{}
+	previousOrdinal := 0
+	for _, raw := range meta.Slice("invocation_refs") {
 		ref, _ := raw.(map[string]any)
-		artifact, err := loadRootRecoveryArtifactRef(st, ref, contracts.RootArtifactKindProviderInvocation, index+1)
+		ordinal, err := rootArtifactOrdinalFromRef(ref, contracts.RootArtifactKindProviderInvocation)
+		if err != nil {
+			return nil, err
+		}
+		if ordinal <= previousOrdinal {
+			return nil, persistenceIntegrityError("Persisted provider invocation refs must be ordered by root artifact ordinal.", nil)
+		}
+		previousOrdinal = ordinal
+		artifact, err := loadRootRecoveryArtifactRef(st, ref, contracts.RootArtifactKindProviderInvocation, ordinal)
 		if err != nil {
 			return nil, err
 		}
 		record, err := contracts.ValidateProviderInvocationRecord(artifact.payload["invocation"])
 		if err != nil {
-			return nil, persistenceIntegrityError("Persisted provider invocation is invalid.", map[string]any{"ordinal": index + 1, "cause": err.Error()})
+			return nil, persistenceIntegrityError("Persisted provider invocation is invalid.", map[string]any{"ordinal": ordinal, "cause": err.Error()})
 		}
 		invocationID := stringFromAny(record["invocation_id"])
-		current := progress[invocationID]
-		current.persistedAttempts++
-		if intFromAny(record["runner_attempt"], 0) != current.persistedAttempts {
-			return nil, persistenceIntegrityError("Persisted provider invocation attempt sequence is invalid.", map[string]any{"invocation_id": invocationID})
-		}
-		if record["provider_launch_attempted"] == true {
-			current.providerLaunchAttempts++
-			if rootProviderRetryPolicy(meta) == recipes.ProviderRetryForbid && current.providerLaunchAttempts > 1 {
-				return nil, persistenceIntegrityError("Persisted provider invocation attempt sequence is invalid.", map[string]any{"invocation_id": invocationID})
-			}
-		}
-		progress[invocationID] = current
 		promptRef, _ := record["rendered_prompt_ref"].(map[string]any)
 		if promptRef == nil {
 			if record["provider_launch_attempted"] == true {
 				return nil, persistenceIntegrityError("Launched provider invocation is missing its rendered prompt ref.", map[string]any{"invocation_id": invocationID})
 			}
-			continue
-		}
-		if _, err := contracts.ValidateArtifactRef(promptRef); err != nil {
+		} else if _, err := contracts.ValidateArtifactRef(promptRef); err != nil {
 			return nil, persistenceIntegrityError("Provider invocation rendered prompt ref is invalid.", map[string]any{"invocation_id": invocationID, "cause": err.Error()})
-		}
-		if digest, ok := promptDigests[artifactRefKey(promptRef)]; !ok || digest != record["rendered_prompt_digest"] {
+		} else if digest, ok := promptDigests[artifactRefKey(promptRef)]; !ok || digest != record["rendered_prompt_digest"] {
 			return nil, persistenceIntegrityError("Provider invocation rendered prompt binding is invalid.", map[string]any{"invocation_id": invocationID})
 		}
+		if record["provider_launch_attempted"] == true {
+			resultRef, _ := record["provider_result_ref"].(map[string]any)
+			resultArtifact, err := validateRootProviderResultRef(st, resultRef, ordinal)
+			if err != nil {
+				return nil, persistenceIntegrityError("Provider invocation result binding is invalid.", map[string]any{"invocation_id": invocationID, "cause": err.Error()})
+			}
+			if _, _, err := contracts.ValidateProviderInvocationResultBinding(record, resultArtifact.payload); err != nil {
+				return nil, persistenceIntegrityError("Provider invocation result binding is invalid.", map[string]any{"invocation_id": invocationID, "cause": err.Error()})
+			}
+			if marker, ok := markerByOrdinal[ordinal]; ok {
+				if err := validateProviderAttemptMarkerAgainstInvocation(marker, record, ref); err != nil {
+					return nil, err
+				}
+			}
+		}
+		invocationOrdinals[ordinal] = true
+		facts = append(facts, rootInvocationFact{
+			invocationID:  invocationID,
+			runnerAttempt: intFromAny(record["runner_attempt"], 0),
+			launched:      record["provider_launch_attempted"] == true,
+			ordinal:       ordinal,
+		})
 	}
-	return progress, nil
+
+	pending := []rootProviderAttemptMarker{}
+	for _, marker := range markers {
+		if invocationOrdinals[marker.ArtifactOrdinal] {
+			continue
+		}
+		if marker.ProviderResultRef == nil {
+			resultArtifact, found, err := loadLatestRootRecoveryArtifact(st, contracts.RootArtifactKindProviderResult, marker.ArtifactOrdinal)
+			if err != nil {
+				return nil, persistenceIntegrityError("Durable provider result discovery failed.", map[string]any{"invocation_id": marker.InvocationID, "cause": err.Error()})
+			}
+			if found {
+				record, err := contracts.ValidateProviderResultRecord(resultArtifact.payload)
+				if err != nil {
+					return nil, persistenceIntegrityError("Discovered durable provider result is invalid.", map[string]any{"invocation_id": marker.InvocationID, "cause": err.Error()})
+				}
+				if err := validateProviderAttemptMarkerAgainstResult(marker, resultArtifact.payload); err != nil {
+					return nil, err
+				}
+				marker.ProviderResultRef = cloneMap(resultArtifact.ref)
+				marker.CompletedAt = stringFromAny(record["completed_at"])
+				marker.Outcome = stringFromAny(record["outcome"])
+				marker.FailureStage = stringFromAny(record["failure_stage"])
+				marker.Classification = stringFromAny(record["classification"])
+			}
+		}
+		if marker.ProviderInvocationRef != nil {
+			ordinal, err := rootArtifactOrdinalFromRef(marker.ProviderInvocationRef, contracts.RootArtifactKindProviderInvocation)
+			if err != nil || ordinal != marker.ArtifactOrdinal {
+				return nil, persistenceIntegrityError("Provider attempt marker invocation ref identity is invalid.", map[string]any{"invocation_id": marker.InvocationID})
+			}
+			artifact, err := loadRootRecoveryArtifactRef(st, marker.ProviderInvocationRef, contracts.RootArtifactKindProviderInvocation, marker.ArtifactOrdinal)
+			if err != nil {
+				return nil, err
+			}
+			record, err := contracts.ValidateProviderInvocationRecord(artifact.payload["invocation"])
+			if err != nil {
+				return nil, persistenceIntegrityError("Provider attempt marker invocation record is invalid.", map[string]any{"invocation_id": marker.InvocationID, "cause": err.Error()})
+			}
+			if err := validateProviderAttemptMarkerAgainstInvocation(marker, record, marker.ProviderInvocationRef); err != nil {
+				return nil, err
+			}
+			pending = append(pending, marker)
+		} else if marker.ProviderResultRef != nil {
+			resultArtifact, err := validateRootProviderResultRef(st, marker.ProviderResultRef, marker.ArtifactOrdinal)
+			if err != nil {
+				return nil, persistenceIntegrityError("Provider attempt marker result ref is invalid.", map[string]any{"invocation_id": marker.InvocationID, "cause": err.Error()})
+			}
+			if err := validateProviderAttemptMarkerAgainstResult(marker, resultArtifact.payload); err != nil {
+				return nil, err
+			}
+			pending = append(pending, marker)
+		}
+		facts = append(facts, rootInvocationFact{
+			invocationID:  marker.InvocationID,
+			runnerAttempt: marker.RunnerAttempt,
+			launched:      true,
+			ordinal:       marker.ArtifactOrdinal,
+		})
+	}
+	progress, err := rootInvocationProgressFromFacts(facts, meta)
+	if err != nil {
+		return nil, err
+	}
+	return &rootInvocationValidationState{progress: progress, pendingProviderInvocations: pending}, nil
 }
 
 func artifactRefKey(ref map[string]any) string {
 	return stringFromAny(ref["id"]) + "\x00" + stringFromAny(ref["digest"])
+}
+
+func validateRootProviderResultRef(st *store.Store, ref map[string]any, ordinal int) (*persistedRootRecoveryArtifact, error) {
+	resultOrdinal, err := rootArtifactOrdinalFromRef(ref, contracts.RootArtifactKindProviderResult)
+	if err != nil {
+		return nil, err
+	}
+	if resultOrdinal != ordinal {
+		return nil, contracts.NewValidationError("provider result ordinal must match provider invocation ordinal")
+	}
+	artifact, err := loadRootRecoveryArtifactRef(st, ref, contracts.RootArtifactKindProviderResult, ordinal)
+	if err != nil {
+		return nil, err
+	}
+	if _, err := contracts.ValidateProviderResultRecord(artifact.payload); err != nil {
+		return nil, err
+	}
+	return artifact, nil
+}
+
+func validateProviderAttemptMarkerAgainstInvocation(marker rootProviderAttemptMarker, invocation map[string]any, invocationRef map[string]any) error {
+	if marker.InvocationID != stringFromAny(invocation["invocation_id"]) ||
+		marker.Phase != stringFromAny(invocation["phase"]) ||
+		marker.Actor != stringFromAny(invocation["actor"]) ||
+		marker.RunnerAttempt != intFromAny(invocation["runner_attempt"], 0) ||
+		marker.ProviderRetry != stringFromAny(invocation["provider_retry"]) ||
+		marker.Backend != stringFromAny(invocation["backend"]) ||
+		marker.StartedAt != stringFromAny(invocation["started_at"]) {
+		return persistenceIntegrityError("Provider attempt marker does not match provider invocation.", map[string]any{"invocation_id": marker.InvocationID})
+	}
+	if invocation["provider_launch_attempted"] != true {
+		return persistenceIntegrityError("Provider attempt marker cannot bind an unlaunched invocation.", map[string]any{"invocation_id": marker.InvocationID})
+	}
+	if marker.ProviderResultRef != nil {
+		resultRef, _ := invocation["provider_result_ref"].(map[string]any)
+		if requireMatchingArtifactRef(marker.ProviderResultRef, resultRef, "provider attempt marker result ref") != nil {
+			return persistenceIntegrityError("Provider attempt marker result ref does not match provider invocation.", map[string]any{"invocation_id": marker.InvocationID})
+		}
+	}
+	if marker.ProviderInvocationRef != nil && requireMatchingArtifactRef(marker.ProviderInvocationRef, invocationRef, "provider attempt marker invocation ref") != nil {
+		return persistenceIntegrityError("Provider attempt marker invocation ref does not match metadata.", map[string]any{"invocation_id": marker.InvocationID})
+	}
+	return nil
+}
+
+func validateProviderAttemptMarkerAgainstResult(marker rootProviderAttemptMarker, result map[string]any) error {
+	record, err := contracts.ValidateProviderResultRecord(result)
+	if err != nil {
+		return err
+	}
+	if marker.InvocationID != stringFromAny(record["invocation_id"]) ||
+		marker.Phase != stringFromAny(record["phase"]) ||
+		marker.Actor != stringFromAny(record["actor"]) ||
+		marker.RunnerAttempt != intFromAny(record["runner_attempt"], 0) ||
+		marker.ProviderRetry != stringFromAny(record["provider_retry"]) ||
+		marker.Backend != stringFromAny(record["backend"]) ||
+		marker.StartedAt != stringFromAny(record["started_at"]) {
+		return persistenceIntegrityError("Provider attempt marker does not match provider result.", map[string]any{"invocation_id": marker.InvocationID})
+	}
+	return nil
+}
+
+func rootInvocationProgressFromFacts(facts []rootInvocationFact, meta model.SessionMeta) (map[string]rootInvocationProgress, error) {
+	byInvocation := map[string][]rootInvocationFact{}
+	for _, fact := range facts {
+		byInvocation[fact.invocationID] = append(byInvocation[fact.invocationID], fact)
+	}
+	progress := map[string]rootInvocationProgress{}
+	for invocationID, items := range byInvocation {
+		sort.Slice(items, func(i, j int) bool {
+			if items[i].runnerAttempt != items[j].runnerAttempt {
+				return items[i].runnerAttempt < items[j].runnerAttempt
+			}
+			return items[i].ordinal < items[j].ordinal
+		})
+		current := rootInvocationProgress{}
+		for index, item := range items {
+			if item.runnerAttempt != index+1 {
+				return nil, persistenceIntegrityError("Persisted provider invocation attempt sequence is invalid.", map[string]any{"invocation_id": invocationID})
+			}
+			current.persistedAttempts++
+			if item.launched {
+				current.providerLaunchAttempts++
+			}
+		}
+		if rootProviderRetryPolicy(meta) == recipes.ProviderRetryForbid && current.providerLaunchAttempts > 1 {
+			return nil, persistenceIntegrityError("Persisted provider invocation attempt sequence is invalid.", map[string]any{"invocation_id": invocationID})
+		}
+		progress[invocationID] = current
+	}
+	return progress, nil
+}
+
+func rootArtifactOrdinalFromRef(ref map[string]any, kind string) (int, error) {
+	artifactRef, err := contracts.ValidateArtifactRef(ref)
+	if err != nil {
+		return 0, err
+	}
+	refID := strings.TrimSpace(stringFromAny(artifactRef["id"]))
+	prefix := kind + ":"
+	if !strings.HasPrefix(refID, prefix) {
+		return 0, contracts.NewValidationError("root artifact ref id %q does not use %s prefix", refID, prefix)
+	}
+	return contracts.RootArtifactOrdinalFromID(kind, strings.TrimPrefix(refID, prefix))
 }

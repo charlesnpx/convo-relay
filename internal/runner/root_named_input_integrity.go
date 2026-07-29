@@ -87,7 +87,7 @@ func runRootProviderTurnWithRetainedIntegrity(
 			namedinputs.IntegrityBoundaryBeforeAttempt,
 			attemptRef,
 		); err != nil {
-			if recordErr := state.persistProviderInvocation(spec, currentAttempt, startedAt, TurnResult{}, err, false, "pre_launch_integrity", promptRef, promptDigest); recordErr != nil {
+			if _, recordErr := state.persistProviderInvocation(spec, currentAttempt, startedAt, TurnResult{}, err, false, "pre_launch_integrity", 0, promptRef, promptDigest); recordErr != nil {
 				return TurnResult{}, rootInvocationPersistenceError{cause: errors.Join(err, recordErr)}
 			}
 			if ctx.Err() != nil && errors.Is(err, ctx.Err()) {
@@ -104,6 +104,22 @@ func runRootProviderTurnWithRetainedIntegrity(
 		if err := state.ensureProviderLaunchAllowed(spec); err != nil {
 			return TurnResult{}, err
 		}
+		artifactOrdinal := 0
+		if state.recordsProviderInvocations() {
+			var ordinalErr error
+			artifactOrdinal, ordinalErr = state.nextProviderInvocationArtifactOrdinal()
+			if ordinalErr != nil {
+				return TurnResult{}, rootInvocationPersistenceError{cause: ordinalErr}
+			}
+			if err := state.recordProviderAttemptLaunchMarker(spec, currentAttempt, artifactOrdinal, startedAt); err != nil {
+				return TurnResult{}, rootInvocationPersistenceError{cause: err}
+			}
+			if rootProviderLaunchMarkerAfterSave != nil {
+				if err := rootProviderLaunchMarkerAfterSave(spec, currentAttempt); err != nil {
+					return TurnResult{}, rootInvocationPersistenceError{cause: err}
+				}
+			}
+		}
 		result, providerErr := operation()
 		postBase := context.WithoutCancel(ctx)
 		postCtx, cancel := context.WithTimeout(postBase, state.retainedInputVerificationTimeout())
@@ -115,7 +131,8 @@ func runRootProviderTurnWithRetainedIntegrity(
 		)
 		cancel()
 		if verifyErr == nil {
-			if recordErr := state.persistProviderInvocation(spec, currentAttempt, startedAt, result, providerErr, true, "", promptRef, promptDigest); recordErr != nil {
+			result, recordErr := state.persistProviderInvocation(spec, currentAttempt, startedAt, result, providerErr, true, "", artifactOrdinal, promptRef, promptDigest)
+			if recordErr != nil {
 				return TurnResult{}, rootInvocationPersistenceError{cause: recordErr}
 			}
 			return result, providerErr
@@ -158,7 +175,8 @@ func runRootProviderTurnWithRetainedIntegrity(
 			providerCause:   providerCause,
 			providerFailure: providerFailure,
 		}
-		if recordErr := state.persistProviderInvocation(spec, currentAttempt, startedAt, result, integrityErr, true, "post_launch_integrity", promptRef, promptDigest); recordErr != nil {
+		result, recordErr := state.persistProviderInvocation(spec, currentAttempt, startedAt, result, integrityErr, true, "post_launch_integrity", artifactOrdinal, promptRef, promptDigest)
+		if recordErr != nil {
 			return TurnResult{}, rootInvocationPersistenceError{cause: errors.Join(integrityErr, recordErr)}
 		}
 		return TurnResult{}, integrityErr

@@ -48,11 +48,19 @@ func ProviderInvocationRecord(fields map[string]any) (map[string]any, error) {
 	if record == nil {
 		record = map[string]any{}
 	}
-	record["schema_version"] = ProviderInvocationV1
+	record["schema_version"] = ProviderInvocationV2
 	return ValidateProviderInvocationRecord(record)
 }
 
 func ValidateProviderInvocationRecord(value any) (map[string]any, error) {
+	return validateProviderInvocationRecord(value, true)
+}
+
+func ValidateProviderInvocationDraftRecord(value any) (map[string]any, error) {
+	return validateProviderInvocationRecord(value, false)
+}
+
+func validateProviderInvocationRecord(value any, requireLaunchedResultRef bool) (map[string]any, error) {
 	object, err := requireObjectValue(value, "provider invocation")
 	if err != nil {
 		return nil, err
@@ -73,6 +81,20 @@ func ValidateProviderInvocationRecord(value any) (map[string]any, error) {
 	if object["provider_launch_attempted"] != true && object["provider_launch_attempted"] != false {
 		return nil, NewValidationError("provider invocation provider_launch_attempted must be boolean")
 	}
+	if object["provider_launch_attempted"] == true && requireLaunchedResultRef {
+		ref, ok := object["provider_result_ref"].(map[string]any)
+		if !ok || ref == nil {
+			return nil, NewValidationError("launched provider invocation requires provider_result_ref")
+		}
+		validated, err := ValidateArtifactRef(ref)
+		if err != nil {
+			return nil, NewValidationError("provider invocation provider_result_ref is invalid: %v", err)
+		}
+		object["provider_result_ref"] = validated
+	}
+	if object["provider_launch_attempted"] == false && object["provider_result_ref"] != nil {
+		return nil, NewValidationError("unlaunched provider invocation requires null provider_result_ref")
+	}
 	if object["provider_retry"] != "allow" && object["provider_retry"] != "forbid" {
 		return nil, NewValidationError("provider invocation provider_retry must be allow or forbid")
 	}
@@ -88,6 +110,77 @@ func ValidateProviderInvocationRecord(value any) (map[string]any, error) {
 		object["participant_ordinal"] = ordinal
 	}
 	return object, nil
+}
+
+func ProviderResultRecord(fields map[string]any) (map[string]any, error) {
+	record, _ := Materialize(fields).(map[string]any)
+	if record == nil {
+		record = map[string]any{}
+	}
+	return ValidateProviderResultRecord(record)
+}
+
+func ValidateProviderResultRecord(value any) (map[string]any, error) {
+	object, err := requireObjectValue(value, "provider result")
+	if err != nil {
+		return nil, err
+	}
+	invocation, err := ValidateProviderInvocationDraftRecord(object["invocation"])
+	if err != nil {
+		return nil, NewValidationError("provider result invocation draft is invalid: %v", err)
+	}
+	if invocation["provider_launch_attempted"] != true {
+		return nil, NewValidationError("provider result requires a launched invocation draft")
+	}
+	if invocation["provider_result_ref"] != nil {
+		return nil, NewValidationError("provider result invocation draft must not self-reference provider_result_ref")
+	}
+	result, err := requireObjectValue(object["provider_result"], "provider result provider_result")
+	if err != nil {
+		return nil, err
+	}
+	for _, key := range []string{
+		"invocation_id", "phase", "actor", "runner_attempt", "provider_retry", "backend",
+		"started_at", "completed_at", "outcome", "failure_stage", "classification",
+	} {
+		if !semanticJSONEqual(object[key], invocation[key]) {
+			return nil, NewValidationError("provider result %s does not match invocation draft", key)
+		}
+	}
+	if backend, _ := result["backend"].(string); strings.TrimSpace(backend) != "" && backend != object["backend"] {
+		return nil, NewValidationError("provider result backend does not match wrapper backend")
+	}
+	object["invocation"] = invocation
+	object["provider_result"] = result
+	return object, nil
+}
+
+func ValidateProviderInvocationResultBinding(invocation any, providerResultArtifact any) (map[string]any, map[string]any, error) {
+	invocationRecord, err := ValidateProviderInvocationRecord(invocation)
+	if err != nil {
+		return nil, nil, err
+	}
+	artifact, err := ValidateRootArtifact(providerResultArtifact, RootArtifactKindProviderResult)
+	if err != nil {
+		return nil, nil, err
+	}
+	resultRecord, err := ValidateProviderResultRecord(artifact)
+	if err != nil {
+		return nil, nil, err
+	}
+	draft, _ := resultRecord["invocation"].(map[string]any)
+	boundInvocation := Materialize(invocationRecord).(map[string]any)
+	boundInvocation["provider_result_ref"] = nil
+	if !semanticJSONEqual(boundInvocation, draft) {
+		return nil, nil, NewValidationError("provider invocation/result binding identity mismatch")
+	}
+	return invocationRecord, resultRecord, nil
+}
+
+func semanticJSONEqual(left any, right any) bool {
+	leftBytes, leftErr := SemanticJSONBytes(left)
+	rightBytes, rightErr := SemanticJSONBytes(right)
+	return leftErr == nil && rightErr == nil && string(leftBytes) == string(rightBytes)
 }
 
 func portableRelativePath(value string) bool {

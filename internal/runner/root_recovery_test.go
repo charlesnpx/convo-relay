@@ -433,6 +433,187 @@ func TestRootRecoveryForbidRejectsAfterDurableReducerInvocationWithoutRelaunch(t
 	}
 }
 
+func TestRootRecoveryRepairsProviderInvocationAfterResultBeforeMetadata(t *testing.T) {
+	fixture := newDurableProviderResultCrashFixture(t)
+	if fixture.marker.ProviderResultRef != nil || fixture.marker.ProviderInvocationRef != nil {
+		t.Fatalf("interrupted reducer marker = %#v", fixture.marker)
+	}
+	if refs := fixture.result["invocation_refs"].([]any); len(refs) != 2 {
+		t.Fatalf("interrupted invocation refs = %#v", refs)
+	}
+
+	recovery := &rootBackendRecorder{}
+	recovery.handler = func(_ context.Context, call rootBackendCall) (TurnResult, error) {
+		if call.SlotID != "reducer" {
+			return TurnResult{}, errors.New("recovery replayed participant or facilitator")
+		}
+		return successfulRootTurn(call.Backend, "recovered reducer result"), nil
+	}
+	resumed, err := Resume(context.Background(), fixture.sessionDir, ResumeOptions{backendFactory: recovery.factory()})
+	if err != nil {
+		t.Fatalf("resume provider result repair: %v", err)
+	}
+	reducerInvocations := persistedRootInvocationRecordsForPhase(t, fixture.st, resumed["invocation_refs"], "reducer")
+	if len(reducerInvocations) != 2 ||
+		reducerInvocations[0]["runner_attempt"] != 1 ||
+		reducerInvocations[1]["runner_attempt"] != 2 {
+		t.Fatalf("repaired reducer invocations = %#v", reducerInvocations)
+	}
+	repairedFirstRef := reducerInvocations[0]["provider_result_ref"].(map[string]any)
+	if requireMatchingArtifactRef(repairedFirstRef, fixture.resultArtifact.ref, "repaired reducer result") != nil {
+		t.Fatalf("repaired reducer result ref = %#v, want %#v", repairedFirstRef, fixture.resultArtifact.ref)
+	}
+	markers, err := loadRootProviderAttemptMarkers(fixture.st)
+	if err != nil {
+		t.Fatalf("load repaired markers: %v", err)
+	}
+	repairedMarker := providerAttemptMarkerFor(t, markers, fixture.marker.InvocationID, fixture.marker.RunnerAttempt)
+	if repairedMarker.ProviderResultRef == nil || repairedMarker.ProviderInvocationRef == nil || repairedMarker.CompletedAt == "" || repairedMarker.Outcome == "" {
+		t.Fatalf("repaired provider marker = %#v", repairedMarker)
+	}
+}
+
+func TestRootRecoveryRetriesLaunchMarkerWithoutDurableResult(t *testing.T) {
+	config := rootRecipeRuntimeConfig("")
+	recipe := config.RelayRecipes["neutral-root"]
+	recipe["participant_turns"] = 1
+	recipe["max_rounds"] = 1
+	recipe["result_source"] = integration.ResultSourceReducer
+	recipe["provider_retry"] = recipes.ProviderRetryAllow
+	sessionDir := filepath.Join(t.TempDir(), "session")
+	initial := &rootBackendRecorder{}
+	initial.handler = func(_ context.Context, call rootBackendCall) (TurnResult, error) {
+		if call.SlotID == "reducer" {
+			return TurnResult{}, errors.New("provider ran after marker interruption")
+		}
+		if call.SlotID == "facilitator" {
+			return successfulRootTurn(call.Backend, `{"settled":[],"contested":[],"withdrawn":[]}`), nil
+		}
+		return successfulRootTurn(call.Backend, "participant result"), nil
+	}
+	interrupted := errors.New("after launch marker before provider result")
+	fired := false
+	rootProviderLaunchMarkerAfterSave = func(spec rootInvocationSpec, attempt int) error {
+		if spec.phase == "reducer" && attempt == 1 && !fired {
+			fired = true
+			return interrupted
+		}
+		return nil
+	}
+	result, runErr := RunRecipe(context.Background(), RecipeOptions{
+		SessionDir:     sessionDir,
+		Task:           "Retry marker-only provider attempt",
+		RecipeID:       "neutral-root",
+		LaunchCWD:      t.TempDir(),
+		RuntimeConfig:  config,
+		ReadinessCheck: readyRootRecipeCheck,
+		backendFactory: initial.factory(),
+	})
+	rootProviderLaunchMarkerAfterSave = nil
+	t.Cleanup(func() { rootProviderLaunchMarkerAfterSave = nil })
+	if !fired || !errors.Is(runErr, interrupted) {
+		t.Fatalf("provider launch marker interruption = %v, fired=%v", runErr, fired)
+	}
+	st := store.New(sessionDir)
+	markers, err := loadRootProviderAttemptMarkers(st)
+	if err != nil {
+		t.Fatalf("load markers: %v", err)
+	}
+	reducerMarker := markers[len(markers)-1]
+	if reducerMarker.Phase != "reducer" || reducerMarker.ProviderResultRef != nil || reducerMarker.ProviderInvocationRef != nil {
+		t.Fatalf("interrupted reducer marker = %#v", reducerMarker)
+	}
+	if _, found, err := loadLatestRootRecoveryArtifact(st, contracts.RootArtifactKindProviderResult, reducerMarker.ArtifactOrdinal); err != nil || found {
+		t.Fatalf("marker-only provider result = found %v, err %v", found, err)
+	}
+	if refs := result["invocation_refs"].([]any); len(refs) != 2 {
+		t.Fatalf("interrupted invocation refs = %#v", refs)
+	}
+
+	recovery := &rootBackendRecorder{}
+	recovery.handler = func(_ context.Context, call rootBackendCall) (TurnResult, error) {
+		if call.SlotID != "reducer" {
+			return TurnResult{}, errors.New("recovery replayed participant or facilitator")
+		}
+		return successfulRootTurn(call.Backend, "recovered reducer result"), nil
+	}
+	resumed, err := Resume(context.Background(), sessionDir, ResumeOptions{backendFactory: recovery.factory()})
+	if err != nil {
+		t.Fatalf("resume marker-only retry: %v", err)
+	}
+	reducerInvocations := persistedRootInvocationRecordsForPhase(t, st, resumed["invocation_refs"], "reducer")
+	if len(reducerInvocations) != 1 || reducerInvocations[0]["runner_attempt"] != 2 {
+		t.Fatalf("retried reducer invocations = %#v", reducerInvocations)
+	}
+}
+
+func TestRootRecoveryRejectsInvalidDiscoveredProviderResultReadOnly(t *testing.T) {
+	tests := []struct {
+		name    string
+		mutate  func(*testing.T, *durableProviderResultCrashFixture)
+		wantErr string
+	}{
+		{
+			name: "corrupt artifact",
+			mutate: func(t *testing.T, fixture *durableProviderResultCrashFixture) {
+				filename, err := fixture.st.ArtifactPathForRef(fixture.resultArtifact.ref)
+				if err != nil {
+					t.Fatalf("resolve provider result path: %v", err)
+				}
+				filename = filepath.Join(fixture.st.Root, filepath.FromSlash(filename))
+				payload := contracts.Materialize(fixture.resultArtifact.payload).(map[string]any)
+				payload["phase"] = "tampered"
+				body, err := contracts.CanonicalJSONBytes(payload)
+				if err != nil {
+					t.Fatalf("encode corrupt provider result: %v", err)
+				}
+				if err := os.WriteFile(filename, body, 0o644); err != nil {
+					t.Fatalf("write corrupt provider result: %v", err)
+				}
+			},
+			wantErr: "Durable provider result discovery failed",
+		},
+		{
+			name: "valid redigested started_at mismatch",
+			mutate: func(t *testing.T, fixture *durableProviderResultCrashFixture) {
+				payload := contracts.Materialize(fixture.resultArtifact.payload).(map[string]any)
+				payload["started_at"] = "2026-02-02T00:00:00Z"
+				payload["invocation"].(map[string]any)["started_at"] = payload["started_at"]
+				if _, err := contracts.ValidateProviderResultRecord(payload); err != nil {
+					t.Fatalf("validate redigested provider result: %v", err)
+				}
+				if _, err := saveRootArtifact(fixture.st, contracts.RootArtifactKindProviderResult, fixture.marker.ArtifactOrdinal, payload); err != nil {
+					t.Fatalf("save redigested provider result: %v", err)
+				}
+			},
+			wantErr: "Provider attempt marker does not match provider result",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			fixture := newDurableProviderResultCrashFixture(t)
+			test.mutate(t, fixture)
+			before := snapshotRootRecoverySession(t, fixture.sessionDir)
+			constructions := 0
+			_, err := Resume(context.Background(), fixture.sessionDir, ResumeOptions{
+				backendFactory: func(string, string, string, string, string, SlotConfig) (Backend, error) {
+					constructions++
+					return nil, errors.New("invalid recovery constructed a provider")
+				},
+			})
+			if err == nil || !strings.Contains(err.Error(), test.wantErr) {
+				t.Fatalf("invalid discovery error = %v, want %q", err, test.wantErr)
+			}
+			if constructions != 0 {
+				t.Fatalf("invalid recovery provider constructions = %d", constructions)
+			}
+			if after := snapshotRootRecoverySession(t, fixture.sessionDir); !equalRootRecoverySnapshots(before, after) {
+				t.Fatal("invalid provider result recovery mutated the session")
+			}
+		})
+	}
+}
+
 func TestRootRecoveryUsesPersistedBundleContractAndNamedInputSnapshots(t *testing.T) {
 	launchCWD := t.TempDir()
 	bundlePath := filepath.Join(launchCWD, "bundle.json")
@@ -868,6 +1049,89 @@ func snapshotRootRecoverySession(t *testing.T, root string) map[string]string {
 	return snapshot
 }
 
+type durableProviderResultCrashFixture struct {
+	sessionDir     string
+	st             *store.Store
+	result         map[string]any
+	marker         rootProviderAttemptMarker
+	resultArtifact *persistedRootRecoveryArtifact
+}
+
+func newDurableProviderResultCrashFixture(t *testing.T) *durableProviderResultCrashFixture {
+	t.Helper()
+	config := rootRecipeRuntimeConfig("")
+	recipe := config.RelayRecipes["neutral-root"]
+	recipe["participant_turns"] = 1
+	recipe["max_rounds"] = 1
+	recipe["result_source"] = integration.ResultSourceReducer
+	recipe["provider_retry"] = recipes.ProviderRetryAllow
+	sessionDir := filepath.Join(t.TempDir(), "session")
+	initial := &rootBackendRecorder{}
+	initial.handler = func(_ context.Context, call rootBackendCall) (TurnResult, error) {
+		if call.SlotID == "reducer" {
+			return successfulRootTurn(call.Backend, "durable provider result without marker completion"), nil
+		}
+		if call.SlotID == "facilitator" {
+			return successfulRootTurn(call.Backend, `{"settled":[],"contested":[],"withdrawn":[]}`), nil
+		}
+		return successfulRootTurn(call.Backend, "participant result"), nil
+	}
+	interrupted := errors.New("after provider result before marker completion")
+	fired := false
+	rootProviderResultAfterSave = func(spec rootInvocationSpec, attempt int) error {
+		if spec.phase == "reducer" && attempt == 1 && !fired {
+			fired = true
+			return interrupted
+		}
+		return nil
+	}
+	t.Cleanup(func() { rootProviderResultAfterSave = nil })
+	result, runErr := RunRecipe(context.Background(), RecipeOptions{
+		SessionDir:     sessionDir,
+		Task:           "Repair provider result lineage",
+		RecipeID:       "neutral-root",
+		LaunchCWD:      t.TempDir(),
+		RuntimeConfig:  config,
+		ReadinessCheck: readyRootRecipeCheck,
+		backendFactory: initial.factory(),
+	})
+	rootProviderResultAfterSave = nil
+	if !fired || !errors.Is(runErr, interrupted) {
+		t.Fatalf("provider result interruption = %v, fired=%v", runErr, fired)
+	}
+	st := store.New(sessionDir)
+	markers, err := loadRootProviderAttemptMarkers(st)
+	if err != nil {
+		t.Fatalf("load interrupted markers: %v", err)
+	}
+	marker := markers[len(markers)-1]
+	if marker.Phase != "reducer" {
+		t.Fatalf("interrupted reducer marker = %#v", marker)
+	}
+	resultArtifact, found, err := loadLatestRootRecoveryArtifact(st, contracts.RootArtifactKindProviderResult, marker.ArtifactOrdinal)
+	if err != nil || !found {
+		t.Fatalf("load durable provider result = found %v, err %v", found, err)
+	}
+	return &durableProviderResultCrashFixture{
+		sessionDir:     sessionDir,
+		st:             st,
+		result:         result,
+		marker:         marker,
+		resultArtifact: resultArtifact,
+	}
+}
+
+func providerAttemptMarkerFor(t *testing.T, markers []rootProviderAttemptMarker, invocationID string, runnerAttempt int) rootProviderAttemptMarker {
+	t.Helper()
+	for _, marker := range markers {
+		if marker.InvocationID == invocationID && marker.RunnerAttempt == runnerAttempt {
+			return marker
+		}
+	}
+	t.Fatalf("provider marker %s attempt %d not found", invocationID, runnerAttempt)
+	return rootProviderAttemptMarker{}
+}
+
 func persistedRootInvocationRecordsForPhase(t *testing.T, st *store.Store, rawRefs any, phase string) []map[string]any {
 	t.Helper()
 	refs, ok := rawRefs.([]any)
@@ -875,11 +1139,16 @@ func persistedRootInvocationRecordsForPhase(t *testing.T, st *store.Store, rawRe
 		t.Fatalf("invocation refs = %#v", rawRefs)
 	}
 	records := []map[string]any{}
-	for index, rawRef := range refs {
-		payload := assertRootRecipeArtifact(t, st, rawRef, contracts.RootArtifactKindProviderInvocation, index+1)
+	for _, rawRef := range refs {
+		ref, _ := rawRef.(map[string]any)
+		ordinal, err := rootArtifactOrdinalFromRef(ref, contracts.RootArtifactKindProviderInvocation)
+		if err != nil {
+			t.Fatalf("provider invocation ref ordinal: %v", err)
+		}
+		payload := assertRootRecipeArtifact(t, st, rawRef, contracts.RootArtifactKindProviderInvocation, ordinal)
 		record, err := contracts.ValidateProviderInvocationRecord(payload["invocation"])
 		if err != nil {
-			t.Fatalf("validate provider invocation %d: %v", index+1, err)
+			t.Fatalf("validate provider invocation %d: %v", ordinal, err)
 		}
 		if record["phase"] == phase {
 			records = append(records, record)

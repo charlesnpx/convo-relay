@@ -35,11 +35,12 @@ var rootResultCompletionAfterWrite func(string) error
 var rootReducerAfterAttempt func() error
 
 type rootCandidate struct {
-	content         string
-	source          string
-	participantTurn int
-	reducerAttempt  map[string]any
-	rawResultRef    map[string]any
+	content           string
+	source            string
+	participantTurn   int
+	reducerAttempt    map[string]any
+	providerResultRef map[string]any
+	rawResultRef      map[string]any
 }
 
 type rootReducerExecutionError struct {
@@ -89,10 +90,15 @@ func (s *rootExecutionState) produceRootCandidate(ctx context.Context) (rootCand
 		if len(entries) == 0 {
 			return rootCandidate{}, persistenceIntegrityError("Root last_turn result requires a participant response.", nil)
 		}
+		var providerResultRef map[string]any
+		if entries[len(entries)-1].Extra != nil {
+			providerResultRef, _ = entries[len(entries)-1].Extra["provider_result_ref"].(map[string]any)
+		}
 		return rootCandidate{
-			content:         entries[len(entries)-1].Content,
-			source:          source,
-			participantTurn: len(entries),
+			content:           entries[len(entries)-1].Content,
+			source:            source,
+			participantTurn:   len(entries),
+			providerResultRef: cloneMap(providerResultRef),
 		}, nil
 	case integration.ResultSourceReducer:
 		return s.runFreshRootReducer(ctx)
@@ -220,15 +226,17 @@ func (s *rootExecutionState) runFreshRootReducer(ctx context.Context) (rootCandi
 		map[string]any{
 			"reducer_attempt_ref": attemptRef,
 			"provider_result":     sanitizedProviderResultMap(providerResult),
+			"provider_result_ref": emptyMapAsNil(result.ProviderResultRef),
 		},
 		store.EventOptions{},
 	); err != nil {
 		return rootCandidate{}, err
 	}
 	return rootCandidate{
-		content:        result.Content,
-		source:         integration.ResultSourceReducer,
-		reducerAttempt: attemptRef,
+		content:           result.Content,
+		source:            integration.ResultSourceReducer,
+		reducerAttempt:    attemptRef,
+		providerResultRef: cloneMap(result.ProviderResultRef),
 	}, nil
 }
 
@@ -248,16 +256,17 @@ func (s *rootExecutionState) persistRootReducerAttempt(
 		content = sanitizeProviderFailureDetail(content)
 	}
 	payload, err := contracts.NormalizeRootArtifact(contracts.RootArtifactKindReducerAttempt, map[string]any{
-		"ordinal":         ordinal,
-		"status":          status,
-		"backend":         reducer.Name(),
-		"profile_id":      profile["profile_id"],
-		"model":           profile["model"],
-		"effort":          profile["effort"],
-		"content":         content,
-		"provider_result": sanitizedProviderResultMap(providerResult),
-		"provider_state":  reducer.SessionState(),
-		"created_at":      utcNow(),
+		"ordinal":             ordinal,
+		"status":              status,
+		"backend":             reducer.Name(),
+		"profile_id":          profile["profile_id"],
+		"model":               profile["model"],
+		"effort":              profile["effort"],
+		"content":             content,
+		"provider_result":     sanitizedProviderResultMap(providerResult),
+		"provider_result_ref": emptyMapAsNil(result.ProviderResultRef),
+		"provider_state":      reducer.SessionState(),
+		"created_at":          utcNow(),
 	})
 	if err != nil {
 		return nil, err
@@ -360,6 +369,7 @@ func (s *rootExecutionState) persistRootCandidate(candidate *rootCandidate) erro
 		"result_source":       candidate.source,
 		"participant_turn":    positiveIntOrNil(candidate.participantTurn),
 		"reducer_attempt_ref": candidate.reducerAttempt,
+		"provider_result_ref": emptyMapAsNil(candidate.providerResultRef),
 		"content":             candidate.content,
 		"content_bytes":       len([]byte(candidate.content)),
 		"created_at":          utcNow(),

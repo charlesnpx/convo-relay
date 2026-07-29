@@ -47,6 +47,7 @@ var storageEnvelopeExclusions = map[string][]string{
 	RootArtifactKindCanonicalResult:    {},
 	RootArtifactKindRenderedPrompt:     {},
 	RootArtifactKindProviderInvocation: {},
+	RootArtifactKindProviderResult:     {},
 	RootArtifactKindIsolationReport:    {},
 }
 

@@ -25,6 +25,7 @@ const (
 	RootArtifactKindCanonicalResult     = "canonical_result"
 	RootArtifactKindRenderedPrompt      = "rendered_prompt"
 	RootArtifactKindProviderInvocation  = "provider_invocation"
+	RootArtifactKindProviderResult      = "provider_result"
 	RootArtifactKindIsolationReport     = "workspace_isolation_report"
 )
 
@@ -53,6 +54,7 @@ var rootArtifactSpecs = []rootArtifactSpec{
 	{kind: RootArtifactKindCanonicalResult},
 	{kind: RootArtifactKindRenderedPrompt, ordinal: true},
 	{kind: RootArtifactKindProviderInvocation, ordinal: true},
+	{kind: RootArtifactKindProviderResult, ordinal: true},
 	{kind: RootArtifactKindIsolationReport},
 }
 

@@ -37,7 +37,7 @@ test-without-optional-defaults:
 	go test -tags=convo_relay_acceptance_no_optional_defaults ./... -count=1
 
 test-race:
-	go test -race ./internal/runner ./internal/store ./internal/workspace ./internal/namedinputs ./cmd/convo-relay -count=1
+	go test -race ./internal/contracts ./internal/portable ./internal/runner ./internal/store ./internal/workspace ./internal/namedinputs ./cmd/convo-relay -count=1
 
 cross-compile:
 	@set -eu; \

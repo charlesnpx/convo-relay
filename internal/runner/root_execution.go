@@ -331,7 +331,17 @@ func (s *rootExecutionState) runParticipantTurn(
 		_ = s.recordProviderFailure(failure)
 		return err
 	}
-	return s.persistFacilitatorSuccess(ordinal, slot, participantProviderResult, facilitatorProviderResult, ledger, report, attemptRef)
+	return s.persistFacilitatorSuccess(
+		ordinal,
+		slot,
+		participantProviderResult,
+		participantResult.ProviderResultRef,
+		facilitatorProviderResult,
+		facilitatorResult.ProviderResultRef,
+		ledger,
+		report,
+		attemptRef,
+	)
 }
 
 func (s *rootExecutionState) persistParticipantResponse(
@@ -356,6 +366,7 @@ func (s *rootExecutionState) persistParticipantResponse(
 		Extra: map[string]any{
 			"participant_turn":    ordinal,
 			"facilitator_pending": true,
+			"provider_result_ref": emptyMapAsNil(result.ProviderResultRef),
 			"steering_ids":        steeringIDs(steering),
 		},
 	}
@@ -377,11 +388,12 @@ func (s *rootExecutionState) persistParticipantResponse(
 		graph.RootNodeID,
 		fmt.Sprintf("Participant turn %d completed by %s", ordinal, slot.Label()),
 		map[string]any{
-			"participant_turn": ordinal,
-			"slot_id":          slot.SlotID(),
-			"speaker":          slot.Label(),
-			"provider_result":  providerResultPayload,
-			"steering_ids":     steeringIDs(steering),
+			"participant_turn":    ordinal,
+			"slot_id":             slot.SlotID(),
+			"speaker":             slot.Label(),
+			"provider_result":     providerResultPayload,
+			"provider_result_ref": emptyMapAsNil(result.ProviderResultRef),
+			"steering_ids":        steeringIDs(steering),
 		},
 		store.EventOptions{},
 	)
@@ -401,13 +413,14 @@ func (s *rootExecutionState) persistFacilitatorAttempt(
 		status = "failed"
 	}
 	payload := map[string]any{
-		"participant_turn": ordinal,
-		"status":           status,
-		"backend":          s.facilitator.Name(),
-		"profile_id":       s.facilitatorProfile["profile_id"],
-		"content":          result.Content,
-		"provider_result":  sanitizedProviderResultMap(providerResult),
-		"provider_state":   s.facilitator.SessionState(),
+		"participant_turn":    ordinal,
+		"status":              status,
+		"backend":             s.facilitator.Name(),
+		"profile_id":          s.facilitatorProfile["profile_id"],
+		"content":             result.Content,
+		"provider_result":     sanitizedProviderResultMap(providerResult),
+		"provider_result_ref": emptyMapAsNil(result.ProviderResultRef),
+		"provider_state":      s.facilitator.SessionState(),
 	}
 	if runErr != nil {
 		payload["content"] = sanitizeProviderFailureDetail(result.Content)
@@ -442,7 +455,9 @@ func (s *rootExecutionState) persistFacilitatorSuccess(
 	ordinal int,
 	slot Backend,
 	participantResult ProviderResult,
+	participantResultRef map[string]any,
 	facilitatorResult ProviderResult,
+	facilitatorResultRef map[string]any,
 	ledger model.Ledger,
 	report LedgerParseReport,
 	attemptRef map[string]any,
@@ -451,6 +466,7 @@ func (s *rootExecutionState) persistFacilitatorSuccess(
 		delete(entry.Extra, "facilitator_pending")
 		entry.Extra["facilitator_output_ref"] = attemptRef
 		entry.Extra["facilitator_provider_result"] = sanitizedProviderResultMap(facilitatorResult)
+		entry.Extra["facilitator_provider_result_ref"] = emptyMapAsNil(facilitatorResultRef)
 		entry.Extra["facilitator_ledger_parse"] = ledgerParseReportMap(report)
 		entry.Ledger = ledger
 		entry.LedgerPresent = true
@@ -466,15 +482,17 @@ func (s *rootExecutionState) persistFacilitatorSuccess(
 		graph.RootNodeID,
 		fmt.Sprintf("Participant turn %d and facilitator update completed", ordinal),
 		map[string]any{
-			"round":                       ordinal,
-			"participant_turn":            ordinal,
-			"slot_id":                     slot.SlotID(),
-			"speaker":                     slot.Label(),
-			"ledger_counts":               ledger.CountsMap(),
-			"parse_status":                string(report.Status),
-			"provider_result":             sanitizedProviderResultMap(participantResult),
-			"facilitator_provider_result": sanitizedProviderResultMap(facilitatorResult),
-			"facilitator_output_ref":      attemptRef,
+			"round":                           ordinal,
+			"participant_turn":                ordinal,
+			"slot_id":                         slot.SlotID(),
+			"speaker":                         slot.Label(),
+			"ledger_counts":                   ledger.CountsMap(),
+			"parse_status":                    string(report.Status),
+			"provider_result":                 sanitizedProviderResultMap(participantResult),
+			"provider_result_ref":             emptyMapAsNil(participantResultRef),
+			"facilitator_provider_result":     sanitizedProviderResultMap(facilitatorResult),
+			"facilitator_provider_result_ref": emptyMapAsNil(facilitatorResultRef),
+			"facilitator_output_ref":          attemptRef,
 		},
 		store.EventOptions{},
 	); err != nil {
