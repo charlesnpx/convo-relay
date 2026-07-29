@@ -318,6 +318,17 @@ convo-relay compile-recipe --recipe review-panel --target root
 
 `recipes list` shows usable recipes and recipes that require an integration bundle by default in human output. JSON output includes all statuses unless `--status` is supplied, including invalid or skipped parseable records that would otherwise be hidden by runtime normalization. `recipes show` reports declared recipe data, integration binding, and resolved participant/backend readiness. `recipes doctor` validates settings parseability, recipe/profile references, nested relay profile rules, installation-only backend readiness, and grouped root-cause diagnostics. A missing integration bundle reports `requires_integration` without degrading list or doctor; pass `--integration-bundle <file>` to list, show, doctor, or root compilation to bind an exact contract.
 
+The optional Witness defaults keep all existing v1 recipe names and contract
+bindings available. Parallel `witness-falsify-v2`,
+`witness-falsify-v2-codex`, and `witness-falsify-v2-claude` recipes bind
+`witnessed-review/witness-falsification-v2`; `economy-equivalence-v2`,
+`economy-equivalence-v2-codex`, and `economy-equivalence-v2-claude` bind
+`witnessed-review/economy-equivalence-v2`. These v2 names select the
+reachability-classified Witness generation. The defaults declare orchestration
+topology and policy only. Contract prompts, result schemas, assertions, and
+adjudication remain consumer-owned bundle data, and the relay treats each
+contract id as opaque.
+
 `compile-recipe` defaults `--target` to `child` for compatibility. Child compilation emits `compiled_plan/v1` and rejects integration-bound recipes as root-only. Explicit `--target root` emits `root_recipe_plan/v1` and binds a matching integration bundle when the recipe declares a contract.
 
 Run a configured recipe directly as the root session:

@@ -1,0 +1,80 @@
+{
+  "schema_version": "relay-integration-bundle-v2",
+  "id": "neutral/default-recipes-v2",
+  "contracts": {
+    "witnessed-review/witness-falsification-v2": {
+      "turns": [
+        {
+          "participant_turn": 1,
+          "slot": "slot_0",
+          "instructions": "Provide the first analysis."
+        },
+        {
+          "participant_turn": 2,
+          "slot": "slot_1",
+          "instructions": "Provide the second analysis."
+        },
+        {
+          "participant_turn": 3,
+          "slot": "slot_0",
+          "instructions": "Provide the third analysis."
+        },
+        {
+          "participant_turn": 4,
+          "slot": "slot_1",
+          "instructions": "Provide the fourth analysis."
+        }
+      ],
+      "reducer": {
+        "instructions": "Return one JSON object."
+      },
+      "result": {
+        "transport": "json",
+        "schema": {
+          "type": "object"
+        }
+      },
+      "prompt_context": {
+        "participant_transcript": "complete",
+        "facilitator_ledger": "trace_only"
+      }
+    },
+    "witnessed-review/economy-equivalence-v2": {
+      "turns": [
+        {
+          "participant_turn": 1,
+          "slot": "slot_0",
+          "instructions": "Provide the first analysis."
+        },
+        {
+          "participant_turn": 2,
+          "slot": "slot_1",
+          "instructions": "Provide the second analysis."
+        },
+        {
+          "participant_turn": 3,
+          "slot": "slot_0",
+          "instructions": "Provide the third analysis."
+        },
+        {
+          "participant_turn": 4,
+          "slot": "slot_1",
+          "instructions": "Provide the fourth analysis."
+        }
+      ],
+      "reducer": {
+        "instructions": "Return one JSON object."
+      },
+      "result": {
+        "transport": "json",
+        "schema": {
+          "type": "object"
+        }
+      },
+      "prompt_context": {
+        "participant_transcript": "complete",
+        "facilitator_ledger": "trace_only"
+      }
+    }
+  }
+}
