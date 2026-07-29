@@ -138,6 +138,26 @@ records must cover the exact alternating participant schedule, and reducer
 instructions are required when `result_source` is `reducer`. Normalized bundle
 and selected-contract digests are recorded separately.
 
+## Default Witness recipes
+
+The optional default catalog preserves the six v1 recipe names and their v1
+contract bindings. It also provides six parallel v2 names:
+
+| Generation | Recipe ids | Opaque integration contract |
+|---|---|---|
+| defect v1 | `witness-falsify`, `witness-falsify-codex`, `witness-falsify-claude` | `witnessed-review/witness-falsification-v1` |
+| defect v2 | `witness-falsify-v2`, `witness-falsify-v2-codex`, `witness-falsify-v2-claude` | `witnessed-review/witness-falsification-v2` |
+| economy v1 | `economy-equivalence`, `economy-equivalence-codex`, `economy-equivalence-claude` | `witnessed-review/economy-equivalence-v1` |
+| economy v2 | `economy-equivalence-v2`, `economy-equivalence-v2-codex`, `economy-equivalence-v2-claude` | `witnessed-review/economy-equivalence-v2` |
+
+The v2 names select the reachability-classified Witness generation. Every
+default supplies only orchestration topology and policy: participant,
+facilitator, and reducer assignments; turn and result-source policy; retry,
+lifecycle, isolation, depth, approval, and conversation mode. The consumer's
+integration bundle continues to own every prompt, result schema, assertion,
+and adjudication rule. The relay does not interpret either generation's
+contract id.
+
 The supported JSON Schema 2020-12 subset includes `type`, `required`,
 `properties`, `items`, `enum`, `const`, string and array length bounds,
 numeric bounds, `additionalProperties`, `oneOf`, `allOf`,
