@@ -21,7 +21,14 @@ type phase10Env struct {
 	homeDir    string
 }
 
-const claudeLifecycleRecoverySeconds = 2
+const (
+	// The Python fake writes its recovery JSONL before it deliberately stalls, but
+	// a parallel full-suite run can delay interpreter startup beyond two seconds.
+	// Keep this startup allowance local to recovery scenarios rather than slowing
+	// the ordinary timeout and stall coverage.
+	claudeLifecycleRecoverySeconds      = 5
+	claudeLifecycleRecoveryOuterSeconds = 15
+)
 
 func TestClaudeHelpersMatchPythonBehavior(t *testing.T) {
 	home := t.TempDir()
@@ -131,15 +138,15 @@ func TestClaudeBackendLifecycleOutcomes(t *testing.T) {
 	}{
 		{name: "stdout fallback", prompt: "PHASE10_STDOUT_FALLBACK", timeout: 5, wantContent: "stdout fallback", wantReturnCode: 0},
 		{name: "nonzero recovery", prompt: "PHASE10_NONZERO_RECOVERED", timeout: 5, wantContent: "recovered after nonzero", wantRecovered: true, wantReturnCode: 7, wantSource: "jsonl"},
-		{name: "timeout recovery", prompt: "PHASE10_TIMEOUT_RECOVERED", timeout: claudeLifecycleRecoverySeconds, stallTimeout: 10, wantContent: "recovered before timeout", wantTimedOut: true, wantRecovered: true, wantReturnCode: -1, wantSource: "jsonl"},
+		{name: "timeout recovery", prompt: "PHASE10_TIMEOUT_RECOVERED", timeout: claudeLifecycleRecoverySeconds, stallTimeout: claudeLifecycleRecoveryOuterSeconds, wantContent: "recovered before timeout", wantTimedOut: true, wantRecovered: true, wantReturnCode: -1, wantSource: "jsonl"},
 		{name: "timeout empty", prompt: "PHASE10_TIMEOUT_EMPTY", timeout: 1, stallTimeout: 10, wantContent: "[Claude Code timed out after 1s]", wantTimedOut: true, wantReturnCode: -1},
-		{name: "stall recovery", prompt: "PHASE10_STALL_RECOVERED", timeout: 10, stallTimeout: claudeLifecycleRecoverySeconds, wantContent: "recovered before stall", wantStalled: true, wantRecovered: true, wantReturnCode: -1, wantSource: "jsonl"},
+		{name: "stall recovery", prompt: "PHASE10_STALL_RECOVERED", timeout: claudeLifecycleRecoveryOuterSeconds, stallTimeout: claudeLifecycleRecoverySeconds, wantContent: "recovered before stall", wantStalled: true, wantRecovered: true, wantReturnCode: -1, wantSource: "jsonl"},
 		{name: "stall empty", prompt: "PHASE10_STALL_EMPTY", timeout: 10, stallTimeout: 1, wantContent: "[Claude Code stalled after 1s of no JSONL activity]", wantStalled: true, wantReturnCode: -1},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			env := setupPhase10FakeProviders(t)
+			env := setupPhase10FakeProvidersForClaudeScenario(t, tt.prompt)
 			backend := newClaudeBackend(env.relayHome, "slot_0", "Claude Code", env.projectDir, SlotConfig{})
 
 			result, err := backend.RunTurn(context.Background(), tt.prompt, TurnOptions{TimeoutSeconds: tt.timeout, StallTimeoutSeconds: tt.stallTimeout})
@@ -200,10 +207,10 @@ func TestClaudeBackendRetriesSessionCollisionAndClassifiesErrors(t *testing.T) {
 
 func TestClaudeBackendAuthTimeoutRecoveryIsNotRecovered(t *testing.T) {
 	withFastClaudePoll(t)
-	env := setupPhase10FakeProviders(t)
+	env := setupPhase10FakeProvidersForClaudeScenario(t, "PHASE10_TIMEOUT_AUTH")
 	backend := newClaudeBackend(env.relayHome, "slot_0", "Claude Code", env.projectDir, SlotConfig{})
 
-	_, err := backend.RunTurn(context.Background(), "PHASE10_TIMEOUT_AUTH", TurnOptions{TimeoutSeconds: claudeLifecycleRecoverySeconds, StallTimeoutSeconds: 10})
+	_, err := backend.RunTurn(context.Background(), "PHASE10_TIMEOUT_AUTH", TurnOptions{TimeoutSeconds: claudeLifecycleRecoverySeconds, StallTimeoutSeconds: claudeLifecycleRecoveryOuterSeconds})
 	var retryable RetryableProviderError
 	if err == nil {
 		t.Fatalf("auth timeout unexpectedly succeeded")
@@ -429,13 +436,13 @@ func TestRunPersistsClaudeLifecycleProviderResults(t *testing.T) {
 		wantRecovered  bool
 		wantReturnCode int
 	}{
-		{name: "stall recovery", task: "PHASE10_STALL_RECOVERED", timeout: 10, stallTimeout: claudeLifecycleRecoverySeconds, wantStalled: true, wantRecovered: true, wantReturnCode: -1},
-		{name: "timeout recovery", task: "PHASE10_TIMEOUT_RECOVERED", timeout: claudeLifecycleRecoverySeconds, stallTimeout: 10, wantTimedOut: true, wantRecovered: true, wantReturnCode: -1},
+		{name: "stall recovery", task: "PHASE10_STALL_RECOVERED", timeout: claudeLifecycleRecoveryOuterSeconds, stallTimeout: claudeLifecycleRecoverySeconds, wantStalled: true, wantRecovered: true, wantReturnCode: -1},
+		{name: "timeout recovery", task: "PHASE10_TIMEOUT_RECOVERED", timeout: claudeLifecycleRecoverySeconds, stallTimeout: claudeLifecycleRecoveryOuterSeconds, wantTimedOut: true, wantRecovered: true, wantReturnCode: -1},
 		{name: "nonzero recovery", task: "PHASE10_NONZERO_RECOVERED", timeout: 5, stallTimeout: 10, wantRecovered: true, wantReturnCode: 7},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			env := setupPhase10FakeProviders(t)
+			env := setupPhase10FakeProvidersForClaudeScenario(t, tt.task)
 			sessionDir := filepath.Join(env.relayHome, "sessions", strings.ReplaceAll(tt.name, " ", "-"))
 
 			if _, err := Run(context.Background(), Options{
@@ -546,7 +553,9 @@ def log_command():
         handle.write(json.dumps(sys.argv[1:]) + "\n")
 
 def main():
-    prompt = sys.stdin.read()
+    prompt = os.environ.get("CONVO_RELAY_FAKE_CLAUDE_SCENARIO")
+    if not prompt:
+        prompt = sys.stdin.read()
     log_command()
     if "PHASE10_SESSION_COLLISION" in prompt:
         marker = Path.home() / ".claude" / "collision_seen"
@@ -568,15 +577,15 @@ def main():
         return 0
     if "PHASE10_TIMEOUT_RECOVERED" in prompt:
         append_response("recovered before timeout")
-        time.sleep(5)
+        time.sleep(20)
         return 0
     if "PHASE10_TIMEOUT_AUTH" in prompt:
         append_response("Authentication error: token expired")
-        time.sleep(5)
+        time.sleep(20)
         return 0
     if "PHASE10_STALL_RECOVERED" in prompt:
         append_response("recovered before stall")
-        time.sleep(5)
+        time.sleep(20)
         return 0
     if "PHASE10_NONZERO_RECOVERED" in prompt:
         append_response("recovered after nonzero")
@@ -613,6 +622,13 @@ if __name__ == "__main__":
 	t.Setenv("CODEX_CLAUDE_HOME", relayHome)
 	t.Setenv("CONVO_RELAY_FAKE_CWD", projectDir)
 	return phase10Env{relayHome: relayHome, projectDir: projectDir, homeDir: homeDir}
+}
+
+func setupPhase10FakeProvidersForClaudeScenario(t *testing.T, scenario string) phase10Env {
+	t.Helper()
+	env := setupPhase10FakeProviders(t)
+	t.Setenv("CONVO_RELAY_FAKE_CLAUDE_SCENARIO", scenario)
+	return env
 }
 
 func withFastClaudePoll(t *testing.T) {
