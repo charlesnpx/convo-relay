@@ -122,6 +122,66 @@ func TestEmbeddedTurnExecutionFailedWithAgentTextRecovers(t *testing.T) {
 	}
 }
 
+func TestEmbeddedTurnCanceledWithoutOutputReturnsBackendError(t *testing.T) {
+	session := &fakeEmbeddedSession{events: []engine.Event{
+		{Type: engine.EventTurnFinal, TurnFinal: &engine.TurnFinalObservation{Canceled: true}},
+	}}
+
+	result, _, err := runEmbeddedTurn(context.Background(), session, "codex", "Codex", "prompt", 0)
+	var backendErr BackendRunError
+	if !errors.As(err, &backendErr) {
+		t.Fatalf("error = %T %v, want BackendRunError", err, err)
+	}
+	if backendErr.Label != "Codex" || backendErr.Detail != "turn canceled" {
+		t.Fatalf("backend error = %#v", backendErr)
+	}
+	if result.Content != "" || !reflect.DeepEqual(result.ProviderResult.Warnings, []string{"agentbus turn canceled"}) {
+		t.Fatalf("turn result = %#v", result)
+	}
+}
+
+func TestEmbeddedTurnCanceledWithAgentTextRecovers(t *testing.T) {
+	session := &fakeEmbeddedSession{events: []engine.Event{
+		{Type: engine.EventAgentText, Text: "partial response"},
+		{Type: engine.EventResultMessage, Text: ""},
+		{Type: engine.EventTurnFinal, TurnFinal: &engine.TurnFinalObservation{Canceled: true}},
+	}}
+
+	result, _, err := runEmbeddedTurn(context.Background(), session, "codex", "Codex", "prompt", 0)
+	if err != nil {
+		t.Fatalf("run turn: %v", err)
+	}
+	if result.Content != "partial response" || !result.Recovered || !result.ProviderResult.Recovered || result.ProviderResult.RecoverySource != "event_stream" {
+		t.Fatalf("turn result = %#v", result)
+	}
+	if !reflect.DeepEqual(result.ProviderResult.Warnings, []string{"agentbus turn canceled"}) {
+		t.Fatalf("warnings = %#v", result.ProviderResult.Warnings)
+	}
+}
+
+func TestEmbeddedTurnEmptyResultMessageDoesNotRecoverExecutionFailure(t *testing.T) {
+	session := &fakeEmbeddedSession{events: []engine.Event{
+		{Type: engine.EventResultMessage, Text: ""},
+		{Type: engine.EventTurnFinal, TurnFinal: &engine.TurnFinalObservation{
+			ReturnCodeKnown: true,
+			ReturnCode:      17,
+			ExecutionFailed: true,
+		}},
+	}}
+
+	result, _, err := runEmbeddedTurn(context.Background(), session, "codex", "Codex", "prompt", 0)
+	var backendErr BackendRunError
+	if !errors.As(err, &backendErr) {
+		t.Fatalf("error = %T %v, want BackendRunError", err, err)
+	}
+	if backendErr.Label != "Codex" || backendErr.Detail != "process exited 17" {
+		t.Fatalf("backend error = %#v", backendErr)
+	}
+	if result.Content != "" {
+		t.Fatalf("content = %q, want empty", result.Content)
+	}
+}
+
 func TestEmbeddedTurnWithoutFinalReturnsBackendError(t *testing.T) {
 	session := &fakeEmbeddedSession{}
 

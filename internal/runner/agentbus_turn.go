@@ -24,7 +24,7 @@ func runEmbeddedTurn(ctx context.Context, session engine.Session, backend string
 
 	var agentText strings.Builder
 	var resultText string
-	var hasResult bool
+	var hasResultText bool
 	var terminalErrors []string
 	warnings := []string{}
 	var final *engine.TurnFinalObservation
@@ -33,8 +33,10 @@ func runEmbeddedTurn(ctx context.Context, session engine.Session, backend string
 		case engine.EventAgentText:
 			agentText.WriteString(event.Text)
 		case engine.EventResultMessage:
-			hasResult = true
-			resultText = event.Text
+			if event.Text != "" {
+				hasResultText = true
+				resultText = event.Text
+			}
 		case engine.EventTerminalError:
 			text := strings.TrimSpace(event.Text)
 			if text == "" {
@@ -69,7 +71,7 @@ func runEmbeddedTurn(ctx context.Context, session engine.Session, backend string
 	}
 
 	content := agentText.String()
-	if hasResult {
+	if hasResultText {
 		content = resultText
 	}
 	result := TurnResult{
@@ -90,13 +92,19 @@ func runEmbeddedTurn(ctx context.Context, session engine.Session, backend string
 		}
 	}
 
-	hasUsableOutput := hasResult || agentText.Len() > 0
-	if (final.ExecutionFailed || final.TimedOut) && hasUsableOutput {
+	hasUsableOutput := hasResultText || agentText.Len() > 0
+	if (final.ExecutionFailed || final.TimedOut || final.Canceled) && hasUsableOutput {
 		providerResult.Recovered = true
 		providerResult.RecoverySource = "event_stream"
 		result.Recovered = true
 		result.ProviderResult = providerResult
 		return result, final, nil
+	}
+	if final.Canceled {
+		return result, final, BackendRunError{
+			Label:  label,
+			Detail: "turn canceled",
+		}
 	}
 	if final.ExecutionFailed {
 		return result, final, BackendRunError{
