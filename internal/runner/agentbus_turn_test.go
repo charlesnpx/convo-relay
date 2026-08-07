@@ -43,6 +43,58 @@ func TestEmbeddedTurnPrefersResultMessageAndMapsFinalObservation(t *testing.T) {
 	}
 }
 
+func TestEmbeddedTurnRecordsLastReportedModel(t *testing.T) {
+	session := &fakeEmbeddedSession{events: []engine.Event{
+		{Type: engine.EventModelReported, ModelReported: "initial-model"},
+		{Type: engine.EventModelReported, Text: "fallback-model"},
+		{Type: engine.EventTurnFinal, TurnFinal: &engine.TurnFinalObservation{}},
+	}}
+
+	result, _, err := runEmbeddedTurn(context.Background(), session, "codex", "Codex", "prompt", 0)
+	if err != nil {
+		t.Fatalf("run turn: %v", err)
+	}
+	if !reflect.DeepEqual(result.ProviderResult.Extra, map[string]any{"model_reported": "fallback-model"}) {
+		t.Fatalf("provider result extra = %#v", result.ProviderResult.Extra)
+	}
+}
+
+func TestEmbeddedTurnRetainsReportedModelAfterEmptyReport(t *testing.T) {
+	session := &fakeEmbeddedSession{events: []engine.Event{
+		{Type: engine.EventModelReported, ModelReported: "initial-model"},
+		{Type: engine.EventModelReported},
+		{Type: engine.EventTurnFinal, TurnFinal: &engine.TurnFinalObservation{}},
+	}}
+
+	result, _, err := runEmbeddedTurn(context.Background(), session, "codex", "Codex", "prompt", 0)
+	if err != nil {
+		t.Fatalf("run turn: %v", err)
+	}
+	if !reflect.DeepEqual(result.ProviderResult.Extra, map[string]any{"model_reported": "initial-model"}) {
+		t.Fatalf("provider result extra = %#v", result.ProviderResult.Extra)
+	}
+}
+
+func TestEmbeddedTurnIgnoresToolUseAndProgress(t *testing.T) {
+	session := &fakeEmbeddedSession{events: []engine.Event{
+		{Type: engine.EventAgentText, Text: "answer"},
+		{Type: engine.EventToolUse, Name: "shell", Text: "tool activity"},
+		{Type: engine.EventProgress, Text: "heartbeat"},
+		{Type: engine.EventTurnFinal, TurnFinal: &engine.TurnFinalObservation{}},
+	}}
+
+	result, _, err := runEmbeddedTurn(context.Background(), session, "codex", "Codex", "prompt", 0)
+	if err != nil {
+		t.Fatalf("run turn: %v", err)
+	}
+	if result.Content != "answer" {
+		t.Fatalf("content = %q, want answer", result.Content)
+	}
+	if len(result.ProviderResult.Warnings) != 0 {
+		t.Fatalf("warnings = %#v, want none", result.ProviderResult.Warnings)
+	}
+}
+
 func TestEmbeddedTurnMapsTerminalErrorAndFinalWarnings(t *testing.T) {
 	session := &fakeEmbeddedSession{events: []engine.Event{
 		{Type: engine.EventAgentText, Text: "partial"},
@@ -78,6 +130,26 @@ func TestEmbeddedTurnMapsTerminalErrorAndFinalWarnings(t *testing.T) {
 	}
 }
 
+func TestEmbeddedTurnClassifiesRetryableTerminalError(t *testing.T) {
+	const retryableText = "API Error: rate limit exceeded"
+	session := &fakeEmbeddedSession{events: []engine.Event{
+		{Type: engine.EventTerminalError, Text: retryableText},
+		{Type: engine.EventTurnFinal, TurnFinal: &engine.TurnFinalObservation{}},
+	}}
+
+	result, _, err := runEmbeddedTurn(context.Background(), session, "codex", "Codex", "prompt", 0)
+	var retryableErr RetryableProviderError
+	if !errors.As(err, &retryableErr) {
+		t.Fatalf("error = %T %v, want RetryableProviderError", err, err)
+	}
+	if retryableErr.Label != "Codex" || retryableErr.Detail != retryableText {
+		t.Fatalf("retryable error = %#v", retryableErr)
+	}
+	if result.ProviderResult.RetryableError != retryableText {
+		t.Fatalf("retryable error = %q, want %q", result.ProviderResult.RetryableError, retryableText)
+	}
+}
+
 func TestEmbeddedTurnExecutionFailedWithoutOutputReturnsBackendError(t *testing.T) {
 	session := &fakeEmbeddedSession{events: []engine.Event{
 		{Type: engine.EventTurnFinal, TurnFinal: &engine.TurnFinalObservation{
@@ -96,6 +168,34 @@ func TestEmbeddedTurnExecutionFailedWithoutOutputReturnsBackendError(t *testing.
 		t.Fatalf("backend error = %#v", backendErr)
 	}
 	if result.Content != "" || result.ProviderResult.ReturnCode != 17 || !result.ProviderResult.ReturnCodeKnown {
+		t.Fatalf("turn result = %#v", result)
+	}
+}
+
+func TestEmbeddedTurnExecutionFailedWithAuthTextReturnsBackendError(t *testing.T) {
+	const authText = "Authentication error: token expired"
+	session := &fakeEmbeddedSession{events: []engine.Event{
+		{Type: engine.EventAgentText, Text: authText},
+		{Type: engine.EventTurnFinal, TurnFinal: &engine.TurnFinalObservation{
+			ReturnCodeKnown: true,
+			ReturnCode:      17,
+			ExecutionFailed: true,
+		}},
+	}}
+
+	result, _, err := runEmbeddedTurn(context.Background(), session, "codex", "Codex", "prompt", 0)
+	var backendErr BackendRunError
+	if !errors.As(err, &backendErr) {
+		t.Fatalf("error = %T %v, want BackendRunError", err, err)
+	}
+	var retryableErr RetryableProviderError
+	if errors.As(err, &retryableErr) {
+		t.Fatalf("auth failure was classified retryable: %v", err)
+	}
+	if backendErr.Label != "Codex" || backendErr.Detail != authText {
+		t.Fatalf("backend error = %#v", backendErr)
+	}
+	if result.Recovered || result.ProviderResult.Recovered || result.ProviderResult.RetryableError != "" {
 		t.Fatalf("turn result = %#v", result)
 	}
 }
@@ -119,6 +219,22 @@ func TestEmbeddedTurnExecutionFailedWithAgentTextRecovers(t *testing.T) {
 	}
 	if !reflect.DeepEqual(result.ProviderResult.Warnings, []string{"agentbus execution failed"}) {
 		t.Fatalf("warnings = %#v", result.ProviderResult.Warnings)
+	}
+}
+
+func TestEmbeddedTurnTimedOutWithoutOutputReturnsPlaceholder(t *testing.T) {
+	session := &fakeEmbeddedSession{events: []engine.Event{
+		{Type: engine.EventTurnFinal, TurnFinal: &engine.TurnFinalObservation{TimedOut: true}},
+	}}
+
+	result, _, err := runEmbeddedTurn(context.Background(), session, "codex", "Codex", "prompt", 3)
+	if err != nil {
+		t.Fatalf("run turn: %v", err)
+	}
+	const timeoutDetail = "codex timed out after 3s with no recoverable response"
+	if result.Content != "[Codex timed out after 3s]" || !result.TimedOut || !result.ProviderResult.TimedOut ||
+		!reflect.DeepEqual(result.ProviderResult.Warnings, []string{"agentbus turn timed out", timeoutDetail}) {
+		t.Fatalf("turn result = %#v", result)
 	}
 }
 
@@ -156,6 +272,25 @@ func TestEmbeddedTurnCanceledWithAgentTextRecovers(t *testing.T) {
 	}
 	if !reflect.DeepEqual(result.ProviderResult.Warnings, []string{"agentbus turn canceled"}) {
 		t.Fatalf("warnings = %#v", result.ProviderResult.Warnings)
+	}
+}
+
+func TestEmbeddedTurnCanceledWithRetryableAgentTextRecovers(t *testing.T) {
+	const retryableText = "API Error: rate limit exceeded"
+	session := &fakeEmbeddedSession{events: []engine.Event{
+		{Type: engine.EventAgentText, Text: retryableText},
+		{Type: engine.EventTurnFinal, TurnFinal: &engine.TurnFinalObservation{Canceled: true}},
+	}}
+
+	result, _, err := runEmbeddedTurn(context.Background(), session, "codex", "Codex", "prompt", 0)
+	if err != nil {
+		t.Fatalf("run turn: %v", err)
+	}
+	if result.Content != retryableText || !result.Recovered || !result.ProviderResult.Recovered || result.ProviderResult.RecoverySource != "event_stream" {
+		t.Fatalf("turn result = %#v", result)
+	}
+	if result.ProviderResult.RetryableError != "" {
+		t.Fatalf("retryable error = %q, want empty", result.ProviderResult.RetryableError)
 	}
 }
 

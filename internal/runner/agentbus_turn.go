@@ -26,12 +26,25 @@ func runEmbeddedTurn(ctx context.Context, session engine.Session, backend string
 	var resultText string
 	var hasResultText bool
 	var terminalErrors []string
+	var reportedModel string
 	warnings := []string{}
 	var final *engine.TurnFinalObservation
 	for event := range events {
 		switch event.Type {
 		case engine.EventAgentText:
 			agentText.WriteString(event.Text)
+		case engine.EventModelReported:
+			candidate := event.ModelReported
+			if candidate == "" {
+				candidate = event.Text
+			}
+			if candidate != "" {
+				reportedModel = candidate
+			}
+		case engine.EventToolUse:
+			// Tool activity is not persisted by the relay.
+		case engine.EventProgress:
+			// Heartbeats are not persisted by the relay.
 		case engine.EventResultMessage:
 			if event.Text != "" {
 				hasResultText = true
@@ -61,6 +74,9 @@ func runEmbeddedTurn(ctx context.Context, session engine.Session, backend string
 		Backend:  backend,
 		Warnings: warnings,
 	}
+	if reportedModel != "" {
+		providerResult.Extra = map[string]any{"model_reported": reportedModel}
+	}
 	if final == nil {
 		providerResult.Warnings = append(providerResult.Warnings, "agentbus turn ended without a final observation")
 	} else {
@@ -79,10 +95,25 @@ func runEmbeddedTurn(ctx context.Context, session engine.Session, backend string
 		TimedOut:       providerResult.TimedOut,
 		ProviderResult: providerResult,
 	}
+	failureText := ""
+	if len(terminalErrors) > 0 {
+		failureText = strings.Join(terminalErrors, "; ")
+	} else if final != nil && (final.ExecutionFailed || final.TimedOut) {
+		failureText = content
+	}
+	if retryableError := classifyRetryableProviderError(failureText); retryableError != "" {
+		providerResult.RetryableError = retryableError
+		result.ProviderResult = providerResult
+		return result, final, RetryableProviderError{Label: label, Detail: retryableError}
+	}
+	if failureText != "" && providerFailureCategory(failureText) == "auth" {
+		result.ProviderResult = providerResult
+		return result, final, BackendRunError{Label: label, Detail: failureText}
+	}
 	if len(terminalErrors) > 0 {
 		return result, final, BackendRunError{
 			Label:  label,
-			Detail: strings.Join(terminalErrors, "; "),
+			Detail: failureText,
 		}
 	}
 	if final == nil {
@@ -113,9 +144,11 @@ func runEmbeddedTurn(ctx context.Context, session engine.Session, backend string
 		}
 	}
 	if final.TimedOut {
-		providerResult.Warnings = append(providerResult.Warnings, fmt.Sprintf("%s timed out after %ds with no recoverable response", backend, timeoutSeconds))
+		timeoutDetail := fmt.Sprintf("%s timed out after %ds with no recoverable response", backend, timeoutSeconds)
+		providerResult.Warnings = append(providerResult.Warnings, timeoutDetail)
 		result.Content = fmt.Sprintf("[%s timed out after %ds]", label, timeoutSeconds)
 		result.ProviderResult = providerResult
+		return result, final, nil
 	}
 	return result, final, nil
 }
