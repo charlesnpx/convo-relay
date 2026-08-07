@@ -34,9 +34,12 @@ func runEmbeddedTurn(ctx context.Context, session engine.Session, backend string
 		case engine.EventAgentText:
 			agentText.WriteString(event.Text)
 		case engine.EventModelReported:
-			reportedModel = event.ModelReported
-			if reportedModel == "" {
-				reportedModel = event.Text
+			candidate := event.ModelReported
+			if candidate == "" {
+				candidate = event.Text
+			}
+			if candidate != "" {
+				reportedModel = candidate
 			}
 		case engine.EventToolUse:
 			// Tool activity is not persisted by the relay.

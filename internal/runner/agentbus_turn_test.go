@@ -59,6 +59,22 @@ func TestEmbeddedTurnRecordsLastReportedModel(t *testing.T) {
 	}
 }
 
+func TestEmbeddedTurnRetainsReportedModelAfterEmptyReport(t *testing.T) {
+	session := &fakeEmbeddedSession{events: []engine.Event{
+		{Type: engine.EventModelReported, ModelReported: "initial-model"},
+		{Type: engine.EventModelReported},
+		{Type: engine.EventTurnFinal, TurnFinal: &engine.TurnFinalObservation{}},
+	}}
+
+	result, _, err := runEmbeddedTurn(context.Background(), session, "codex", "Codex", "prompt", 0)
+	if err != nil {
+		t.Fatalf("run turn: %v", err)
+	}
+	if !reflect.DeepEqual(result.ProviderResult.Extra, map[string]any{"model_reported": "initial-model"}) {
+		t.Fatalf("provider result extra = %#v", result.ProviderResult.Extra)
+	}
+}
+
 func TestEmbeddedTurnIgnoresToolUseAndProgress(t *testing.T) {
 	session := &fakeEmbeddedSession{events: []engine.Event{
 		{Type: engine.EventAgentText, Text: "answer"},
