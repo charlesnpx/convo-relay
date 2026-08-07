@@ -77,3 +77,63 @@ func TestEmbeddedTurnMapsTerminalErrorAndFinalWarnings(t *testing.T) {
 		t.Fatalf("warnings = %#v, want %#v", result.ProviderResult.Warnings, wantWarnings)
 	}
 }
+
+func TestEmbeddedTurnExecutionFailedWithoutOutputReturnsBackendError(t *testing.T) {
+	session := &fakeEmbeddedSession{events: []engine.Event{
+		{Type: engine.EventTurnFinal, TurnFinal: &engine.TurnFinalObservation{
+			ReturnCodeKnown: true,
+			ReturnCode:      17,
+			ExecutionFailed: true,
+		}},
+	}}
+
+	result, _, err := runEmbeddedTurn(context.Background(), session, "codex", "Codex", "prompt", 0)
+	var backendErr BackendRunError
+	if !errors.As(err, &backendErr) {
+		t.Fatalf("error = %T %v, want BackendRunError", err, err)
+	}
+	if backendErr.Label != "Codex" || backendErr.Detail != "process exited 17" {
+		t.Fatalf("backend error = %#v", backendErr)
+	}
+	if result.Content != "" || result.ProviderResult.ReturnCode != 17 || !result.ProviderResult.ReturnCodeKnown {
+		t.Fatalf("turn result = %#v", result)
+	}
+}
+
+func TestEmbeddedTurnExecutionFailedWithAgentTextRecovers(t *testing.T) {
+	session := &fakeEmbeddedSession{events: []engine.Event{
+		{Type: engine.EventAgentText, Text: "partial response"},
+		{Type: engine.EventTurnFinal, TurnFinal: &engine.TurnFinalObservation{
+			ReturnCodeKnown: true,
+			ReturnCode:      17,
+			ExecutionFailed: true,
+		}},
+	}}
+
+	result, _, err := runEmbeddedTurn(context.Background(), session, "codex", "Codex", "prompt", 0)
+	if err != nil {
+		t.Fatalf("run turn: %v", err)
+	}
+	if result.Content != "partial response" || !result.Recovered || !result.ProviderResult.Recovered || result.ProviderResult.RecoverySource != "event_stream" {
+		t.Fatalf("turn result = %#v", result)
+	}
+	if !reflect.DeepEqual(result.ProviderResult.Warnings, []string{"agentbus execution failed"}) {
+		t.Fatalf("warnings = %#v", result.ProviderResult.Warnings)
+	}
+}
+
+func TestEmbeddedTurnWithoutFinalReturnsBackendError(t *testing.T) {
+	session := &fakeEmbeddedSession{}
+
+	result, final, err := runEmbeddedTurn(context.Background(), session, "codex", "Codex", "prompt", 0)
+	var backendErr BackendRunError
+	if !errors.As(err, &backendErr) {
+		t.Fatalf("error = %T %v, want BackendRunError", err, err)
+	}
+	if final != nil || backendErr.Label != "Codex" || backendErr.Detail != "turn ended without final observation" {
+		t.Fatalf("final = %#v, backend error = %#v", final, backendErr)
+	}
+	if !reflect.DeepEqual(result.ProviderResult.Warnings, []string{"agentbus turn ended without a final observation"}) {
+		t.Fatalf("warnings = %#v", result.ProviderResult.Warnings)
+	}
+}

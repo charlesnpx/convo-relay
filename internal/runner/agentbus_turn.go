@@ -83,7 +83,43 @@ func runEmbeddedTurn(ctx context.Context, session engine.Session, backend string
 			Detail: strings.Join(terminalErrors, "; "),
 		}
 	}
+	if final == nil {
+		return result, nil, BackendRunError{
+			Label:  label,
+			Detail: "turn ended without final observation",
+		}
+	}
+
+	hasUsableOutput := hasResult || agentText.Len() > 0
+	if (final.ExecutionFailed || final.TimedOut) && hasUsableOutput {
+		providerResult.Recovered = true
+		providerResult.RecoverySource = "event_stream"
+		result.Recovered = true
+		result.ProviderResult = providerResult
+		return result, final, nil
+	}
+	if final.ExecutionFailed {
+		return result, final, BackendRunError{
+			Label:  label,
+			Detail: embeddedTurnFailureDetail(final),
+		}
+	}
+	if final.TimedOut {
+		providerResult.Warnings = append(providerResult.Warnings, fmt.Sprintf("%s timed out after %ds with no recoverable response", backend, timeoutSeconds))
+		result.Content = fmt.Sprintf("[%s timed out after %ds]", label, timeoutSeconds)
+		result.ProviderResult = providerResult
+	}
 	return result, final, nil
+}
+
+func embeddedTurnFailureDetail(final *engine.TurnFinalObservation) string {
+	if final.ReturnCodeKnown {
+		return fmt.Sprintf("process exited %d", final.ReturnCode)
+	}
+	if signal := strings.TrimSpace(final.Signal); signal != "" {
+		return fmt.Sprintf("process terminated by signal %s", signal)
+	}
+	return "execution failed"
 }
 
 func embeddedTurnTimeout(timeoutSeconds int) time.Duration {
