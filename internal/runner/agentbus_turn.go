@@ -95,7 +95,7 @@ func runEmbeddedTurn(ctx context.Context, session engine.Session, backend string
 	failureText := ""
 	if len(terminalErrors) > 0 {
 		failureText = strings.Join(terminalErrors, "; ")
-	} else if final != nil && (final.ExecutionFailed || final.TimedOut || final.Canceled) {
+	} else if final != nil && (final.ExecutionFailed || final.TimedOut) {
 		failureText = content
 	}
 	if retryableError := classifyRetryableProviderError(failureText); retryableError != "" {

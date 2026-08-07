@@ -259,6 +259,25 @@ func TestEmbeddedTurnCanceledWithAgentTextRecovers(t *testing.T) {
 	}
 }
 
+func TestEmbeddedTurnCanceledWithRetryableAgentTextRecovers(t *testing.T) {
+	const retryableText = "API Error: rate limit exceeded"
+	session := &fakeEmbeddedSession{events: []engine.Event{
+		{Type: engine.EventAgentText, Text: retryableText},
+		{Type: engine.EventTurnFinal, TurnFinal: &engine.TurnFinalObservation{Canceled: true}},
+	}}
+
+	result, _, err := runEmbeddedTurn(context.Background(), session, "codex", "Codex", "prompt", 0)
+	if err != nil {
+		t.Fatalf("run turn: %v", err)
+	}
+	if result.Content != retryableText || !result.Recovered || !result.ProviderResult.Recovered || result.ProviderResult.RecoverySource != "event_stream" {
+		t.Fatalf("turn result = %#v", result)
+	}
+	if result.ProviderResult.RetryableError != "" {
+		t.Fatalf("retryable error = %q, want empty", result.ProviderResult.RetryableError)
+	}
+}
+
 func TestEmbeddedTurnEmptyResultMessageDoesNotRecoverExecutionFailure(t *testing.T) {
 	session := &fakeEmbeddedSession{events: []engine.Event{
 		{Type: engine.EventResultMessage, Text: ""},
