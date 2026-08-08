@@ -128,12 +128,12 @@ func (b *embeddedBackend) RunTurn(ctx context.Context, prompt string, options Tu
 			return TurnResult{}, err
 		}
 	}
+	sessionOptions := b.sessionOptions(options.TimeoutSeconds)
 	if b.session == nil {
 		var (
 			session engine.Session
 			err     error
 		)
-		sessionOptions := b.sessionOptions(options.TimeoutSeconds)
 		if b.started && b.sessionID != "" {
 			session, err = b.engineBackend.Resume(ctx, b.sessionID, sessionOptions)
 		} else {
@@ -145,8 +145,11 @@ func (b *embeddedBackend) RunTurn(ctx context.Context, prompt string, options Tu
 		b.session = session
 	}
 
-	result, final, err := runEmbeddedTurn(ctx, b.session, b.backendName, b.label, prompt, options.TimeoutSeconds)
+	result, final, err := runEmbeddedTurn(ctx, b.session, b.backendName, b.label, prompt, sessionOptions.Write, options.TimeoutSeconds)
 	b.captureSessionID(final)
+	if err != nil {
+		b.session = nil
+	}
 	return result, err
 }
 

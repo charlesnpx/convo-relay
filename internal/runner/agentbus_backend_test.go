@@ -15,6 +15,7 @@ import (
 type fakeEmbeddedEngineBackend struct {
 	name          string
 	startSession  engine.Session
+	startSessions []engine.Session
 	resumeSession engine.Session
 	startErr      error
 	resumeErr     error
@@ -39,6 +40,9 @@ func (b *fakeEmbeddedEngineBackend) Start(_ context.Context, options engine.Sess
 	b.startOptions = append(b.startOptions, options)
 	if b.startErr != nil {
 		return nil, b.startErr
+	}
+	if call := len(b.startOptions) - 1; call < len(b.startSessions) {
+		return b.startSessions[call], nil
 	}
 	return b.startSession, nil
 }
@@ -239,6 +243,118 @@ func TestEmbeddedCodexUsesHomeOverlayTrustedPolicyAndLiveSession(t *testing.T) {
 	}
 }
 
+func TestEmbeddedBackendDropsErroredSessionAndResumesConfirmedID(t *testing.T) {
+	failedSession := &fakeEmbeddedSession{
+		id: "live-session-id",
+		events: []engine.Event{{
+			Type: engine.EventTurnFinal,
+			TurnFinal: &engine.TurnFinalObservation{
+				BackendSessionID: "thread-confirmed",
+				ExecutionFailed:  true,
+			},
+		}},
+	}
+	resumedSession := &fakeEmbeddedSession{events: []engine.Event{{
+		Type:      engine.EventTurnFinal,
+		TurnFinal: &engine.TurnFinalObservation{BackendSessionID: "thread-confirmed"},
+	}}}
+	engineBackend := &fakeEmbeddedEngineBackend{
+		name:          "codex",
+		startSession:  failedSession,
+		resumeSession: resumedSession,
+	}
+	backend := newEmbeddedBackend("codex", t.TempDir(), "slot_0", "Codex", "/workspace", SlotConfig{}, engineBackend)
+	backend.codexHomeReady = true
+
+	if _, err := backend.RunTurn(context.Background(), "first", TurnOptions{}); err == nil {
+		t.Fatal("first turn succeeded, want an error")
+	}
+	if backend.session != nil {
+		t.Fatalf("session = %#v after errored turn, want nil", backend.session)
+	}
+	if backend.sessionID != "thread-confirmed" || !backend.started {
+		t.Fatalf("captured state = sessionID %q, started %t", backend.sessionID, backend.started)
+	}
+
+	if _, err := backend.RunTurn(context.Background(), "second", TurnOptions{}); err != nil {
+		t.Fatalf("second turn: %v", err)
+	}
+	if len(engineBackend.startOptions) != 1 {
+		t.Fatalf("start calls = %d, want one", len(engineBackend.startOptions))
+	}
+	if len(engineBackend.resumeCalls) != 1 || engineBackend.resumeCalls[0].id != "thread-confirmed" {
+		t.Fatalf("resume calls = %#v, want one for thread-confirmed", engineBackend.resumeCalls)
+	}
+}
+
+func TestEmbeddedBackendRestartsAfterErroredTurnWithoutConfirmedID(t *testing.T) {
+	failedSession := &fakeEmbeddedSession{}
+	freshSession := &fakeEmbeddedSession{events: []engine.Event{{
+		Type:      engine.EventTurnFinal,
+		TurnFinal: &engine.TurnFinalObservation{},
+	}}}
+	engineBackend := &fakeEmbeddedEngineBackend{
+		name:          "codex",
+		startSessions: []engine.Session{failedSession, freshSession},
+	}
+	backend := newEmbeddedBackend("codex", t.TempDir(), "slot_0", "Codex", "/workspace", SlotConfig{}, engineBackend)
+	backend.codexHomeReady = true
+
+	if _, err := backend.RunTurn(context.Background(), "first", TurnOptions{}); err == nil {
+		t.Fatal("first turn succeeded, want an error")
+	}
+	if backend.session != nil {
+		t.Fatalf("session = %#v after errored turn, want nil", backend.session)
+	}
+	if backend.sessionID != "" || backend.started {
+		t.Fatalf("captured state = sessionID %q, started %t, want no confirmed ID", backend.sessionID, backend.started)
+	}
+
+	if _, err := backend.RunTurn(context.Background(), "second", TurnOptions{}); err != nil {
+		t.Fatalf("second turn: %v", err)
+	}
+	if len(engineBackend.startOptions) != 2 {
+		t.Fatalf("start calls = %d, want two", len(engineBackend.startOptions))
+	}
+	if len(engineBackend.resumeCalls) != 0 {
+		t.Fatalf("resume calls = %#v, want none", engineBackend.resumeCalls)
+	}
+}
+
+func TestEmbeddedBackendReusesSuccessfulSessionAndForwardsTurnInput(t *testing.T) {
+	session := &fakeEmbeddedSession{
+		id: "session-id",
+		events: []engine.Event{{
+			Type:      engine.EventTurnFinal,
+			TurnFinal: &engine.TurnFinalObservation{},
+		}},
+	}
+	engineBackend := &fakeEmbeddedEngineBackend{name: "claude", startSession: session}
+	backend := newEmbeddedBackend("claude", t.TempDir(), "slot_0", "Claude Code", "/workspace", SlotConfig{}, engineBackend)
+
+	for _, prompt := range []string{"first", "second"} {
+		if _, err := backend.RunTurn(context.Background(), prompt, TurnOptions{TimeoutSeconds: 9}); err != nil {
+			t.Fatalf("run %q: %v", prompt, err)
+		}
+	}
+	if len(engineBackend.startOptions) != 1 {
+		t.Fatalf("start calls = %d, want one", len(engineBackend.startOptions))
+	}
+	if len(engineBackend.resumeCalls) != 0 {
+		t.Fatalf("resume calls = %#v, want none", engineBackend.resumeCalls)
+	}
+	if len(session.turnInputs) != 2 {
+		t.Fatalf("turn calls = %d, want two", len(session.turnInputs))
+	}
+	input := session.turnInputs[0]
+	if input.Prompt != "first" || !input.Write || input.Timeout != 9*time.Second {
+		t.Fatalf("first turn input = %#v", input)
+	}
+	if input.Write != engineBackend.startOptions[0].Write {
+		t.Fatalf("turn write = %t, session write = %t", input.Write, engineBackend.startOptions[0].Write)
+	}
+}
+
 func TestEmbeddedBackendResumesRestoredSessionLazily(t *testing.T) {
 	resumedSession := &fakeEmbeddedSession{events: []engine.Event{{
 		Type: engine.EventTurnFinal,
@@ -284,7 +400,7 @@ func TestEmbeddedTurnReturnsContextCancellation(t *testing.T) {
 	}
 	done := make(chan turnOutcome, 1)
 	go func() {
-		_, _, err := runEmbeddedTurn(ctx, session, "codex", "Codex", "wait", 0)
+		_, _, err := runEmbeddedTurn(ctx, session, "codex", "Codex", "wait", true, 0)
 		done <- turnOutcome{err: err}
 	}()
 	select {
