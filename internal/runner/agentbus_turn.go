@@ -43,6 +43,7 @@ func runEmbeddedTurnWithWatchdogTimeout(ctx context.Context, session engine.Sess
 	stalled := false
 	canceled := false
 	streamDidNotClose := false
+	var stallInterruptResult <-chan error
 	var drainTimer *time.Timer
 	defer func() {
 		if drainTimer != nil {
@@ -64,6 +65,12 @@ eventLoop:
 		if stalled || canceled {
 			select {
 			case event, ok = <-events:
+			case interruptErr := <-stallInterruptResult:
+				if interruptErr != nil {
+					warnings = append(warnings, fmt.Sprintf("stall interrupt failed: %v", interruptErr))
+				}
+				stallInterruptResult = nil
+				continue
 			case <-drainTimer.C:
 				streamDidNotClose = true
 				break eventLoop
@@ -91,7 +98,11 @@ eventLoop:
 				}
 				stalled = true
 				startDrainTimer()
-				_ = session.Interrupt(ctx)
+				interruptResult := make(chan error, 1)
+				stallInterruptResult = interruptResult
+				go func() {
+					interruptResult <- session.Interrupt(context.Background())
+				}()
 				continue
 			}
 		}
@@ -141,6 +152,15 @@ eventLoop:
 			if event.TurnFinal != nil {
 				final = event.TurnFinal
 			}
+		}
+	}
+	if stallInterruptResult != nil {
+		select {
+		case interruptErr := <-stallInterruptResult:
+			if interruptErr != nil {
+				warnings = append(warnings, fmt.Sprintf("stall interrupt failed: %v", interruptErr))
+			}
+		default:
 		}
 	}
 	providerResult := ProviderResult{

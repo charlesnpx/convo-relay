@@ -224,7 +224,9 @@ func TestEmbeddedTurnClassifiesRetryableContentWithTerminalError(t *testing.T) {
 
 func TestEmbeddedTurnStallStopsDrainingWhenStreamDoesNotClose(t *testing.T) {
 	const watchdogTimeout = 10 * time.Millisecond
-	const drainGrace = 20 * time.Millisecond
+	const drainGrace = 25 * time.Millisecond
+	const interruptDelay = 5 * time.Millisecond
+	const interruptFailure = "interrupt failed"
 	originalDrainGrace := embeddedDrainGrace
 	embeddedDrainGrace = drainGrace
 	t.Cleanup(func() {
@@ -239,7 +241,8 @@ func TestEmbeddedTurnStallStopsDrainingWhenStreamDoesNotClose(t *testing.T) {
 		},
 		onInterrupt: func(context.Context) error {
 			interruptedAt <- time.Now()
-			return errors.New("interrupt failed")
+			time.Sleep(interruptDelay)
+			return errors.New(interruptFailure)
 		},
 	}
 
@@ -254,14 +257,20 @@ func TestEmbeddedTurnStallStopsDrainingWhenStreamDoesNotClose(t *testing.T) {
 		t.Fatalf("stalled result = %#v", result)
 	}
 	foundDrainWarning := false
+	foundInterruptWarning := false
 	for _, warning := range result.ProviderResult.Warnings {
 		if warning == "agentbus event stream did not close before drain grace elapsed" {
 			foundDrainWarning = true
-			break
+		}
+		if warning == "stall interrupt failed: "+interruptFailure {
+			foundInterruptWarning = true
 		}
 	}
 	if !foundDrainWarning {
 		t.Fatalf("warnings = %#v, want stream-not-closed warning", result.ProviderResult.Warnings)
+	}
+	if !foundInterruptWarning {
+		t.Fatalf("warnings = %#v, want interrupt failure warning", result.ProviderResult.Warnings)
 	}
 	if session.interruptCalls != 1 {
 		t.Fatalf("interrupt calls = %d, want one", session.interruptCalls)
