@@ -172,6 +172,160 @@ func TestEmbeddedTurnStallWithAgentTextDuringInterruptDrainRecovers(t *testing.T
 	}
 }
 
+func TestEmbeddedTurnStallWithAuthTextReturnsBackendError(t *testing.T) {
+	const authText = "Authentication error: token expired"
+	events := make(chan engine.Event, 1)
+	events <- engine.Event{Type: engine.EventAgentText, Text: authText}
+	session := &fakeEmbeddedSession{
+		onTurn: func(context.Context, engine.TurnInput) (<-chan engine.Event, error) {
+			return events, nil
+		},
+		onInterrupt: func(context.Context) error {
+			close(events)
+			return nil
+		},
+	}
+
+	result, _, err := runEmbeddedTurnWithWatchdogTimeout(context.Background(), session, "codex", "Codex", "prompt", true, 0, 1, 10*time.Millisecond)
+	var backendErr BackendRunError
+	if !errors.As(err, &backendErr) {
+		t.Fatalf("error = %T %v, want BackendRunError", err, err)
+	}
+	if backendErr.Label != "Codex" || backendErr.Detail != authText {
+		t.Fatalf("backend error = %#v", backendErr)
+	}
+	if !result.Stalled || !result.ProviderResult.Stalled || result.Recovered || result.ProviderResult.Recovered {
+		t.Fatalf("stalled auth result = %#v", result)
+	}
+}
+
+func TestEmbeddedTurnClassifiesRetryableContentWithTerminalError(t *testing.T) {
+	const terminalText = "backend exploded"
+	const retryableText = "API Error: rate limit exceeded"
+	session := &fakeEmbeddedSession{events: []engine.Event{
+		{Type: engine.EventAgentText, Text: retryableText},
+		{Type: engine.EventTerminalError, Text: terminalText},
+		{Type: engine.EventTurnFinal, TurnFinal: &engine.TurnFinalObservation{}},
+	}}
+
+	result, _, err := runEmbeddedTurn(context.Background(), session, "codex", "Codex", "prompt", true, 0, 0)
+	var retryableErr RetryableProviderError
+	if !errors.As(err, &retryableErr) {
+		t.Fatalf("error = %T %v, want RetryableProviderError", err, err)
+	}
+	wantDetail := terminalText + "; " + retryableText
+	if retryableErr.Label != "Codex" || retryableErr.Detail != wantDetail {
+		t.Fatalf("retryable error = %#v, want detail %q", retryableErr, wantDetail)
+	}
+	if result.ProviderResult.RetryableError != wantDetail || result.Recovered || result.ProviderResult.Recovered {
+		t.Fatalf("terminal retryable result = %#v", result)
+	}
+}
+
+func TestEmbeddedTurnStallStopsDrainingWhenStreamDoesNotClose(t *testing.T) {
+	const watchdogTimeout = 10 * time.Millisecond
+	const drainGrace = 20 * time.Millisecond
+	originalDrainGrace := embeddedDrainGrace
+	embeddedDrainGrace = drainGrace
+	t.Cleanup(func() {
+		embeddedDrainGrace = originalDrainGrace
+	})
+
+	events := make(chan engine.Event)
+	interruptedAt := make(chan time.Time, 1)
+	session := &fakeEmbeddedSession{
+		onTurn: func(context.Context, engine.TurnInput) (<-chan engine.Event, error) {
+			return events, nil
+		},
+		onInterrupt: func(context.Context) error {
+			interruptedAt <- time.Now()
+			return errors.New("interrupt failed")
+		},
+	}
+
+	result, _, err := runEmbeddedTurnWithWatchdogTimeout(context.Background(), session, "codex", "Codex", "prompt", true, 0, 1, watchdogTimeout)
+	if err != nil {
+		t.Fatalf("stalled turn: %v", err)
+	}
+	if elapsed := time.Since(<-interruptedAt); elapsed > drainGrace+100*time.Millisecond {
+		t.Fatalf("turn returned %s after interrupt, want it bounded by the %s drain grace", elapsed, drainGrace)
+	}
+	if result.Content != "[Codex stalled after 1s of no stream activity]" || !result.Stalled || !result.ProviderResult.Stalled || result.Recovered || result.ProviderResult.Recovered {
+		t.Fatalf("stalled result = %#v", result)
+	}
+	foundDrainWarning := false
+	for _, warning := range result.ProviderResult.Warnings {
+		if warning == "agentbus event stream did not close before drain grace elapsed" {
+			foundDrainWarning = true
+			break
+		}
+	}
+	if !foundDrainWarning {
+		t.Fatalf("warnings = %#v, want stream-not-closed warning", result.ProviderResult.Warnings)
+	}
+	if session.interruptCalls != 1 {
+		t.Fatalf("interrupt calls = %d, want one", session.interruptCalls)
+	}
+}
+
+func TestEmbeddedTurnCancellationStopsDrainingWhenStreamDoesNotClose(t *testing.T) {
+	const drainGrace = 20 * time.Millisecond
+	originalDrainGrace := embeddedDrainGrace
+	embeddedDrainGrace = drainGrace
+	t.Cleanup(func() {
+		embeddedDrainGrace = originalDrainGrace
+	})
+
+	events := make(chan engine.Event)
+	turnStarted := make(chan struct{})
+	session := &fakeEmbeddedSession{
+		onTurn: func(context.Context, engine.TurnInput) (<-chan engine.Event, error) {
+			close(turnStarted)
+			return events, nil
+		},
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	type outcome struct {
+		result TurnResult
+		err    error
+	}
+	done := make(chan outcome, 1)
+	go func() {
+		result, _, err := runEmbeddedTurn(ctx, session, "codex", "Codex", "prompt", true, 0, 0)
+		done <- outcome{result: result, err: err}
+	}()
+
+	select {
+	case <-turnStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("turn did not start")
+	}
+	canceledAt := time.Now()
+	cancel()
+	select {
+	case got := <-done:
+		if !errors.Is(got.err, context.Canceled) {
+			t.Fatalf("cancellation error = %v, want context.Canceled", got.err)
+		}
+		if elapsed := time.Since(canceledAt); elapsed > drainGrace+100*time.Millisecond {
+			t.Fatalf("turn returned %s after cancellation, want it bounded by the %s drain grace", elapsed, drainGrace)
+		}
+		foundDrainWarning := false
+		for _, warning := range got.result.ProviderResult.Warnings {
+			if warning == "agentbus event stream did not close before drain grace elapsed" {
+				foundDrainWarning = true
+				break
+			}
+		}
+		if !foundDrainWarning {
+			t.Fatalf("warnings = %#v, want stream-not-closed warning", got.result.ProviderResult.Warnings)
+		}
+	case <-time.After(drainGrace + 250*time.Millisecond):
+		t.Fatalf("turn did not return within the %s drain grace", drainGrace)
+	}
+}
+
 func TestEmbeddedTurnRecoversTerminalErrorAfterAgentText(t *testing.T) {
 	session := &fakeEmbeddedSession{events: []engine.Event{
 		{Type: engine.EventAgentText, Text: "partial"},
@@ -237,11 +391,12 @@ func TestEmbeddedTurnClassifiesRetryableTerminalError(t *testing.T) {
 	if !errors.As(err, &retryableErr) {
 		t.Fatalf("error = %T %v, want RetryableProviderError", err, err)
 	}
-	if retryableErr.Label != "Codex" || retryableErr.Detail != retryableText {
+	wantDetail := retryableText + "; partial response"
+	if retryableErr.Label != "Codex" || retryableErr.Detail != wantDetail {
 		t.Fatalf("retryable error = %#v", retryableErr)
 	}
-	if result.ProviderResult.RetryableError != retryableText {
-		t.Fatalf("retryable error = %q, want %q", result.ProviderResult.RetryableError, retryableText)
+	if result.ProviderResult.RetryableError != wantDetail {
+		t.Fatalf("retryable error = %q, want %q", result.ProviderResult.RetryableError, wantDetail)
 	}
 	if result.Recovered || result.ProviderResult.Recovered {
 		t.Fatalf("retryable terminal error recovered: %#v", result)

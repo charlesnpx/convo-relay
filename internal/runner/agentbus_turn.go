@@ -9,6 +9,8 @@ import (
 	"github.com/charlesnpx/agentbus/engine"
 )
 
+var embeddedDrainGrace = 5 * time.Second
+
 func runEmbeddedTurn(ctx context.Context, session engine.Session, backend string, label string, prompt string, write bool, timeoutSeconds int, stallTimeoutSeconds int) (TurnResult, *engine.TurnFinalObservation, error) {
 	return runEmbeddedTurnWithWatchdogTimeout(ctx, session, backend, label, prompt, write, timeoutSeconds, stallTimeoutSeconds, embeddedTurnTimeout(stallTimeoutSeconds))
 }
@@ -40,25 +42,55 @@ func runEmbeddedTurnWithWatchdogTimeout(ctx context.Context, session engine.Sess
 	}
 	stalled := false
 	canceled := false
+	streamDidNotClose := false
+	var drainTimer *time.Timer
+	defer func() {
+		if drainTimer != nil {
+			drainTimer.Stop()
+		}
+	}()
+	startDrainTimer := func() {
+		if drainTimer == nil {
+			drainTimer = time.NewTimer(embeddedDrainGrace)
+		}
+	}
+
+eventLoop:
 	for {
 		var (
 			event engine.Event
 			ok    bool
 		)
-		if stalled || canceled || stallTimer == nil {
-			event, ok = <-events
+		if stalled || canceled {
+			select {
+			case event, ok = <-events:
+			case <-drainTimer.C:
+				streamDidNotClose = true
+				break eventLoop
+			}
+		} else if stallTimer == nil {
+			select {
+			case event, ok = <-events:
+			case <-ctx.Done():
+				canceled = true
+				startDrainTimer()
+				continue
+			}
 		} else {
 			select {
 			case event, ok = <-events:
 			case <-ctx.Done():
 				canceled = true
+				startDrainTimer()
 				continue
 			case <-stallTimer.C:
 				if ctx.Err() != nil {
 					canceled = true
+					startDrainTimer()
 					continue
 				}
 				stalled = true
+				startDrainTimer()
 				_ = session.Interrupt(ctx)
 				continue
 			}
@@ -66,7 +98,7 @@ func runEmbeddedTurnWithWatchdogTimeout(ctx context.Context, session engine.Sess
 		if !ok {
 			break
 		}
-		if stallTimer != nil && !stalled {
+		if stallTimer != nil && !stalled && !canceled {
 			if !stallTimer.Stop() {
 				select {
 				case <-stallTimer.C:
@@ -111,10 +143,6 @@ func runEmbeddedTurnWithWatchdogTimeout(ctx context.Context, session engine.Sess
 			}
 		}
 	}
-	if ctxErr := ctx.Err(); ctxErr != nil && !stalled {
-		return TurnResult{}, final, ctxErr
-	}
-
 	providerResult := ProviderResult{
 		Backend:  backend,
 		Warnings: warnings,
@@ -146,21 +174,28 @@ func runEmbeddedTurnWithWatchdogTimeout(ctx context.Context, session engine.Sess
 		providerResult.Stalled = true
 		providerResult.Warnings = append(providerResult.Warnings, stallDetail)
 		result.Stalled = true
-		if hasUsableOutput {
-			providerResult.Recovered = true
-			providerResult.RecoverySource = "event_stream"
-			result.Recovered = true
-		} else {
-			result.Content = fmt.Sprintf("[%s stalled after %ds of no stream activity]", label, stallTimeoutSeconds)
-		}
-		result.ProviderResult = providerResult
-		return result, final, nil
 	}
+	if streamDidNotClose {
+		providerResult.Warnings = append(providerResult.Warnings, "agentbus event stream did not close before drain grace elapsed")
+	}
+	result.ProviderResult = providerResult
+
+	cancellationOutcome := !stalled && (canceled || ctx.Err() != nil || (final != nil && final.Canceled))
+	abnormalOutcome := stalled || len(terminalErrors) > 0 || final == nil || (final != nil && (final.ExecutionFailed || final.TimedOut))
 	failureText := ""
-	if len(terminalErrors) > 0 {
-		failureText = strings.Join(terminalErrors, "; ")
-	} else if final != nil && (final.ExecutionFailed || final.TimedOut) {
-		failureText = content
+	if abnormalOutcome && !cancellationOutcome {
+		failureParts := make([]string, 0, len(terminalErrors)+1)
+		seenFailureParts := make(map[string]struct{}, len(terminalErrors)+1)
+		for _, terminalError := range terminalErrors {
+			failureParts = append(failureParts, terminalError)
+			seenFailureParts[terminalError] = struct{}{}
+		}
+		if visibleContent := strings.TrimSpace(content); visibleContent != "" {
+			if _, alreadyIncluded := seenFailureParts[visibleContent]; !alreadyIncluded {
+				failureParts = append(failureParts, visibleContent)
+			}
+		}
+		failureText = strings.Join(failureParts, "; ")
 	}
 	if retryableError := classifyRetryableProviderError(failureText); retryableError != "" {
 		providerResult.RetryableError = retryableError
@@ -170,6 +205,23 @@ func runEmbeddedTurnWithWatchdogTimeout(ctx context.Context, session engine.Sess
 	if failureText != "" && providerFailureCategory(failureText) == "auth" {
 		result.ProviderResult = providerResult
 		return result, final, BackendRunError{Label: label, Detail: failureText}
+	}
+	if ctxErr := ctx.Err(); ctxErr != nil && !stalled {
+		if streamDidNotClose {
+			return result, final, ctxErr
+		}
+		return TurnResult{}, final, ctxErr
+	}
+	if stalled {
+		if hasUsableOutput {
+			providerResult.Recovered = true
+			providerResult.RecoverySource = "event_stream"
+			result.Recovered = true
+		} else {
+			result.Content = fmt.Sprintf("[%s stalled after %ds of no stream activity]", label, stallTimeoutSeconds)
+		}
+		result.ProviderResult = providerResult
+		return result, final, nil
 	}
 	if len(terminalErrors) > 0 {
 		if hasUsableOutput {
