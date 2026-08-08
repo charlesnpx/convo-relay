@@ -214,15 +214,7 @@ func TestCleanSessionRemovesLegacyClaudeFacilitatorArtifacts(t *testing.T) {
 	fixture := newIsolatedSessionFixture(t, "completed")
 	homeDir := t.TempDir()
 	t.Setenv("HOME", homeDir)
-	legacyArtifacts := filepath.Join(
-		homeDir,
-		".claude",
-		"projects",
-		strings.ReplaceAll(filepath.Clean(fixture.sessionDir), string(filepath.Separator), "-"),
-	)
-	if got := claudeProjectDir(fixture.sessionDir); got != legacyArtifacts {
-		t.Fatalf("legacy Claude project path = %q, want %q", got, legacyArtifacts)
-	}
+	legacyArtifacts := claudeProjectDir(fixture.sessionDir)
 	if err := os.MkdirAll(legacyArtifacts, 0o755); err != nil {
 		t.Fatalf("create legacy Claude project: %v", err)
 	}
@@ -243,6 +235,53 @@ func TestCleanSessionRemovesLegacyClaudeFacilitatorArtifacts(t *testing.T) {
 	}
 	if _, err := os.Stat(legacyArtifacts); !os.IsNotExist(err) {
 		t.Fatalf("legacy Claude project still exists: %v", err)
+	}
+}
+
+func TestCleanSessionLegacyClaudeProjectDirEncodesPunctuation(t *testing.T) {
+	homeDir := t.TempDir()
+	t.Setenv("HOME", homeDir)
+
+	const sessionDir = "/tmp/convo-relay/legacy.session_name"
+	const expectedEncodedName = "-tmp-convo-relay-legacy-session-name"
+	want := filepath.Join(homeDir, ".claude", "projects", expectedEncodedName)
+	if got := claudeProjectDir(sessionDir); got != want {
+		t.Fatalf("legacy Claude project path = %q, want %q", got, want)
+	}
+}
+
+func TestCleanSessionRemovesLegacyClaudeFacilitatorArtifactsByDefault(t *testing.T) {
+	fixture := newIsolatedSessionFixture(t, "completed")
+	homeDir := t.TempDir()
+	t.Setenv("HOME", homeDir)
+	legacyArtifacts := claudeProjectDir(fixture.sessionDir)
+	if err := os.MkdirAll(legacyArtifacts, 0o755); err != nil {
+		t.Fatalf("create legacy Claude project: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(legacyArtifacts, "legacy.jsonl"), []byte("legacy transcript\n"), 0o644); err != nil {
+		t.Fatalf("write legacy Claude transcript: %v", err)
+	}
+
+	st := store.New(fixture.sessionDir)
+	meta := mustLoadMeta(t, fixture.sessionDir)
+	delete(meta, "facilitator_backend")
+	delete(meta, "slots")
+	if _, hasFacilitatorBackend := meta["facilitator_backend"]; hasFacilitatorBackend {
+		t.Fatal("legacy metadata unexpectedly has facilitator_backend")
+	}
+	if _, hasSlots := meta["slots"]; hasSlots {
+		t.Fatal("legacy metadata unexpectedly has slots")
+	}
+	if err := st.SaveMetaMap(meta); err != nil {
+		t.Fatalf("save legacy facilitator metadata: %v", err)
+	}
+
+	report, err := CleanSession(fixture.sessionDir)
+	if err != nil || report["status"] != "deleted" {
+		t.Fatalf("clean default legacy Claude session = %#v, %v", report, err)
+	}
+	if _, err := os.Stat(legacyArtifacts); !os.IsNotExist(err) {
+		t.Fatalf("default legacy Claude project still exists: %v", err)
 	}
 }
 

@@ -713,17 +713,32 @@ func cleanupBackendArtifactsForSession(meta map[string]any, sessionDir string) e
 	return errors.Join(errs...)
 }
 
-func claudeProjectDir(sessionDir string) string {
+func claudeProjectDir(cwd string) string {
 	home, err := os.UserHomeDir()
-	if err != nil {
-		return ""
+	if err != nil || home == "" {
+		home = "."
 	}
-	encodedCWD := strings.ReplaceAll(filepath.Clean(sessionDir), string(filepath.Separator), "-")
-	return filepath.Join(home, ".claude", "projects", encodedCWD)
+	var encoded strings.Builder
+	for _, ch := range cwd {
+		if (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9') || ch == '-' {
+			encoded.WriteRune(ch)
+		} else {
+			encoded.WriteByte('-')
+		}
+	}
+	return filepath.Join(home, ".claude", "projects", encoded.String())
 }
 
 func shouldCleanClaudeFacilitatorArtifacts(meta map[string]any) bool {
-	return strings.TrimSpace(stringFromAny(meta["facilitator_backend"])) == "claude"
+	facilitator := strings.TrimSpace(stringFromAny(meta["facilitator_backend"]))
+	if facilitator == "" {
+		if _, hasSlots := meta["slots"]; hasSlots {
+			facilitator = "codex"
+		} else {
+			facilitator = "claude"
+		}
+	}
+	return facilitator == "claude"
 }
 
 func backendCleanupCWD(record backendCleanupRecord, meta map[string]any, sessionDir string) (string, error) {
