@@ -285,6 +285,54 @@ func TestCleanSessionRemovesLegacyClaudeFacilitatorArtifactsByDefault(t *testing
 	}
 }
 
+func TestCleanSessionRemovesPersistedClaudeArtifactsForEveryProviderRole(t *testing.T) {
+	for _, role := range []string{"participant", "facilitator", "reducer"} {
+		t.Run(role, func(t *testing.T) {
+			fixture := newIsolatedSessionFixture(t, "crashed")
+			homeDir := t.TempDir()
+			t.Setenv("HOME", homeDir)
+			sessionID := "historical-" + role
+			projectDir := claudeProjectDir(fixture.executionCWD)
+			jsonlPath := filepath.Join(projectDir, sessionID+".jsonl")
+			artifactSessionDir := filepath.Join(projectDir, sessionID)
+			if err := os.MkdirAll(artifactSessionDir, 0o755); err != nil {
+				t.Fatalf("create Claude session artifact directory: %v", err)
+			}
+			if err := os.WriteFile(jsonlPath, []byte("historical transcript\n"), 0o644); err != nil {
+				t.Fatalf("write Claude transcript: %v", err)
+			}
+			if err := os.WriteFile(filepath.Join(artifactSessionDir, "artifact.txt"), []byte("historical session artifact\n"), 0o644); err != nil {
+				t.Fatalf("write Claude session artifact: %v", err)
+			}
+
+			meta := mustLoadMeta(t, fixture.sessionDir)
+			envelope := claudeCleanupEnvelope(sessionID, role, fixture.executionCWD)
+			switch role {
+			case "participant":
+				meta["slots"] = []any{envelope}
+			case "facilitator":
+				meta["facilitator_provider_state"] = envelope
+			case "reducer":
+				meta["reducer_provider_state"] = envelope
+			}
+			if err := store.New(fixture.sessionDir).SaveMetaMap(meta); err != nil {
+				t.Fatalf("save historical %s provider state: %v", role, err)
+			}
+
+			report, err := CleanSession(fixture.sessionDir)
+			if err != nil || report["status"] != "deleted" {
+				t.Fatalf("clean historical %s session = %#v, %v", role, report, err)
+			}
+			if _, err := os.Stat(jsonlPath); !os.IsNotExist(err) {
+				t.Fatalf("historical %s transcript still exists: %v", role, err)
+			}
+			if _, err := os.Stat(artifactSessionDir); !os.IsNotExist(err) {
+				t.Fatalf("historical %s session directory still exists: %v", role, err)
+			}
+		})
+	}
+}
+
 func TestCleanSessionRejectsUnsafeClaudeSessionIDsForEveryProviderRole(t *testing.T) {
 	for _, role := range []string{"participant", "facilitator", "reducer"} {
 		t.Run(role, func(t *testing.T) {

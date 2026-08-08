@@ -3,10 +3,12 @@ package runner
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/charlesnpx/convo-relay/internal/inspect"
 	"github.com/charlesnpx/convo-relay/internal/recipes"
@@ -82,6 +84,73 @@ func TestEmbeddedClaudeBackendRunTurnStateAndResumeProtocol(t *testing.T) {
 	if !contains(commands[0], "--model") || !contains(commands[0], "claude-sonnet") ||
 		!contains(commands[0], "--effort") || !contains(commands[0], "high") {
 		t.Fatalf("model/effort command = %#v", commands[0])
+	}
+}
+
+func TestEmbeddedClaudeBackendMissingBinaryReturnsBackendError(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("PATH", t.TempDir())
+	backend, err := newBackend("claude", root, "slot_0", "Claude Code", root, SlotConfig{})
+	if err != nil {
+		t.Fatalf("new backend: %v", err)
+	}
+
+	_, err = backend.RunTurn(context.Background(), "prompt", TurnOptions{TimeoutSeconds: 1})
+	if err == nil || !strings.Contains(strings.ToLower(err.Error()), "claude") {
+		t.Fatalf("missing Claude binary error = %v", err)
+	}
+}
+
+func TestEmbeddedClaudeBackendTimeoutReturnsPlaceholder(t *testing.T) {
+	env := setupPhase10FakeProviders(t)
+	backend, err := newBackend("claude", env.relayHome, "slot_0", "Claude Code", env.projectDir, SlotConfig{})
+	if err != nil {
+		t.Fatalf("new backend: %v", err)
+	}
+
+	result, err := backend.RunTurn(context.Background(), "PHASE10_TIMEOUT", TurnOptions{TimeoutSeconds: 1})
+	if err != nil {
+		t.Fatalf("timeout turn: result = %#v, error = %v", result, err)
+	}
+	if result.Content != "[Claude Code timed out after 1s]" || !result.TimedOut || !result.ProviderResult.TimedOut || result.Recovered || result.ProviderResult.Recovered {
+		t.Fatalf("timeout result = %#v", result)
+	}
+}
+
+func TestEmbeddedClaudeBackendVisibleAuthFailureIsNotRetriedOrRecovered(t *testing.T) {
+	env := setupPhase10FakeProviders(t)
+	backend, err := newBackend("claude", env.relayHome, "slot_0", "Claude Code", env.projectDir, SlotConfig{})
+	if err != nil {
+		t.Fatalf("new backend: %v", err)
+	}
+	var retries int
+	withFakeRetryBackoff(t, func(context.Context, time.Duration) error {
+		retries++
+		return nil
+	})
+
+	result, err := runWithRetryableProviderErrors(context.Background(), backend.Label(), func() (TurnResult, error) {
+		return backend.RunTurn(context.Background(), "PHASE10_AUTH_FAILURE", TurnOptions{TimeoutSeconds: 5})
+	})
+	var backendErr BackendRunError
+	if !errors.As(err, &backendErr) {
+		t.Fatalf("auth error = %T %v, want BackendRunError", err, err)
+	}
+	var retryableErr RetryableProviderError
+	if errors.As(err, &retryableErr) {
+		t.Fatalf("auth failure was classified retryable: %v", err)
+	}
+	if backendErr.Label != "Claude Code" || backendErr.Detail != "Authentication error: token expired" {
+		t.Fatalf("backend error = %#v", backendErr)
+	}
+	if result.Content != "Authentication error: token expired" || result.Recovered || result.ProviderResult.Recovered || result.ProviderResult.RetryableError != "" {
+		t.Fatalf("auth result = %#v", result)
+	}
+	if retries != 0 {
+		t.Fatalf("auth failure retried %d times", retries)
+	}
+	if commands := readClaudeCommands(t, env.homeDir); len(commands) != 1 {
+		t.Fatalf("auth failure command count = %d, want one", len(commands))
 	}
 }
 
@@ -462,6 +531,7 @@ const fakeClaudeStreamJSONScript = `#!/usr/bin/env python3
 import json
 import os
 import sys
+import time
 from pathlib import Path
 
 def arg_value(flag):
@@ -480,7 +550,7 @@ def text_for(prompt):
     if "PHASE10_RETRYABLE" in prompt:
         return "", "API Error: rate limit exceeded"
     if "PHASE10_AUTH_FAILURE" in prompt:
-        return "", "Authentication error: token expired"
+        return "Authentication error: token expired", "Authentication error: token expired"
     if "second" in prompt.lower():
         return "second reply", ""
     if "first" in prompt.lower():
@@ -513,9 +583,14 @@ def main():
     user = json.loads(user_line)
     prompt = str((user.get("message") or {}).get("content", ""))
     session_id = arg_value("--resume") or f"claude-{os.getpid()}"
+    if "PHASE10_TIMEOUT" in prompt:
+        while True:
+            time.sleep(1)
     text, failure = text_for(prompt)
     send({"type": "system", "session_id": session_id, "model": arg_value("--model") or "fake-claude-model"})
     if failure:
+        if text:
+            send({"type": "assistant", "session_id": session_id, "message": {"content": [{"type": "text", "text": text}]}})
         send({"type": "result", "session_id": session_id, "subtype": "error", "is_error": True, "error": failure})
         return 0
     send({"type": "assistant", "session_id": session_id, "message": {"content": [{"type": "text", "text": text}]}})
