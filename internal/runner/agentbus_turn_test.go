@@ -23,7 +23,7 @@ func TestEmbeddedTurnPrefersResultMessageAndMapsFinalObservation(t *testing.T) {
 		{Type: engine.EventResultMessage, Text: "authoritative result"},
 		{Type: engine.EventTurnFinal, TurnFinal: final},
 	}}
-	result, gotFinal, err := runEmbeddedTurn(context.Background(), session, "codex", "Codex", "prompt", true, 0)
+	result, gotFinal, err := runEmbeddedTurn(context.Background(), session, "codex", "Codex", "prompt", true, 0, 0)
 	if err != nil {
 		t.Fatalf("run turn: %v", err)
 	}
@@ -50,7 +50,7 @@ func TestEmbeddedTurnForwardsProvidedWriteAndTimeout(t *testing.T) {
 		TurnFinal: &engine.TurnFinalObservation{},
 	}}}
 
-	if _, _, err := runEmbeddedTurn(context.Background(), session, "codex", "Codex", "prompt", false, 11); err != nil {
+	if _, _, err := runEmbeddedTurn(context.Background(), session, "codex", "Codex", "prompt", false, 11, 0); err != nil {
 		t.Fatalf("run turn: %v", err)
 	}
 	if len(session.turnInputs) != 1 {
@@ -69,7 +69,7 @@ func TestEmbeddedTurnRecordsLastReportedModel(t *testing.T) {
 		{Type: engine.EventTurnFinal, TurnFinal: &engine.TurnFinalObservation{}},
 	}}
 
-	result, _, err := runEmbeddedTurn(context.Background(), session, "codex", "Codex", "prompt", true, 0)
+	result, _, err := runEmbeddedTurn(context.Background(), session, "codex", "Codex", "prompt", true, 0, 0)
 	if err != nil {
 		t.Fatalf("run turn: %v", err)
 	}
@@ -85,7 +85,7 @@ func TestEmbeddedTurnRetainsReportedModelAfterEmptyReport(t *testing.T) {
 		{Type: engine.EventTurnFinal, TurnFinal: &engine.TurnFinalObservation{}},
 	}}
 
-	result, _, err := runEmbeddedTurn(context.Background(), session, "codex", "Codex", "prompt", true, 0)
+	result, _, err := runEmbeddedTurn(context.Background(), session, "codex", "Codex", "prompt", true, 0, 0)
 	if err != nil {
 		t.Fatalf("run turn: %v", err)
 	}
@@ -102,7 +102,7 @@ func TestEmbeddedTurnIgnoresToolUseAndProgress(t *testing.T) {
 		{Type: engine.EventTurnFinal, TurnFinal: &engine.TurnFinalObservation{}},
 	}}
 
-	result, _, err := runEmbeddedTurn(context.Background(), session, "codex", "Codex", "prompt", true, 0)
+	result, _, err := runEmbeddedTurn(context.Background(), session, "codex", "Codex", "prompt", true, 0, 0)
 	if err != nil {
 		t.Fatalf("run turn: %v", err)
 	}
@@ -111,6 +111,64 @@ func TestEmbeddedTurnIgnoresToolUseAndProgress(t *testing.T) {
 	}
 	if len(result.ProviderResult.Warnings) != 0 {
 		t.Fatalf("warnings = %#v, want none", result.ProviderResult.Warnings)
+	}
+}
+
+func TestEmbeddedTurnProgressKeepsWatchdogAlive(t *testing.T) {
+	session := &fakeEmbeddedSession{
+		onTurn: func(context.Context, engine.TurnInput) (<-chan engine.Event, error) {
+			events := make(chan engine.Event, 1)
+			events <- engine.Event{Type: engine.EventProgress}
+			go func() {
+				defer close(events)
+				for range 3 {
+					time.Sleep(100 * time.Millisecond)
+					events <- engine.Event{Type: engine.EventProgress}
+				}
+				events <- engine.Event{Type: engine.EventTurnFinal, TurnFinal: &engine.TurnFinalObservation{}}
+			}()
+			return events, nil
+		},
+	}
+
+	result, _, err := runEmbeddedTurn(context.Background(), session, "codex", "Codex", "prompt", true, 0, 1)
+	if err != nil {
+		t.Fatalf("run turn: %v", err)
+	}
+	if result.Stalled || result.ProviderResult.Stalled {
+		t.Fatalf("turn stalled despite progress events: %#v", result)
+	}
+	if session.interruptCalls != 0 {
+		t.Fatalf("interrupt calls = %d, want none", session.interruptCalls)
+	}
+}
+
+func TestEmbeddedTurnStallWithAgentTextRecovers(t *testing.T) {
+	events := make(chan engine.Event, 1)
+	events <- engine.Event{Type: engine.EventAgentText, Text: "partial response"}
+	session := &fakeEmbeddedSession{}
+	session.onTurn = func(context.Context, engine.TurnInput) (<-chan engine.Event, error) {
+		return events, nil
+	}
+	session.onInterrupt = func(context.Context) error {
+		events <- engine.Event{Type: engine.EventTurnFinal, TurnFinal: &engine.TurnFinalObservation{}}
+		close(events)
+		return nil
+	}
+
+	result, _, err := runEmbeddedTurn(context.Background(), session, "codex", "Codex", "prompt", true, 0, 1)
+	if err != nil {
+		t.Fatalf("stalled turn: %v", err)
+	}
+	if result.Content != "partial response" || !result.Stalled || !result.ProviderResult.Stalled || !result.Recovered ||
+		!result.ProviderResult.Recovered || result.ProviderResult.RecoverySource != "event_stream" {
+		t.Fatalf("stalled recovery result = %#v", result)
+	}
+	if !reflect.DeepEqual(result.ProviderResult.Warnings, []string{"codex stalled - no stream activity for 1s, interrupting turn"}) {
+		t.Fatalf("stalled warnings = %#v", result.ProviderResult.Warnings)
+	}
+	if session.interruptCalls != 1 {
+		t.Fatalf("interrupt calls = %d, want one", session.interruptCalls)
 	}
 }
 
@@ -127,7 +185,7 @@ func TestEmbeddedTurnMapsTerminalErrorAndFinalWarnings(t *testing.T) {
 			CleanupFailed:   true,
 		}},
 	}}
-	result, _, err := runEmbeddedTurn(context.Background(), session, "claude", "Claude Code", "prompt", true, 0)
+	result, _, err := runEmbeddedTurn(context.Background(), session, "claude", "Claude Code", "prompt", true, 0, 0)
 	var backendErr BackendRunError
 	if !errors.As(err, &backendErr) {
 		t.Fatalf("error = %T %v, want BackendRunError", err, err)
@@ -156,7 +214,7 @@ func TestEmbeddedTurnClassifiesRetryableTerminalError(t *testing.T) {
 		{Type: engine.EventTurnFinal, TurnFinal: &engine.TurnFinalObservation{}},
 	}}
 
-	result, _, err := runEmbeddedTurn(context.Background(), session, "codex", "Codex", "prompt", true, 0)
+	result, _, err := runEmbeddedTurn(context.Background(), session, "codex", "Codex", "prompt", true, 0, 0)
 	var retryableErr RetryableProviderError
 	if !errors.As(err, &retryableErr) {
 		t.Fatalf("error = %T %v, want RetryableProviderError", err, err)
@@ -178,7 +236,7 @@ func TestEmbeddedTurnExecutionFailedWithoutOutputReturnsBackendError(t *testing.
 		}},
 	}}
 
-	result, _, err := runEmbeddedTurn(context.Background(), session, "codex", "Codex", "prompt", true, 0)
+	result, _, err := runEmbeddedTurn(context.Background(), session, "codex", "Codex", "prompt", true, 0, 0)
 	var backendErr BackendRunError
 	if !errors.As(err, &backendErr) {
 		t.Fatalf("error = %T %v, want BackendRunError", err, err)
@@ -202,7 +260,7 @@ func TestEmbeddedTurnExecutionFailedWithAuthTextReturnsBackendError(t *testing.T
 		}},
 	}}
 
-	result, _, err := runEmbeddedTurn(context.Background(), session, "codex", "Codex", "prompt", true, 0)
+	result, _, err := runEmbeddedTurn(context.Background(), session, "codex", "Codex", "prompt", true, 0, 0)
 	var backendErr BackendRunError
 	if !errors.As(err, &backendErr) {
 		t.Fatalf("error = %T %v, want BackendRunError", err, err)
@@ -229,7 +287,7 @@ func TestEmbeddedTurnExecutionFailedWithAgentTextRecovers(t *testing.T) {
 		}},
 	}}
 
-	result, _, err := runEmbeddedTurn(context.Background(), session, "codex", "Codex", "prompt", true, 0)
+	result, _, err := runEmbeddedTurn(context.Background(), session, "codex", "Codex", "prompt", true, 0, 0)
 	if err != nil {
 		t.Fatalf("run turn: %v", err)
 	}
@@ -246,7 +304,7 @@ func TestEmbeddedTurnTimedOutWithoutOutputReturnsPlaceholder(t *testing.T) {
 		{Type: engine.EventTurnFinal, TurnFinal: &engine.TurnFinalObservation{TimedOut: true}},
 	}}
 
-	result, _, err := runEmbeddedTurn(context.Background(), session, "codex", "Codex", "prompt", true, 3)
+	result, _, err := runEmbeddedTurn(context.Background(), session, "codex", "Codex", "prompt", true, 3, 0)
 	if err != nil {
 		t.Fatalf("run turn: %v", err)
 	}
@@ -262,7 +320,7 @@ func TestEmbeddedTurnCanceledWithoutOutputReturnsBackendError(t *testing.T) {
 		{Type: engine.EventTurnFinal, TurnFinal: &engine.TurnFinalObservation{Canceled: true}},
 	}}
 
-	result, _, err := runEmbeddedTurn(context.Background(), session, "codex", "Codex", "prompt", true, 0)
+	result, _, err := runEmbeddedTurn(context.Background(), session, "codex", "Codex", "prompt", true, 0, 0)
 	var backendErr BackendRunError
 	if !errors.As(err, &backendErr) {
 		t.Fatalf("error = %T %v, want BackendRunError", err, err)
@@ -282,7 +340,7 @@ func TestEmbeddedTurnCanceledWithAgentTextRecovers(t *testing.T) {
 		{Type: engine.EventTurnFinal, TurnFinal: &engine.TurnFinalObservation{Canceled: true}},
 	}}
 
-	result, _, err := runEmbeddedTurn(context.Background(), session, "codex", "Codex", "prompt", true, 0)
+	result, _, err := runEmbeddedTurn(context.Background(), session, "codex", "Codex", "prompt", true, 0, 0)
 	if err != nil {
 		t.Fatalf("run turn: %v", err)
 	}
@@ -301,7 +359,7 @@ func TestEmbeddedTurnCanceledWithRetryableAgentTextRecovers(t *testing.T) {
 		{Type: engine.EventTurnFinal, TurnFinal: &engine.TurnFinalObservation{Canceled: true}},
 	}}
 
-	result, _, err := runEmbeddedTurn(context.Background(), session, "codex", "Codex", "prompt", true, 0)
+	result, _, err := runEmbeddedTurn(context.Background(), session, "codex", "Codex", "prompt", true, 0, 0)
 	if err != nil {
 		t.Fatalf("run turn: %v", err)
 	}
@@ -323,7 +381,7 @@ func TestEmbeddedTurnEmptyResultMessageDoesNotRecoverExecutionFailure(t *testing
 		}},
 	}}
 
-	result, _, err := runEmbeddedTurn(context.Background(), session, "codex", "Codex", "prompt", true, 0)
+	result, _, err := runEmbeddedTurn(context.Background(), session, "codex", "Codex", "prompt", true, 0, 0)
 	var backendErr BackendRunError
 	if !errors.As(err, &backendErr) {
 		t.Fatalf("error = %T %v, want BackendRunError", err, err)
@@ -339,7 +397,7 @@ func TestEmbeddedTurnEmptyResultMessageDoesNotRecoverExecutionFailure(t *testing
 func TestEmbeddedTurnWithoutFinalReturnsBackendError(t *testing.T) {
 	session := &fakeEmbeddedSession{}
 
-	result, final, err := runEmbeddedTurn(context.Background(), session, "codex", "Codex", "prompt", true, 0)
+	result, final, err := runEmbeddedTurn(context.Background(), session, "codex", "Codex", "prompt", true, 0, 0)
 	var backendErr BackendRunError
 	if !errors.As(err, &backendErr) {
 		t.Fatalf("error = %T %v, want BackendRunError", err, err)

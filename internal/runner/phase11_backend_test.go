@@ -279,56 +279,7 @@ func setupPhase11FakeProviders(t *testing.T) phase11Env {
 	root := filepath.Dir(base.relayHome)
 	binDir := filepath.Join(root, "bin")
 	homeDir := filepath.Join(root, "home")
-	fakeClaude := `#!/usr/bin/env python3
-import json
-import os
-import re
-import sys
-from pathlib import Path
-
-def arg_value(flag):
-    if flag in sys.argv:
-        idx = sys.argv.index(flag)
-        if idx + 1 < len(sys.argv):
-            return sys.argv[idx + 1]
-    return ""
-
-def session_id():
-    return arg_value("--session-id") or arg_value("--resume")
-
-def project_dir():
-    cwd = os.getcwd()
-    encoded = re.sub(r"[^a-zA-Z0-9-]", "-", cwd)
-    return Path.home() / ".claude" / "projects" / encoded
-
-def append_response(text):
-    sid = session_id()
-    root = project_dir()
-    root.mkdir(parents=True, exist_ok=True)
-    (root / sid).mkdir(exist_ok=True)
-    path = root / f"{sid}.jsonl"
-    record = {"type": "assistant", "message": {"content": [{"type": "text", "text": text}]}}
-    with path.open("a", encoding="utf-8") as handle:
-        handle.write(json.dumps(record) + "\n")
-    print(text, flush=True)
-
-def log_command():
-    path = Path.home() / "claude_commands.jsonl"
-    with path.open("a", encoding="utf-8") as handle:
-        handle.write(json.dumps(sys.argv[1:]) + "\n")
-
-def main():
-    prompt = sys.stdin.read()
-    log_command()
-    if "Return the updated ledger as JSON" in prompt:
-        append_response('{"settled":["claude facilitator"],"contested":[],"withdrawn":[]}')
-    else:
-        append_response("Fake Claude phase11")
-    return 0
-
-if __name__ == "__main__":
-    raise SystemExit(main())
-`
+	fakeClaude := fakeClaudeStreamJSONScript
 	fakeGemini := `#!/usr/bin/env python3
 import json
 import os

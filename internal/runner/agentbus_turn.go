@@ -9,7 +9,7 @@ import (
 	"github.com/charlesnpx/agentbus/engine"
 )
 
-func runEmbeddedTurn(ctx context.Context, session engine.Session, backend string, label string, prompt string, write bool, timeoutSeconds int) (TurnResult, *engine.TurnFinalObservation, error) {
+func runEmbeddedTurn(ctx context.Context, session engine.Session, backend string, label string, prompt string, write bool, timeoutSeconds int, stallTimeoutSeconds int) (TurnResult, *engine.TurnFinalObservation, error) {
 	events, err := session.Turn(ctx, engine.TurnInput{
 		Prompt:  prompt,
 		Write:   write,
@@ -29,7 +29,51 @@ func runEmbeddedTurn(ctx context.Context, session engine.Session, backend string
 	var reportedModel string
 	warnings := []string{}
 	var final *engine.TurnFinalObservation
-	for event := range events {
+	var stallTimer *time.Timer
+	stallTimeout := embeddedTurnTimeout(stallTimeoutSeconds)
+	if stallTimeout > 0 {
+		stallTimer = time.NewTimer(stallTimeout)
+		defer stallTimer.Stop()
+	}
+	stalled := false
+	canceled := false
+	hadUsableOutputAtStall := false
+	for {
+		var (
+			event engine.Event
+			ok    bool
+		)
+		if stalled || canceled || stallTimer == nil {
+			event, ok = <-events
+		} else {
+			select {
+			case event, ok = <-events:
+			case <-ctx.Done():
+				canceled = true
+				continue
+			case <-stallTimer.C:
+				if ctx.Err() != nil {
+					canceled = true
+					continue
+				}
+				stalled = true
+				hadUsableOutputAtStall = hasResultText || agentText.Len() > 0
+				_ = session.Interrupt(ctx)
+				continue
+			}
+		}
+		if !ok {
+			break
+		}
+		if stallTimer != nil && !stalled {
+			if !stallTimer.Stop() {
+				select {
+				case <-stallTimer.C:
+				default:
+				}
+			}
+			stallTimer.Reset(stallTimeout)
+		}
 		switch event.Type {
 		case engine.EventAgentText:
 			agentText.WriteString(event.Text)
@@ -66,7 +110,7 @@ func runEmbeddedTurn(ctx context.Context, session engine.Session, backend string
 			}
 		}
 	}
-	if ctxErr := ctx.Err(); ctxErr != nil {
+	if ctxErr := ctx.Err(); ctxErr != nil && !stalled {
 		return TurnResult{}, final, ctxErr
 	}
 
@@ -94,6 +138,21 @@ func runEmbeddedTurn(ctx context.Context, session engine.Session, backend string
 		Content:        content,
 		TimedOut:       providerResult.TimedOut,
 		ProviderResult: providerResult,
+	}
+	if stalled {
+		stallDetail := fmt.Sprintf("%s stalled - no stream activity for %ds, interrupting turn", backend, stallTimeoutSeconds)
+		providerResult.Stalled = true
+		providerResult.Warnings = append(providerResult.Warnings, stallDetail)
+		result.Stalled = true
+		if hadUsableOutputAtStall {
+			providerResult.Recovered = true
+			providerResult.RecoverySource = "event_stream"
+			result.Recovered = true
+		} else {
+			result.Content = fmt.Sprintf("[%s stalled after %ds of no stream activity]", label, stallTimeoutSeconds)
+		}
+		result.ProviderResult = providerResult
+		return result, final, nil
 	}
 	failureText := ""
 	if len(terminalErrors) > 0 {
