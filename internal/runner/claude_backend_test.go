@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"errors"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -21,70 +20,32 @@ type phase10Env struct {
 	homeDir    string
 }
 
-const claudeLifecycleRecoverySeconds = 2
-
-func TestClaudeHelpersMatchPythonBehavior(t *testing.T) {
-	home := t.TempDir()
-	t.Setenv("HOME", home)
-
-	projectDir := claudeProjectDir("/tmp/project dir")
-	if projectDir != filepath.Join(home, ".claude", "projects", "-tmp-project-dir") {
-		t.Fatalf("claudeProjectDir = %q", projectDir)
-	}
-
-	jsonlPath := filepath.Join(home, "main.jsonl")
-	if err := os.WriteFile(jsonlPath, []byte("abcd"), 0o644); err != nil {
-		t.Fatalf("write main jsonl: %v", err)
-	}
-	subagentsDir := filepath.Join(home, "main", "subagents")
-	if err := os.MkdirAll(subagentsDir, 0o755); err != nil {
-		t.Fatalf("mkdir subagents: %v", err)
-	}
-	if err := os.WriteFile(filepath.Join(subagentsDir, "one.jsonl"), []byte("12345"), 0o644); err != nil {
-		t.Fatalf("write subagent one: %v", err)
-	}
-	if err := os.WriteFile(filepath.Join(subagentsDir, "two.jsonl"), []byte("xy"), 0o644); err != nil {
-		t.Fatalf("write subagent two: %v", err)
-	}
-	if err := os.WriteFile(filepath.Join(subagentsDir, "ignore.txt"), []byte("ignored"), 0o644); err != nil {
-		t.Fatalf("write ignored subagent: %v", err)
-	}
-	if size := jsonlTotalSize(jsonlPath); size != 11 {
-		t.Fatalf("jsonlTotalSize = %d, want 11", size)
-	}
-
-	extractPath := filepath.Join(home, "extract.jsonl")
-	prefix := []byte("{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"old\"}]}}\n")
-	body := []byte(strings.Join([]string{
-		`{"type":"user","message":{"content":[{"type":"text","text":"skip"}]}}`,
-		`not json`,
-		`{"type":"assistant","message":{"content":[{"type":"text","text":"first"},{"type":"tool_use","text":"skip"},{"type":"text","text":"second"}]}}`,
-		`{"type":"assistant","message":{"content":[{"type":"text","text":"   "}]}}`,
-	}, "\n"))
-	if err := os.WriteFile(extractPath, append(prefix, body...), 0o644); err != nil {
-		t.Fatalf("write extract jsonl: %v", err)
-	}
-	if got := extractClaudeResponse(extractPath, int64(len(prefix))); got != "first\n\nsecond" {
-		t.Fatalf("extractClaudeResponse = %q", got)
-	}
-}
-
-func TestClaudeBackendRunTurnStateAndResumeCommand(t *testing.T) {
+func TestEmbeddedClaudeBackendRunTurnStateAndResumeProtocol(t *testing.T) {
 	env := setupPhase10FakeProviders(t)
-	backend := newClaudeBackend(env.relayHome, "slot_0", "Claude Code", env.projectDir, SlotConfig{
+	backend, err := newBackend("claude", env.relayHome, "slot_0", "Claude Code", env.projectDir, SlotConfig{
 		Model:  "claude-sonnet",
 		Effort: "high",
 	})
+	if err != nil {
+		t.Fatalf("new backend: %v", err)
+	}
+	if _, ok := backend.(*embeddedBackend); !ok {
+		t.Fatalf("backend type = %T, want embeddedBackend", backend)
+	}
 
 	first, err := backend.RunTurn(context.Background(), "PHASE10_SUCCESS first", TurnOptions{TimeoutSeconds: 5})
 	if err != nil {
 		t.Fatalf("first run turn: %v", err)
 	}
+	firstSessionID := stringFromAny(backend.SessionState()["session_id"])
+	if firstSessionID == "" {
+		t.Fatalf("first turn session state = %#v", backend.SessionState())
+	}
 	second, err := backend.RunTurn(context.Background(), "PHASE10_SUCCESS second", TurnOptions{TimeoutSeconds: 5})
 	if err != nil {
 		t.Fatalf("second run turn: %v", err)
 	}
-	if !strings.Contains(first.Content, "first") || !strings.Contains(second.Content, "second") {
+	if first.Content != "first reply" || second.Content != "second reply" {
 		t.Fatalf("responses = %q / %q", first.Content, second.Content)
 	}
 	if first.ProviderResult.Backend != "claude" || first.ProviderResult.ReturnCode != 0 {
@@ -103,11 +64,22 @@ func TestClaudeBackendRunTurnStateAndResumeCommand(t *testing.T) {
 	if len(commands) != 2 {
 		t.Fatalf("commands = %#v", commands)
 	}
-	if !contains(commands[0], "--session-id") || contains(commands[0], "--resume") {
-		t.Fatalf("first command = %#v", commands[0])
+	if !contains(commands[0], "-p") ||
+		!contains(commands[0], "--input-format") ||
+		!contains(commands[0], "--output-format") ||
+		!contains(commands[0], "--verbose") ||
+		!contains(commands[0], "--dangerously-skip-permissions") ||
+		contains(commands[0], "--resume") {
+		t.Fatalf("first stream-json command = %#v", commands[0])
 	}
-	if !contains(commands[1], "--resume") || contains(commands[1], "--session-id") {
-		t.Fatalf("second command = %#v", commands[1])
+	if inputFormat, ok := valueAfter(commands[0], "--input-format"); !ok || inputFormat != "stream-json" {
+		t.Fatalf("input format command = %#v", commands[0])
+	}
+	if outputFormat, ok := valueAfter(commands[0], "--output-format"); !ok || outputFormat != "stream-json" {
+		t.Fatalf("output format command = %#v", commands[0])
+	}
+	if resumeSessionID, ok := valueAfter(commands[1], "--resume"); !ok || resumeSessionID != firstSessionID || contains(commands[1], "--session-id") {
+		t.Fatalf("resume stream-json command = %#v", commands[1])
 	}
 	if !contains(commands[0], "--model") || !contains(commands[0], "claude-sonnet") ||
 		!contains(commands[0], "--effort") || !contains(commands[0], "high") {
@@ -115,124 +87,70 @@ func TestClaudeBackendRunTurnStateAndResumeCommand(t *testing.T) {
 	}
 }
 
-func TestClaudeBackendLifecycleOutcomes(t *testing.T) {
-	withFastClaudePoll(t)
-	tests := []struct {
-		name           string
-		prompt         string
-		timeout        int
-		stallTimeout   int
-		wantContent    string
-		wantTimedOut   bool
-		wantStalled    bool
-		wantRecovered  bool
-		wantReturnCode int
-		wantSource     string
-	}{
-		{name: "stdout fallback", prompt: "PHASE10_STDOUT_FALLBACK", timeout: 5, wantContent: "stdout fallback", wantReturnCode: 0},
-		{name: "nonzero recovery", prompt: "PHASE10_NONZERO_RECOVERED", timeout: 5, wantContent: "recovered after nonzero", wantRecovered: true, wantReturnCode: 7, wantSource: "jsonl"},
-		{name: "timeout recovery", prompt: "PHASE10_TIMEOUT_RECOVERED", timeout: claudeLifecycleRecoverySeconds, stallTimeout: 10, wantContent: "recovered before timeout", wantTimedOut: true, wantRecovered: true, wantReturnCode: -1, wantSource: "jsonl"},
-		{name: "timeout empty", prompt: "PHASE10_TIMEOUT_EMPTY", timeout: 1, stallTimeout: 10, wantContent: "[Claude Code timed out after 1s]", wantTimedOut: true, wantReturnCode: -1},
-		{name: "stall recovery", prompt: "PHASE10_STALL_RECOVERED", timeout: 10, stallTimeout: claudeLifecycleRecoverySeconds, wantContent: "recovered before stall", wantStalled: true, wantRecovered: true, wantReturnCode: -1, wantSource: "jsonl"},
-		{name: "stall empty", prompt: "PHASE10_STALL_EMPTY", timeout: 10, stallTimeout: 1, wantContent: "[Claude Code stalled after 1s of no JSONL activity]", wantStalled: true, wantReturnCode: -1},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			env := setupPhase10FakeProviders(t)
-			backend := newClaudeBackend(env.relayHome, "slot_0", "Claude Code", env.projectDir, SlotConfig{})
-
-			result, err := backend.RunTurn(context.Background(), tt.prompt, TurnOptions{TimeoutSeconds: tt.timeout, StallTimeoutSeconds: tt.stallTimeout})
-			if err != nil {
-				t.Fatalf("run turn: %v", err)
-			}
-			if result.Content != tt.wantContent ||
-				result.ProviderResult.TimedOut != tt.wantTimedOut ||
-				result.ProviderResult.Stalled != tt.wantStalled ||
-				result.ProviderResult.Recovered != tt.wantRecovered ||
-				result.ProviderResult.ReturnCode != tt.wantReturnCode ||
-				result.ProviderResult.RecoverySource != tt.wantSource {
-				t.Fatalf("result = %#v, provider = %#v", result, result.ProviderResult)
-			}
-		})
-	}
-}
-
-func TestClaudeBackendRetriesSessionCollisionAndClassifiesErrors(t *testing.T) {
-	env := setupPhase10FakeProviders(t)
-	backend := newClaudeBackend(env.relayHome, "slot_0", "Claude Code", env.projectDir, SlotConfig{})
-	oldSessionID := stringFromAny(backend.SessionState()["session_id"])
-	result, err := backend.RunTurn(context.Background(), "PHASE10_SESSION_COLLISION", TurnOptions{TimeoutSeconds: 5})
-	if err != nil {
-		t.Fatalf("session collision run turn: %v", err)
-	}
-	if result.Content != "fresh response" {
-		t.Fatalf("content = %q", result.Content)
-	}
-	newSessionID := stringFromAny(backend.SessionState()["session_id"])
-	if newSessionID == "" || newSessionID == oldSessionID {
-		t.Fatalf("session id was not refreshed: old=%q new=%q", oldSessionID, newSessionID)
-	}
-	commands := readClaudeCommands(t, env.homeDir)
-	if len(commands) != 2 || commands[0][argIndex(commands[0], "--session-id")+1] != oldSessionID || commands[1][argIndex(commands[1], "--session-id")+1] != newSessionID {
-		t.Fatalf("commands = %#v, old=%q new=%q", commands, oldSessionID, newSessionID)
-	}
-
-	backend = newClaudeBackend(env.relayHome, "slot_1", "Claude Code", env.projectDir, SlotConfig{})
-	_, err = backend.RunTurn(context.Background(), "PHASE10_RETRYABLE", TurnOptions{TimeoutSeconds: 5})
-	var retryable RetryableProviderError
-	if !errors.As(err, &retryable) {
-		t.Fatalf("error = %T %[1]v, want RetryableProviderError", err)
-	}
-
-	backend = newClaudeBackend(env.relayHome, "slot_2", "Claude Code", env.projectDir, SlotConfig{})
-	_, err = backend.RunTurn(context.Background(), "PHASE10_API_ERROR_PARTIAL", TurnOptions{TimeoutSeconds: 5})
-	if !errors.As(err, &retryable) {
-		t.Fatalf("partial api error = %T %[1]v, want RetryableProviderError", err)
-	}
-
-	backend = newClaudeBackend(env.relayHome, "slot_3", "Claude Code", env.projectDir, SlotConfig{})
-	_, err = backend.RunTurn(context.Background(), "PHASE10_STDERR_ONLY", TurnOptions{TimeoutSeconds: 5})
-	if err == nil || errors.As(err, &retryable) || !strings.Contains(err.Error(), "Claude Code failed: boom") {
-		t.Fatalf("stderr-only error = %v", err)
-	}
-}
-
-func TestClaudeBackendAuthTimeoutRecoveryIsNotRecovered(t *testing.T) {
-	withFastClaudePoll(t)
-	env := setupPhase10FakeProviders(t)
-	backend := newClaudeBackend(env.relayHome, "slot_0", "Claude Code", env.projectDir, SlotConfig{})
-
-	_, err := backend.RunTurn(context.Background(), "PHASE10_TIMEOUT_AUTH", TurnOptions{TimeoutSeconds: claudeLifecycleRecoverySeconds, StallTimeoutSeconds: 10})
-	var retryable RetryableProviderError
-	if err == nil {
-		t.Fatalf("auth timeout unexpectedly succeeded")
-	}
-	if errors.As(err, &retryable) {
-		t.Fatalf("auth timeout was classified retryable: %v", err)
-	}
-	if !strings.Contains(err.Error(), "Authentication error") {
-		t.Fatalf("auth timeout detail = %v", err)
-	}
-}
-
-func TestClaudeBackendMissingBinaryIsNotRetryable(t *testing.T) {
+func TestEmbeddedClaudeBackendMissingBinaryReturnsBackendError(t *testing.T) {
 	root := t.TempDir()
-	t.Setenv("PATH", root)
-	t.Setenv("HOME", filepath.Join(root, "home"))
-	projectDir := filepath.Join(root, "project")
-	if err := os.MkdirAll(projectDir, 0o755); err != nil {
-		t.Fatalf("mkdir project: %v", err)
+	t.Setenv("PATH", t.TempDir())
+	backend, err := newBackend("claude", root, "slot_0", "Claude Code", root, SlotConfig{})
+	if err != nil {
+		t.Fatalf("new backend: %v", err)
 	}
-	backend := newClaudeBackend(root, "slot_0", "Claude Code", projectDir, SlotConfig{})
 
-	_, err := backend.RunTurn(context.Background(), "prompt", TurnOptions{TimeoutSeconds: 1})
-	var retryable RetryableProviderError
-	if err == nil {
-		t.Fatalf("missing binary unexpectedly succeeded")
+	_, err = backend.RunTurn(context.Background(), "prompt", TurnOptions{TimeoutSeconds: 1})
+	if err == nil || !strings.Contains(strings.ToLower(err.Error()), "claude") {
+		t.Fatalf("missing Claude binary error = %v", err)
 	}
-	if errors.As(err, &retryable) {
-		t.Fatalf("missing binary was classified retryable: %v", err)
+}
+
+func TestEmbeddedClaudeBackendTimeoutReturnsPlaceholder(t *testing.T) {
+	env := setupPhase10FakeProviders(t)
+	backend, err := newBackend("claude", env.relayHome, "slot_0", "Claude Code", env.projectDir, SlotConfig{})
+	if err != nil {
+		t.Fatalf("new backend: %v", err)
+	}
+
+	result, err := backend.RunTurn(context.Background(), "PHASE10_TIMEOUT", TurnOptions{TimeoutSeconds: 1})
+	if err != nil {
+		t.Fatalf("timeout turn: result = %#v, error = %v", result, err)
+	}
+	if result.Content != "[Claude Code timed out after 1s]" || !result.TimedOut || !result.ProviderResult.TimedOut || result.Recovered || result.ProviderResult.Recovered {
+		t.Fatalf("timeout result = %#v", result)
+	}
+}
+
+func TestEmbeddedClaudeBackendVisibleAuthFailureIsNotRetriedOrRecovered(t *testing.T) {
+	env := setupPhase10FakeProviders(t)
+	backend, err := newBackend("claude", env.relayHome, "slot_0", "Claude Code", env.projectDir, SlotConfig{})
+	if err != nil {
+		t.Fatalf("new backend: %v", err)
+	}
+	var retries int
+	withFakeRetryBackoff(t, func(context.Context, time.Duration) error {
+		retries++
+		return nil
+	})
+
+	result, err := runWithRetryableProviderErrors(context.Background(), backend.Label(), func() (TurnResult, error) {
+		return backend.RunTurn(context.Background(), "PHASE10_AUTH_FAILURE", TurnOptions{TimeoutSeconds: 5})
+	})
+	var backendErr BackendRunError
+	if !errors.As(err, &backendErr) {
+		t.Fatalf("auth error = %T %v, want BackendRunError", err, err)
+	}
+	var retryableErr RetryableProviderError
+	if errors.As(err, &retryableErr) {
+		t.Fatalf("auth failure was classified retryable: %v", err)
+	}
+	if backendErr.Label != "Claude Code" || backendErr.Detail != "Authentication error: token expired" {
+		t.Fatalf("backend error = %#v", backendErr)
+	}
+	if result.Content != "Authentication error: token expired" || result.Recovered || result.ProviderResult.Recovered || result.ProviderResult.RetryableError != "" {
+		t.Fatalf("auth result = %#v", result)
+	}
+	if retries != 0 {
+		t.Fatalf("auth failure retried %d times", retries)
+	}
+	if commands := readClaudeCommands(t, env.homeDir); len(commands) != 1 {
+		t.Fatalf("auth failure command count = %d, want one", len(commands))
 	}
 }
 
@@ -336,12 +254,13 @@ func TestRunResumeAndCleanClaudeSessions(t *testing.T) {
 			foundClaude := false
 			for _, rawSlot := range slots {
 				slot := rawSlot.(map[string]any)
-				if slot["backend"] == "claude" {
-					foundClaude = true
-					state := slot["state"].(map[string]any)
-					if state["session_id"] == "" || state["cwd"] != env.projectDir {
-						t.Fatalf("claude slot state = %#v", state)
-					}
+				if slot["backend"] != "claude" {
+					continue
+				}
+				foundClaude = true
+				state := slot["state"].(map[string]any)
+				if state["session_id"] == "" || state["cwd"] != env.projectDir {
+					t.Fatalf("claude slot state = %#v", state)
 				}
 			}
 			if !foundClaude {
@@ -350,12 +269,13 @@ func TestRunResumeAndCleanClaudeSessions(t *testing.T) {
 			transcript := mustLoadTranscript(t, sessionDir)
 			foundClaudeTurn := false
 			for _, entry := range transcript {
-				if strings.HasPrefix(stringFromAny(entry["from"]), "Claude Code") {
-					foundClaudeTurn = true
-					providerResult := entry["provider_result"].(map[string]any)
-					if providerResult["backend"] != "claude" {
-						t.Fatalf("claude provider_result = %#v", providerResult)
-					}
+				if !strings.HasPrefix(stringFromAny(entry["from"]), "Claude Code") {
+					continue
+				}
+				foundClaudeTurn = true
+				providerResult := entry["provider_result"].(map[string]any)
+				if providerResult["backend"] != "claude" {
+					t.Fatalf("claude provider_result = %#v", providerResult)
 				}
 			}
 			if !foundClaudeTurn {
@@ -384,85 +304,39 @@ func TestRunResumeAndCleanClaudeSessions(t *testing.T) {
 	if transcript := mustLoadTranscript(t, resumeDir); len(transcript) != 2 {
 		t.Fatalf("resumed transcript = %#v", transcript)
 	}
-
-	meta := mustLoadMeta(t, resumeDir)
-	claudeState := firstClaudeState(t, meta)
-	jsonlPath := filepath.Join(claudeProjectDir(stringFromAny(claudeState["cwd"])), stringFromAny(claudeState["session_id"])+".jsonl")
-	sessionArtifactDir := filepath.Join(filepath.Dir(jsonlPath), stringFromAny(claudeState["session_id"]))
-	if err := os.MkdirAll(sessionArtifactDir, 0o755); err != nil {
-		t.Fatalf("mkdir session artifact dir: %v", err)
-	}
-	unrelated := filepath.Join(filepath.Dir(jsonlPath), "other-session.jsonl")
-	if err := os.WriteFile(unrelated, []byte("keep"), 0o644); err != nil {
-		t.Fatalf("write unrelated claude history: %v", err)
-	}
 	cleanReport, err := CleanSession(resumeDir)
-	if err != nil {
-		t.Fatalf("clean: %v", err)
-	}
-	if cleanReport["status"] != "deleted" {
-		t.Fatalf("clean report = %#v", cleanReport)
+	if err != nil || cleanReport["status"] != "deleted" {
+		t.Fatalf("clean: %#v, %v", cleanReport, err)
 	}
 	if _, err := os.Stat(resumeDir); !os.IsNotExist(err) {
 		t.Fatalf("cleaned session still exists")
 	}
-	if _, err := os.Stat(jsonlPath); !os.IsNotExist(err) {
-		t.Fatalf("claude jsonl was not removed")
-	}
-	if _, err := os.Stat(sessionArtifactDir); !os.IsNotExist(err) {
-		t.Fatalf("claude session artifact dir was not removed")
-	}
-	if _, err := os.Stat(unrelated); err != nil {
-		t.Fatalf("unrelated claude history should remain: %v", err)
-	}
 }
 
-func TestRunPersistsClaudeLifecycleProviderResults(t *testing.T) {
-	withFastClaudePoll(t)
-	tests := []struct {
-		name           string
-		task           string
-		timeout        int
-		stallTimeout   int
-		wantTimedOut   bool
-		wantStalled    bool
-		wantRecovered  bool
-		wantReturnCode int
-	}{
-		{name: "stall recovery", task: "PHASE10_STALL_RECOVERED", timeout: 10, stallTimeout: claudeLifecycleRecoverySeconds, wantStalled: true, wantRecovered: true, wantReturnCode: -1},
-		{name: "timeout recovery", task: "PHASE10_TIMEOUT_RECOVERED", timeout: claudeLifecycleRecoverySeconds, stallTimeout: 10, wantTimedOut: true, wantRecovered: true, wantReturnCode: -1},
-		{name: "nonzero recovery", task: "PHASE10_NONZERO_RECOVERED", timeout: 5, stallTimeout: 10, wantRecovered: true, wantReturnCode: 7},
+func TestRunPersistsClaudeProviderResult(t *testing.T) {
+	env := setupPhase10FakeProviders(t)
+	sessionDir := filepath.Join(env.relayHome, "sessions", "claude-provider-result")
+	if _, err := Run(context.Background(), Options{
+		SessionDir:     sessionDir,
+		Task:           "PHASE10_SUCCESS",
+		Agents:         []string{"claude", "codex"},
+		Rounds:         1,
+		TimeoutSeconds: 5,
+		LaunchCWD:      env.projectDir,
+	}); err != nil {
+		t.Fatalf("run: %v", err)
 	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			env := setupPhase10FakeProviders(t)
-			sessionDir := filepath.Join(env.relayHome, "sessions", strings.ReplaceAll(tt.name, " ", "-"))
-
-			if _, err := Run(context.Background(), Options{
-				SessionDir:          sessionDir,
-				Task:                tt.task,
-				Agents:              []string{"claude", "codex"},
-				Rounds:              1,
-				TimeoutSeconds:      tt.timeout,
-				StallTimeoutSeconds: tt.stallTimeout,
-				LaunchCWD:           env.projectDir,
-			}); err != nil {
-				t.Fatalf("run: %v", err)
-			}
-			transcript := mustLoadTranscript(t, sessionDir)
-			if len(transcript) != 1 {
-				t.Fatalf("transcript = %#v", transcript)
-			}
-			providerResult := transcript[0]["provider_result"].(map[string]any)
-			if providerResult["backend"] != "claude" ||
-				providerResult["timed_out"] != tt.wantTimedOut ||
-				providerResult["stalled"] != tt.wantStalled ||
-				providerResult["recovered"] != tt.wantRecovered ||
-				providerResult["recovery_source"] != "jsonl" ||
-				intFromAny(providerResult["return_code"], 0) != tt.wantReturnCode {
-				t.Fatalf("provider_result = %#v", providerResult)
-			}
-		})
+	transcript := mustLoadTranscript(t, sessionDir)
+	if len(transcript) != 1 {
+		t.Fatalf("transcript = %#v", transcript)
+	}
+	providerResult := transcript[0]["provider_result"].(map[string]any)
+	if providerResult["backend"] != "claude" ||
+		providerResult["timed_out"] != false ||
+		providerResult["stalled"] != false ||
+		providerResult["recovered"] != false ||
+		intFromAny(providerResult["return_code"], -1) != 0 {
+		t.Fatalf("provider_result = %#v", providerResult)
 	}
 }
 
@@ -478,150 +352,31 @@ func setupPhase10FakeProviders(t *testing.T) phase10Env {
 			t.Fatalf("mkdir %s: %v", dir, err)
 		}
 	}
-	if err := exec.Command("git", "init", projectDir).Run(); err != nil {
-		t.Fatalf("git init project: %v", err)
-	}
-	fakeCodex := `#!/usr/bin/env python3
-import json
-import os
-import sys
-from pathlib import Path
-
-def main():
-    prompt = sys.stdin.read()
-    codex_home = Path(os.environ.get("CODEX_HOME", ""))
-    suffix = codex_home.name or "default"
-    if "resume" in sys.argv:
-        idx = sys.argv.index("resume")
-        thread_id = sys.argv[idx + 2] if idx + 2 < len(sys.argv) and sys.argv[idx + 1] == "--json" else "thread-resumed"
-    else:
-        thread_id = f"thread-{suffix}"
-        print(json.dumps({"type": "thread.started", "thread_id": thread_id}), flush=True)
-    if "Return the updated ledger as JSON" in prompt:
-        text = '{"settled":["done"],"contested":[],"withdrawn":[]}'
-    else:
-        text = f"Fake Codex {suffix}"
-    print(json.dumps({"type": "item.completed", "item": {"text": text}}), flush=True)
-    return 0
-
-if __name__ == "__main__":
-    raise SystemExit(main())
-`
-	fakeClaude := `#!/usr/bin/env python3
-import json
-import os
-import re
-import sys
-import time
-from pathlib import Path
-
-def arg_value(flag):
-    if flag in sys.argv:
-        idx = sys.argv.index(flag)
-        if idx + 1 < len(sys.argv):
-            return sys.argv[idx + 1]
-    return ""
-
-def session_id():
-    return arg_value("--session-id") or arg_value("--resume")
-
-def project_dir():
-    cwd = os.environ.get("CONVO_RELAY_FAKE_CWD") or os.getcwd()
-    encoded = re.sub(r"[^a-zA-Z0-9-]", "-", cwd)
-    return Path.home() / ".claude" / "projects" / encoded
-
-def append_response(text):
-    sid = session_id()
-    root = project_dir()
-    root.mkdir(parents=True, exist_ok=True)
-    (root / sid).mkdir(exist_ok=True)
-    path = root / f"{sid}.jsonl"
-    record = {"type": "assistant", "message": {"content": [{"type": "text", "text": text}]}}
-    with path.open("a", encoding="utf-8") as handle:
-        handle.write(json.dumps(record) + "\n")
-
-def log_command():
-    path = Path.home() / "claude_commands.jsonl"
-    with path.open("a", encoding="utf-8") as handle:
-        handle.write(json.dumps(sys.argv[1:]) + "\n")
-
-def main():
-    prompt = sys.stdin.read()
-    log_command()
-    if "PHASE10_SESSION_COLLISION" in prompt:
-        marker = Path.home() / ".claude" / "collision_seen"
-        marker.parent.mkdir(parents=True, exist_ok=True)
-        if not marker.exists():
-            marker.write_text("seen", encoding="utf-8")
-            print(f"Error: Session ID {session_id()} is already in use.", file=sys.stderr, flush=True)
-            return 1
-        append_response("fresh response")
-        return 0
-    if "PHASE10_STDOUT_FALLBACK" in prompt:
-        print("stdout fallback", flush=True)
-        return 0
-    if "PHASE10_TIMEOUT_EMPTY" in prompt:
-        time.sleep(5)
-        return 0
-    if "PHASE10_STALL_EMPTY" in prompt:
-        time.sleep(5)
-        return 0
-    if "PHASE10_TIMEOUT_RECOVERED" in prompt:
-        append_response("recovered before timeout")
-        time.sleep(5)
-        return 0
-    if "PHASE10_TIMEOUT_AUTH" in prompt:
-        append_response("Authentication error: token expired")
-        time.sleep(5)
-        return 0
-    if "PHASE10_STALL_RECOVERED" in prompt:
-        append_response("recovered before stall")
-        time.sleep(5)
-        return 0
-    if "PHASE10_NONZERO_RECOVERED" in prompt:
-        append_response("recovered after nonzero")
-        print("backend exited after partial output", file=sys.stderr, flush=True)
-        return 7
-    if "PHASE10_RETRYABLE" in prompt:
-        print("API Error: rate limit exceeded", file=sys.stderr, flush=True)
-        return 1
-    if "PHASE10_API_ERROR_PARTIAL" in prompt:
-        append_response("API Error: rate limit exceeded")
-        return 1
-    if "PHASE10_STDERR_ONLY" in prompt:
-        print("boom", file=sys.stderr, flush=True)
-        return 1
-    if "second" in prompt.lower():
-        append_response("second reply")
-    elif "first" in prompt.lower():
-        append_response("first reply")
-    else:
-        append_response("Fake Claude response")
-    return 0
-
-if __name__ == "__main__":
-    raise SystemExit(main())
-`
-	if err := os.WriteFile(filepath.Join(binDir, "codex"), []byte(fakeCodex), 0o755); err != nil {
-		t.Fatalf("write fake codex: %v", err)
-	}
-	if err := os.WriteFile(filepath.Join(binDir, "claude"), []byte(fakeClaude), 0o755); err != nil {
-		t.Fatalf("write fake claude: %v", err)
-	}
+	writeEmbeddedProviderFakes(t, binDir)
 	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
 	t.Setenv("HOME", homeDir)
 	t.Setenv("CODEX_CLAUDE_HOME", relayHome)
-	t.Setenv("CONVO_RELAY_FAKE_CWD", projectDir)
+	t.Setenv("CONVO_RELAY_COMMAND_HOME", homeDir)
 	return phase10Env{relayHome: relayHome, projectDir: projectDir, homeDir: homeDir}
 }
 
-func withFastClaudePoll(t *testing.T) {
+func writeEmbeddedProviderFakes(t *testing.T, binDir string) {
 	t.Helper()
-	previous := defaultClaudePollInterval
-	defaultClaudePollInterval = 10 * time.Millisecond
-	t.Cleanup(func() {
-		defaultClaudePollInterval = previous
-	})
+	for name, script := range map[string]string{
+		"codex":  fakeCodexAppServerScript,
+		"claude": fakeClaudeStreamJSONScript,
+	} {
+		if err := os.WriteFile(filepath.Join(binDir, name), []byte(script), 0o755); err != nil {
+			t.Fatalf("write fake %s: %v", name, err)
+		}
+	}
+}
+
+func writeFakeCodexAppServer(t *testing.T, binDir string) {
+	t.Helper()
+	if err := os.WriteFile(filepath.Join(binDir, "codex"), []byte(fakeCodexAppServerScript), 0o755); err != nil {
+		t.Fatalf("write fake codex: %v", err)
+	}
 }
 
 func readClaudeCommands(t *testing.T, homeDir string) [][]string {
@@ -644,29 +399,204 @@ func readClaudeCommands(t *testing.T, homeDir string) [][]string {
 	return commands
 }
 
-func contains(values []string, target string) bool {
-	return argIndex(values, target) >= 0
+func contains(values []string, want string) bool {
+	for _, value := range values {
+		if value == want {
+			return true
+		}
+	}
+	return false
 }
 
-func argIndex(values []string, target string) int {
+func valueAfter(values []string, flag string) (string, bool) {
 	for index, value := range values {
-		if value == target {
-			return index
+		if value == flag && index+1 < len(values) {
+			return values[index+1], true
 		}
 	}
-	return -1
+	return "", false
 }
 
-func firstClaudeState(t *testing.T, meta map[string]any) map[string]any {
-	t.Helper()
-	slots, _ := meta["slots"].([]any)
-	for _, rawSlot := range slots {
-		slot, _ := rawSlot.(map[string]any)
-		if slot["backend"] == "claude" {
-			state, _ := slot["state"].(map[string]any)
-			return state
-		}
-	}
-	t.Fatalf("no claude slot in meta: %#v", meta)
-	return nil
-}
+const fakeCodexAppServerScript = `#!/usr/bin/env python3
+import json
+import os
+import sys
+import time
+from pathlib import Path
+
+def send(value):
+    print(json.dumps(value), flush=True)
+
+def response(request, result):
+    send({"id": request.get("id"), "result": result})
+
+def prompt_from(params):
+    items = params.get("input", [])
+    if items and isinstance(items[0], dict):
+        return str(items[0].get("text", ""))
+    return ""
+
+def text_for(prompt, suffix):
+    if "Return the updated ledger as JSON" in prompt and "Persistent contested dynamic" in prompt:
+        return '{"settled":[],"contested":["phase risk"],"withdrawn":[]}', ""
+    if "Return the updated ledger as JSON" in prompt and "Malformed ledger stall" in prompt:
+        return "not a ledger " + ("💥" * 60), ""
+    if "Return the updated ledger as JSON" in prompt and ("Explicit empty ledger stall" in prompt or "Empty ledger done convergence" in prompt):
+        return '{"settled":[],"contested":[],"withdrawn":[]}', ""
+    if "Return the updated ledger as JSON" in prompt:
+        return '{"settled":["done"],"contested":[],"withdrawn":[]}', ""
+    if "PHASE8_RETRY_ALWAYS" in prompt:
+        return "", "API Error: rate limit exceeded"
+    if "PHASE8_RETRY_THEN_SUCCESS" in prompt:
+        marker = Path(os.environ.get("CODEX_HOME", ".")) / "phase8_retry_count"
+        count = int(marker.read_text(encoding="utf-8")) if marker.exists() else 0
+        marker.write_text(str(count + 1), encoding="utf-8")
+        if count == 0:
+            return "", "API Error: rate limit exceeded"
+        return "retry succeeded", ""
+    if "PHASE8_AUTH_FAILURE" in prompt:
+        return "", "Authentication error: token expired"
+    if "Empty ledger done convergence" in prompt:
+        return "task is complete; no further changes", ""
+    if "Explicit empty ledger stall" in prompt:
+        return "Explicit empty ledger stall response", ""
+    if "Malformed ledger stall" in prompt:
+        return "Malformed ledger stall response", ""
+    if "Resume context marker" in prompt and "Resume skill marker" in prompt:
+        return "Fake Codex saw resume input bundles", ""
+    if "Phase 7 steering marker" in prompt:
+        return "Fake Codex saw Phase 7 steering marker", ""
+    if "Persistent contested dynamic" in prompt:
+        return "Persistent contested dynamic phase risk remains unresolved", ""
+    lines = prompt.splitlines()
+    first = lines[0] if lines else ""
+    return f"Fake Codex {suffix}: {first[:80]}", ""
+
+def main():
+    if "--version" in sys.argv:
+        print("codex fake 1.0")
+        return 0
+    if len(sys.argv) < 2 or sys.argv[1] != "app-server":
+        print("expected codex app-server", file=sys.stderr)
+        return 2
+
+    suffix = Path(os.environ.get("CODEX_HOME", "slot")).name or "slot"
+    thread_id = f"thread-{suffix}"
+    turn_number = 0
+    for raw in sys.stdin:
+        try:
+            request = json.loads(raw)
+        except json.JSONDecodeError:
+            continue
+        method = request.get("method", "")
+        params = request.get("params", {}) or {}
+        if method == "initialize":
+            response(request, {"serverInfo": {"name": "fake-codex"}})
+        elif method in ("thread/start", "thread/resume"):
+            thread_id = params.get("threadId") or thread_id
+            response(request, {"thread": {"id": thread_id}})
+        elif method == "model/list":
+            response(request, {"data": [{"id": "fake-codex-model", "supportedReasoningEfforts": ["low", "high"]}]})
+        elif method == "turn/start":
+            turn_number += 1
+            turn_id = f"turn-{turn_number}"
+            response(request, {"turn": {"id": turn_id}})
+            prompt = prompt_from(params)
+            if "Slow cancellation check" in prompt:
+                time.sleep(30)
+                continue
+            text, failure = text_for(prompt, suffix)
+            if failure:
+                send({"method": "turn/completed", "params": {
+                    "threadId": thread_id,
+                    "turn": {"id": turn_id, "status": "failed", "error": {"message": failure}},
+                }})
+                continue
+            send({"method": "item/completed", "params": {
+                "item": {"id": f"item-{turn_number}", "type": "agentMessage", "text": text},
+            }})
+            send({"method": "turn/completed", "params": {
+                "threadId": thread_id,
+                "turn": {"id": turn_id, "status": "completed"},
+            }})
+        elif method == "turn/interrupt":
+            response(request, {})
+    return 0
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+`
+
+const fakeClaudeStreamJSONScript = `#!/usr/bin/env python3
+import json
+import os
+import sys
+import time
+from pathlib import Path
+
+def arg_value(flag):
+    if flag in sys.argv:
+        index = sys.argv.index(flag)
+        if index + 1 < len(sys.argv):
+            return sys.argv[index + 1]
+    return ""
+
+def send(value):
+    print(json.dumps(value), flush=True)
+
+def text_for(prompt):
+    if "Return the updated ledger as JSON" in prompt:
+        return '{"settled":["claude facilitator"],"contested":[],"withdrawn":[]}', ""
+    if "PHASE10_RETRYABLE" in prompt:
+        return "", "API Error: rate limit exceeded"
+    if "PHASE10_AUTH_FAILURE" in prompt:
+        return "Authentication error: token expired", "Authentication error: token expired"
+    if "second" in prompt.lower():
+        return "second reply", ""
+    if "first" in prompt.lower():
+        return "first reply", ""
+    return "Fake Claude response", ""
+
+def log_command():
+    home = Path(os.environ.get("CONVO_RELAY_COMMAND_HOME") or os.environ.get("HOME", "."))
+    home.mkdir(parents=True, exist_ok=True)
+    with (home / "claude_commands.jsonl").open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(sys.argv[1:]) + "\n")
+
+def main():
+    if "--version" in sys.argv:
+        print("2.1.205")
+        return 0
+    if "--help" in sys.argv:
+        print("--effort values (low, medium, high, max)\n--model examples (fake-claude-model)")
+        return 0
+    log_command()
+    init_line = sys.stdin.readline()
+    if not init_line:
+        return 0
+    initialize = json.loads(init_line)
+    request_id = initialize.get("request_id", "")
+    send({"type": "control_response", "response": {"subtype": "success", "request_id": request_id, "response": {}}})
+    user_line = sys.stdin.readline()
+    if not user_line:
+        return 0
+    user = json.loads(user_line)
+    prompt = str((user.get("message") or {}).get("content", ""))
+    session_id = arg_value("--resume") or f"claude-{os.getpid()}"
+    if "PHASE10_TIMEOUT" in prompt:
+        while True:
+            time.sleep(1)
+    text, failure = text_for(prompt)
+    send({"type": "system", "session_id": session_id, "model": arg_value("--model") or "fake-claude-model"})
+    if failure:
+        if text:
+            send({"type": "assistant", "session_id": session_id, "message": {"content": [{"type": "text", "text": text}]}})
+        send({"type": "result", "session_id": session_id, "subtype": "error", "is_error": True, "error": failure})
+        return 0
+    send({"type": "assistant", "session_id": session_id, "message": {"content": [{"type": "text", "text": text}]}})
+    send({"type": "result", "session_id": session_id, "subtype": "success", "is_error": False, "result": text})
+    return 0
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+`

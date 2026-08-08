@@ -682,6 +682,15 @@ func cleanupBackendArtifactsForSession(meta map[string]any, sessionDir string) e
 			errs = append(errs, fmt.Errorf("cleanup %s %s provider %s: %w", record.backend, record.role, record.slotID, err))
 		}
 	}
+	if !hasFacilitatorState && shouldCleanClaudeFacilitatorArtifacts(meta) {
+		// LEGACY-COMPAT: pre-embedded-migration Claude facilitators wrote
+		// transcripts under ~/.claude/projects. No new sessions produce these
+		// artifacts; this path exists only to clean pre-migration or interrupted
+		// sessions that never persisted facilitator state.
+		if err := os.RemoveAll(claudeProjectDir(sessionDir)); err != nil {
+			errs = append(errs, fmt.Errorf("cleanup legacy Claude facilitator artifacts: %w", err))
+		}
+	}
 	if !hasParticipantSlots {
 		if sessionID := stringFromAny(meta["claude_session_id"]); sessionID != "" {
 			cwd := firstNonEmpty(stringFromAny(meta["launch_cwd"]), sessionDir)
@@ -701,12 +710,35 @@ func cleanupBackendArtifactsForSession(meta map[string]any, sessionDir string) e
 			}
 		}
 	}
-	if !hasFacilitatorState && shouldCleanClaudeFacilitatorArtifacts(meta) {
-		if err := os.RemoveAll(claudeProjectDir(sessionDir)); err != nil {
-			errs = append(errs, fmt.Errorf("cleanup claude facilitator artifacts: %w", err))
+	return errors.Join(errs...)
+}
+
+func claudeProjectDir(cwd string) string {
+	home, err := os.UserHomeDir()
+	if err != nil || home == "" {
+		home = "."
+	}
+	var encoded strings.Builder
+	for _, ch := range cwd {
+		if (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9') || ch == '-' {
+			encoded.WriteRune(ch)
+		} else {
+			encoded.WriteByte('-')
 		}
 	}
-	return errors.Join(errs...)
+	return filepath.Join(home, ".claude", "projects", encoded.String())
+}
+
+func shouldCleanClaudeFacilitatorArtifacts(meta map[string]any) bool {
+	facilitator := strings.TrimSpace(stringFromAny(meta["facilitator_backend"]))
+	if facilitator == "" {
+		if _, hasSlots := meta["slots"]; hasSlots {
+			facilitator = "codex"
+		} else {
+			facilitator = "claude"
+		}
+	}
+	return facilitator == "claude"
 }
 
 func backendCleanupCWD(record backendCleanupRecord, meta map[string]any, sessionDir string) (string, error) {
@@ -977,18 +1009,6 @@ func workspaceCleanupResultMap(result *workspace.CleanupResult) map[string]any {
 		"worktree_removed":   result.WorktreeRemoved,
 		"metadata_pruned":    result.MetadataPruned,
 	}
-}
-
-func shouldCleanClaudeFacilitatorArtifacts(meta map[string]any) bool {
-	facilitator := strings.TrimSpace(stringFromAny(meta["facilitator_backend"]))
-	if facilitator == "" {
-		if _, hasSlots := meta["slots"]; hasSlots {
-			facilitator = "codex"
-		} else {
-			facilitator = "claude"
-		}
-	}
-	return facilitator == "claude"
 }
 
 func CleanupSessions(home string, limit int, force bool) (map[string]any, error) {

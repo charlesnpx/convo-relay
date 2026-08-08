@@ -17,7 +17,7 @@ The elegant way to create this is of course to implement your own agentic loop w
 
 1. Creates an isolated session directory under `~/.codex-claude/sessions/`
 2. Initializes a git repo in that directory so Codex always has a valid repository
-3. Runs alternating turns across two backend slots. Today that means Codex via `codex exec --json`, Claude Code via `claude -p`, and Gemini via `gemini --output-format json`
+3. Runs alternating turns across two backend slots. Codex and Claude Code use embedded agentbus v0.9.1 engine adapters: Codex via `codex app-server` JSON-RPC and Claude via its stream-json CLI transport; Gemini remains `gemini --output-format json`
 4. Uses symmetric framing driven by `--mode`: `cooperative`, `adversarial`, or `steelman`
 5. Runs a lightweight facilitator after every turn to maintain a ledger of settled, contested, and withdrawn points
 6. Persists the original launch directory so resume and clean keep using the same project context
@@ -795,9 +795,9 @@ Each `transcript.json` entry contains:
 
 Provider failures that look like bad or expired credentials are treated as non-retryable so they do not consume the full transient retry budget. Failed turns persist sanitized `provider_failure` events with category, retryability, attempt count, phase, actor, backend, timeout/stall flags, return code, remediation, and redacted detail; raw provider stderr is not exposed by default.
 
-Codex runs with `CODEX_HOME` redirected so its sessions do not write into `~/.codex/`, and each slot gets its own isolated home. Gemini runs with a slot-scoped home while linking existing Gemini config where available. The original launch directory is persisted in `meta.json` so `resume` and `clean` stay tied to the same project context. Claude Code still uses the real `~/.claude/` config for auth, and `clean` removes only the relay-owned Claude artifacts for the saved launch directory. Override the base directory with `CODEX_CLAUDE_HOME`.
+Codex runs through an embedded agentbus adapter with `CODEX_HOME` redirected; each slot gets an isolated home that links `auth.json` and `config.toml` from `~/.codex`, and the relay deliberately uses Codex's trusted (`dangerFullAccess`) write posture. Gemini runs with a slot-scoped home while linking existing Gemini config where available. The original launch directory is persisted in `meta.json` so `resume` and `clean` stay tied to the same project context. Claude Code still uses the real `~/.claude/` config for auth and can write project transcripts; `clean` removes only relay-owned Claude artifacts for the saved launch directory, including legacy-compatible cleanup for pre-migration sessions. Override the base directory with `CODEX_CLAUDE_HOME`.
 
-Each slot also persists its own working directory inside `slots[*].state.cwd`. Claude normally uses the original launch directory. Codex also uses that launch directory when it is still inside a git repo; otherwise it falls back to the session git repo so `codex exec` always has a valid repository. Older pre-slot sessions can still be listed, shown, diffed, and cleaned, but `resume` requires the current slot-based session format.
+Each slot also persists its own working directory inside `slots[*].state.cwd`. Claude normally uses the original launch directory. Codex also uses that launch directory when it is still inside a git repo; otherwise it falls back to the session git repo so the Codex app-server adapter has a valid repository context. Older pre-slot sessions can still be listed, shown, diffed, and cleaned, but `resume` requires the current slot-based session format.
 
 ## License
 

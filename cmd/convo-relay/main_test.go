@@ -717,34 +717,7 @@ workspace_isolation = "inherited"
 	}
 	providerLog := filepath.Join(tempDir, "provider.log")
 	fakeCodex := filepath.Join(fakeBin, "codex")
-	fakeScript := `#!/bin/sh
-printf '%s\n' "$*" >> "$ROOT_RECIPE_CLI_LOG"
-if [ "$1" = "--version" ]; then
-  printf 'codex test 1.0\n'
-  exit 0
-fi
-prompt=$(cat)
-suffix=$(basename "${CODEX_HOME:-codex}")
-case " $* " in
-  *" resume "*) ;;
-  *) printf '{"type":"thread.started","thread_id":"root-cli-%s"}\n' "$suffix" ;;
-esac
-case "$prompt" in
-  *"Return the updated ledger as JSON"*)
-    printf '%s\n' '{"type":"item.completed","item":{"text":"{\"settled\":[\"cli\"],\"contested\":[],\"withdrawn\":[]}"}}'
-    ;;
-  *"Invalid structured result"*)
-    printf '%s\n' '{"type":"item.completed","item":{"text":"not a JSON result"}}'
-    ;;
-  *"Integration Contract Instructions for This Turn"*)
-    printf '%s\n' '{"type":"item.completed","item":{"text":"{\"value\":\"cli\"}"}}'
-    ;;
-  *)
-    printf '{"type":"item.completed","item":{"text":"CLI participant %s"}}\n' "$suffix"
-    ;;
-esac
-`
-	if err := os.WriteFile(fakeCodex, []byte(fakeScript), 0o755); err != nil {
+	if err := os.WriteFile(fakeCodex, []byte(fakeCodexAppServerScript), 0o755); err != nil {
 		t.Fatalf("write fake codex: %v", err)
 	}
 

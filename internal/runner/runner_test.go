@@ -1969,61 +1969,7 @@ func setupFakeCodex(t *testing.T) fakeEnv {
 			t.Fatalf("mkdir %s: %v", dir, err)
 		}
 	}
-	if err := exec.Command("git", "init", projectDir).Run(); err != nil {
-		t.Fatalf("git init project: %v", err)
-	}
-	fakeCodex := `#!/usr/bin/env python3
-import json
-import os
-import sys
-import time
-from pathlib import Path
-
-def main():
-    prompt = sys.stdin.read()
-    if "Slow cancellation check" in prompt:
-        time.sleep(30)
-    codex_home = Path(os.environ.get("CODEX_HOME", ""))
-    home_suffix = codex_home.name or "default"
-    if "resume" in sys.argv:
-        idx = sys.argv.index("resume")
-        thread_id = sys.argv[idx + 2] if idx + 2 < len(sys.argv) and sys.argv[idx + 1] == "--json" else "thread-resumed"
-    else:
-        thread_id = f"thread-{home_suffix}"
-        print(json.dumps({"type": "thread.started", "thread_id": thread_id}), flush=True)
-    if "Return the updated ledger as JSON" in prompt and "Persistent contested dynamic" in prompt:
-        text = '{"settled":[],"contested":["phase risk"],"withdrawn":[]}'
-    elif "Return the updated ledger as JSON" in prompt and "Malformed ledger stall" in prompt:
-        text = "not a ledger " + ("\U0001F4A5" * 60)
-    elif "Return the updated ledger as JSON" in prompt and ("Explicit empty ledger stall" in prompt or "Empty ledger done convergence" in prompt):
-        text = '{"settled":[],"contested":[],"withdrawn":[]}'
-    elif "Return the updated ledger as JSON" in prompt:
-        text = '{"settled":["done"],"contested":[],"withdrawn":[]}'
-    elif "Empty ledger done convergence" in prompt:
-        text = "task is complete; no further changes"
-    elif "Explicit empty ledger stall" in prompt:
-        text = "Explicit empty ledger stall response"
-    elif "Malformed ledger stall" in prompt:
-        text = "Malformed ledger stall response"
-    elif "Resume context marker" in prompt and "Resume skill marker" in prompt:
-        text = "Fake Codex saw resume input bundles"
-    elif "Phase 7 steering marker" in prompt:
-        text = "Fake Codex saw Phase 7 steering marker"
-    elif "Persistent contested dynamic" in prompt:
-        text = "Persistent contested dynamic phase risk remains unresolved"
-    else:
-        first = prompt.splitlines()[0] if prompt.splitlines() else ""
-        text = f"Fake Codex {home_suffix}: {first[:80]}"
-    print(json.dumps({"type": "item.completed", "item": {"text": text}}), flush=True)
-    return 0
-
-if __name__ == "__main__":
-    raise SystemExit(main())
-`
-	codexPath := filepath.Join(binDir, "codex")
-	if err := os.WriteFile(codexPath, []byte(fakeCodex), 0o755); err != nil {
-		t.Fatalf("write fake codex: %v", err)
-	}
+	writeFakeCodexAppServer(t, binDir)
 	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
 	t.Setenv("HOME", homeDir)
 	t.Setenv("CODEX_CLAUDE_HOME", relayHome)

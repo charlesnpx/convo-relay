@@ -2,11 +2,8 @@ package runner
 
 import (
 	"context"
-	"errors"
 	"os"
-	"os/exec"
 	"path/filepath"
-	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -38,30 +35,6 @@ func TestClassifyRetryableProviderErrorPolicy(t *testing.T) {
 				t.Fatalf("retryable = %v, want %v for %q", got, tt.retryable, tt.text)
 			}
 		})
-	}
-}
-
-func TestCodexBuildCommandPlacesOptionsAfterExecSubcommand(t *testing.T) {
-	backend := newCodexBackend("/tmp/session", "slot_0", "Codex", "/tmp/project", SlotConfig{
-		Model:  "gpt-test",
-		Effort: "high",
-	})
-	first := backend.buildCommand()
-	wantFirst := []string{"codex", "exec", "-m", "gpt-test", "-c", `model_reasoning_effort="high"`, "--json", "-"}
-	if !slices.Equal(first, wantFirst) {
-		t.Fatalf("first command = %#v, want %#v", first, wantFirst)
-	}
-
-	if err := backend.RestoreState(map[string]any{"started": true, "thread_id": "thread-123"}, SlotConfig{
-		Model:  "gpt-test",
-		Effort: "high",
-	}); err != nil {
-		t.Fatalf("restore codex state: %v", err)
-	}
-	resume := backend.buildCommand()
-	wantResume := []string{"codex", "exec", "resume", "-m", "gpt-test", "-c", `model_reasoning_effort="high"`, "--json", "thread-123", "-"}
-	if !slices.Equal(resume, wantResume) {
-		t.Fatalf("resume command = %#v, want %#v", resume, wantResume)
 	}
 }
 
@@ -113,158 +86,6 @@ func TestRunPersistsProviderResultOnTranscriptAndTurnEvent(t *testing.T) {
 	validation := report["validation"].(map[string]any)
 	if validation["ok"] != true {
 		t.Fatalf("strict validation = %#v", validation)
-	}
-}
-
-func TestCodexProviderResultRecordsRecoveredNonzeroExit(t *testing.T) {
-	env := setupPhase8FakeCodex(t)
-	backend := newCodexBackend(env.relayHome, "slot_0", "Codex", env.projectDir, SlotConfig{})
-
-	result, err := backend.RunTurn(context.Background(), "PHASE8_NONZERO_RECOVERED", TurnOptions{TimeoutSeconds: 5})
-	if err != nil {
-		t.Fatalf("run turn: %v", err)
-	}
-	if !strings.Contains(result.Content, "recovered after nonzero") {
-		t.Fatalf("content = %q", result.Content)
-	}
-	providerResult := result.ProviderResult
-	if providerResult.Backend != "codex" ||
-		providerResult.ReturnCode != 7 ||
-		!providerResult.Recovered ||
-		providerResult.RecoverySource != "event_buffer" ||
-		len(providerResult.Warnings) == 0 {
-		t.Fatalf("provider result = %#v", providerResult)
-	}
-}
-
-func TestCodexProviderResultRecordsTimeoutRecovery(t *testing.T) {
-	env := setupPhase8FakeCodex(t)
-	backend := newCodexBackend(env.relayHome, "slot_0", "Codex", env.projectDir, SlotConfig{})
-
-	result, err := backend.RunTurn(context.Background(), "PHASE8_TIMEOUT_RECOVERED", TurnOptions{TimeoutSeconds: 1})
-	if err != nil {
-		t.Fatalf("run turn: %v", err)
-	}
-	if !strings.Contains(result.Content, "recovered before timeout") {
-		t.Fatalf("content = %q", result.Content)
-	}
-	if !result.ProviderResult.TimedOut ||
-		!result.ProviderResult.Recovered ||
-		result.ProviderResult.RecoverySource != "event_buffer" {
-		t.Fatalf("provider result = %#v", result.ProviderResult)
-	}
-}
-
-func TestCodexProviderResultAuthTimeoutRecoveryIsNotRecovered(t *testing.T) {
-	env := setupPhase8FakeCodex(t)
-	backend := newCodexBackend(env.relayHome, "slot_0", "Codex", env.projectDir, SlotConfig{})
-
-	_, err := backend.RunTurn(context.Background(), "PHASE8_TIMEOUT_AUTH", TurnOptions{TimeoutSeconds: 1})
-	var retryable RetryableProviderError
-	if err == nil {
-		t.Fatalf("auth timeout unexpectedly succeeded")
-	}
-	if errors.As(err, &retryable) {
-		t.Fatalf("auth timeout was classified retryable: %v", err)
-	}
-	if !strings.Contains(err.Error(), "Authentication error") {
-		t.Fatalf("auth timeout detail = %v", err)
-	}
-}
-
-func TestCodexProviderResultRecordsTimeoutWithoutOutput(t *testing.T) {
-	env := setupPhase8FakeCodex(t)
-	backend := newCodexBackend(env.relayHome, "slot_0", "Codex", env.projectDir, SlotConfig{})
-
-	result, err := backend.RunTurn(context.Background(), "PHASE8_TIMEOUT_EMPTY", TurnOptions{TimeoutSeconds: 1})
-	if err != nil {
-		t.Fatalf("run turn: %v", err)
-	}
-	if result.Content != "[Codex timed out after 1s]" {
-		t.Fatalf("content = %q", result.Content)
-	}
-	if !result.ProviderResult.TimedOut ||
-		result.ProviderResult.Recovered ||
-		result.ProviderResult.RecoverySource != "" ||
-		len(result.ProviderResult.Warnings) == 0 {
-		t.Fatalf("provider result = %#v", result.ProviderResult)
-	}
-}
-
-func TestCodexProviderResultHandlesMalformedOutput(t *testing.T) {
-	env := setupPhase8FakeCodex(t)
-	backend := newCodexBackend(env.relayHome, "slot_0", "Codex", env.projectDir, SlotConfig{})
-
-	result, err := backend.RunTurn(context.Background(), "PHASE8_MALFORMED", TurnOptions{TimeoutSeconds: 5})
-	if err != nil {
-		t.Fatalf("run turn: %v", err)
-	}
-	if result.Content != "[No response from Codex]" {
-		t.Fatalf("content = %q", result.Content)
-	}
-	if result.ProviderResult.ReturnCode != 0 || result.ProviderResult.Recovered {
-		t.Fatalf("provider result = %#v", result.ProviderResult)
-	}
-	if backend.SessionState()["started"] != false {
-		t.Fatalf("malformed output should not create restorable started state: %#v", backend.SessionState())
-	}
-}
-
-func TestCodexProviderResultClassifiesRetryableError(t *testing.T) {
-	env := setupPhase8FakeCodex(t)
-	backend := newCodexBackend(env.relayHome, "slot_0", "Codex", env.projectDir, SlotConfig{})
-
-	_, err := backend.RunTurn(context.Background(), "PHASE8_RETRYABLE", TurnOptions{TimeoutSeconds: 5})
-	var retryable RetryableProviderError
-	if !errors.As(err, &retryable) {
-		t.Fatalf("error = %T %[1]v, want RetryableProviderError", err)
-	}
-	if !strings.Contains(retryable.Detail, "API Error") {
-		t.Fatalf("retryable detail = %q", retryable.Detail)
-	}
-}
-
-func TestCodexProviderResultAuthFailureIsNotRetryable(t *testing.T) {
-	env := setupPhase8FakeCodex(t)
-	backend := newCodexBackend(env.relayHome, "slot_0", "Codex", env.projectDir, SlotConfig{})
-
-	_, err := backend.RunTurn(context.Background(), "PHASE8_AUTH_FAILURE", TurnOptions{TimeoutSeconds: 5})
-	var retryable RetryableProviderError
-	if err == nil {
-		t.Fatalf("auth failure unexpectedly succeeded")
-	}
-	if errors.As(err, &retryable) {
-		t.Fatalf("auth failure was classified retryable: %v", err)
-	}
-	if !strings.Contains(err.Error(), "Authentication error") {
-		t.Fatalf("auth detail = %v", err)
-	}
-}
-
-func TestCodexProviderResultStderrOnlyFailureIsNotRetryable(t *testing.T) {
-	env := setupPhase8FakeCodex(t)
-	backend := newCodexBackend(env.relayHome, "slot_0", "Codex", env.projectDir, SlotConfig{})
-
-	_, err := backend.RunTurn(context.Background(), "PHASE8_STDERR_ONLY", TurnOptions{TimeoutSeconds: 5})
-	var retryable RetryableProviderError
-	if err == nil {
-		t.Fatalf("stderr-only failure unexpectedly succeeded")
-	}
-	if errors.As(err, &retryable) {
-		t.Fatalf("stderr-only failure was classified retryable: %v", err)
-	}
-	if !strings.Contains(err.Error(), "Codex failed: boom") {
-		t.Fatalf("error = %v", err)
-	}
-}
-
-func TestCodexProviderResultNonzeroExitWithoutOutput(t *testing.T) {
-	env := setupPhase8FakeCodex(t)
-	backend := newCodexBackend(env.relayHome, "slot_0", "Codex", env.projectDir, SlotConfig{})
-
-	_, err := backend.RunTurn(context.Background(), "PHASE8_NONZERO_EMPTY", TurnOptions{TimeoutSeconds: 5})
-	if err == nil || !strings.Contains(err.Error(), "process exited 3") {
-		t.Fatalf("error = %v, want process exited detail", err)
 	}
 }
 
@@ -387,26 +208,6 @@ func TestRunAuthProviderFailureShortCircuitsAndRecordsEvent(t *testing.T) {
 	}
 }
 
-func TestCodexProviderResultMissingBinaryIsNotRetryable(t *testing.T) {
-	root := t.TempDir()
-	t.Setenv("PATH", root)
-	t.Setenv("HOME", filepath.Join(root, "home"))
-	projectDir := filepath.Join(root, "project")
-	if err := os.MkdirAll(projectDir, 0o755); err != nil {
-		t.Fatalf("mkdir project: %v", err)
-	}
-	backend := newCodexBackend(root, "slot_0", "Codex", projectDir, SlotConfig{})
-
-	_, err := backend.RunTurn(context.Background(), "prompt", TurnOptions{TimeoutSeconds: 1})
-	var retryable RetryableProviderError
-	if err == nil {
-		t.Fatalf("missing binary unexpectedly succeeded")
-	}
-	if errors.As(err, &retryable) {
-		t.Fatalf("missing binary was classified retryable: %v", err)
-	}
-}
-
 func TestHistoricalSessionWithoutProviderResultStillInspects(t *testing.T) {
 	sessionDir := filepath.Join(t.TempDir(), "sessions", "legacy-no-provider-result")
 	st := store.New(sessionDir)
@@ -454,77 +255,7 @@ func setupPhase8FakeCodex(t *testing.T) fakeEnv {
 			t.Fatalf("mkdir %s: %v", dir, err)
 		}
 	}
-	if err := exec.Command("git", "init", projectDir).Run(); err != nil {
-		t.Fatalf("git init project: %v", err)
-	}
-	fakeCodex := `#!/usr/bin/env python3
-import json
-import os
-import sys
-import time
-from pathlib import Path
-
-def emit(text):
-    suffix = Path(os.environ.get("CODEX_HOME", "slot")).name
-    print(json.dumps({"type": "thread.started", "thread_id": f"thread-{suffix}"}), flush=True)
-    print(json.dumps({"type": "item.completed", "item": {"text": text}}), flush=True)
-
-def main():
-    prompt = sys.stdin.read()
-    if "Return the updated ledger as JSON" in prompt:
-        emit('{"settled":["done"],"contested":[],"withdrawn":[]}')
-        return 0
-    if "PHASE8_TIMEOUT_RECOVERED" in prompt:
-        emit("recovered before timeout")
-        time.sleep(5)
-        return 0
-    if "PHASE8_TIMEOUT_AUTH" in prompt:
-        emit("Authentication error: token expired")
-        time.sleep(5)
-        return 0
-    if "PHASE8_TIMEOUT_EMPTY" in prompt:
-        time.sleep(5)
-        return 0
-    if "PHASE8_NONZERO_RECOVERED" in prompt:
-        emit("recovered after nonzero")
-        print("backend exited after partial output", file=sys.stderr, flush=True)
-        return 7
-    if "PHASE8_RETRYABLE" in prompt:
-        print("API Error: rate limit exceeded", file=sys.stderr, flush=True)
-        return 1
-    if "PHASE8_AUTH_FAILURE" in prompt:
-        print("Authentication error: token expired", file=sys.stderr, flush=True)
-        return 1
-    if "PHASE8_STDERR_ONLY" in prompt:
-        print("boom", file=sys.stderr, flush=True)
-        return 1
-    if "PHASE8_NONZERO_EMPTY" in prompt:
-        return 3
-    if "PHASE8_RETRY_ALWAYS" in prompt:
-        print("API Error: rate limit exceeded", file=sys.stderr, flush=True)
-        return 1
-    if "PHASE8_RETRY_THEN_SUCCESS" in prompt:
-        marker = Path(os.environ.get("CODEX_HOME", ".")) / "phase8_retry_count"
-        count = int(marker.read_text(encoding="utf-8")) if marker.exists() else 0
-        marker.write_text(str(count + 1), encoding="utf-8")
-        if count == 0:
-            print("API Error: rate limit exceeded", file=sys.stderr, flush=True)
-            return 1
-        emit("retry succeeded")
-        return 0
-    if "PHASE8_MALFORMED" in prompt:
-        print("this is not codex json", flush=True)
-        return 0
-    emit("phase8 success")
-    return 0
-
-if __name__ == "__main__":
-    raise SystemExit(main())
-`
-	codexPath := filepath.Join(binDir, "codex")
-	if err := os.WriteFile(codexPath, []byte(fakeCodex), 0o755); err != nil {
-		t.Fatalf("write fake codex: %v", err)
-	}
+	writeFakeCodexAppServer(t, binDir)
 	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
 	t.Setenv("HOME", homeDir)
 	t.Setenv("CODEX_CLAUDE_HOME", relayHome)
@@ -540,11 +271,11 @@ func lastEventOfType(events []map[string]any, eventType string) map[string]any {
 	return nil
 }
 
-func withFakeRetryBackoff(t *testing.T, fn func(context.Context, time.Duration) error) {
+func withFakeRetryBackoff(t *testing.T, fake func(context.Context, time.Duration) error) {
 	t.Helper()
-	previous := retryBackoff
-	retryBackoff = fn
+	original := retryBackoff
+	retryBackoff = fake
 	t.Cleanup(func() {
-		retryBackoff = previous
+		retryBackoff = original
 	})
 }
