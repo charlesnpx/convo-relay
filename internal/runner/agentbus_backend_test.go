@@ -56,11 +56,13 @@ func (b *fakeEmbeddedEngineBackend) Resume(_ context.Context, id string, options
 }
 
 type fakeEmbeddedSession struct {
-	id         string
-	events     []engine.Event
-	turnErr    error
-	turnInputs []engine.TurnInput
-	onTurn     func(context.Context, engine.TurnInput) (<-chan engine.Event, error)
+	id             string
+	events         []engine.Event
+	turnErr        error
+	turnInputs     []engine.TurnInput
+	interruptCalls int
+	onTurn         func(context.Context, engine.TurnInput) (<-chan engine.Event, error)
+	onInterrupt    func(context.Context) error
 }
 
 func (s *fakeEmbeddedSession) ID() string {
@@ -83,7 +85,11 @@ func (s *fakeEmbeddedSession) Turn(ctx context.Context, input engine.TurnInput) 
 	return events, nil
 }
 
-func (s *fakeEmbeddedSession) Interrupt(context.Context) error {
+func (s *fakeEmbeddedSession) Interrupt(ctx context.Context) error {
+	s.interruptCalls++
+	if s.onInterrupt != nil {
+		return s.onInterrupt(ctx)
+	}
 	return nil
 }
 
@@ -287,6 +293,63 @@ func TestEmbeddedBackendDropsErroredSessionAndResumesConfirmedID(t *testing.T) {
 	}
 }
 
+func TestEmbeddedBackendDropsStalledSessionAndResumesConfirmedID(t *testing.T) {
+	events := make(chan engine.Event, 1)
+	stalledSession := &fakeEmbeddedSession{id: "live-session-id"}
+	stalledSession.onTurn = func(context.Context, engine.TurnInput) (<-chan engine.Event, error) {
+		return events, nil
+	}
+	stalledSession.onInterrupt = func(context.Context) error {
+		events <- engine.Event{
+			Type:      engine.EventTurnFinal,
+			TurnFinal: &engine.TurnFinalObservation{BackendSessionID: "thread-confirmed"},
+		}
+		close(events)
+		return nil
+	}
+	resumedSession := &fakeEmbeddedSession{events: []engine.Event{{
+		Type:      engine.EventTurnFinal,
+		TurnFinal: &engine.TurnFinalObservation{BackendSessionID: "thread-confirmed"},
+	}}}
+	engineBackend := &fakeEmbeddedEngineBackend{
+		name:          "codex",
+		startSession:  stalledSession,
+		resumeSession: resumedSession,
+	}
+	backend := newEmbeddedBackend("codex", t.TempDir(), "slot_0", "Codex", "/workspace", SlotConfig{}, engineBackend)
+	backend.codexHomeReady = true
+
+	result, err := backend.RunTurn(context.Background(), "first", TurnOptions{StallTimeoutSeconds: 1})
+	if err != nil {
+		t.Fatalf("stalled turn: %v", err)
+	}
+	if result.Content != "[Codex stalled after 1s of no stream activity]" || !result.Stalled || !result.ProviderResult.Stalled || result.Recovered {
+		t.Fatalf("stalled result = %#v", result)
+	}
+	if !reflect.DeepEqual(result.ProviderResult.Warnings, []string{"codex stalled - no stream activity for 1s, interrupting turn"}) {
+		t.Fatalf("stalled warnings = %#v", result.ProviderResult.Warnings)
+	}
+	if stalledSession.interruptCalls != 1 {
+		t.Fatalf("interrupt calls = %d, want one", stalledSession.interruptCalls)
+	}
+	if backend.session != nil {
+		t.Fatalf("session = %#v after stalled turn, want nil", backend.session)
+	}
+	if backend.sessionID != "thread-confirmed" || !backend.started {
+		t.Fatalf("captured state = sessionID %q, started %t", backend.sessionID, backend.started)
+	}
+
+	if _, err := backend.RunTurn(context.Background(), "second", TurnOptions{}); err != nil {
+		t.Fatalf("resumed turn: %v", err)
+	}
+	if len(engineBackend.startOptions) != 1 {
+		t.Fatalf("start calls = %d, want one", len(engineBackend.startOptions))
+	}
+	if len(engineBackend.resumeCalls) != 1 || engineBackend.resumeCalls[0].id != "thread-confirmed" {
+		t.Fatalf("resume calls = %#v, want one for thread-confirmed", engineBackend.resumeCalls)
+	}
+}
+
 func TestEmbeddedBackendRestartsAfterErroredTurnWithoutConfirmedID(t *testing.T) {
 	failedSession := &fakeEmbeddedSession{}
 	freshSession := &fakeEmbeddedSession{events: []engine.Event{{
@@ -400,7 +463,7 @@ func TestEmbeddedTurnReturnsContextCancellation(t *testing.T) {
 	}
 	done := make(chan turnOutcome, 1)
 	go func() {
-		_, _, err := runEmbeddedTurn(ctx, session, "codex", "Codex", "wait", true, 0)
+		_, _, err := runEmbeddedTurn(ctx, session, "codex", "Codex", "wait", true, 0, 0)
 		done <- turnOutcome{err: err}
 	}()
 	select {

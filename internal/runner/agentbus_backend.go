@@ -149,7 +149,7 @@ func (b *embeddedBackend) RunTurn(ctx context.Context, prompt string, options Tu
 		b.session = session
 	}
 
-	result, final, err := runEmbeddedTurn(ctx, b.session, b.backendName, b.label, prompt, sessionOptions.Write, options.TimeoutSeconds)
+	result, final, err := runEmbeddedTurn(ctx, b.session, b.backendName, b.label, prompt, sessionOptions.Write, options.TimeoutSeconds, options.StallTimeoutSeconds)
 	if final != nil && final.TimedOut && result.Content == "" && !result.Recovered {
 		var backendErr BackendRunError
 		if errors.As(err, &backendErr) && backendErr.Detail == embeddedTurnFailureDetail(final) {
@@ -166,7 +166,7 @@ func (b *embeddedBackend) RunTurn(ctx context.Context, prompt string, options Tu
 		}
 	}
 	b.captureSessionID(final)
-	if err != nil {
+	if err != nil || result.Stalled {
 		b.session = nil
 	}
 	return result, err
