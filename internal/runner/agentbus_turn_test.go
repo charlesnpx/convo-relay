@@ -143,14 +143,14 @@ func TestEmbeddedTurnProgressKeepsWatchdogAlive(t *testing.T) {
 	}
 }
 
-func TestEmbeddedTurnStallWithAgentTextRecovers(t *testing.T) {
-	events := make(chan engine.Event, 1)
-	events <- engine.Event{Type: engine.EventAgentText, Text: "partial response"}
+func TestEmbeddedTurnStallWithAgentTextDuringInterruptDrainRecovers(t *testing.T) {
+	events := make(chan engine.Event, 2)
 	session := &fakeEmbeddedSession{}
 	session.onTurn = func(context.Context, engine.TurnInput) (<-chan engine.Event, error) {
 		return events, nil
 	}
 	session.onInterrupt = func(context.Context) error {
+		events <- engine.Event{Type: engine.EventAgentText, Text: "partial response"}
 		events <- engine.Event{Type: engine.EventTurnFinal, TurnFinal: &engine.TurnFinalObservation{}}
 		close(events)
 		return nil
@@ -172,7 +172,7 @@ func TestEmbeddedTurnStallWithAgentTextRecovers(t *testing.T) {
 	}
 }
 
-func TestEmbeddedTurnMapsTerminalErrorAndFinalWarnings(t *testing.T) {
+func TestEmbeddedTurnRecoversTerminalErrorAfterAgentText(t *testing.T) {
 	session := &fakeEmbeddedSession{events: []engine.Event{
 		{Type: engine.EventAgentText, Text: "partial"},
 		{Type: engine.EventWarning, Text: "provider warning"},
@@ -186,14 +186,11 @@ func TestEmbeddedTurnMapsTerminalErrorAndFinalWarnings(t *testing.T) {
 		}},
 	}}
 	result, _, err := runEmbeddedTurn(context.Background(), session, "claude", "Claude Code", "prompt", true, 0, 0)
-	var backendErr BackendRunError
-	if !errors.As(err, &backendErr) {
-		t.Fatalf("error = %T %v, want BackendRunError", err, err)
+	if err != nil {
+		t.Fatalf("run turn: %v", err)
 	}
-	if backendErr.Label != "Claude Code" || backendErr.Detail != "backend exploded" {
-		t.Fatalf("backend error = %#v", backendErr)
-	}
-	if result.Content != "partial" || result.ProviderResult.ReturnCode != 9 || !result.ProviderResult.ReturnCodeKnown {
+	if result.Content != "partial" || !result.Recovered || !result.ProviderResult.Recovered || result.ProviderResult.RecoverySource != "event_stream" ||
+		result.ProviderResult.ReturnCode != 9 || !result.ProviderResult.ReturnCodeKnown {
 		t.Fatalf("turn result = %#v", result)
 	}
 	wantWarnings := []string{
@@ -201,15 +198,36 @@ func TestEmbeddedTurnMapsTerminalErrorAndFinalWarnings(t *testing.T) {
 		"agentbus process signal: SIGTERM",
 		"agentbus execution failed",
 		"agentbus cleanup failed",
+		"backend exploded",
 	}
 	if !reflect.DeepEqual(result.ProviderResult.Warnings, wantWarnings) {
 		t.Fatalf("warnings = %#v, want %#v", result.ProviderResult.Warnings, wantWarnings)
 	}
 }
 
+func TestEmbeddedTurnTerminalErrorWithoutOutputReturnsBackendError(t *testing.T) {
+	session := &fakeEmbeddedSession{events: []engine.Event{
+		{Type: engine.EventTerminalError, Text: "backend exploded"},
+		{Type: engine.EventTurnFinal, TurnFinal: &engine.TurnFinalObservation{}},
+	}}
+
+	result, _, err := runEmbeddedTurn(context.Background(), session, "claude", "Claude Code", "prompt", true, 0, 0)
+	var backendErr BackendRunError
+	if !errors.As(err, &backendErr) {
+		t.Fatalf("error = %T %v, want BackendRunError", err, err)
+	}
+	if backendErr.Label != "Claude Code" || backendErr.Detail != "backend exploded" {
+		t.Fatalf("backend error = %#v", backendErr)
+	}
+	if result.Content != "" || result.Recovered || result.ProviderResult.Recovered {
+		t.Fatalf("terminal error result = %#v", result)
+	}
+}
+
 func TestEmbeddedTurnClassifiesRetryableTerminalError(t *testing.T) {
 	const retryableText = "API Error: rate limit exceeded"
 	session := &fakeEmbeddedSession{events: []engine.Event{
+		{Type: engine.EventAgentText, Text: "partial response"},
 		{Type: engine.EventTerminalError, Text: retryableText},
 		{Type: engine.EventTurnFinal, TurnFinal: &engine.TurnFinalObservation{}},
 	}}
@@ -224,6 +242,9 @@ func TestEmbeddedTurnClassifiesRetryableTerminalError(t *testing.T) {
 	}
 	if result.ProviderResult.RetryableError != retryableText {
 		t.Fatalf("retryable error = %q, want %q", result.ProviderResult.RetryableError, retryableText)
+	}
+	if result.Recovered || result.ProviderResult.Recovered {
+		t.Fatalf("retryable terminal error recovered: %#v", result)
 	}
 }
 
@@ -391,6 +412,21 @@ func TestEmbeddedTurnEmptyResultMessageDoesNotRecoverExecutionFailure(t *testing
 	}
 	if result.Content != "" {
 		t.Fatalf("content = %q, want empty", result.Content)
+	}
+}
+
+func TestEmbeddedTurnEmptySuccessfulFinalUsesPlaceholder(t *testing.T) {
+	session := &fakeEmbeddedSession{events: []engine.Event{{
+		Type:      engine.EventTurnFinal,
+		TurnFinal: &engine.TurnFinalObservation{},
+	}}}
+
+	result, _, err := runEmbeddedTurn(context.Background(), session, "codex", "Codex", "prompt", true, 0, 0)
+	if err != nil {
+		t.Fatalf("run turn: %v", err)
+	}
+	if result.Content != "[No response from Codex]" {
+		t.Fatalf("content = %q, want no-response placeholder", result.Content)
 	}
 }
 

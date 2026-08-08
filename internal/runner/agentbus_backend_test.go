@@ -418,6 +418,41 @@ func TestEmbeddedBackendReusesSuccessfulSessionAndForwardsTurnInput(t *testing.T
 	}
 }
 
+func TestEmbeddedClaudeBackendUsesLegacyDefaultStallWatchdog(t *testing.T) {
+	originalDefault := embeddedClaudeDefaultStallTimeout
+	embeddedClaudeDefaultStallTimeout = 10 * time.Millisecond // Test-only override avoids a five-minute wait.
+	t.Cleanup(func() {
+		embeddedClaudeDefaultStallTimeout = originalDefault
+	})
+
+	events := make(chan engine.Event, 1)
+	session := &fakeEmbeddedSession{}
+	session.onTurn = func(context.Context, engine.TurnInput) (<-chan engine.Event, error) {
+		return events, nil
+	}
+	session.onInterrupt = func(context.Context) error {
+		events <- engine.Event{Type: engine.EventTurnFinal, TurnFinal: &engine.TurnFinalObservation{}}
+		close(events)
+		return nil
+	}
+	engineBackend := &fakeEmbeddedEngineBackend{name: "claude", startSession: session}
+	backend := newEmbeddedBackend("claude", t.TempDir(), "slot_0", "Claude Code", "/workspace", SlotConfig{}, engineBackend)
+
+	result, err := backend.RunTurn(context.Background(), "first", TurnOptions{})
+	if err != nil {
+		t.Fatalf("stalled turn: %v", err)
+	}
+	if result.Content != "[Claude Code stalled after 300s of no stream activity]" || !result.Stalled || !result.ProviderResult.Stalled || result.Recovered {
+		t.Fatalf("stalled result = %#v", result)
+	}
+	if !reflect.DeepEqual(result.ProviderResult.Warnings, []string{"claude stalled - no stream activity for 300s, interrupting turn"}) {
+		t.Fatalf("stalled warnings = %#v", result.ProviderResult.Warnings)
+	}
+	if session.interruptCalls != 1 {
+		t.Fatalf("interrupt calls = %d, want one", session.interruptCalls)
+	}
+}
+
 func TestEmbeddedBackendResumesRestoredSessionLazily(t *testing.T) {
 	resumedSession := &fakeEmbeddedSession{events: []engine.Event{{
 		Type: engine.EventTurnFinal,

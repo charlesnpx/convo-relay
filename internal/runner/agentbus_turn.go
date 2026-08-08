@@ -10,6 +10,10 @@ import (
 )
 
 func runEmbeddedTurn(ctx context.Context, session engine.Session, backend string, label string, prompt string, write bool, timeoutSeconds int, stallTimeoutSeconds int) (TurnResult, *engine.TurnFinalObservation, error) {
+	return runEmbeddedTurnWithWatchdogTimeout(ctx, session, backend, label, prompt, write, timeoutSeconds, stallTimeoutSeconds, embeddedTurnTimeout(stallTimeoutSeconds))
+}
+
+func runEmbeddedTurnWithWatchdogTimeout(ctx context.Context, session engine.Session, backend string, label string, prompt string, write bool, timeoutSeconds int, stallTimeoutSeconds int, watchdogTimeout time.Duration) (TurnResult, *engine.TurnFinalObservation, error) {
 	events, err := session.Turn(ctx, engine.TurnInput{
 		Prompt:  prompt,
 		Write:   write,
@@ -30,14 +34,12 @@ func runEmbeddedTurn(ctx context.Context, session engine.Session, backend string
 	warnings := []string{}
 	var final *engine.TurnFinalObservation
 	var stallTimer *time.Timer
-	stallTimeout := embeddedTurnTimeout(stallTimeoutSeconds)
-	if stallTimeout > 0 {
-		stallTimer = time.NewTimer(stallTimeout)
+	if watchdogTimeout > 0 {
+		stallTimer = time.NewTimer(watchdogTimeout)
 		defer stallTimer.Stop()
 	}
 	stalled := false
 	canceled := false
-	hadUsableOutputAtStall := false
 	for {
 		var (
 			event engine.Event
@@ -57,7 +59,6 @@ func runEmbeddedTurn(ctx context.Context, session engine.Session, backend string
 					continue
 				}
 				stalled = true
-				hadUsableOutputAtStall = hasResultText || agentText.Len() > 0
 				_ = session.Interrupt(ctx)
 				continue
 			}
@@ -72,7 +73,7 @@ func runEmbeddedTurn(ctx context.Context, session engine.Session, backend string
 				default:
 				}
 			}
-			stallTimer.Reset(stallTimeout)
+			stallTimer.Reset(watchdogTimeout)
 		}
 		switch event.Type {
 		case engine.EventAgentText:
@@ -134,6 +135,7 @@ func runEmbeddedTurn(ctx context.Context, session engine.Session, backend string
 	if hasResultText {
 		content = resultText
 	}
+	hasUsableOutput := hasResultText || agentText.Len() > 0
 	result := TurnResult{
 		Content:        content,
 		TimedOut:       providerResult.TimedOut,
@@ -144,7 +146,7 @@ func runEmbeddedTurn(ctx context.Context, session engine.Session, backend string
 		providerResult.Stalled = true
 		providerResult.Warnings = append(providerResult.Warnings, stallDetail)
 		result.Stalled = true
-		if hadUsableOutputAtStall {
+		if hasUsableOutput {
 			providerResult.Recovered = true
 			providerResult.RecoverySource = "event_stream"
 			result.Recovered = true
@@ -170,6 +172,14 @@ func runEmbeddedTurn(ctx context.Context, session engine.Session, backend string
 		return result, final, BackendRunError{Label: label, Detail: failureText}
 	}
 	if len(terminalErrors) > 0 {
+		if hasUsableOutput {
+			providerResult.Warnings = append(providerResult.Warnings, terminalErrors...)
+			providerResult.Recovered = true
+			providerResult.RecoverySource = "event_stream"
+			result.Recovered = true
+			result.ProviderResult = providerResult
+			return result, final, nil
+		}
 		return result, final, BackendRunError{
 			Label:  label,
 			Detail: failureText,
@@ -182,7 +192,6 @@ func runEmbeddedTurn(ctx context.Context, session engine.Session, backend string
 		}
 	}
 
-	hasUsableOutput := hasResultText || agentText.Len() > 0
 	if (final.ExecutionFailed || final.TimedOut || final.Canceled) && hasUsableOutput {
 		providerResult.Recovered = true
 		providerResult.RecoverySource = "event_stream"
@@ -208,6 +217,9 @@ func runEmbeddedTurn(ctx context.Context, session engine.Session, backend string
 		result.Content = fmt.Sprintf("[%s timed out after %ds]", label, timeoutSeconds)
 		result.ProviderResult = providerResult
 		return result, final, nil
+	}
+	if result.Content == "" {
+		result.Content = fmt.Sprintf("[No response from %s]", label)
 	}
 	return result, final, nil
 }
