@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -345,35 +344,7 @@ func setupPhase9FakeProviders(t *testing.T) phase9Env {
 			t.Fatalf("mkdir %s: %v", dir, err)
 		}
 	}
-	if err := exec.Command("git", "init", projectDir).Run(); err != nil {
-		t.Fatalf("git init project: %v", err)
-	}
-	fakeCodex := `#!/usr/bin/env python3
-import json
-import os
-import sys
-from pathlib import Path
-
-def main():
-    prompt = sys.stdin.read()
-    codex_home = Path(os.environ.get("CODEX_HOME", ""))
-    suffix = codex_home.name or "default"
-    if "resume" in sys.argv:
-        idx = sys.argv.index("resume")
-        thread_id = sys.argv[idx + 2] if idx + 2 < len(sys.argv) and sys.argv[idx + 1] == "--json" else "thread-resumed"
-    else:
-        thread_id = f"thread-{suffix}"
-        print(json.dumps({"type": "thread.started", "thread_id": thread_id}), flush=True)
-    if "Return the updated ledger as JSON" in prompt:
-        text = '{"settled":["done"],"contested":[],"withdrawn":[]}'
-    else:
-        text = f"Fake Codex {suffix}"
-    print(json.dumps({"type": "item.completed", "item": {"text": text}}), flush=True)
-    return 0
-
-if __name__ == "__main__":
-    raise SystemExit(main())
-`
+	writeFakeCodexAppServer(t, binDir)
 	fakeGemini := `#!/usr/bin/env python3
 import json
 import os
@@ -423,9 +394,6 @@ def main():
 if __name__ == "__main__":
     raise SystemExit(main())
 `
-	if err := os.WriteFile(filepath.Join(binDir, "codex"), []byte(fakeCodex), 0o755); err != nil {
-		t.Fatalf("write fake codex: %v", err)
-	}
 	if err := os.WriteFile(filepath.Join(binDir, "gemini"), []byte(fakeGemini), 0o755); err != nil {
 		t.Fatalf("write fake gemini: %v", err)
 	}

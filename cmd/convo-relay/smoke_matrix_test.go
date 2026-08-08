@@ -30,6 +30,90 @@ type phase17SmokeCase struct {
 	extraRunArgs     []string
 }
 
+const fakeCodexAppServerScript = `#!/usr/bin/env python3
+import atexit
+import json
+import os
+import sys
+from pathlib import Path
+
+root_recipe_log = os.environ.get("ROOT_RECIPE_CLI_LOG", "")
+if root_recipe_log:
+    with open(root_recipe_log, "a", encoding="utf-8") as log:
+        log.write(" ".join(sys.argv[1:]) + "\n")
+
+marker = None
+pids = os.environ.get("CONVO_RELAY_FAKE_PROVIDER_PIDS", "")
+if pids:
+    Path(pids).mkdir(parents=True, exist_ok=True)
+    marker = Path(pids) / f"codex-{os.getpid()}.pid"
+    marker.write_text(str(os.getpid()) + "\n", encoding="utf-8")
+    atexit.register(lambda: marker.unlink(missing_ok=True))
+
+def send(value):
+    print(json.dumps(value), flush=True)
+
+def response(request, result):
+    send({"id": request.get("id"), "result": result})
+
+def prompt_from(params):
+    items = params.get("input", [])
+    if items and isinstance(items[0], dict):
+        return str(items[0].get("text", ""))
+    return ""
+
+def main():
+    if "--version" in sys.argv:
+        print("0.143.0")
+        return 0
+    if len(sys.argv) < 2 or sys.argv[1] != "app-server":
+        print("expected codex app-server", file=sys.stderr)
+        return 2
+    suffix = Path(os.environ.get("CODEX_HOME", "default")).name or "default"
+    thread_id = f"phase17-{suffix}"
+    turn_number = 0
+    for raw in sys.stdin:
+        try:
+            request = json.loads(raw)
+        except json.JSONDecodeError:
+            continue
+        method = request.get("method", "")
+        params = request.get("params", {}) or {}
+        if method == "initialize":
+            response(request, {"serverInfo": {"name": "phase17-codex"}})
+        elif method in ("thread/start", "thread/resume"):
+            thread_id = params.get("threadId") or thread_id
+            response(request, {"thread": {"id": thread_id}})
+        elif method == "model/list":
+            response(request, {"data": [{"id": "phase17-codex", "supportedReasoningEfforts": ["low", "high"]}]})
+        elif method == "turn/start":
+            turn_number += 1
+            turn_id = f"turn-{turn_number}"
+            response(request, {"turn": {"id": turn_id}})
+            prompt = prompt_from(params)
+            if "Return the updated ledger as JSON" in prompt:
+                text = '{"settled":["phase17"],"contested":[],"withdrawn":[]}'
+            elif root_recipe_log and "Invalid structured result" in prompt:
+                text = "not a JSON result"
+            elif root_recipe_log and "Integration Contract Instructions for This Turn" in prompt:
+                text = '{"value":"cli"}'
+            else:
+                text = f"Fake Codex {suffix}"
+            send({"method": "item/completed", "params": {
+                "item": {"id": f"item-{turn_number}", "type": "agentMessage", "text": text},
+            }})
+            send({"method": "turn/completed", "params": {
+                "threadId": thread_id,
+                "turn": {"id": turn_id, "status": "completed"},
+            }})
+        elif method == "turn/interrupt":
+            response(request, {})
+    return 0
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+`
+
 func TestGoOnlySmokeMatrix(t *testing.T) {
 	if os.Getenv("CONVO_RELAY_RUN_SMOKE_MATRIX") != "1" {
 		t.Skip("set CONVO_RELAY_RUN_SMOKE_MATRIX=1 or run make smoke-fake-providers")
@@ -136,69 +220,68 @@ func setupPhase17SmokeEnv(t *testing.T) phase17SmokeEnv {
 func (env phase17SmokeEnv) writeFakeProviders(t *testing.T) {
 	t.Helper()
 	fakes := map[string]string{
-		"codex": `#!/bin/sh
-set -eu
-if [ -n "${CONVO_RELAY_FAKE_PROVIDER_PIDS:-}" ]; then
-  mkdir -p "$CONVO_RELAY_FAKE_PROVIDER_PIDS"
-  marker="$CONVO_RELAY_FAKE_PROVIDER_PIDS/codex-$$.pid"
-  printf '%s\n' "$$" > "$marker"
-  trap 'rm -f "$marker"' EXIT INT TERM
-fi
-prompt=$(cat)
-suffix=$(basename "${CODEX_HOME:-default}")
-is_resume=0
-for arg in "$@"; do
-  if [ "$arg" = "resume" ]; then
-    is_resume=1
-  fi
-done
-if [ "$is_resume" -eq 0 ]; then
-  printf '{"type":"thread.started","thread_id":"phase17-%s"}\n' "$suffix"
-fi
-case "$prompt" in
-  *"Return the updated ledger as JSON"*)
-    printf '%s\n' '{"type":"item.completed","item":{"text":"{\"settled\":[\"phase17\"],\"contested\":[],\"withdrawn\":[]}"}}'
-    ;;
-  *)
-    printf '{"type":"item.completed","item":{"text":"Fake Codex %s"}}\n' "$suffix"
-    ;;
-esac
-`,
-		"claude": `#!/bin/sh
-set -eu
-if [ -n "${CONVO_RELAY_FAKE_PROVIDER_PIDS:-}" ]; then
-  mkdir -p "$CONVO_RELAY_FAKE_PROVIDER_PIDS"
-  marker="$CONVO_RELAY_FAKE_PROVIDER_PIDS/claude-$$.pid"
-  printf '%s\n' "$$" > "$marker"
-  trap 'rm -f "$marker"' EXIT INT TERM
-fi
-prompt=$(cat)
-sid=""
-previous=""
-for arg in "$@"; do
-  if [ "$previous" = "--session-id" ] || [ "$previous" = "--resume" ]; then
-    sid="$arg"
-    break
-  fi
-  previous="$arg"
-done
-if [ -z "$sid" ]; then
-  sid="phase17-claude"
-fi
-cwd="${CONVO_RELAY_FAKE_CWD:-$(pwd)}"
-encoded=$(printf '%s' "$cwd" | sed 's/[^a-zA-Z0-9-]/-/g')
-root="$HOME/.claude/projects/$encoded"
-mkdir -p "$root/$sid"
-jsonl="$root/$sid.jsonl"
-case "$prompt" in
-  *"Return the updated ledger as JSON"*)
-    text='{\"settled\":[\"phase17\"],\"contested\":[],\"withdrawn\":[]}'
-    ;;
-  *)
-    text='Fake Claude response'
-    ;;
-esac
-printf '{"type":"assistant","message":{"content":[{"type":"text","text":"%s"}]}}\n' "$text" >> "$jsonl"
+		"codex": fakeCodexAppServerScript,
+		"claude": `#!/usr/bin/env python3
+import atexit
+import json
+import os
+import sys
+from pathlib import Path
+
+marker = None
+pids = os.environ.get("CONVO_RELAY_FAKE_PROVIDER_PIDS", "")
+if pids:
+    Path(pids).mkdir(parents=True, exist_ok=True)
+    marker = Path(pids) / f"claude-{os.getpid()}.pid"
+    marker.write_text(str(os.getpid()) + "\n", encoding="utf-8")
+    atexit.register(lambda: marker.unlink(missing_ok=True))
+
+def arg_value(flag):
+    if flag in sys.argv:
+        index = sys.argv.index(flag)
+        if index + 1 < len(sys.argv):
+            return sys.argv[index + 1]
+    return ""
+
+def send(value):
+    print(json.dumps(value), flush=True)
+
+def main():
+    if "--version" in sys.argv:
+        print("2.1.205")
+        return 0
+    if "--help" in sys.argv:
+        print("--effort values (low, medium, high, max)\n--model examples (phase17-claude)")
+        return 0
+    if arg_value("--input-format") != "stream-json" or arg_value("--output-format") != "stream-json":
+        print("expected Claude stream-json flags", file=sys.stderr)
+        return 2
+    initialize_line = sys.stdin.readline()
+    if not initialize_line:
+        return 0
+    initialize = json.loads(initialize_line)
+    send({"type": "control_response", "response": {
+        "subtype": "success",
+        "request_id": initialize.get("request_id", ""),
+        "response": {},
+    }})
+    user_line = sys.stdin.readline()
+    if not user_line:
+        return 0
+    user = json.loads(user_line)
+    prompt = str((user.get("message") or {}).get("content", ""))
+    session_id = arg_value("--resume") or f"phase17-claude-{os.getpid()}"
+    if "Return the updated ledger as JSON" in prompt:
+        text = '{"settled":["phase17"],"contested":[],"withdrawn":[]}'
+    else:
+        text = "Fake Claude response"
+    send({"type": "system", "session_id": session_id, "model": arg_value("--model") or "phase17-claude"})
+    send({"type": "assistant", "session_id": session_id, "message": {"content": [{"type": "text", "text": text}]}})
+    send({"type": "result", "session_id": session_id, "subtype": "success", "is_error": False, "result": text})
+    return 0
+
+if __name__ == "__main__":
+    raise SystemExit(main())
 `,
 		"gemini": `#!/bin/sh
 set -eu
@@ -276,16 +359,6 @@ func (env phase17SmokeEnv) verifyResumeCleanupAndClean(t *testing.T, provider st
 
 	sessionDir := filepath.Join(env.relayHome, "sessions", sessionID)
 	meta := phase17ReadJSONObject(t, filepath.Join(sessionDir, "meta.json"))
-	claudeJSONL := ""
-	if provider == "claude" {
-		claudeJSONL = phase17ClaudeJSONLPath(env.homeDir, meta)
-		if claudeJSONL == "" {
-			t.Fatalf("claude session did not persist a jsonl path: %#v", meta)
-		}
-		if _, err := os.Stat(claudeJSONL); err != nil {
-			t.Fatalf("claude jsonl before clean: %v", err)
-		}
-	}
 
 	meta["status"] = "running"
 	phase17WriteJSONObject(t, filepath.Join(sessionDir, "meta.json"), meta)
@@ -310,11 +383,6 @@ func (env phase17SmokeEnv) verifyResumeCleanupAndClean(t *testing.T, provider st
 	}
 	if _, err := os.Stat(sessionDir); !os.IsNotExist(err) {
 		t.Fatalf("cleaned session still exists, err = %v", err)
-	}
-	if claudeJSONL != "" {
-		if _, err := os.Stat(claudeJSONL); !os.IsNotExist(err) {
-			t.Fatalf("claude jsonl should be removed by clean, err = %v", err)
-		}
 	}
 }
 
@@ -554,35 +622,6 @@ func phase17ReadJSONLines(t *testing.T, path string) []map[string]any {
 		events = append(events, event)
 	}
 	return events
-}
-
-func phase17ClaudeJSONLPath(homeDir string, meta map[string]any) string {
-	for _, rawSlot := range phase17Slice(meta["slots"]) {
-		slot := phase17Map(rawSlot)
-		if slot["backend"] != "claude" {
-			continue
-		}
-		state := phase17Map(slot["state"])
-		sessionID := phase17String(state["session_id"])
-		cwd := phase17String(state["cwd"])
-		if sessionID == "" || cwd == "" {
-			return ""
-		}
-		return filepath.Join(homeDir, ".claude", "projects", phase17ClaudeProjectSlug(cwd), sessionID+".jsonl")
-	}
-	return ""
-}
-
-func phase17ClaudeProjectSlug(path string) string {
-	var builder strings.Builder
-	for _, ch := range path {
-		if (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9') || ch == '-' {
-			builder.WriteRune(ch)
-		} else {
-			builder.WriteByte('-')
-		}
-	}
-	return builder.String()
 }
 
 func phase17Map(value any) map[string]any {

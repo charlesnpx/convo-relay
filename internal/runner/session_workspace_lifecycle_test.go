@@ -174,49 +174,7 @@ func TestCleanSessionWorktreeRemovalFailureIsActionableAndRetryable(t *testing.T
 	}
 }
 
-func TestCleanSessionRestoresParticipantFacilitatorAndReducerBeforeWorkspaceRemoval(t *testing.T) {
-	providerHome := t.TempDir()
-	t.Setenv("HOME", providerHome)
-	fixture := newIsolatedSessionFixture(t, "crashed")
-	st := store.New(fixture.sessionDir)
-
-	participant := claudeCleanupEnvelope("participant-session", "slot_0", fixture.executionCWD)
-	facilitator := claudeCleanupEnvelope("facilitator-session", "facilitator", fixture.executionCWD)
-	reducer := claudeCleanupEnvelope("reducer-session", "reducer", fixture.executionCWD)
-	facilitatorRef, err := st.SaveArtifact("provider_states", "facilitator", facilitator)
-	if err != nil {
-		t.Fatalf("persist facilitator state: %v", err)
-	}
-	meta := mustLoadMeta(t, fixture.sessionDir)
-	meta["slots"] = []any{participant}
-	meta["facilitator_state_ref"] = facilitatorRef
-	meta["reducer_provider_state"] = reducer
-	if err := st.SaveMetaMap(meta); err != nil {
-		t.Fatalf("save role states: %v", err)
-	}
-
-	paths := []string{}
-	for _, envelope := range []map[string]any{participant, facilitator, reducer} {
-		state := envelope["state"].(map[string]any)
-		paths = append(paths, createClaudeCleanupArtifacts(t, stringFromAny(state["cwd"]), stringFromAny(state["session_id"]))...)
-	}
-	report, err := CleanSession(fixture.sessionDir)
-	if err != nil || report["status"] != "deleted" {
-		t.Fatalf("role-aware clean = %#v, %v", report, err)
-	}
-	for _, path := range paths {
-		if _, err := os.Stat(path); !os.IsNotExist(err) {
-			t.Fatalf("provider artifact remains at %s: %v", path, err)
-		}
-	}
-	if _, err := os.Stat(fixture.worktreePath); !os.IsNotExist(err) {
-		t.Fatalf("worktree remains after role cleanup: %v", err)
-	}
-}
-
 func TestCleanSessionProviderFailureRetainsWorktreeAndSessionForRetry(t *testing.T) {
-	providerHome := t.TempDir()
-	t.Setenv("HOME", providerHome)
 	fixture := newIsolatedSessionFixture(t, "invalid")
 	st := store.New(fixture.sessionDir)
 	meta := mustLoadMeta(t, fixture.sessionDir)
@@ -246,7 +204,6 @@ func TestCleanSessionProviderFailureRetainsWorktreeAndSessionForRetry(t *testing
 	if err := st.SaveMetaMap(meta); err != nil {
 		t.Fatalf("repair facilitator state: %v", err)
 	}
-	createClaudeCleanupArtifacts(t, fixture.executionCWD, "fixed-facilitator-session")
 	report, err := CleanSession(fixture.sessionDir)
 	if err != nil || report["status"] != "deleted" {
 		t.Fatalf("provider cleanup retry = %#v, %v", report, err)
@@ -256,21 +213,10 @@ func TestCleanSessionProviderFailureRetainsWorktreeAndSessionForRetry(t *testing
 func TestCleanSessionRejectsUnsafeClaudeSessionIDsForEveryProviderRole(t *testing.T) {
 	for _, role := range []string{"participant", "facilitator", "reducer"} {
 		t.Run(role, func(t *testing.T) {
-			providerHome := t.TempDir()
-			t.Setenv("HOME", providerHome)
 			fixture := newIsolatedSessionFixture(t, "crashed")
 			st := store.New(fixture.sessionDir)
-			projectDir := claudeProjectDir(fixture.executionCWD)
-			outsideDir := filepath.Join(filepath.Dir(projectDir), "outside-"+role)
-			outsideMarker := filepath.Join(outsideDir, "preserve")
-			if err := os.MkdirAll(outsideDir, 0o755); err != nil {
-				t.Fatalf("create outside directory: %v", err)
-			}
-			if err := os.WriteFile(outsideMarker, []byte("preserve outside data\n"), 0o644); err != nil {
-				t.Fatalf("write outside marker: %v", err)
-			}
 
-			envelope := claudeCleanupEnvelope(filepath.Join("..", filepath.Base(outsideDir)), role, fixture.executionCWD)
+			envelope := claudeCleanupEnvelope("../outside-"+role, role, fixture.executionCWD)
 			meta := mustLoadMeta(t, fixture.sessionDir)
 			switch role {
 			case "participant":
@@ -287,9 +233,6 @@ func TestCleanSessionRejectsUnsafeClaudeSessionIDsForEveryProviderRole(t *testin
 			report, err := CleanSession(fixture.sessionDir)
 			if report != nil || err == nil || !strings.Contains(err.Error(), "safe path component") {
 				t.Fatalf("adversarial %s cleanup = %#v, %v", role, report, err)
-			}
-			if data, err := os.ReadFile(outsideMarker); err != nil || string(data) != "preserve outside data\n" {
-				t.Fatalf("outside marker changed: %q, %v", data, err)
 			}
 			persisted := mustLoadMeta(t, fixture.sessionDir)
 			checkpoint := persisted["workspace_cleanup"].(map[string]any)
@@ -309,8 +252,6 @@ func TestCleanSessionRejectsUnsafeClaudeSessionIDsForEveryProviderRole(t *testin
 func TestCleanSessionRejectsForeignClaudeCWDForEveryProviderRole(t *testing.T) {
 	for _, role := range []string{"participant", "facilitator", "reducer"} {
 		t.Run(role, func(t *testing.T) {
-			providerHome := t.TempDir()
-			t.Setenv("HOME", providerHome)
 			fixture := newIsolatedSessionFixture(t, "crashed")
 			st := store.New(fixture.sessionDir)
 			foreignCWD := filepath.Join(t.TempDir(), "foreign-project")
@@ -318,9 +259,6 @@ func TestCleanSessionRejectsForeignClaudeCWDForEveryProviderRole(t *testing.T) {
 				t.Fatalf("create foreign cwd: %v", err)
 			}
 			sessionID := "safe-foreign-" + role
-			foreignArtifacts := createClaudeCleanupArtifacts(t, foreignCWD, sessionID)
-			foreignMarker := filepath.Join(foreignArtifacts[1], "marker")
-
 			envelope := claudeCleanupEnvelope(sessionID, role, foreignCWD)
 			meta := mustLoadMeta(t, fixture.sessionDir)
 			switch role {
@@ -338,9 +276,6 @@ func TestCleanSessionRejectsForeignClaudeCWDForEveryProviderRole(t *testing.T) {
 			report, err := CleanSession(fixture.sessionDir)
 			if report != nil || err == nil || !strings.Contains(err.Error(), "cleanup cwd") {
 				t.Fatalf("foreign %s cleanup = %#v, %v", role, report, err)
-			}
-			if data, err := os.ReadFile(foreignMarker); err != nil || string(data) != "provider state\n" {
-				t.Fatalf("foreign marker changed: %q, %v", data, err)
 			}
 			persisted := mustLoadMeta(t, fixture.sessionDir)
 			checkpoint := persisted["workspace_cleanup"].(map[string]any)
@@ -451,21 +386,4 @@ func claudeCleanupEnvelope(sessionID string, slotID string, cwd string) map[stri
 			"cwd":        cwd,
 		},
 	}
-}
-
-func createClaudeCleanupArtifacts(t *testing.T, cwd string, sessionID string) []string {
-	t.Helper()
-	projectDir := claudeProjectDir(cwd)
-	if err := os.MkdirAll(filepath.Join(projectDir, sessionID), 0o755); err != nil {
-		t.Fatalf("create Claude artifact directory: %v", err)
-	}
-	jsonlPath := filepath.Join(projectDir, sessionID+".jsonl")
-	if err := os.WriteFile(jsonlPath, []byte("provider history\n"), 0o644); err != nil {
-		t.Fatalf("write Claude history: %v", err)
-	}
-	marker := filepath.Join(projectDir, sessionID, "marker")
-	if err := os.WriteFile(marker, []byte("provider state\n"), 0o644); err != nil {
-		t.Fatalf("write Claude provider marker: %v", err)
-	}
-	return []string{jsonlPath, filepath.Join(projectDir, sessionID)}
 }

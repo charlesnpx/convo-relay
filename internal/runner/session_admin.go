@@ -656,7 +656,7 @@ func cleanSessionWithRemover(sessionDir string, removeSession func(string) error
 }
 
 func cleanupBackendArtifactsForSession(meta map[string]any, sessionDir string) error {
-	records, hasParticipantSlots, hasFacilitatorState, err := persistedBackendCleanupRecords(meta, sessionDir)
+	records, hasParticipantSlots, _, err := persistedBackendCleanupRecords(meta, sessionDir)
 	if err != nil {
 		return err
 	}
@@ -699,11 +699,6 @@ func cleanupBackendArtifactsForSession(meta map[string]any, sessionDir string) e
 			} else if err := backend.Cleanup(); err != nil {
 				errs = append(errs, fmt.Errorf("cleanup legacy claude slot: %w", err))
 			}
-		}
-	}
-	if !hasFacilitatorState && shouldCleanClaudeFacilitatorArtifacts(meta) {
-		if err := os.RemoveAll(claudeProjectDir(sessionDir)); err != nil {
-			errs = append(errs, fmt.Errorf("cleanup claude facilitator artifacts: %w", err))
 		}
 	}
 	return errors.Join(errs...)
@@ -977,18 +972,6 @@ func workspaceCleanupResultMap(result *workspace.CleanupResult) map[string]any {
 		"worktree_removed":   result.WorktreeRemoved,
 		"metadata_pruned":    result.MetadataPruned,
 	}
-}
-
-func shouldCleanClaudeFacilitatorArtifacts(meta map[string]any) bool {
-	facilitator := strings.TrimSpace(stringFromAny(meta["facilitator_backend"]))
-	if facilitator == "" {
-		if _, hasSlots := meta["slots"]; hasSlots {
-			facilitator = "codex"
-		} else {
-			facilitator = "claude"
-		}
-	}
-	return facilitator == "claude"
 }
 
 func CleanupSessions(home string, limit int, force bool) (map[string]any, error) {

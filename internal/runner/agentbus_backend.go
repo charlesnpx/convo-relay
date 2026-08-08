@@ -2,6 +2,8 @@ package runner
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -325,4 +327,31 @@ func (b *embeddedBackend) ensureCodexHome() error {
 	}
 	b.codexHomeReady = true
 	return nil
+}
+
+func validateClaudeSessionID(sessionID string) error {
+	if sessionID == "" {
+		return fmt.Errorf("session_id must be a non-empty string")
+	}
+	if sessionID == "." || sessionID == ".." {
+		return fmt.Errorf("session_id must be a safe path component")
+	}
+	for _, ch := range sessionID {
+		if (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9') || ch == '-' || ch == '_' || ch == '.' {
+			continue
+		}
+		return fmt.Errorf("session_id must be a safe path component")
+	}
+	return nil
+}
+
+func newUUID() (string, error) {
+	var data [16]byte
+	if _, err := rand.Read(data[:]); err != nil {
+		return "", err
+	}
+	data[6] = (data[6] & 0x0f) | 0x40
+	data[8] = (data[8] & 0x3f) | 0x80
+	hexText := hex.EncodeToString(data[:])
+	return fmt.Sprintf("%s-%s-%s-%s-%s", hexText[0:8], hexText[8:12], hexText[12:16], hexText[16:20], hexText[20:32]), nil
 }
