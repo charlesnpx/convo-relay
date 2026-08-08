@@ -88,7 +88,7 @@ Failed provider turns append a `provider_failure` event and mirror the sanitized
 
 The permanent Go test boundary uses embedded-adapter protocol fakes and temporary fake provider binaries in `PATH`, not live provider credentials.
 
-Covered now:
+### Covered by Go tests
 
 - success
 - malformed output
@@ -110,6 +110,13 @@ Covered now:
 - stream-event stall-watchdog behavior, including agentbus `Progress` heartbeat resets, interruption, and partial recovery
 - hard-timeout and stalled soft outcomes with and without recovered text
 - cleanup of relay-owned Claude project transcripts, including legacy-compatible paths
+
+### Covered upstream in agentbus
+
+- process supervision
+
+### Covered by the existing Python baseline
+
 - Python orchestrator retryable provider backoff
 
 Implemented in Go Phase 9:
