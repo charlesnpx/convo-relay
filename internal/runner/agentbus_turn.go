@@ -9,10 +9,10 @@ import (
 	"github.com/charlesnpx/agentbus/engine"
 )
 
-func runEmbeddedTurn(ctx context.Context, session engine.Session, backend string, label string, prompt string, timeoutSeconds int) (TurnResult, *engine.TurnFinalObservation, error) {
+func runEmbeddedTurn(ctx context.Context, session engine.Session, backend string, label string, prompt string, write bool, timeoutSeconds int) (TurnResult, *engine.TurnFinalObservation, error) {
 	events, err := session.Turn(ctx, engine.TurnInput{
 		Prompt:  prompt,
-		Write:   true,
+		Write:   write,
 		Timeout: embeddedTurnTimeout(timeoutSeconds),
 	})
 	if err != nil {
