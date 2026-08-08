@@ -293,6 +293,54 @@ func TestEmbeddedBackendDropsErroredSessionAndResumesConfirmedID(t *testing.T) {
 	}
 }
 
+func TestEmbeddedBackendDropsRecoveredExecutionFailedSessionAndResumesConfirmedID(t *testing.T) {
+	failedSession := &fakeEmbeddedSession{
+		id: "live-session-id",
+		events: []engine.Event{
+			{Type: engine.EventAgentText, Text: "partial response"},
+			{Type: engine.EventTurnFinal, TurnFinal: &engine.TurnFinalObservation{
+				BackendSessionID: "thread-confirmed",
+				ExecutionFailed:  true,
+			}},
+		},
+	}
+	resumedSession := &fakeEmbeddedSession{events: []engine.Event{{
+		Type:      engine.EventTurnFinal,
+		TurnFinal: &engine.TurnFinalObservation{BackendSessionID: "thread-confirmed"},
+	}}}
+	engineBackend := &fakeEmbeddedEngineBackend{
+		name:          "codex",
+		startSession:  failedSession,
+		resumeSession: resumedSession,
+	}
+	backend := newEmbeddedBackend("codex", t.TempDir(), "slot_0", "Codex", "/workspace", SlotConfig{}, engineBackend)
+	backend.codexHomeReady = true
+
+	result, err := backend.RunTurn(context.Background(), "first", TurnOptions{})
+	if err != nil {
+		t.Fatalf("recovered turn: %v", err)
+	}
+	if result.Content != "partial response" || !result.Recovered || !result.ProviderResult.Recovered {
+		t.Fatalf("recovered result = %#v", result)
+	}
+	if backend.session != nil {
+		t.Fatalf("session = %#v after recovered execution failure, want nil", backend.session)
+	}
+	if backend.sessionID != "thread-confirmed" || !backend.started {
+		t.Fatalf("captured state = sessionID %q, started %t", backend.sessionID, backend.started)
+	}
+
+	if _, err := backend.RunTurn(context.Background(), "second", TurnOptions{}); err != nil {
+		t.Fatalf("second turn: %v", err)
+	}
+	if len(engineBackend.startOptions) != 1 {
+		t.Fatalf("start calls = %d, want one", len(engineBackend.startOptions))
+	}
+	if len(engineBackend.resumeCalls) != 1 || engineBackend.resumeCalls[0].id != "thread-confirmed" {
+		t.Fatalf("resume calls = %#v, want one for thread-confirmed", engineBackend.resumeCalls)
+	}
+}
+
 func TestEmbeddedBackendDropsStalledSessionAndResumesConfirmedID(t *testing.T) {
 	events := make(chan engine.Event, 1)
 	stalledSession := &fakeEmbeddedSession{id: "live-session-id"}

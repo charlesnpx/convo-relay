@@ -537,7 +537,7 @@ func TestEmbeddedTurnCanceledWithAgentTextRecovers(t *testing.T) {
 	}
 }
 
-func TestEmbeddedTurnCanceledWithRetryableAgentTextRecovers(t *testing.T) {
+func TestEmbeddedTurnCanceledWithRetryableAgentTextReturnsRetryableProviderError(t *testing.T) {
 	const retryableText = "API Error: rate limit exceeded"
 	session := &fakeEmbeddedSession{events: []engine.Event{
 		{Type: engine.EventAgentText, Text: retryableText},
@@ -545,14 +545,43 @@ func TestEmbeddedTurnCanceledWithRetryableAgentTextRecovers(t *testing.T) {
 	}}
 
 	result, _, err := runEmbeddedTurn(context.Background(), session, "codex", "Codex", "prompt", true, 0, 0)
-	if err != nil {
-		t.Fatalf("run turn: %v", err)
+	var retryableErr RetryableProviderError
+	if !errors.As(err, &retryableErr) {
+		t.Fatalf("error = %T %v, want RetryableProviderError", err, err)
 	}
-	if result.Content != retryableText || !result.Recovered || !result.ProviderResult.Recovered || result.ProviderResult.RecoverySource != "event_stream" {
+	if retryableErr.Label != "Codex" || retryableErr.Detail != retryableText {
+		t.Fatalf("retryable error = %#v", retryableErr)
+	}
+	if result.Content != retryableText || result.Recovered || result.ProviderResult.Recovered || result.ProviderResult.RecoverySource != "" {
 		t.Fatalf("turn result = %#v", result)
 	}
-	if result.ProviderResult.RetryableError != "" {
-		t.Fatalf("retryable error = %q, want empty", result.ProviderResult.RetryableError)
+	if result.ProviderResult.RetryableError != retryableText {
+		t.Fatalf("retryable error = %q, want %q", result.ProviderResult.RetryableError, retryableText)
+	}
+}
+
+func TestEmbeddedTurnCallerCancellationBypassesRetryableCanceledFinal(t *testing.T) {
+	const retryableText = "API Error: rate limit exceeded"
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	session := &fakeEmbeddedSession{
+		onTurn: func(context.Context, engine.TurnInput) (<-chan engine.Event, error) {
+			events := make(chan engine.Event, 2)
+			events <- engine.Event{Type: engine.EventAgentText, Text: retryableText}
+			cancel()
+			events <- engine.Event{Type: engine.EventTurnFinal, TurnFinal: &engine.TurnFinalObservation{Canceled: true}}
+			close(events)
+			return events, nil
+		},
+	}
+
+	_, _, err := runEmbeddedTurn(ctx, session, "codex", "Codex", "prompt", true, 0, 0)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("error = %v, want context.Canceled", err)
+	}
+	var retryableErr RetryableProviderError
+	if errors.As(err, &retryableErr) {
+		t.Fatalf("caller cancellation was classified retryable: %v", err)
 	}
 }
 

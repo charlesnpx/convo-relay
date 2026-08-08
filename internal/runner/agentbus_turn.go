@@ -200,8 +200,12 @@ eventLoop:
 	}
 	result.ProviderResult = providerResult
 
-	cancellationOutcome := !stalled && (canceled || ctx.Err() != nil || (final != nil && final.Canceled))
-	abnormalOutcome := stalled || len(terminalErrors) > 0 || final == nil || (final != nil && (final.ExecutionFailed || final.TimedOut))
+	callerCanceled := ctx.Err() != nil
+	// A provider-side canceled final can contain a retryable or authentication
+	// failure. Only suppress that classification when the caller canceled the
+	// turn or the final follows the watchdog's own interruption.
+	cancellationOutcome := callerCanceled || (stalled && final != nil && final.Canceled)
+	abnormalOutcome := stalled || len(terminalErrors) > 0 || final == nil || (final != nil && (final.ExecutionFailed || final.TimedOut || final.Canceled))
 	failureText := ""
 	if abnormalOutcome && !cancellationOutcome {
 		failureParts := make([]string, 0, len(terminalErrors)+1)

@@ -180,7 +180,7 @@ func (b *embeddedBackend) RunTurn(ctx context.Context, prompt string, options Tu
 		}
 	}
 	b.captureSessionID(final)
-	if err != nil || result.Stalled {
+	if err != nil || result.Stalled || (final != nil && (final.ExecutionFailed || final.TimedOut || final.Canceled)) {
 		b.session = nil
 	}
 	return result, err
