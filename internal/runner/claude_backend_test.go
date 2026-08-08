@@ -35,6 +35,10 @@ func TestEmbeddedClaudeBackendRunTurnStateAndResumeProtocol(t *testing.T) {
 	if err != nil {
 		t.Fatalf("first run turn: %v", err)
 	}
+	firstSessionID := stringFromAny(backend.SessionState()["session_id"])
+	if firstSessionID == "" {
+		t.Fatalf("first turn session state = %#v", backend.SessionState())
+	}
 	second, err := backend.RunTurn(context.Background(), "PHASE10_SUCCESS second", TurnOptions{TimeoutSeconds: 5})
 	if err != nil {
 		t.Fatalf("second run turn: %v", err)
@@ -60,14 +64,19 @@ func TestEmbeddedClaudeBackendRunTurnStateAndResumeProtocol(t *testing.T) {
 	}
 	if !contains(commands[0], "-p") ||
 		!contains(commands[0], "--input-format") ||
-		!contains(commands[0], "stream-json") ||
 		!contains(commands[0], "--output-format") ||
 		!contains(commands[0], "--verbose") ||
 		!contains(commands[0], "--dangerously-skip-permissions") ||
 		contains(commands[0], "--resume") {
 		t.Fatalf("first stream-json command = %#v", commands[0])
 	}
-	if !contains(commands[1], "--resume") || contains(commands[1], "--session-id") {
+	if inputFormat, ok := valueAfter(commands[0], "--input-format"); !ok || inputFormat != "stream-json" {
+		t.Fatalf("input format command = %#v", commands[0])
+	}
+	if outputFormat, ok := valueAfter(commands[0], "--output-format"); !ok || outputFormat != "stream-json" {
+		t.Fatalf("output format command = %#v", commands[0])
+	}
+	if resumeSessionID, ok := valueAfter(commands[1], "--resume"); !ok || resumeSessionID != firstSessionID || contains(commands[1], "--session-id") {
 		t.Fatalf("resume stream-json command = %#v", commands[1])
 	}
 	if !contains(commands[0], "--model") || !contains(commands[0], "claude-sonnet") ||
@@ -328,6 +337,15 @@ func contains(values []string, want string) bool {
 		}
 	}
 	return false
+}
+
+func valueAfter(values []string, flag string) (string, bool) {
+	for index, value := range values {
+		if value == flag && index+1 < len(values) {
+			return values[index+1], true
+		}
+	}
+	return "", false
 }
 
 const fakeCodexAppServerScript = `#!/usr/bin/env python3

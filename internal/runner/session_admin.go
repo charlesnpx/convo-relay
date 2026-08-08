@@ -656,7 +656,7 @@ func cleanSessionWithRemover(sessionDir string, removeSession func(string) error
 }
 
 func cleanupBackendArtifactsForSession(meta map[string]any, sessionDir string) error {
-	records, hasParticipantSlots, _, err := persistedBackendCleanupRecords(meta, sessionDir)
+	records, hasParticipantSlots, hasFacilitatorState, err := persistedBackendCleanupRecords(meta, sessionDir)
 	if err != nil {
 		return err
 	}
@@ -682,6 +682,15 @@ func cleanupBackendArtifactsForSession(meta map[string]any, sessionDir string) e
 			errs = append(errs, fmt.Errorf("cleanup %s %s provider %s: %w", record.backend, record.role, record.slotID, err))
 		}
 	}
+	if !hasFacilitatorState && shouldCleanClaudeFacilitatorArtifacts(meta) {
+		// LEGACY-COMPAT: pre-embedded-migration Claude facilitators wrote
+		// transcripts under ~/.claude/projects. No new sessions produce these
+		// artifacts; this path exists only to clean pre-migration or interrupted
+		// sessions that never persisted facilitator state.
+		if err := os.RemoveAll(claudeProjectDir(sessionDir)); err != nil {
+			errs = append(errs, fmt.Errorf("cleanup legacy Claude facilitator artifacts: %w", err))
+		}
+	}
 	if !hasParticipantSlots {
 		if sessionID := stringFromAny(meta["claude_session_id"]); sessionID != "" {
 			cwd := firstNonEmpty(stringFromAny(meta["launch_cwd"]), sessionDir)
@@ -702,6 +711,19 @@ func cleanupBackendArtifactsForSession(meta map[string]any, sessionDir string) e
 		}
 	}
 	return errors.Join(errs...)
+}
+
+func claudeProjectDir(sessionDir string) string {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return ""
+	}
+	encodedCWD := strings.ReplaceAll(filepath.Clean(sessionDir), string(filepath.Separator), "-")
+	return filepath.Join(home, ".claude", "projects", encodedCWD)
+}
+
+func shouldCleanClaudeFacilitatorArtifacts(meta map[string]any) bool {
+	return strings.TrimSpace(stringFromAny(meta["facilitator_backend"])) == "claude"
 }
 
 func backendCleanupCWD(record backendCleanupRecord, meta map[string]any, sessionDir string) (string, error) {

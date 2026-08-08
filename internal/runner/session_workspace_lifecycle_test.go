@@ -210,6 +210,42 @@ func TestCleanSessionProviderFailureRetainsWorktreeAndSessionForRetry(t *testing
 	}
 }
 
+func TestCleanSessionRemovesLegacyClaudeFacilitatorArtifacts(t *testing.T) {
+	fixture := newIsolatedSessionFixture(t, "completed")
+	homeDir := t.TempDir()
+	t.Setenv("HOME", homeDir)
+	legacyArtifacts := filepath.Join(
+		homeDir,
+		".claude",
+		"projects",
+		strings.ReplaceAll(filepath.Clean(fixture.sessionDir), string(filepath.Separator), "-"),
+	)
+	if got := claudeProjectDir(fixture.sessionDir); got != legacyArtifacts {
+		t.Fatalf("legacy Claude project path = %q, want %q", got, legacyArtifacts)
+	}
+	if err := os.MkdirAll(legacyArtifacts, 0o755); err != nil {
+		t.Fatalf("create legacy Claude project: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(legacyArtifacts, "legacy.jsonl"), []byte("legacy transcript\n"), 0o644); err != nil {
+		t.Fatalf("write legacy Claude transcript: %v", err)
+	}
+
+	st := store.New(fixture.sessionDir)
+	meta := mustLoadMeta(t, fixture.sessionDir)
+	meta["facilitator_backend"] = "claude"
+	if err := st.SaveMetaMap(meta); err != nil {
+		t.Fatalf("save legacy Claude facilitator metadata: %v", err)
+	}
+
+	report, err := CleanSession(fixture.sessionDir)
+	if err != nil || report["status"] != "deleted" {
+		t.Fatalf("clean legacy Claude session = %#v, %v", report, err)
+	}
+	if _, err := os.Stat(legacyArtifacts); !os.IsNotExist(err) {
+		t.Fatalf("legacy Claude project still exists: %v", err)
+	}
+}
+
 func TestCleanSessionRejectsUnsafeClaudeSessionIDsForEveryProviderRole(t *testing.T) {
 	for _, role := range []string{"participant", "facilitator", "reducer"} {
 		t.Run(role, func(t *testing.T) {
