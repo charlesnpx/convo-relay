@@ -561,6 +561,19 @@ func cleanSessionWithRemover(sessionDir string, removeSession func(string) error
 		if !errors.Is(err, os.ErrNotExist) {
 			return nil, err
 		}
+		originRecovered, originErr := recoverRootInitializationDestinationOrigin(lock.sessionRoot, lock)
+		if originRecovered {
+			if originErr != nil {
+				return nil, originErr
+			}
+			return map[string]any{
+				"session_id":             sessionIDFromDir(sessionDir),
+				"session_dir":            sessionDir,
+				"initialization_state":   RootInitializationStateInitializing,
+				"initialization_cleanup": "interrupted_origin",
+				"status":                 "deleted",
+			}, nil
+		}
 		transaction, loadErr := loadRootInitializationTransaction(sessionDir, nil, lock)
 		if loadErr != nil {
 			return nil, errors.Join(err, loadErr)

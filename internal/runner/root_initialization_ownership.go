@@ -22,7 +22,10 @@ import (
 	"github.com/charlesnpx/convo-relay/internal/workspace"
 )
 
-const rootInitializationJournalSchemaVersion = 3
+const (
+	rootInitializationJournalSchemaVersion       = 4
+	rootInitializationLegacyJournalSchemaVersion = 3
+)
 
 type rootInitializationOwnedEntry struct {
 	Path     string
@@ -1043,6 +1046,9 @@ func (t *rootInitializationTransaction) removeOwnedEntriesExact() error {
 		return paths[left] > paths[right]
 	})
 	for _, relative := range paths {
+		if relative == rootInitializationOriginName {
+			continue
+		}
 		expected := t.ownedEntries[relative]
 		actual, exists, err := rootInitializationMaybeRecordPath(t.sessionRoot, relative)
 		if err != nil {
@@ -1192,6 +1198,11 @@ func (t *rootInitializationTransaction) finalizeInitializationControls() error {
 		return err
 	}
 	t.st.SetFileMutationObserver(nil)
+	if !t.preExistingRoot {
+		if _, hasOrigin := t.ownedEntries[rootInitializationOriginName]; !hasOrigin {
+			return t.finalizeLegacyToolCreatedRoot()
+		}
+	}
 	if err := removeRootInitializationClaim(t.sessionRoot, t.token); err != nil {
 		return err
 	}
@@ -1228,13 +1239,21 @@ func (t *rootInitializationTransaction) finalizeInitializationControls() error {
 	if err != nil {
 		return err
 	}
-	if len(entries) != 0 {
-		return errors.New("root initialization session contains foreign entries after exact cleanup")
-	}
 	if t.preExistingRoot {
+		if len(entries) != 0 {
+			return errors.New("root initialization session contains foreign entries after exact cleanup")
+		}
 		return nil
 	}
-	return os.Remove(t.sessionRoot)
+	if !rootInitializationDestinationEntriesMatch(entries, rootInitializationOriginName) {
+		return errors.New("root initialization session lost its origin marker before final removal")
+	}
+	if rootInitializationBeforeRootRemoval != nil {
+		if err := rootInitializationBeforeRootRemoval(); err != nil {
+			return err
+		}
+	}
+	return t.removeToolCreatedRoot()
 }
 
 func (t *rootInitializationTransaction) removeBootstrapControls() error {
@@ -1264,9 +1283,103 @@ func (t *rootInitializationTransaction) removeBootstrapControls() error {
 		failures = append(failures, t.mutationLock.removePathAfterUnlock())
 	}
 	if !t.preExistingRoot {
-		failures = append(failures, os.Remove(t.sessionRoot))
+		failures = append(failures, t.removeToolCreatedRoot())
 	}
 	return errors.Join(failures...)
+}
+
+func (t *rootInitializationTransaction) removeToolCreatedRoot() error {
+	if t == nil || t.preExistingRoot {
+		return errors.New("root initialization destination origin is not available for removal")
+	}
+	origin, exists := t.ownedEntries[rootInitializationOriginName]
+	if !exists {
+		return errors.New("root initialization destination origin is missing from the ownership inventory")
+	}
+	return removeRootInitializationDestinationOriginAndRoot(t.sessionRoot, origin)
+}
+
+func (t *rootInitializationTransaction) finalizeLegacyToolCreatedRoot() error {
+	if t == nil || t.mutationLock == nil || t.mutationLock.file == nil {
+		return errors.New("legacy root initialization cleanup requires its mutation lease")
+	}
+	lock := t.mutationLock
+	if err := lock.Unlock(); err != nil {
+		return err
+	}
+	parent := filepath.Dir(t.sessionRoot)
+	holdingRoot, err := os.MkdirTemp(parent, "relay-initialization-cleanup-")
+	if err != nil {
+		return err
+	}
+	removeHoldingRoot := true
+	defer func() {
+		if removeHoldingRoot {
+			_ = os.Remove(holdingRoot)
+		}
+	}()
+	if err := syncRootInitializationDirectory(parent); err != nil {
+		return err
+	}
+	movedRoot := filepath.Join(holdingRoot, "session-root")
+	if err := os.Rename(t.sessionRoot, movedRoot); err != nil {
+		return err
+	}
+	removeHoldingRoot = false
+	if err := syncRootInitializationDirectory(holdingRoot); err != nil {
+		return err
+	}
+	if err := syncRootInitializationDirectory(parent); err != nil {
+		return err
+	}
+	t.sessionRoot = movedRoot
+	lock.sessionRoot = movedRoot
+	lock.path = filepath.Join(movedRoot, ".mutation.lock")
+	if err := removeRootInitializationClaim(movedRoot, t.token); err != nil {
+		return err
+	}
+	journalPath := filepath.Join(movedRoot, rootInitializationJournalName)
+	if info, err := os.Lstat(journalPath); err == nil {
+		if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
+			return errors.New("root initialization journal changed before legacy final removal")
+		}
+		if err := os.Remove(journalPath); err != nil {
+			return err
+		}
+	} else if !os.IsNotExist(err) {
+		return err
+	}
+	journalTemporaryPath := filepath.Join(movedRoot, "."+rootInitializationJournalName+"."+t.token+".tmp")
+	if info, err := os.Lstat(journalTemporaryPath); err == nil {
+		if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
+			return errors.New("root initialization journal temporary path changed before legacy final removal")
+		}
+		if err := os.Remove(journalTemporaryPath); err != nil {
+			return err
+		}
+	} else if !os.IsNotExist(err) {
+		return err
+	}
+	if err := lock.removePathAfterUnlock(); err != nil {
+		return err
+	}
+	entries, err := os.ReadDir(movedRoot)
+	if err != nil {
+		return err
+	}
+	if len(entries) != 0 {
+		return errors.New("legacy root initialization session contains foreign entries after exact cleanup")
+	}
+	if err := os.Remove(movedRoot); err != nil {
+		return err
+	}
+	if err := syncRootInitializationDirectory(holdingRoot); err != nil {
+		return err
+	}
+	if err := os.Remove(holdingRoot); err != nil {
+		return err
+	}
+	return syncRootInitializationDirectory(parent)
 }
 
 func (t *rootInitializationTransaction) ownedEntriesPayload() []any {

@@ -1018,21 +1018,21 @@ func TestRootInitializationDestinationClaimCompensatesRacingRootCreator(t *testi
 	}()
 	<-created
 
-	winner, err := beginRootInitialization(winnerPreflight)
-	if err != nil {
-		t.Fatalf("winner initialization: %v", err)
-	}
-	if err := validateRootInitializationClaim(winner.sessionRoot, winner.token); err != nil {
-		t.Fatalf("winner claim is not durable: %v", err)
+	contender, err := beginRootInitialization(winnerPreflight)
+	if contender != nil || err == nil {
+		t.Fatalf("racing contender result = %#v, %v; want one refused claimant", contender, err)
 	}
 	close(releaseCreator)
 	creatorReleased = true
-	loser := <-creatorResult
-	if loser.transaction != nil || loser.err == nil {
-		t.Fatalf("racing creator result = %#v, want one failed claimant", loser)
+	winner := <-creatorResult
+	if winner.transaction == nil || winner.err != nil {
+		t.Fatalf("racing creator result = %#v, want one successful claimant", winner)
+	}
+	if err := validateRootInitializationClaim(winner.transaction.sessionRoot, winner.transaction.token); err != nil {
+		t.Fatalf("winner claim is not durable: %v", err)
 	}
 
-	if err := winner.compensate(); err != nil {
+	if err := winner.transaction.compensate(); err != nil {
 		t.Fatalf("compensate winner: %v", err)
 	}
 	if _, err := os.Lstat(sessionDir); !os.IsNotExist(err) {
@@ -1040,6 +1040,123 @@ func TestRootInitializationDestinationClaimCompensatesRacingRootCreator(t *testi
 	}
 	if _, err := os.Lstat(rootInitializationDestinationOriginPath(sessionDir)); !os.IsNotExist(err) {
 		t.Fatalf("destination origin receipt remained after compensation: %v", err)
+	}
+}
+
+func TestRootInitializationDestinationClaimKeepsToolOriginThroughTeardown(t *testing.T) {
+	launchRoot := newRootInitializationRepository(t)
+	sessionDir := filepath.Join(t.TempDir(), "session")
+	preflight, err := preflightRecipe(context.Background(), rootInitializationOptions(launchRoot, sessionDir))
+	if err != nil {
+		t.Fatalf("preflight: %v", err)
+	}
+	transaction, err := beginRootInitialization(preflight)
+	if err != nil {
+		t.Fatalf("begin initialization: %v", err)
+	}
+	if transaction.preExistingRoot {
+		t.Fatal("new destination was recorded as pre-existing")
+	}
+
+	enteredTeardown := make(chan struct{})
+	releaseTeardown := make(chan struct{})
+	released := false
+	rootInitializationBeforeRootRemoval = func() error {
+		close(enteredTeardown)
+		<-releaseTeardown
+		return nil
+	}
+	defer func() {
+		rootInitializationBeforeRootRemoval = nil
+		if !released {
+			close(releaseTeardown)
+		}
+	}()
+
+	compensated := make(chan error, 1)
+	go func() {
+		compensated <- transaction.compensate()
+	}()
+	<-enteredTeardown
+
+	secondPreExisting, secondErr := claimRootInitializationDestination(transaction.sessionRoot, strings.Repeat("a", 64))
+	if secondErr == nil {
+		t.Fatalf("teardown claimant inherited pre-existing destination: first=%v second=%v", transaction.preExistingRoot, secondPreExisting)
+	}
+	close(releaseTeardown)
+	released = true
+	if err := <-compensated; err != nil {
+		t.Fatalf("compensate tool-created destination: %v", err)
+	}
+	if _, err := os.Lstat(sessionDir); !os.IsNotExist(err) {
+		t.Fatalf("tool-created destination remained after teardown: %v", err)
+	}
+}
+
+func TestRootInitializationDestinationClaimRejectsForeignCreatorBeforeMkdir(t *testing.T) {
+	launchRoot := newRootInitializationRepository(t)
+	sessionDir := filepath.Join(t.TempDir(), "session")
+	preflight, err := preflightRecipe(context.Background(), rootInitializationOptions(launchRoot, sessionDir))
+	if err != nil {
+		t.Fatalf("preflight: %v", err)
+	}
+
+	rootInitializationBeforeDestinationCreate = func() error {
+		return os.Mkdir(sessionDir, 0o755)
+	}
+	defer func() { rootInitializationBeforeDestinationCreate = nil }()
+
+	transaction, initializationErr := beginRootInitialization(preflight)
+	if transaction != nil {
+		if err := transaction.compensate(); err != nil {
+			t.Fatalf("compensate contested initialization: %v", err)
+		}
+	}
+	if _, err := os.Lstat(sessionDir); err != nil {
+		t.Fatalf("foreign destination was deleted after contested create: %v", err)
+	}
+	if initializationErr == nil {
+		t.Fatal("foreign destination was accepted after contested create")
+	}
+}
+
+func TestCleanSessionRecoversInterruptedRootInitializationOrigin(t *testing.T) {
+	launchRoot := newRootInitializationRepository(t)
+	parent, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatalf("resolve interrupted-origin parent: %v", err)
+	}
+	sessionDir := filepath.Join(parent, "session")
+	if err := os.Mkdir(sessionDir, 0o755); err != nil {
+		t.Fatalf("create interrupted destination: %v", err)
+	}
+	if _, err := establishRootInitializationDestinationOrigin(sessionDir); err != nil {
+		t.Fatalf("establish interrupted origin: %v", err)
+	}
+	if _, err := claimRootInitializationDestination(sessionDir, strings.Repeat("b", 64)); err == nil {
+		t.Fatal("interrupted origin was accepted as an empty destination")
+	}
+	if info, err := os.Lstat(sessionDir); err != nil || !info.IsDir() {
+		t.Fatalf("interrupted destination changed after refused claim: %v", err)
+	}
+
+	if report, err := CleanSession(sessionDir); err != nil || report["status"] != "deleted" || report["initialization_cleanup"] != "interrupted_origin" {
+		t.Fatalf("recover interrupted origin = %#v, %v", report, err)
+	}
+	if _, err := os.Lstat(sessionDir); !os.IsNotExist(err) {
+		t.Fatalf("interrupted destination remained after recovery: %v", err)
+	}
+
+	preflight, err := preflightRecipe(context.Background(), rootInitializationOptions(launchRoot, sessionDir))
+	if err != nil {
+		t.Fatalf("preflight after interrupted-origin recovery: %v", err)
+	}
+	transaction, err := beginRootInitialization(preflight)
+	if err != nil {
+		t.Fatalf("begin after interrupted-origin recovery: %v", err)
+	}
+	if err := transaction.compensate(); err != nil {
+		t.Fatalf("compensate after interrupted-origin recovery: %v", err)
 	}
 }
 
