@@ -1093,6 +1093,139 @@ func TestRootInitializationDestinationClaimKeepsToolOriginThroughTeardown(t *tes
 	}
 }
 
+func TestRootInitializationDestinationRemovalRefusesLateForeignEntryInPlace(t *testing.T) {
+	parent, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatalf("resolve destination parent: %v", err)
+	}
+	sessionDir := filepath.Join(parent, "session")
+	if err := os.Mkdir(sessionDir, 0o755); err != nil {
+		t.Fatalf("create tool-created destination: %v", err)
+	}
+	origin, err := establishRootInitializationDestinationOrigin(sessionDir)
+	if err != nil {
+		t.Fatalf("establish destination origin: %v", err)
+	}
+	foreignPath := filepath.Join(sessionDir, "foreign.txt")
+	rootInitializationBeforeDestinationRootRemoval = func() error {
+		return os.WriteFile(foreignPath, []byte("foreign"), 0o644)
+	}
+	defer func() { rootInitializationBeforeDestinationRootRemoval = nil }()
+
+	err = removeRootInitializationDestinationOriginAndRoot(sessionDir, origin.entry)
+	if err == nil {
+		t.Fatal("late foreign entry did not refuse destination removal")
+	}
+	if data, statErr := os.ReadFile(foreignPath); statErr != nil || string(data) != "foreign" {
+		t.Fatalf("late foreign entry was moved from public session root: %q, %v", data, statErr)
+	}
+	if info, statErr := os.Lstat(sessionDir); statErr != nil || !info.IsDir() {
+		t.Fatalf("public session root disappeared after late foreign entry: %v", statErr)
+	}
+	entries, readErr := os.ReadDir(parent)
+	if readErr != nil {
+		t.Fatalf("read destination parent: %v", readErr)
+	}
+	for _, entry := range entries {
+		if strings.HasPrefix(entry.Name(), "relay-initialization-cleanup-") {
+			t.Fatalf("late foreign entry left an unreachable holding directory: %s", entry.Name())
+		}
+	}
+}
+
+func TestRootInitializationDestinationRemovalInterruptionRemainsRecoverable(t *testing.T) {
+	assertNoHoldingRoot := func(t *testing.T, parent string) {
+		t.Helper()
+		entries, err := os.ReadDir(parent)
+		if err != nil {
+			t.Fatalf("read destination parent: %v", err)
+		}
+		for _, entry := range entries {
+			if strings.HasPrefix(entry.Name(), "relay-initialization-cleanup-") {
+				t.Fatalf("interrupted removal left a holding directory: %s", entry.Name())
+			}
+		}
+	}
+
+	t.Run("before origin removal", func(t *testing.T) {
+		parent, err := filepath.EvalSymlinks(t.TempDir())
+		if err != nil {
+			t.Fatalf("resolve destination parent: %v", err)
+		}
+		sessionDir := filepath.Join(parent, "session")
+		if err := os.Mkdir(sessionDir, 0o755); err != nil {
+			t.Fatalf("create tool-created destination: %v", err)
+		}
+		origin, err := establishRootInitializationDestinationOrigin(sessionDir)
+		if err != nil {
+			t.Fatalf("establish destination origin: %v", err)
+		}
+		injected := errors.New("interrupt before destination origin removal")
+		rootInitializationBeforeDestinationRootRemoval = func() error { return injected }
+		defer func() { rootInitializationBeforeDestinationRootRemoval = nil }()
+
+		if err := removeRootInitializationDestinationOriginAndRoot(sessionDir, origin.entry); !errors.Is(err, injected) {
+			t.Fatalf("interrupted destination removal = %v, want %v", err, injected)
+		}
+		assertNoHoldingRoot(t, parent)
+		rootInitializationBeforeDestinationRootRemoval = nil
+		if report, err := CleanSession(sessionDir); err != nil || report["status"] != "deleted" || report["initialization_cleanup"] != "interrupted_origin" {
+			t.Fatalf("recover origin-preserving interruption = %#v, %v", report, err)
+		}
+		if _, err := os.Lstat(sessionDir); !os.IsNotExist(err) {
+			t.Fatalf("origin-preserving interruption remained after recovery: %v", err)
+		}
+	})
+
+	t.Run("after origin removal", func(t *testing.T) {
+		launchRoot := newRootInitializationRepository(t)
+		parent, err := filepath.EvalSymlinks(t.TempDir())
+		if err != nil {
+			t.Fatalf("resolve destination parent: %v", err)
+		}
+		sessionDir := filepath.Join(parent, "session")
+		if err := os.Mkdir(sessionDir, 0o755); err != nil {
+			t.Fatalf("create tool-created destination: %v", err)
+		}
+		origin, err := establishRootInitializationDestinationOrigin(sessionDir)
+		if err != nil {
+			t.Fatalf("establish destination origin: %v", err)
+		}
+		injected := errors.New("interrupt after destination origin removal")
+		rootInitializationAfterDestinationOriginRemoval = func() error { return injected }
+		defer func() { rootInitializationAfterDestinationOriginRemoval = nil }()
+
+		if err := removeRootInitializationDestinationOriginAndRoot(sessionDir, origin.entry); !errors.Is(err, injected) {
+			t.Fatalf("interrupted destination removal = %v, want %v", err, injected)
+		}
+		assertNoHoldingRoot(t, parent)
+		rootInitializationAfterDestinationOriginRemoval = nil
+		entries, err := os.ReadDir(sessionDir)
+		if err != nil || len(entries) != 0 {
+			t.Fatalf("post-origin interruption state = %#v, %v; want supported empty destination", entries, err)
+		}
+
+		preflight, err := preflightRecipe(context.Background(), rootInitializationOptions(launchRoot, sessionDir))
+		if err != nil {
+			t.Fatalf("preflight after empty-destination interruption: %v", err)
+		}
+		transaction, err := beginRootInitialization(preflight)
+		if err != nil {
+			t.Fatalf("begin after empty-destination interruption: %v", err)
+		}
+		if !transaction.preExistingRoot {
+			t.Fatal("empty interruption state was not recovered as a pre-existing destination")
+		}
+		if err := transaction.compensate(); err != nil {
+			t.Fatalf("compensate recovered empty destination: %v", err)
+		}
+		entries, err = os.ReadDir(sessionDir)
+		if err != nil || len(entries) != 0 {
+			t.Fatalf("recovered pre-existing destination = %#v, %v", entries, err)
+		}
+	})
+}
+
 func TestRootInitializationDestinationClaimRejectsForeignCreatorBeforeMkdir(t *testing.T) {
 	launchRoot := newRootInitializationRepository(t)
 	sessionDir := filepath.Join(t.TempDir(), "session")

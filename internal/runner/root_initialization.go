@@ -42,6 +42,17 @@ var rootInitializationAfterDestinationCreate func() error
 // is removed.
 var rootInitializationBeforeRootRemoval func() error
 
+// rootInitializationBeforeDestinationRootRemoval is a test-only
+// synchronization hook after the destination origin has been verified for
+// removal. It makes the final deletion race reproducible without changing
+// production behavior.
+var rootInitializationBeforeDestinationRootRemoval func() error
+
+// rootInitializationAfterDestinationOriginRemoval is a test-only interruption
+// seam after the owned origin is removed but before the empty session root is
+// removed.
+var rootInitializationAfterDestinationOriginRemoval func() error
+
 var rootInitializationOwnedEntries = []string{
 	".git",
 	".mutation.lock",
@@ -621,69 +632,23 @@ func removeRootInitializationDestinationOriginAndRoot(sessionRoot string, expect
 	if !rootInitializationEntryMatches(expected, actual, true) {
 		return errors.New("root initialization destination origin changed before removal")
 	}
-	entries, err := os.ReadDir(sessionRoot)
-	if err != nil {
-		return err
-	}
-	if !rootInitializationDestinationEntriesMatch(entries, rootInitializationOriginName) {
-		return errors.New("root initialization session contains entries other than its origin marker")
-	}
-
-	parent := filepath.Dir(sessionRoot)
-	holdingRoot, err := os.MkdirTemp(parent, "relay-initialization-cleanup-")
-	if err != nil {
-		return err
-	}
-	removeHoldingRoot := true
-	defer func() {
-		if removeHoldingRoot {
-			_ = os.Remove(holdingRoot)
+	if rootInitializationBeforeDestinationRootRemoval != nil {
+		if err := rootInitializationBeforeDestinationRootRemoval(); err != nil {
+			return err
 		}
-	}()
-	if err := syncRootInitializationDirectory(parent); err != nil {
+	}
+	if err := os.Remove(rootInitializationDestinationOriginPath(sessionRoot)); err != nil {
 		return err
 	}
-	movedRoot := filepath.Join(holdingRoot, "session-root")
-	if err := os.Rename(sessionRoot, movedRoot); err != nil {
+	if rootInitializationAfterDestinationOriginRemoval != nil {
+		if err := rootInitializationAfterDestinationOriginRemoval(); err != nil {
+			return err
+		}
+	}
+	if err := os.Remove(sessionRoot); err != nil {
 		return err
 	}
-	removeHoldingRoot = false
-	if err := syncRootInitializationDirectory(holdingRoot); err != nil {
-		return err
-	}
-	if err := syncRootInitializationDirectory(parent); err != nil {
-		return err
-	}
-	movedOrigin, err := rootInitializationDestinationOriginEntry(movedRoot)
-	if err != nil {
-		return err
-	}
-	if !rootInitializationEntryMatches(expected, movedOrigin, true) {
-		return errors.New("root initialization destination origin changed during removal")
-	}
-	entries, err = os.ReadDir(movedRoot)
-	if err != nil {
-		return err
-	}
-	if !rootInitializationDestinationEntriesMatch(entries, rootInitializationOriginName) {
-		return errors.New("root initialization destination changed during removal")
-	}
-	if err := os.Remove(rootInitializationDestinationOriginPath(movedRoot)); err != nil {
-		return err
-	}
-	if err := syncRootInitializationDirectory(movedRoot); err != nil {
-		return err
-	}
-	if err := os.Remove(movedRoot); err != nil {
-		return err
-	}
-	if err := syncRootInitializationDirectory(holdingRoot); err != nil {
-		return err
-	}
-	if err := os.Remove(holdingRoot); err != nil {
-		return err
-	}
-	return syncRootInitializationDirectory(parent)
+	return syncRootInitializationDirectory(filepath.Dir(sessionRoot))
 }
 
 func recoverRootInitializationDestinationOrigin(

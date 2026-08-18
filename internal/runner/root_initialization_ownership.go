@@ -1307,38 +1307,10 @@ func (t *rootInitializationTransaction) finalizeLegacyToolCreatedRoot() error {
 	if err := lock.Unlock(); err != nil {
 		return err
 	}
-	parent := filepath.Dir(t.sessionRoot)
-	holdingRoot, err := os.MkdirTemp(parent, "relay-initialization-cleanup-")
-	if err != nil {
+	if err := removeRootInitializationClaim(t.sessionRoot, t.token); err != nil {
 		return err
 	}
-	removeHoldingRoot := true
-	defer func() {
-		if removeHoldingRoot {
-			_ = os.Remove(holdingRoot)
-		}
-	}()
-	if err := syncRootInitializationDirectory(parent); err != nil {
-		return err
-	}
-	movedRoot := filepath.Join(holdingRoot, "session-root")
-	if err := os.Rename(t.sessionRoot, movedRoot); err != nil {
-		return err
-	}
-	removeHoldingRoot = false
-	if err := syncRootInitializationDirectory(holdingRoot); err != nil {
-		return err
-	}
-	if err := syncRootInitializationDirectory(parent); err != nil {
-		return err
-	}
-	t.sessionRoot = movedRoot
-	lock.sessionRoot = movedRoot
-	lock.path = filepath.Join(movedRoot, ".mutation.lock")
-	if err := removeRootInitializationClaim(movedRoot, t.token); err != nil {
-		return err
-	}
-	journalPath := filepath.Join(movedRoot, rootInitializationJournalName)
+	journalPath := filepath.Join(t.sessionRoot, rootInitializationJournalName)
 	if info, err := os.Lstat(journalPath); err == nil {
 		if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
 			return errors.New("root initialization journal changed before legacy final removal")
@@ -1349,7 +1321,7 @@ func (t *rootInitializationTransaction) finalizeLegacyToolCreatedRoot() error {
 	} else if !os.IsNotExist(err) {
 		return err
 	}
-	journalTemporaryPath := filepath.Join(movedRoot, "."+rootInitializationJournalName+"."+t.token+".tmp")
+	journalTemporaryPath := filepath.Join(t.sessionRoot, "."+rootInitializationJournalName+"."+t.token+".tmp")
 	if info, err := os.Lstat(journalTemporaryPath); err == nil {
 		if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
 			return errors.New("root initialization journal temporary path changed before legacy final removal")
@@ -1363,23 +1335,10 @@ func (t *rootInitializationTransaction) finalizeLegacyToolCreatedRoot() error {
 	if err := lock.removePathAfterUnlock(); err != nil {
 		return err
 	}
-	entries, err := os.ReadDir(movedRoot)
-	if err != nil {
+	if err := os.Remove(t.sessionRoot); err != nil {
 		return err
 	}
-	if len(entries) != 0 {
-		return errors.New("legacy root initialization session contains foreign entries after exact cleanup")
-	}
-	if err := os.Remove(movedRoot); err != nil {
-		return err
-	}
-	if err := syncRootInitializationDirectory(holdingRoot); err != nil {
-		return err
-	}
-	if err := os.Remove(holdingRoot); err != nil {
-		return err
-	}
-	return syncRootInitializationDirectory(parent)
+	return syncRootInitializationDirectory(filepath.Dir(t.sessionRoot))
 }
 
 func (t *rootInitializationTransaction) ownedEntriesPayload() []any {
