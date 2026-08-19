@@ -1,4 +1,4 @@
-package runner
+package provider
 
 import (
 	"context"
@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
 
@@ -186,7 +187,7 @@ func (b *embeddedBackend) RunTurn(ctx context.Context, prompt string, options Tu
 	return result, err
 }
 
-func (b *embeddedBackend) SessionState() map[string]any {
+func (b *embeddedBackend) SessionState() SlotState {
 	sessionIDKey := "session_id"
 	if b.backendName == "codex" {
 		sessionIDKey = "thread_id"
@@ -211,14 +212,14 @@ func (b *embeddedBackend) SessionState() map[string]any {
 	return state
 }
 
-func (b *embeddedBackend) RestoreState(state map[string]any, override SlotConfig) error {
+func (b *embeddedBackend) RestoreState(state SlotState, override SlotConfig) error {
 	if b.backendName == "codex" {
 		return b.restoreCodexState(state, override)
 	}
 	return b.restoreClaudeState(state, override)
 }
 
-func (b *embeddedBackend) restoreCodexState(state map[string]any, override SlotConfig) error {
+func (b *embeddedBackend) restoreCodexState(state SlotState, override SlotConfig) error {
 	if state == nil {
 		state = map[string]any{}
 	}
@@ -244,7 +245,7 @@ func (b *embeddedBackend) restoreCodexState(state map[string]any, override SlotC
 	return nil
 }
 
-func (b *embeddedBackend) restoreClaudeState(state map[string]any, override SlotConfig) error {
+func (b *embeddedBackend) restoreClaudeState(state SlotState, override SlotConfig) error {
 	if state == nil {
 		state = map[string]any{}
 	}
@@ -417,4 +418,20 @@ func newUUID() (string, error) {
 	data[8] = (data[8] & 0x3f) | 0x80
 	hexText := hex.EncodeToString(data[:])
 	return fmt.Sprintf("%s-%s-%s-%s-%s", hexText[0:8], hexText[8:12], hexText[12:16], hexText[16:20], hexText[20:32]), nil
+}
+
+func claudeProjectDir(cwd string) string {
+	home, err := os.UserHomeDir()
+	if err != nil || home == "" {
+		home = "."
+	}
+	var encoded strings.Builder
+	for _, ch := range cwd {
+		if (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9') || ch == '-' {
+			encoded.WriteRune(ch)
+		} else {
+			encoded.WriteByte('-')
+		}
+	}
+	return filepath.Join(home, ".claude", "projects", encoded.String())
 }

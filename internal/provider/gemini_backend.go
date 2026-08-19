@@ -1,4 +1,4 @@
-package runner
+package provider
 
 import (
 	"context"
@@ -129,7 +129,7 @@ func (b *geminiBackend) RunTurn(ctx context.Context, prompt string, options Turn
 	}, nil
 }
 
-func (b *geminiBackend) SessionState() map[string]any {
+func (b *geminiBackend) SessionState() SlotState {
 	state := map[string]any{
 		"session_ref": b.sessionRef,
 		"started":     b.started,
@@ -150,7 +150,7 @@ func (b *geminiBackend) SessionState() map[string]any {
 	return state
 }
 
-func (b *geminiBackend) RestoreState(state map[string]any, override SlotConfig) error {
+func (b *geminiBackend) RestoreState(state SlotState, override SlotConfig) error {
 	if state == nil {
 		state = map[string]any{}
 	}
