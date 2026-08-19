@@ -134,6 +134,7 @@ func hasEdge(graph GraphView, from string, to string, kind string) bool {
 func viewPlan() session.Plan {
 	return session.Plan{
 		Kind:          session.PlanKind,
+		Provenance:    session.ProvenanceOrdinary,
 		SchemaVersion: session.SchemaVersion,
 		SessionID:     "session-one",
 		Actors:        []session.Actor{{ID: "actor-a", Backend: "codex", Model: "model", Effort: "medium"}},

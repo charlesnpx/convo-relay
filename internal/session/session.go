@@ -16,6 +16,13 @@ import (
 	"github.com/charlesnpx/convo-relay/internal/eventlog"
 )
 
+// Provenance values. These label a plan's origin; they never select behaviour.
+const (
+	ProvenanceOrdinary = "ordinary"
+	ProvenanceRecipe   = "recipe"
+	ProvenanceChild    = "child"
+)
+
 const (
 	PlanKind        = "relay.plan/v1"
 	SchemaVersion   = 1
@@ -25,9 +32,16 @@ const (
 // Plan is the complete typed, portable compiled-plan document. It owns the
 // only schema_version; nested plan records deliberately have none.
 type Plan struct {
-	Kind          string        `json:"kind"`
-	SchemaVersion int           `json:"schema_version"`
-	SessionID     string        `json:"session_id"`
+	Kind          string `json:"kind"`
+	SchemaVersion int    `json:"schema_version"`
+	SessionID     string `json:"session_id"`
+	// Provenance records where the plan came from: ordinary, recipe, or child.
+	// It is a label for operators and inspectors. Nothing may branch on it to
+	// choose execution behaviour - one plan, one engine.
+	Provenance string `json:"provenance"`
+	// RecipeID names the recipe a plan was compiled from, when it was. The
+	// public run report surfaces it, so it is part of the operator contract.
+	RecipeID      string        `json:"recipe_id,omitempty"`
 	Actors        []Actor       `json:"actors"`
 	Schedule      Schedule      `json:"schedule"`
 	Facilitator   *Facilitator  `json:"facilitator,omitempty"`
@@ -309,6 +323,14 @@ func ValidatePlan(plan Plan) error {
 	}
 	if plan.SchemaVersion != SchemaVersion {
 		return fmt.Errorf("plan schema_version must be %d", SchemaVersion)
+	}
+	switch plan.Provenance {
+	case ProvenanceOrdinary, ProvenanceRecipe, ProvenanceChild:
+	default:
+		return fmt.Errorf("plan provenance must be one of %s, %s, %s", ProvenanceOrdinary, ProvenanceRecipe, ProvenanceChild)
+	}
+	if plan.Provenance == ProvenanceRecipe && plan.RecipeID == "" {
+		return errors.New("plan compiled from a recipe must record recipe_id")
 	}
 	if err := validateToken("session_id", plan.SessionID); err != nil {
 		return err

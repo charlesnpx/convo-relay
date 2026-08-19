@@ -198,6 +198,7 @@ func walkJSONValue(decoder *json.Decoder, visit func(string)) error {
 func testPlan() Plan {
 	return Plan{
 		Kind:          PlanKind,
+		Provenance:    ProvenanceOrdinary,
 		SchemaVersion: SchemaVersion,
 		Actors: []Actor{{
 			ID: "actor-a", Backend: "codex", Model: "test-model", Effort: "medium",

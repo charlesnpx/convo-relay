@@ -208,6 +208,7 @@ func fixtureSourceSession(t *testing.T) *session.Session {
 func bundlePlan() session.Plan {
 	return session.Plan{
 		Kind:          session.PlanKind,
+		Provenance:    session.ProvenanceOrdinary,
 		SchemaVersion: session.SchemaVersion,
 		Actors:        []session.Actor{{ID: "actor-a", Backend: "codex", Model: "test-model", Effort: "medium"}},
 		Schedule:      session.Schedule{Kind: "dialogue", Turns: 1},
