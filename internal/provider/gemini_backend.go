@@ -273,10 +273,6 @@ func parseGeminiOutput(stdout string) (string, string) {
 	return raw, ""
 }
 
-func ParseGeminiOutput(stdout string) (string, string) {
-	return parseGeminiOutput(stdout)
-}
-
 func geminiSessionRef(data map[string]any) string {
 	value, ok := data["session_id"].(string)
 	if !ok || value == "" {

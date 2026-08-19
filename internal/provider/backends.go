@@ -205,10 +205,6 @@ func ParseAgents(rawAgents string) ([]string, bool, error) {
 	return parts, false, nil
 }
 
-func buildSlots(agents []string, sessionRoot string, launchCWD string, configs []SlotConfig, runtimeConfig recipes.RuntimeConfig, settingsPath string, relayDepth int, maxRelayDepth int) ([]Backend, error) {
-	return buildSlotsWithConstructor(agents, sessionRoot, launchCWD, configs, runtimeConfig, settingsPath, relayDepth, maxRelayDepth, nil)
-}
-
 // BuildSlots builds slots from typed launch configuration. The optional relay
 // constructor retains the runner-owned relay pseudo-backend.
 func BuildSlots(input SlotBuildInput) ([]Backend, error) {

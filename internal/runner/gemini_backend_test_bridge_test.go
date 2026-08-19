@@ -9,7 +9,3 @@ func newGeminiBackend(sessionRoot string, slotID string, label string, cwd strin
 	}
 	return backend
 }
-
-func parseGeminiOutput(stdout string) (string, string) {
-	return provider.ParseGeminiOutput(stdout)
-}

@@ -206,25 +206,6 @@ func classifyRetryableProviderError(text string) string {
 	return ""
 }
 
-func runWithRetryableProviderErrors[T any](ctx context.Context, label string, operation func() (T, error)) (T, error) {
-	return runWithProviderRetryPolicy(ctx, label, recipes.ProviderRetryAllow, operation)
-}
-
-func runWithProviderRetryPolicy[T any](ctx context.Context, label string, policy string, operation func() (T, error)) (T, error) {
-	return runWithProviderRetryPolicyWithBackoff(ctx, label, policy, retryBackoff, operation)
-}
-
-// RunWithRetryableProviderErrors applies the normal retry policy.
-func RunWithRetryableProviderErrors[T any](ctx context.Context, label string, operation func() (T, error)) (T, error) {
-	return runWithRetryableProviderErrors(ctx, label, operation)
-}
-
-// RunWithProviderRetryPolicy applies the declared retry policy using the
-// provider package's standard backoff behavior.
-func RunWithProviderRetryPolicy[T any](ctx context.Context, label string, policy string, operation func() (T, error)) (T, error) {
-	return runWithProviderRetryPolicy(ctx, label, policy, operation)
-}
-
 // RunWithProviderRetryPolicyWithBackoff retains runner's existing deterministic
 // retry-test seam without moving untyped session logic into this package.
 func RunWithProviderRetryPolicyWithBackoff[T any](ctx context.Context, label string, policy string, backoff RetryBackoff, operation func() (T, error)) (T, error) {
