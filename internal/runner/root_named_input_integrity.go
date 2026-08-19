@@ -54,9 +54,9 @@ func (e *rootNamedInputIntegrityError) Unwrap() []error {
 	return causes
 }
 
-// suppressProviderRetry keeps a provider's secondary retryable failure from
+// SuppressProviderRetry keeps a provider's secondary retryable failure from
 // overriding the primary retained-input integrity failure.
-func (e *rootNamedInputIntegrityError) suppressProviderRetry() {}
+func (e *rootNamedInputIntegrityError) SuppressProviderRetry() {}
 
 func runRootProviderTurnWithRetainedIntegrity(
 	ctx context.Context,

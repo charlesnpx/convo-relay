@@ -1,4 +1,4 @@
-package runner
+package provider
 
 import (
 	"context"
@@ -17,7 +17,11 @@ const (
 	retryMaxBackoffSeconds     = 160
 )
 
-var retryBackoff = func(ctx context.Context, delay time.Duration) error {
+// RetryBackoff controls one retry delay. Runner supplies its existing test
+// seam; ordinary provider callers use the default below.
+type RetryBackoff func(context.Context, time.Duration) error
+
+var retryBackoff RetryBackoff = func(ctx context.Context, delay time.Duration) error {
 	timer := time.NewTimer(delay)
 	defer timer.Stop()
 	select {
@@ -50,7 +54,7 @@ type RetryableProviderError struct {
 }
 
 type providerRetrySuppressed interface {
-	suppressProviderRetry()
+	SuppressProviderRetry()
 }
 
 func (e RetryableProviderError) Error() string {
@@ -91,6 +95,24 @@ func (e ProviderFailureError) Unwrap() error {
 	return e.Cause
 }
 
+// ProviderFailure is the typed failure record that runner serializes into its
+// legacy event payload.
+type ProviderFailure struct {
+	Phase           string
+	Actor           string
+	Backend         string
+	Category        string
+	Retryable       bool
+	Attempts        int
+	TimedOut        bool
+	Stalled         bool
+	ReturnCode      any
+	RemediationCode string
+	Remediation     string
+	SanitizedDetail string
+	RawDetailHidden bool
+}
+
 type ProviderResult = model.ProviderResult
 
 func newProviderResult(backend string, result processResult) ProviderResult {
@@ -117,8 +139,8 @@ func providerResultForTurn(backend string, result TurnResult) ProviderResult {
 	return providerResult
 }
 
-func providerResultMap(result ProviderResult) map[string]any {
-	return result.ToMap()
+func ProviderResultForTurn(backend string, result TurnResult) ProviderResult {
+	return providerResultForTurn(backend, result)
 }
 
 var nonRetryableProviderErrorHints = []string{
@@ -184,13 +206,18 @@ func classifyRetryableProviderError(text string) string {
 	return ""
 }
 
-func runWithRetryableProviderErrors[T any](ctx context.Context, label string, operation func() (T, error)) (T, error) {
-	return runWithProviderRetryPolicy(ctx, label, recipes.ProviderRetryAllow, operation)
+// RunWithProviderRetryPolicyWithBackoff retains runner's existing deterministic
+// retry-test seam without moving untyped session logic into this package.
+func RunWithProviderRetryPolicyWithBackoff[T any](ctx context.Context, label string, policy string, backoff RetryBackoff, operation func() (T, error)) (T, error) {
+	return runWithProviderRetryPolicyWithBackoff(ctx, label, policy, backoff, operation)
 }
 
-func runWithProviderRetryPolicy[T any](ctx context.Context, label string, policy string, operation func() (T, error)) (T, error) {
+func runWithProviderRetryPolicyWithBackoff[T any](ctx context.Context, label string, policy string, backoff RetryBackoff, operation func() (T, error)) (T, error) {
 	if strings.TrimSpace(policy) == recipes.ProviderRetryForbid {
 		return operation()
+	}
+	if backoff == nil {
+		backoff = retryBackoff
 	}
 	delay := retryInitialBackoffSeconds
 	attempts := 0
@@ -222,7 +249,7 @@ func runWithProviderRetryPolicy[T any](ctx context.Context, label string, policy
 				},
 			}
 		}
-		if backoffErr := retryBackoff(ctx, time.Duration(delay)*time.Second); backoffErr != nil {
+		if backoffErr := backoff(ctx, time.Duration(delay)*time.Second); backoffErr != nil {
 			return result, backoffErr
 		}
 		delay *= 2
@@ -253,7 +280,13 @@ func providerFailureCategory(text string) string {
 	return "provider_error"
 }
 
-func providerFailurePayload(phase string, actor string, backend string, err error, result ProviderResult) map[string]any {
+func ProviderFailureCategory(text string) string {
+	return providerFailureCategory(text)
+}
+
+// NewProviderFailure classifies and sanitizes a provider failure without
+// depending on runner's event-map representation.
+func NewProviderFailure(phase string, actor string, backend string, err error, result ProviderResult) ProviderFailure {
 	detail := providerFailureDetail(err, result)
 	category := providerFailureCategory(detail)
 	retryable := false
@@ -272,20 +305,20 @@ func providerFailurePayload(phase string, actor string, backend string, err erro
 			attempts = failureErr.Attempts
 		}
 	}
-	return map[string]any{
-		"phase":             phase,
-		"actor":             actor,
-		"backend":           backend,
-		"category":          category,
-		"retryable":         retryable,
-		"attempts":          attempts,
-		"timed_out":         result.TimedOut,
-		"stalled":           result.Stalled,
-		"return_code":       providerReturnCodeForFailure(result),
-		"remediation_code":  providerRemediationCode(category, backend),
-		"remediation":       providerRemediationText(category, backend),
-		"sanitized_detail":  sanitizeProviderFailureDetail(detail),
-		"raw_detail_hidden": true,
+	return ProviderFailure{
+		Phase:           phase,
+		Actor:           actor,
+		Backend:         backend,
+		Category:        category,
+		Retryable:       retryable,
+		Attempts:        attempts,
+		TimedOut:        result.TimedOut,
+		Stalled:         result.Stalled,
+		ReturnCode:      providerReturnCodeForFailure(result),
+		RemediationCode: providerRemediationCode(category, backend),
+		Remediation:     providerRemediationText(category, backend),
+		SanitizedDetail: sanitizeProviderFailureDetail(detail),
+		RawDetailHidden: true,
 	}
 }
 
@@ -309,6 +342,10 @@ func providerFailureDetail(err error, result ProviderResult) string {
 		return err.Error()
 	}
 	return ""
+}
+
+func ProviderFailureDetail(err error, result ProviderResult) string {
+	return providerFailureDetail(err, result)
 }
 
 func providerReturnCodeForFailure(result ProviderResult) any {
@@ -366,4 +403,15 @@ func sanitizeProviderFailureDetail(detail string) string {
 	cleaned = standaloneBearer.ReplaceAllString(cleaned, "Bearer [redacted]")
 	cleaned = regexp.MustCompile(`(?i)sk-[a-z0-9_-]{8,}`).ReplaceAllString(cleaned, "[redacted-key]")
 	return truncateString(cleaned, 500)
+}
+
+func SanitizeProviderFailureDetail(detail string) string {
+	return sanitizeProviderFailureDetail(detail)
+}
+
+func truncateString(value string, limit int) string {
+	if len(value) <= limit {
+		return value
+	}
+	return value[:limit]
 }
