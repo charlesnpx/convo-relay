@@ -24,13 +24,13 @@ var newEmbeddedClaudeEngine = func(options claudecli.Options) engine.Backend {
 	return claudecli.New(options)
 }
 
-// legacyClaudeDefaultStallTimeoutSeconds is the 300-second default used by the
-// legacy Claude backend when no positive stall timeout was configured.
-const legacyClaudeDefaultStallTimeoutSeconds = 300
+// claudeDefaultStallTimeoutSeconds is the current 300-second default when no
+// positive Claude stall timeout is configured.
+const claudeDefaultStallTimeoutSeconds = 300
 
-// embeddedClaudeDefaultStallTimeout retains the legacy default. Tests may
+// embeddedClaudeDefaultStallTimeout retains the current default. Tests may
 // temporarily override this package variable to exercise the watchdog quickly.
-var embeddedClaudeDefaultStallTimeout = time.Duration(legacyClaudeDefaultStallTimeoutSeconds) * time.Second
+var embeddedClaudeDefaultStallTimeout = time.Duration(claudeDefaultStallTimeoutSeconds) * time.Second
 
 // embeddedBackend adapts one in-process AgentBus backend to the runner's
 // persisted slot interface. The engine owns process supervision; this wrapper
@@ -160,7 +160,7 @@ func (b *embeddedBackend) RunTurn(ctx context.Context, prompt string, options Tu
 	stallTimeoutSeconds := options.StallTimeoutSeconds
 	watchdogTimeout := embeddedTurnTimeout(stallTimeoutSeconds)
 	if b.backendName == "claude" && stallTimeoutSeconds <= 0 {
-		stallTimeoutSeconds = legacyClaudeDefaultStallTimeoutSeconds
+		stallTimeoutSeconds = claudeDefaultStallTimeoutSeconds
 		watchdogTimeout = embeddedClaudeDefaultStallTimeout
 	}
 	result, final, err := runEmbeddedTurnWithWatchdogTimeout(ctx, b.session, b.backendName, b.label, prompt, sessionOptions.Write, options.TimeoutSeconds, stallTimeoutSeconds, watchdogTimeout)

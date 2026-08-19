@@ -14,14 +14,14 @@ import (
 	"github.com/charlesnpx/convo-relay/internal/recipes"
 )
 
-type phase10Env struct {
+type claudeFakeEnv struct {
 	relayHome  string
 	projectDir string
 	homeDir    string
 }
 
 func TestEmbeddedClaudeBackendRunTurnStateAndResumeProtocol(t *testing.T) {
-	env := setupPhase10FakeProviders(t)
+	env := setupClaudeFakeProviders(t)
 	backend, err := newBackend("claude", env.relayHome, "slot_0", "Claude Code", env.projectDir, SlotConfig{
 		Model:  "claude-sonnet",
 		Effort: "high",
@@ -33,7 +33,7 @@ func TestEmbeddedClaudeBackendRunTurnStateAndResumeProtocol(t *testing.T) {
 		t.Fatalf("backend type = %T, want embeddedBackend", backend)
 	}
 
-	first, err := backend.RunTurn(context.Background(), "PHASE10_SUCCESS first", TurnOptions{TimeoutSeconds: 5})
+	first, err := backend.RunTurn(context.Background(), "CLAUDE_SUCCESS first", TurnOptions{TimeoutSeconds: 5})
 	if err != nil {
 		t.Fatalf("first run turn: %v", err)
 	}
@@ -41,7 +41,7 @@ func TestEmbeddedClaudeBackendRunTurnStateAndResumeProtocol(t *testing.T) {
 	if firstSessionID == "" {
 		t.Fatalf("first turn session state = %#v", backend.SessionState())
 	}
-	second, err := backend.RunTurn(context.Background(), "PHASE10_SUCCESS second", TurnOptions{TimeoutSeconds: 5})
+	second, err := backend.RunTurn(context.Background(), "CLAUDE_SUCCESS second", TurnOptions{TimeoutSeconds: 5})
 	if err != nil {
 		t.Fatalf("second run turn: %v", err)
 	}
@@ -102,13 +102,13 @@ func TestEmbeddedClaudeBackendMissingBinaryReturnsBackendError(t *testing.T) {
 }
 
 func TestEmbeddedClaudeBackendTimeoutReturnsPlaceholder(t *testing.T) {
-	env := setupPhase10FakeProviders(t)
+	env := setupClaudeFakeProviders(t)
 	backend, err := newBackend("claude", env.relayHome, "slot_0", "Claude Code", env.projectDir, SlotConfig{})
 	if err != nil {
 		t.Fatalf("new backend: %v", err)
 	}
 
-	result, err := backend.RunTurn(context.Background(), "PHASE10_TIMEOUT", TurnOptions{TimeoutSeconds: 1})
+	result, err := backend.RunTurn(context.Background(), "CLAUDE_TIMEOUT", TurnOptions{TimeoutSeconds: 1})
 	if err != nil {
 		t.Fatalf("timeout turn: result = %#v, error = %v", result, err)
 	}
@@ -118,7 +118,7 @@ func TestEmbeddedClaudeBackendTimeoutReturnsPlaceholder(t *testing.T) {
 }
 
 func TestEmbeddedClaudeBackendVisibleAuthFailureIsNotRetriedOrRecovered(t *testing.T) {
-	env := setupPhase10FakeProviders(t)
+	env := setupClaudeFakeProviders(t)
 	backend, err := newBackend("claude", env.relayHome, "slot_0", "Claude Code", env.projectDir, SlotConfig{})
 	if err != nil {
 		t.Fatalf("new backend: %v", err)
@@ -130,7 +130,7 @@ func TestEmbeddedClaudeBackendVisibleAuthFailureIsNotRetriedOrRecovered(t *testi
 	})
 
 	result, err := runWithRetryableProviderErrors(context.Background(), backend.Label(), func() (TurnResult, error) {
-		return backend.RunTurn(context.Background(), "PHASE10_AUTH_FAILURE", TurnOptions{TimeoutSeconds: 5})
+		return backend.RunTurn(context.Background(), "CLAUDE_AUTH_FAILURE", TurnOptions{TimeoutSeconds: 5})
 	})
 	var backendErr BackendRunError
 	if !errors.As(err, &backendErr) {
@@ -155,16 +155,16 @@ func TestEmbeddedClaudeBackendVisibleAuthFailureIsNotRetriedOrRecovered(t *testi
 }
 
 func TestBuildAndRestoreSlotsSupportClaude(t *testing.T) {
-	env := setupPhase10FakeProviders(t)
+	env := setupClaudeFakeProviders(t)
 	profiles := map[string]map[string]any{
-		"phase10-claude": {
+		"claude-profile": {
 			"backend": "claude",
 			"model":   "claude-sonnet",
 			"effort":  "medium",
 		},
 	}
 	slots, err := buildSlots(
-		[]string{"phase10-claude", "codex"},
+		[]string{"claude-profile", "codex"},
 		env.relayHome,
 		env.projectDir,
 		[]SlotConfig{{}, {}},
@@ -224,7 +224,7 @@ func TestBuildAndRestoreSlotsSupportClaude(t *testing.T) {
 }
 
 func TestRunResumeAndCleanClaudeSessions(t *testing.T) {
-	env := setupPhase10FakeProviders(t)
+	env := setupClaudeFakeProviders(t)
 	cases := []struct {
 		name   string
 		agents []string
@@ -241,7 +241,7 @@ func TestRunResumeAndCleanClaudeSessions(t *testing.T) {
 			sessionDir := filepath.Join(env.relayHome, "sessions", tt.name)
 			if _, err := Run(context.Background(), Options{
 				SessionDir:     sessionDir,
-				Task:           "PHASE10_SUCCESS",
+				Task:           "CLAUDE_SUCCESS",
 				Agents:         tt.agents,
 				Rounds:         tt.rounds,
 				TimeoutSeconds: 5,
@@ -290,7 +290,7 @@ func TestRunResumeAndCleanClaudeSessions(t *testing.T) {
 	resumeDir := filepath.Join(env.relayHome, "sessions", "claude-resume-clean")
 	if _, err := Run(context.Background(), Options{
 		SessionDir:     resumeDir,
-		Task:           "PHASE10_SUCCESS",
+		Task:           "CLAUDE_SUCCESS",
 		Agents:         []string{"claude", "codex"},
 		Rounds:         1,
 		TimeoutSeconds: 5,
@@ -314,11 +314,11 @@ func TestRunResumeAndCleanClaudeSessions(t *testing.T) {
 }
 
 func TestRunPersistsClaudeProviderResult(t *testing.T) {
-	env := setupPhase10FakeProviders(t)
+	env := setupClaudeFakeProviders(t)
 	sessionDir := filepath.Join(env.relayHome, "sessions", "claude-provider-result")
 	if _, err := Run(context.Background(), Options{
 		SessionDir:     sessionDir,
-		Task:           "PHASE10_SUCCESS",
+		Task:           "CLAUDE_SUCCESS",
 		Agents:         []string{"claude", "codex"},
 		Rounds:         1,
 		TimeoutSeconds: 5,
@@ -340,7 +340,7 @@ func TestRunPersistsClaudeProviderResult(t *testing.T) {
 	}
 }
 
-func setupPhase10FakeProviders(t *testing.T) phase10Env {
+func setupClaudeFakeProviders(t *testing.T) claudeFakeEnv {
 	t.Helper()
 	root := t.TempDir()
 	binDir := filepath.Join(root, "bin")
@@ -357,7 +357,7 @@ func setupPhase10FakeProviders(t *testing.T) phase10Env {
 	t.Setenv("HOME", homeDir)
 	t.Setenv("CODEX_CLAUDE_HOME", relayHome)
 	t.Setenv("CONVO_RELAY_COMMAND_HOME", homeDir)
-	return phase10Env{relayHome: relayHome, projectDir: projectDir, homeDir: homeDir}
+	return claudeFakeEnv{relayHome: relayHome, projectDir: projectDir, homeDir: homeDir}
 }
 
 func writeEmbeddedProviderFakes(t *testing.T, binDir string) {
@@ -547,9 +547,9 @@ def send(value):
 def text_for(prompt):
     if "Return the updated ledger as JSON" in prompt:
         return '{"settled":["claude facilitator"],"contested":[],"withdrawn":[]}', ""
-    if "PHASE10_RETRYABLE" in prompt:
+    if "CLAUDE_RETRYABLE" in prompt:
         return "", "API Error: rate limit exceeded"
-    if "PHASE10_AUTH_FAILURE" in prompt:
+    if "CLAUDE_AUTH_FAILURE" in prompt:
         return "Authentication error: token expired", "Authentication error: token expired"
     if "second" in prompt.lower():
         return "second reply", ""
@@ -583,7 +583,7 @@ def main():
     user = json.loads(user_line)
     prompt = str((user.get("message") or {}).get("content", ""))
     session_id = arg_value("--resume") or f"claude-{os.getpid()}"
-    if "PHASE10_TIMEOUT" in prompt:
+    if "CLAUDE_TIMEOUT" in prompt:
         while True:
             time.sleep(1)
     text, failure = text_for(prompt)

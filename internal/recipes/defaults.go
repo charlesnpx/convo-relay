@@ -325,9 +325,6 @@ var defaultRelayRecipes = selectedDefaultRelayRecipeRecords(defaultRelayRecipeRe
 func selectedDefaultRelayRecipeRecords(records map[string]map[string]any) map[string]map[string]any {
 	selected := make(map[string]map[string]any, len(records))
 	for recipeID, record := range records {
-		if !includeOptionalRelayRecipeDefaults && stringValue(record["integration_contract"]) != "" {
-			continue
-		}
 		selected[recipeID] = cloneObject(record)
 	}
 	return selected
