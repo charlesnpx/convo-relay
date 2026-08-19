@@ -49,12 +49,10 @@ func ForChild(parent session.Plan, request ChildRequest, recipes []Recipe) (sess
 }
 
 func childRequestAllowed(policy session.ChildPolicy, recipeID string) error {
-	switch policy.Mode {
-	case "deny":
+	// ValidatePlan(parent) has already limited the mode to deny, ask or allow, so
+	// only the deny rejection is reachable here.
+	if policy.Mode == "deny" {
 		return fmt.Errorf("child policy denies child plans")
-	case "ask", "allow":
-	default:
-		return fmt.Errorf("child policy mode %q is not supported", policy.Mode)
 	}
 	if policy.MaxDepth <= 0 {
 		return fmt.Errorf("child policy has no remaining depth")

@@ -414,10 +414,9 @@ func ValidatePlan(plan Plan) error {
 			return fmt.Errorf("plan contains duplicate actor %q", actor.ID)
 		}
 		actorIDs[actor.ID] = false
-		if err := validateToken("actor.backend", actor.Backend); err != nil {
-			return err
-		}
-		if !supportedActorBackend(actor.Backend) {
+		switch actor.Backend {
+		case "claude", "codex", "gemini":
+		default:
 			return fmt.Errorf("actor backend %q is not supported", actor.Backend)
 		}
 		if err := validateOptionalToken("actor.model", actor.Model); err != nil {
@@ -426,9 +425,6 @@ func ValidatePlan(plan Plan) error {
 		if err := validateOptionalToken("actor.effort", actor.Effort); err != nil {
 			return err
 		}
-	}
-	if plan.Schedule.Kind != "dialogue" && plan.Schedule.Kind != "sequence" {
-		return errors.New("schedule kind must be dialogue or sequence")
 	}
 	if plan.Schedule.Turns < 1 {
 		return errors.New("schedule turns must be positive")
@@ -482,6 +478,8 @@ func ValidatePlan(plan Plan) error {
 		if scheduledActorCount != len(plan.Actors)-controlActorCount {
 			return errors.New("sequence schedule must include every actor that does not hold a control role")
 		}
+	default:
+		return errors.New("schedule kind must be dialogue or sequence")
 	}
 	if plan.ProviderRetry.Mode != "allow" && plan.ProviderRetry.Mode != "forbid" {
 		return errors.New("provider_retry mode must be allow or forbid")
@@ -551,21 +549,26 @@ func ValidatePlan(plan Plan) error {
 	if plan.Lifecycle != nil && plan.Lifecycle.Dynamic == "forbid" && plan.ChildPolicy.Mode != "deny" {
 		return errors.New("lifecycle dynamic forbid requires child_policy mode deny")
 	}
+	// A recipe's declared workspace isolation is a minimum. The executable
+	// workspace may strengthen it but never weaken it, per the documented
+	// operator contract. Validated here because the plan is the only place both
+	// values are visible: the compiler emits consistent pairs, but Create and
+	// Open would otherwise persist a contradiction the engine cannot execute
+	// unambiguously - it would have to choose between the recorded minimum and
+	// the weaker executable value.
+	if plan.Lifecycle != nil {
+		minimum, minimumKnown := workspaceIsolationRank(plan.Lifecycle.WorkspaceIsolation)
+		effective, effectiveKnown := workspaceIsolationRank(plan.Workspace.Isolation)
+		if minimumKnown && effectiveKnown && effective < minimum {
+			return fmt.Errorf("workspace isolation %q weakens the recipe minimum %q", plan.Workspace.Isolation, plan.Lifecycle.WorkspaceIsolation)
+		}
+	}
 	if plan.IntegrationContract != "" {
 		if err := validateToken("integration_contract", plan.IntegrationContract); err != nil {
 			return err
 		}
 	}
 	return eventlog.ValidatePortableValue(portableProjection(plan))
-}
-
-func supportedActorBackend(value string) bool {
-	switch value {
-	case "claude", "codex", "gemini":
-		return true
-	default:
-		return false
-	}
 }
 
 // ActorIDs returns deterministic actor ids without exposing an untyped map.
@@ -712,4 +715,20 @@ func (plan Plan) Equal(other Plan) bool {
 func portableProjection(plan Plan) Plan {
 	plan.Task = ""
 	return plan
+}
+
+// workspaceIsolationRank orders the isolation policies weakest to strongest,
+// matching internal/workspace.policyRank, which is the authority. An empty or
+// unrecognised value reports unknown so the enum checks own that rejection.
+func workspaceIsolationRank(value string) (int, bool) {
+	switch value {
+	case "inherited":
+		return 0, true
+	case "read_only":
+		return 1, true
+	case "ephemeral":
+		return 2, true
+	default:
+		return 0, false
+	}
 }

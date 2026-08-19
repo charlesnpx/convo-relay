@@ -335,3 +335,25 @@ func TestValidatePlanRejectsUnknownChildPolicyMode(t *testing.T) {
 		})
 	}
 }
+
+// A recipe's workspace isolation is a minimum the executable workspace may
+// strengthen but not weaken. Both values are only visible on the plan, so the
+// plan validator owns the rule; Create and Open would otherwise persist a
+// contradiction the engine cannot execute unambiguously.
+func TestWorkspaceIsolationCannotWeakenTheRecipeMinimum(t *testing.T) {
+	weakened := testPlan()
+	weakened.SessionID = "workspace-minimum"
+	weakened.Lifecycle = &Lifecycle{Resume: "allow", Steering: "allow", Dynamic: "forbid", WorkspaceIsolation: "ephemeral"}
+	weakened.ChildPolicy.Mode = "deny"
+	weakened.Workspace.Isolation = "inherited"
+	if err := ValidatePlan(weakened); err == nil {
+		t.Fatal("a workspace isolation weaker than the recipe minimum was accepted")
+	}
+
+	strengthened := weakened
+	strengthened.Lifecycle = &Lifecycle{Resume: "allow", Steering: "allow", Dynamic: "forbid", WorkspaceIsolation: "read_only"}
+	strengthened.Workspace.Isolation = "ephemeral"
+	if err := ValidatePlan(strengthened); err != nil {
+		t.Fatalf("strengthening the recipe minimum was rejected: %v", err)
+	}
+}
