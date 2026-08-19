@@ -4,7 +4,7 @@ on:
   push:
     branches: [main]
   pull_request:
-    branches: [main, feature/root-recipe-integration, feature/root-recipe-remediation]
+    branches: [main, feature/relay-v2]
 
 jobs:
   go:
