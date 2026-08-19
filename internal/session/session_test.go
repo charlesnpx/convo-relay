@@ -201,6 +201,8 @@ func testPlan() Plan {
 		Provenance:    ProvenanceOrdinary,
 		Task:          "trace task",
 		Timeouts:      Timeouts{TurnSeconds: 30, StallSeconds: 30},
+		Mode:          ModeAdversarial,
+		Investigation: InvestigationAuto,
 		SchemaVersion: SchemaVersion,
 		Actors: []Actor{{
 			ID: "actor-a", Backend: "codex", Model: "test-model", Effort: "medium",

@@ -211,6 +211,8 @@ func bundlePlan() session.Plan {
 		Provenance:    session.ProvenanceOrdinary,
 		Task:          "trace task",
 		Timeouts:      session.Timeouts{TurnSeconds: 30, StallSeconds: 30},
+		Mode:          session.ModeAdversarial,
+		Investigation: session.InvestigationAuto,
 		SchemaVersion: session.SchemaVersion,
 		Actors:        []session.Actor{{ID: "actor-a", Backend: "codex", Model: "test-model", Effort: "medium"}},
 		Schedule:      session.Schedule{Kind: "dialogue", Turns: 1},

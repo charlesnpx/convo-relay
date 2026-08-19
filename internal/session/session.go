@@ -16,6 +16,20 @@ import (
 	"github.com/charlesnpx/convo-relay/internal/eventlog"
 )
 
+// Relay modes frame how actors address one another.
+const (
+	ModeAdversarial = "adversarial"
+	ModeCooperative = "cooperative"
+	ModeSteelman    = "steelman"
+)
+
+// Investigation levels control how much context an actor receives.
+const (
+	InvestigationAuto        = "auto"
+	InvestigationNormal      = "normal"
+	InvestigationContextOnly = "context_only"
+)
+
 // Provenance values. These label a plan's origin; they never select behaviour.
 const (
 	ProvenanceOrdinary = "ordinary"
@@ -51,7 +65,14 @@ type Plan struct {
 	Task string `json:"task"`
 	// Timeouts govern one provider turn and its stall watchdog. They are compiler
 	// policy, fixed before this immutable boundary.
-	Timeouts      Timeouts      `json:"timeouts"`
+	Timeouts Timeouts `json:"timeouts"`
+	// Mode frames how actors address each other: adversarial, cooperative, or
+	// steelman. It shapes prompts and is recorded per turn, so it is execution
+	// policy rather than presentation.
+	Mode string `json:"mode"`
+	// Investigation controls how much context an actor receives: auto, normal, or
+	// context_only.
+	Investigation string        `json:"investigation"`
 	Actors        []Actor       `json:"actors"`
 	Schedule      Schedule      `json:"schedule"`
 	Facilitator   *Facilitator  `json:"facilitator,omitempty"`
@@ -362,6 +383,16 @@ func ValidatePlan(plan Plan) error {
 	if plan.Timeouts.StallSeconds <= 0 {
 		return errors.New("plan timeouts.stall_seconds must be positive")
 	}
+	switch plan.Mode {
+	case ModeAdversarial, ModeCooperative, ModeSteelman:
+	default:
+		return fmt.Errorf("plan mode must be one of %s, %s, %s", ModeAdversarial, ModeCooperative, ModeSteelman)
+	}
+	switch plan.Investigation {
+	case InvestigationAuto, InvestigationNormal, InvestigationContextOnly:
+	default:
+		return fmt.Errorf("plan investigation must be one of %s, %s, %s", InvestigationAuto, InvestigationNormal, InvestigationContextOnly)
+	}
 	if err := validateToken("session_id", plan.SessionID); err != nil {
 		return err
 	}
@@ -392,6 +423,25 @@ func ValidatePlan(plan Plan) error {
 	}
 	if plan.Schedule.Turns < 1 {
 		return errors.New("schedule turns must be positive")
+	}
+	// Order rules were documented on the field but never enforced here, so a plan
+	// built outside the compiler could carry an invalid sequence. Enforce them at
+	// the type that owns them.
+	if plan.Schedule.Kind == "sequence" {
+		if len(plan.Schedule.Order) == 0 {
+			return errors.New("sequence schedule must state schedule.order")
+		}
+		known := make(map[string]struct{}, len(plan.Actors))
+		for _, actor := range plan.Actors {
+			known[actor.ID] = struct{}{}
+		}
+		for _, id := range plan.Schedule.Order {
+			if _, ok := known[id]; !ok {
+				return fmt.Errorf("schedule.order names unknown actor %q", id)
+			}
+		}
+	} else if len(plan.Schedule.Order) != 0 {
+		return errors.New("schedule.order is only valid for a sequence schedule")
 	}
 	if plan.Facilitator != nil {
 		if _, exists := actorIDs[plan.Facilitator.Actor]; !exists {

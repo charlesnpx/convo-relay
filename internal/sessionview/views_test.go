@@ -137,6 +137,8 @@ func viewPlan() session.Plan {
 		Provenance:    session.ProvenanceOrdinary,
 		Task:          "trace task",
 		Timeouts:      session.Timeouts{TurnSeconds: 30, StallSeconds: 30},
+		Mode:          session.ModeAdversarial,
+		Investigation: session.InvestigationAuto,
 		SchemaVersion: session.SchemaVersion,
 		SessionID:     "session-one",
 		Actors:        []session.Actor{{ID: "actor-a", Backend: "codex", Model: "model", Effort: "medium"}},
