@@ -199,6 +199,8 @@ func testPlan() Plan {
 	return Plan{
 		Kind:          PlanKind,
 		Provenance:    ProvenanceOrdinary,
+		Task:          "trace task",
+		Timeouts:      Timeouts{TurnSeconds: 30, StallSeconds: 30},
 		SchemaVersion: SchemaVersion,
 		Actors: []Actor{{
 			ID: "actor-a", Backend: "codex", Model: "test-model", Effort: "medium",
@@ -216,4 +218,23 @@ func testPlan() Plan {
 
 func fixedTime() time.Time {
 	return time.Date(2026, 8, 18, 12, 0, 0, 0, time.UTC)
+}
+
+// Task carries operator prose that may deliberately name a path, so it is the one
+// field excluded from the portability walk. Every other field must still reject one.
+func TestTaskIsExemptFromPortabilityWalkButOtherFieldsAreNot(t *testing.T) {
+	plan := testPlan()
+	plan.SessionID = "task-exempt"
+	plan.Task = "review /Users/someone/project/main.go and report back"
+	if err := ValidatePlan(plan); err != nil {
+		t.Fatalf("operator task naming a path was rejected: %v", err)
+	}
+
+	leaky := testPlan()
+	leaky.SessionID = "task-exempt"
+	leaky.Provenance = ProvenanceRecipe
+	leaky.RecipeID = "/Users/someone/recipes/panel.toml"
+	if err := ValidatePlan(leaky); err == nil {
+		t.Fatal("an absolute path in recipe_id was accepted")
+	}
 }

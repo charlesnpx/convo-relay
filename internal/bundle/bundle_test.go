@@ -209,6 +209,8 @@ func bundlePlan() session.Plan {
 	return session.Plan{
 		Kind:          session.PlanKind,
 		Provenance:    session.ProvenanceOrdinary,
+		Task:          "trace task",
+		Timeouts:      session.Timeouts{TurnSeconds: 30, StallSeconds: 30},
 		SchemaVersion: session.SchemaVersion,
 		Actors:        []session.Actor{{ID: "actor-a", Backend: "codex", Model: "test-model", Effort: "medium"}},
 		Schedule:      session.Schedule{Kind: "dialogue", Turns: 1},

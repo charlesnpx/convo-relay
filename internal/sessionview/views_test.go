@@ -135,6 +135,8 @@ func viewPlan() session.Plan {
 	return session.Plan{
 		Kind:          session.PlanKind,
 		Provenance:    session.ProvenanceOrdinary,
+		Task:          "trace task",
+		Timeouts:      session.Timeouts{TurnSeconds: 30, StallSeconds: 30},
 		SchemaVersion: session.SchemaVersion,
 		SessionID:     "session-one",
 		Actors:        []session.Actor{{ID: "actor-a", Backend: "codex", Model: "model", Effort: "medium"}},

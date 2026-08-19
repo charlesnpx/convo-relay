@@ -41,7 +41,17 @@ type Plan struct {
 	Provenance string `json:"provenance"`
 	// RecipeID names the recipe a plan was compiled from, when it was. The
 	// public run report surfaces it, so it is part of the operator contract.
-	RecipeID      string        `json:"recipe_id,omitempty"`
+	RecipeID string `json:"recipe_id,omitempty"`
+	// Task is the operator's stated purpose for the run. It is deliberately a
+	// plain string rather than a blob reference so the compiler stays a pure
+	// function of its inputs and needs no blobstore. It is also the one field
+	// excluded from the portability walk: it is operator-authored prose that may
+	// legitimately name a path, and it reads identically on every machine, so it
+	// is intentional content rather than incidental machine state.
+	Task string `json:"task"`
+	// Timeouts govern one provider turn and its stall watchdog. They are compiler
+	// policy, fixed before this immutable boundary.
+	Timeouts      Timeouts      `json:"timeouts"`
 	Actors        []Actor       `json:"actors"`
 	Schedule      Schedule      `json:"schedule"`
 	Facilitator   *Facilitator  `json:"facilitator,omitempty"`
@@ -64,6 +74,17 @@ type Schedule struct {
 	Kind              string `json:"kind"`
 	Turns             int    `json:"turns"`
 	StopOnConvergence bool   `json:"stop_on_convergence"`
+	// Order is the explicit per-turn actor sequence for a sequence schedule. It
+	// exists so a fixed order is stated rather than inferred from the position of
+	// entries in Actors. It must be empty for a dialogue schedule.
+	Order []string `json:"order,omitempty"`
+}
+
+// Timeouts is measured in seconds. Zero is not valid: a plan states its own
+// limits rather than letting a downstream default decide.
+type Timeouts struct {
+	TurnSeconds  int `json:"turn_seconds"`
+	StallSeconds int `json:"stall_seconds"`
 }
 
 type Facilitator struct {
@@ -149,7 +170,7 @@ func CreateWithOptions(options CreateOptions) (*Session, error) {
 	if err := ValidatePlan(plan); err != nil {
 		return nil, err
 	}
-	if err := eventlog.ValidatePortableValue(plan, root, relayHome); err != nil {
+	if err := eventlog.ValidatePortableValue(portableProjection(plan), root, relayHome); err != nil {
 		return nil, err
 	}
 	if err := os.MkdirAll(filepath.Join(root, "runtime"), 0o700); err != nil {
@@ -240,7 +261,7 @@ func Open(root string) (*Session, error) {
 	if err := ValidatePlan(plan); err != nil {
 		return nil, err
 	}
-	if err := eventlog.ValidatePortableValue(plan, cleaned); err != nil {
+	if err := eventlog.ValidatePortableValue(portableProjection(plan), cleaned); err != nil {
 		return nil, err
 	}
 	digest, err := eventlog.SemanticJSONDigestBytes(body)
@@ -332,6 +353,15 @@ func ValidatePlan(plan Plan) error {
 	if plan.Provenance == ProvenanceRecipe && plan.RecipeID == "" {
 		return errors.New("plan compiled from a recipe must record recipe_id")
 	}
+	if strings.TrimSpace(plan.Task) == "" {
+		return errors.New("plan must state a task")
+	}
+	if plan.Timeouts.TurnSeconds <= 0 {
+		return errors.New("plan timeouts.turn_seconds must be positive")
+	}
+	if plan.Timeouts.StallSeconds <= 0 {
+		return errors.New("plan timeouts.stall_seconds must be positive")
+	}
 	if err := validateToken("session_id", plan.SessionID); err != nil {
 		return err
 	}
@@ -422,7 +452,7 @@ func ValidatePlan(plan Plan) error {
 			return fmt.Errorf("result schema is not strict JSON: %w", err)
 		}
 	}
-	return eventlog.ValidatePortableValue(plan)
+	return eventlog.ValidatePortableValue(portableProjection(plan))
 }
 
 // ActorIDs returns deterministic actor ids without exposing an untyped map.
@@ -495,4 +525,13 @@ func (plan Plan) Equal(other Plan) bool {
 	left, leftErr := CanonicalBytes(plan)
 	right, rightErr := CanonicalBytes(other)
 	return leftErr == nil && rightErr == nil && bytes.Equal(left, right)
+}
+
+// portableProjection returns the plan with Task cleared, for the portability walk
+// only. Task is operator-authored prose that may deliberately name a path; it is
+// identical on every machine, so it cannot break relocation of a bundle. Every
+// other field stays bound, including the recipe id and every input name.
+func portableProjection(plan Plan) Plan {
+	plan.Task = ""
+	return plan
 }
