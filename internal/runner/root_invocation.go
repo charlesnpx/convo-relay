@@ -34,7 +34,7 @@ type rootInvocationPersistenceError struct{ cause error }
 
 func (e rootInvocationPersistenceError) Error() string          { return e.cause.Error() }
 func (e rootInvocationPersistenceError) Unwrap() error          { return e.cause }
-func (e rootInvocationPersistenceError) suppressProviderRetry() {}
+func (e rootInvocationPersistenceError) SuppressProviderRetry() {}
 
 // rootProviderInvocationAfterSave is a test-only failpoint after a provider
 // invocation ref is durable in metadata. Production leaves it nil.

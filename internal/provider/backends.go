@@ -1,4 +1,4 @@
-package runner
+package provider
 
 import (
 	"bytes"
@@ -12,6 +12,9 @@ import (
 	"strings"
 	"time"
 
+	"github.com/charlesnpx/convo-relay/internal/contracts"
+	"github.com/charlesnpx/convo-relay/internal/gitexec"
+	"github.com/charlesnpx/convo-relay/internal/model"
 	"github.com/charlesnpx/convo-relay/internal/recipes"
 )
 
@@ -26,7 +29,7 @@ type TurnResult struct {
 	Stalled           bool
 	Recovered         bool
 	ProviderResult    ProviderResult
-	ProviderResultRef map[string]any
+	ProviderResultRef Metadata
 }
 
 type SlotConfig struct {
@@ -40,14 +43,76 @@ type SlotConfig struct {
 	MaxDepth        int
 }
 
+// providerState keeps the provider-owned persisted state wire-compatible with
+// existing sessions while preventing the raw session metadata map from
+// crossing the exported provider boundary.
+type providerState = map[string]any
+
+// SlotState is the persisted state of one provider slot.
+type SlotState = providerState
+
+// Metadata is provider-owned structured metadata retained for compatibility.
+type Metadata = providerState
+
 type Backend interface {
 	Name() string
 	SlotID() string
 	Label() string
 	RunTurn(context.Context, string, TurnOptions) (TurnResult, error)
-	SessionState() map[string]any
-	RestoreState(map[string]any, SlotConfig) error
+	SessionState() SlotState
+	RestoreState(SlotState, SlotConfig) error
 	Cleanup() error
+}
+
+// RelayConstructor supplies only the runner-owned relay pseudo-backend. The
+// provider package constructs every declared external provider itself.
+type RelayConstructor func(sessionRoot string, slotID string, label string, cwd string, config SlotConfig) (Backend, error)
+
+// SlotBuildInput contains the typed launch information needed to create the
+// two participant slots.
+type SlotBuildInput struct {
+	Agents           []string
+	SessionRoot      string
+	LaunchCWD        string
+	Configs          []SlotConfig
+	RuntimeConfig    recipes.RuntimeConfig
+	SettingsPath     string
+	RelayDepth       int
+	MaxRelayDepth    int
+	RelayConstructor RelayConstructor
+}
+
+// PersistedSlot is the typed representation of one decoded session slot.
+// Runner owns decoding it from legacy session metadata.
+type PersistedSlot struct {
+	Backend       string
+	SlotID        string
+	Label         string
+	LogicalSlotID string
+	Generation    int
+	ProfileID     string
+	State         SlotState
+}
+
+// RestoreSlotsInput contains typed restored-slot data and launch context.
+type RestoreSlotsInput struct {
+	Slots            []PersistedSlot
+	SessionRoot      string
+	LaunchCWD        string
+	Overrides        []SlotConfig
+	RuntimeConfig    recipes.RuntimeConfig
+	SettingsPath     string
+	RelayDepth       int
+	MaxRelayDepth    int
+	Replacements     []string
+	AppliesFromRound int
+	RelayConstructor RelayConstructor
+}
+
+// RestoreSlotsResult is the typed output of a slot restoration.
+type RestoreSlotsResult struct {
+	Slots             []Backend
+	ReplacementEvents []model.SlotReplacementRecord
 }
 
 type processResult struct {
@@ -89,11 +154,27 @@ func newBackend(backendName string, sessionRoot string, slotID string, label str
 		return newEmbeddedCodexBackend(sessionRoot, slotID, label, cwd, config), nil
 	case "gemini":
 		return newGeminiBackend(sessionRoot, slotID, label, cwd, config), nil
-	case "relay":
-		return newRelayBackend(sessionRoot, slotID, label, cwd, config), nil
 	default:
 		return nil, fmt.Errorf("unsupported backend %q for Go runner", backendName)
 	}
+}
+
+// NewBackend constructs one declared external provider adapter. Relay is a
+// runner pseudo-backend and is supplied only by the runner-side constructor.
+func NewBackend(backendName string, sessionRoot string, slotID string, label string, cwd string, config SlotConfig) (Backend, error) {
+	return newBackend(backendName, sessionRoot, slotID, label, cwd, config)
+}
+
+func KnownBackend(name string) bool {
+	return knownBackend(name)
+}
+
+func BackendLabel(name string) string {
+	return backendLabel(name)
+}
+
+func FacilitatorBackendAllowed(name string) bool {
+	return facilitatorBackendAllowed(name)
 }
 
 func facilitatorBackendAllowed(name string) bool {
@@ -125,6 +206,26 @@ func ParseAgents(rawAgents string) ([]string, bool, error) {
 }
 
 func buildSlots(agents []string, sessionRoot string, launchCWD string, configs []SlotConfig, runtimeConfig recipes.RuntimeConfig, settingsPath string, relayDepth int, maxRelayDepth int) ([]Backend, error) {
+	return buildSlotsWithConstructor(agents, sessionRoot, launchCWD, configs, runtimeConfig, settingsPath, relayDepth, maxRelayDepth, nil)
+}
+
+// BuildSlots builds slots from typed launch configuration. The optional relay
+// constructor retains the runner-owned relay pseudo-backend.
+func BuildSlots(input SlotBuildInput) ([]Backend, error) {
+	return buildSlotsWithConstructor(
+		input.Agents,
+		input.SessionRoot,
+		input.LaunchCWD,
+		input.Configs,
+		input.RuntimeConfig,
+		input.SettingsPath,
+		input.RelayDepth,
+		input.MaxRelayDepth,
+		input.RelayConstructor,
+	)
+}
+
+func buildSlotsWithConstructor(agents []string, sessionRoot string, launchCWD string, configs []SlotConfig, runtimeConfig recipes.RuntimeConfig, settingsPath string, relayDepth int, maxRelayDepth int, relayConstructor RelayConstructor) ([]Backend, error) {
 	if len(agents) != 2 {
 		return nil, fmt.Errorf("--agents requires exactly two backends")
 	}
@@ -157,13 +258,20 @@ func buildSlots(agents []string, sessionRoot string, launchCWD string, configs [
 	for index, agent := range resolved {
 		config := resolvedConfigs[index]
 		cwd := resolveBackendCWD(launchCWD, sessionRoot, agent)
-		backend, err := newBackend(agent, sessionRoot, fmt.Sprintf("slot_%d", index), labels[index], cwd, config)
+		backend, err := newBackendForSlot(agent, sessionRoot, fmt.Sprintf("slot_%d", index), labels[index], cwd, config, relayConstructor)
 		if err != nil {
 			return nil, err
 		}
 		slots = append(slots, backend)
 	}
 	return slots, nil
+}
+
+func newBackendForSlot(backendName string, sessionRoot string, slotID string, label string, cwd string, config SlotConfig, relayConstructor RelayConstructor) (Backend, error) {
+	if strings.TrimSpace(backendName) == "relay" && relayConstructor != nil {
+		return relayConstructor(sessionRoot, slotID, label, cwd, config)
+	}
+	return newBackend(backendName, sessionRoot, slotID, label, cwd, config)
 }
 
 func resolveAgent(agent string, override SlotConfig, profiles map[string]map[string]any) (string, SlotConfig, error) {
@@ -197,39 +305,26 @@ func resolveAgent(agent string, override SlotConfig, profiles map[string]map[str
 	return backendName, config, nil
 }
 
-func restoreSlots(meta map[string]any, sessionRoot string, overrides []SlotConfig, runtimeConfig recipes.RuntimeConfig, settingsPath string, relayDepth int, maxRelayDepth int) ([]Backend, error) {
-	slots, _, err := restoreSlotsWithReplacements(meta, sessionRoot, overrides, runtimeConfig, settingsPath, relayDepth, maxRelayDepth, nil, 0)
-	return slots, err
-}
-
-func restoreSlotsForResume(meta map[string]any, sessionRoot string, overrides []SlotConfig, runtimeConfig recipes.RuntimeConfig, settingsPath string, relayDepth int, maxRelayDepth int, replacements []string, appliesFromRound int) ([]Backend, []map[string]any, error) {
-	return restoreSlotsWithReplacements(meta, sessionRoot, overrides, runtimeConfig, settingsPath, relayDepth, maxRelayDepth, replacements, appliesFromRound)
-}
-
-func restoreSlotsWithReplacements(meta map[string]any, sessionRoot string, overrides []SlotConfig, runtimeConfig recipes.RuntimeConfig, settingsPath string, relayDepth int, maxRelayDepth int, replacements []string, appliesFromRound int) ([]Backend, []map[string]any, error) {
-	rawSlots, ok := meta["slots"].([]any)
-	if !ok || len(rawSlots) != 2 {
-		return nil, nil, fmt.Errorf("session metadata must contain exactly two slots")
+// RestoreSlots restores provider slots from runner-decoded typed metadata.
+func RestoreSlots(input RestoreSlotsInput) (RestoreSlotsResult, error) {
+	if len(input.Slots) != 2 {
+		return RestoreSlotsResult{}, fmt.Errorf("session metadata must contain exactly two slots")
 	}
-	replacementAgents := normalizeReplacementAgents(replacements, len(rawSlots))
-	slots := make([]Backend, 0, len(rawSlots))
-	replacementEvents := []map[string]any{}
-	for index, rawSlot := range rawSlots {
-		slotEntry, ok := rawSlot.(map[string]any)
-		if !ok {
-			return nil, nil, fmt.Errorf("slot %d metadata must be an object", index)
-		}
-		backendName, _ := slotEntry["backend"].(string)
-		slotID, _ := slotEntry["slot_id"].(string)
-		label, _ := slotEntry["label"].(string)
+	replacementAgents := normalizeReplacementAgents(input.Replacements, len(input.Slots))
+	slots := make([]Backend, 0, len(input.Slots))
+	replacementEvents := make([]model.SlotReplacementRecord, 0)
+	for index, slotEntry := range input.Slots {
+		backendName := slotEntry.Backend
+		slotID := slotEntry.SlotID
+		label := slotEntry.Label
 		if backendName == "" || slotID == "" {
-			return nil, nil, fmt.Errorf("slot %d metadata is missing backend or slot_id", index)
+			return RestoreSlotsResult{}, fmt.Errorf("slot %d metadata is missing backend or slot_id", index)
 		}
-		override := slotConfigForRestore(index, overrides, runtimeConfig, settingsPath, relayDepth, maxRelayDepth)
+		override := slotConfigForRestore(index, input.Overrides, input.RuntimeConfig, input.SettingsPath, input.RelayDepth, input.MaxRelayDepth)
 		if replacementAgent := replacementAgents[index]; replacementAgent != "" {
-			backend, event, err := replacementSlot(meta, sessionRoot, slotEntry, index, replacementAgent, override, runtimeConfig, appliesFromRound)
+			backend, event, err := replacementSlot(input.SessionRoot, input.LaunchCWD, slotEntry, index, replacementAgent, override, input.RuntimeConfig, input.AppliesFromRound, input.RelayConstructor)
 			if err != nil {
-				return nil, nil, err
+				return RestoreSlotsResult{}, err
 			}
 			slots = append(slots, backend)
 			replacementEvents = append(replacementEvents, event)
@@ -238,17 +333,16 @@ func restoreSlotsWithReplacements(meta map[string]any, sessionRoot string, overr
 		if label == "" {
 			label = backendLabel(backendName)
 		}
-		state, _ := slotEntry["state"].(map[string]any)
-		backend, err := newBackend(backendName, sessionRoot, slotID, label, sessionRoot, override)
+		backend, err := newBackendForSlot(backendName, input.SessionRoot, slotID, label, input.SessionRoot, override, input.RelayConstructor)
 		if err != nil {
-			return nil, nil, err
+			return RestoreSlotsResult{}, err
 		}
-		if err := backend.RestoreState(state, override); err != nil {
-			return nil, nil, fmt.Errorf("slot %s has invalid %s state: %w", slotID, backendName, err)
+		if err := backend.RestoreState(slotEntry.State, override); err != nil {
+			return RestoreSlotsResult{}, fmt.Errorf("slot %s has invalid %s state: %w", slotID, backendName, err)
 		}
 		slots = append(slots, backend)
 	}
-	return slots, replacementEvents, nil
+	return RestoreSlotsResult{Slots: slots, ReplacementEvents: replacementEvents}, nil
 }
 
 func normalizeReplacementAgents(replacements []string, count int) []string {
@@ -277,21 +371,20 @@ func slotConfigForRestore(index int, overrides []SlotConfig, runtimeConfig recip
 	return override
 }
 
-func replacementSlot(meta map[string]any, sessionRoot string, oldSlot map[string]any, index int, requestedAgent string, override SlotConfig, runtimeConfig recipes.RuntimeConfig, appliesFromRound int) (Backend, map[string]any, error) {
+func replacementSlot(sessionRoot string, launchCWD string, oldSlot PersistedSlot, index int, requestedAgent string, override SlotConfig, runtimeConfig recipes.RuntimeConfig, appliesFromRound int, relayConstructor RelayConstructor) (Backend, model.SlotReplacementRecord, error) {
 	backendName, resolvedConfig, err := resolveReplacementAgent(requestedAgent, override, runtimeConfig.BackendProfiles)
 	if err != nil {
-		return nil, nil, err
+		return nil, model.SlotReplacementRecord{}, err
 	}
 	logicalSlotID := slotEntryLogicalSlotID(oldSlot, index)
 	previousGeneration := slotEntryGeneration(oldSlot)
 	newGeneration := previousGeneration + 1
 	newSlotID := physicalSlotID(logicalSlotID, newGeneration)
 	label := replacementSlotLabel(backendName, index)
-	launchCWD := firstNonEmpty(stringFromAny(meta["launch_cwd"]), sessionRoot)
-	cwd := resolveBackendCWD(launchCWD, sessionRoot, backendName)
-	backend, err := newBackend(backendName, sessionRoot, newSlotID, label, cwd, resolvedConfig)
+	cwd := resolveBackendCWD(firstNonEmpty(launchCWD, sessionRoot), sessionRoot, backendName)
+	backend, err := newBackendForSlot(backendName, sessionRoot, newSlotID, label, cwd, resolvedConfig, relayConstructor)
 	if err != nil {
-		return nil, nil, err
+		return nil, model.SlotReplacementRecord{}, err
 	}
 	return backend, slotReplacementPayload(sessionRoot, oldSlot, backend, index, requestedAgent, resolvedConfig.ProfileID, appliesFromRound), nil
 }
@@ -315,15 +408,15 @@ func replacementSlotLabel(backendName string, index int) string {
 	return backendLabel(backendName)
 }
 
-func slotReplacementPayload(sessionRoot string, oldSlot map[string]any, backend Backend, index int, requestedAgent string, newProfileID string, appliesFromRound int) map[string]any {
-	oldState, _ := oldSlot["state"].(map[string]any)
-	previousSlotID := stringFromAny(oldSlot["slot_id"])
-	previousBackend := stringFromAny(oldSlot["backend"])
+func slotReplacementPayload(sessionRoot string, oldSlot PersistedSlot, backend Backend, index int, requestedAgent string, newProfileID string, appliesFromRound int) model.SlotReplacementRecord {
+	oldState := oldSlot.State
+	previousSlotID := oldSlot.SlotID
+	previousBackend := oldSlot.Backend
 	logicalSlotID := slotEntryLogicalSlotID(oldSlot, index)
 	previousGeneration := slotEntryGeneration(oldSlot)
 	newState := backend.SessionState()
 	newSlotID := backend.SlotID()
-	return map[string]any{
+	return model.NewSlotReplacementRecord(map[string]any{
 		"kind":                        "slot_replacement",
 		"schema_version":              1,
 		"source":                      "resume",
@@ -363,34 +456,36 @@ func slotReplacementPayload(sessionRoot string, oldSlot map[string]any, backend 
 			"model":      emptyStringAsNil(slotStateModel(newState)),
 			"effort":     emptyStringAsNil(slotStateEffort(newState)),
 		},
+	})
+}
+
+func slotEntryLogicalSlotID(slotEntry PersistedSlot, index int) string {
+	return firstNonEmpty(slotEntry.LogicalSlotID, logicalSlotIDForSlotID(slotEntry.SlotID), logicalSlotIDForIndex(index))
+}
+
+func slotEntryGeneration(slotEntry PersistedSlot) int {
+	generation := slotEntry.Generation
+	if generation == 0 {
+		generation = slotGenerationForSlotID(slotEntry.SlotID)
 	}
-}
-
-func slotEntryLogicalSlotID(slotEntry map[string]any, index int) string {
-	return firstNonEmpty(stringFromAny(slotEntry["logical_slot_id"]), logicalSlotIDForSlotID(stringFromAny(slotEntry["slot_id"])), logicalSlotIDForIndex(index))
-}
-
-func slotEntryGeneration(slotEntry map[string]any) int {
-	generation := intFromAny(slotEntry["generation"], slotGenerationForSlotID(stringFromAny(slotEntry["slot_id"])))
 	if generation < 1 {
 		return 1
 	}
 	return generation
 }
 
-func slotEntryProfileID(slotEntry map[string]any) string {
-	if profileID := stringFromAny(slotEntry["profile_id"]); profileID != "" {
-		return profileID
+func slotEntryProfileID(slotEntry PersistedSlot) string {
+	if slotEntry.ProfileID != "" {
+		return slotEntry.ProfileID
 	}
-	state, _ := slotEntry["state"].(map[string]any)
-	return stringFromAny(state["profile_id"])
+	return stringFromAny(slotEntry.State["profile_id"])
 }
 
-func slotStateModel(state map[string]any) string {
+func slotStateModel(state SlotState) string {
 	return firstNonEmpty(stringFromAny(state["model"]), stringFromAny(state["recipe_id"]))
 }
 
-func slotStateEffort(state map[string]any) string {
+func slotStateEffort(state SlotState) string {
 	if effort := stringFromAny(state["effort"]); effort != "" {
 		return effort
 	}
@@ -436,6 +531,10 @@ func slotLabels(agents []string) []string {
 	return labels
 }
 
+func SlotLabels(agents []string) []string {
+	return slotLabels(agents)
+}
+
 func slotEnvelope(slot Backend) map[string]any {
 	logicalSlotID := logicalSlotIDForSlotID(slot.SlotID())
 	generation := slotGenerationForSlotID(slot.SlotID())
@@ -452,6 +551,12 @@ func slotEnvelope(slot Backend) map[string]any {
 	}
 }
 
+// SlotEnvelope converts provider state to the project slot record used by
+// runner-owned session persistence.
+func SlotEnvelope(slot Backend) model.SlotEnvelope {
+	return model.NewSlotEnvelope(slotEnvelope(slot))
+}
+
 func logicalSlotIDForSlotID(slotID string) string {
 	slotID = strings.TrimSpace(slotID)
 	if slotID == "" {
@@ -461,6 +566,10 @@ func logicalSlotIDForSlotID(slotID string) string {
 		return base
 	}
 	return slotID
+}
+
+func LogicalSlotIDForSlotID(slotID string) string {
+	return logicalSlotIDForSlotID(slotID)
 }
 
 func slotGenerationForSlotID(slotID string) int {
@@ -477,6 +586,10 @@ func slotGenerationForSlotID(slotID string) int {
 		return 1
 	}
 	return generation
+}
+
+func SlotGenerationForSlotID(slotID string) int {
+	return slotGenerationForSlotID(slotID)
 }
 
 func physicalSlotID(logicalSlotID string, generation int) string {
@@ -567,4 +680,114 @@ func runSubprocess(ctx context.Context, command []string, prompt string, cwd str
 
 func collapseWhitespace(value string) string {
 	return strings.Join(strings.Fields(value), " ")
+}
+
+func CollapseWhitespace(value string) string {
+	return collapseWhitespace(value)
+}
+
+func cloneRuntimeConfig(config recipes.RuntimeConfig) recipes.RuntimeConfig {
+	return recipes.RuntimeConfig{
+		BackendProfiles: mapStringObjectMap(config.BackendProfiles),
+		RelayRecipes:    mapStringObjectMap(config.RelayRecipes),
+		Limits:          config.EffectiveLimits(),
+		SettingsPath:    strings.TrimSpace(config.SettingsPath),
+	}
+}
+
+func mapStringObjectMap(value any) map[string]map[string]any {
+	result := map[string]map[string]any{}
+	switch typed := value.(type) {
+	case map[string]map[string]any:
+		for key, child := range typed {
+			result[key] = cloneMap(child)
+		}
+	case map[string]any:
+		for key, raw := range typed {
+			if child, ok := raw.(map[string]any); ok {
+				result[key] = cloneMap(child)
+			}
+		}
+	}
+	return result
+}
+
+func cloneMap(value map[string]any) map[string]any {
+	if value == nil {
+		return nil
+	}
+	cloned, _ := contracts.Materialize(value).(map[string]any)
+	return cloned
+}
+
+func intFromAny(value any, fallback int) int {
+	switch typed := value.(type) {
+	case int:
+		return typed
+	case int64:
+		return int(typed)
+	case float64:
+		return int(typed)
+	case jsonNumber:
+		if value, err := typed.Int64(); err == nil {
+			return int(value)
+		}
+	}
+	return fallback
+}
+
+type jsonNumber interface {
+	Int64() (int64, error)
+}
+
+func stringFromAny(value any) string {
+	if value == nil {
+		return ""
+	}
+	if text, ok := value.(string); ok {
+		return text
+	}
+	return fmt.Sprint(value)
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" {
+			return value
+		}
+	}
+	return ""
+}
+
+func utcNow() string {
+	return time.Now().UTC().Format("2006-01-02T15:04:05.000000+00:00")
+}
+
+func pathWithinGitRepo(path string) bool {
+	_, ok := gitRootForPath(path)
+	return ok
+}
+
+func gitRootForPath(path string) (string, bool) {
+	if path == "" {
+		return "", false
+	}
+	info, err := os.Stat(path)
+	if err != nil || !info.IsDir() {
+		return "", false
+	}
+	output, err := gitexec.Run(context.Background(), "git", path, nil, "rev-parse", "--show-toplevel")
+	if err != nil {
+		return "", false
+	}
+	root := strings.TrimSpace(string(output))
+	root, err = filepath.EvalSymlinks(root)
+	if err != nil {
+		return "", false
+	}
+	root, err = filepath.Abs(root)
+	if err != nil {
+		return "", false
+	}
+	return filepath.Clean(root), true
 }

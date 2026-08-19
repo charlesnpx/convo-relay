@@ -29,10 +29,6 @@ func TestEmbeddedClaudeBackendRunTurnStateAndResumeProtocol(t *testing.T) {
 	if err != nil {
 		t.Fatalf("new backend: %v", err)
 	}
-	if _, ok := backend.(*embeddedBackend); !ok {
-		t.Fatalf("backend type = %T, want embeddedBackend", backend)
-	}
-
 	first, err := backend.RunTurn(context.Background(), "CLAUDE_SUCCESS first", TurnOptions{TimeoutSeconds: 5})
 	if err != nil {
 		t.Fatalf("first run turn: %v", err)
