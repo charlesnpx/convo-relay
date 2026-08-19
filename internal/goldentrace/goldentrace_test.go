@@ -1068,9 +1068,14 @@ func traceGit(t *testing.T, dir string, args ...string) {
 		t.Fatalf("create isolated git XDG config: %v", err)
 	}
 	command := make([]string, 0, len(args)+4)
+	emptyTemplate := filepath.Join(fixtureRoot, "fixture-git-empty-template")
+	if err := os.MkdirAll(emptyTemplate, 0o755); err != nil {
+		t.Fatalf("create isolated git template dir: %v", err)
+	}
 	command = append(command,
 		"-c", "commit.gpgSign=false",
 		"-c", "core.hooksPath="+filepath.Join(fixtureRoot, "fixture-git-hooks-disabled"),
+		"-c", "init.templateDir="+emptyTemplate,
 	)
 	command = append(command, args...)
 	cmd := exec.Command("git", command...)
@@ -1081,10 +1086,16 @@ func traceGit(t *testing.T, dir string, args ...string) {
 		"GIT_CONFIG_GLOBAL":   filepath.Join(fixtureRoot, "fixture-git-global-config"),
 		"GIT_CONFIG_NOSYSTEM": "1",
 		"GIT_CONFIG_COUNT":    "0",
-		"GIT_AUTHOR_NAME":     "goldentrace",
-		"GIT_AUTHOR_EMAIL":    "goldentrace@example.invalid",
-		"GIT_COMMITTER_NAME":  "goldentrace",
-		"GIT_COMMITTER_EMAIL": "goldentrace@example.invalid",
+		// GIT_CONFIG_COUNT only neutralises GIT_CONFIG_KEY/VALUE pairs. Git also
+		// propagates -c settings to subprocesses through the legacy
+		// GIT_CONFIG_PARAMETERS channel, and a template dir arrives by env var as
+		// well as by config, so both are cleared explicitly.
+		"GIT_CONFIG_PARAMETERS": "",
+		"GIT_TEMPLATE_DIR":      emptyTemplate,
+		"GIT_AUTHOR_NAME":       "goldentrace",
+		"GIT_AUTHOR_EMAIL":      "goldentrace@example.invalid",
+		"GIT_COMMITTER_NAME":    "goldentrace",
+		"GIT_COMMITTER_EMAIL":   "goldentrace@example.invalid",
 	})
 	output, err := cmd.CombinedOutput()
 	if err != nil {
