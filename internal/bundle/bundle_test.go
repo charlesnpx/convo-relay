@@ -209,18 +209,22 @@ func bundlePlan() session.Plan {
 	return session.Plan{
 		Kind:          session.PlanKind,
 		Provenance:    session.ProvenanceOrdinary,
+		SessionID:     "bundle-plan",
 		Task:          "trace task",
 		Timeouts:      session.Timeouts{TurnSeconds: 30, StallSeconds: 30},
 		Mode:          session.ModeAdversarial,
 		Investigation: session.InvestigationAuto,
 		SchemaVersion: session.SchemaVersion,
-		Actors:        []session.Actor{{ID: "actor-a", Backend: "codex", Model: "test-model", Effort: "medium"}},
+		Actors: []session.Actor{
+			{ID: "actor-a", Backend: "codex", Model: "test-model", Effort: "medium"},
+			{ID: "actor-b", Backend: "claude", Model: "test-model", Effort: "medium"},
+		},
 		Schedule:      session.Schedule{Kind: "dialogue", Turns: 1},
 		ProviderRetry: session.ProviderRetry{Mode: "allow", MaxAttempts: 1},
 		Workspace:     session.Workspace{Mode: "current"},
 		Inputs:        []session.Input{},
-		ChildPolicy:   session.ChildPolicy{Mode: "disabled", AllowedRecipes: []string{}},
-		Result:        session.Result{Format: "text"},
+		ChildPolicy:   session.ChildPolicy{Mode: "deny", MaxDepth: 0, MaxChildren: 0, MaxTurns: 0, AllowedRecipes: []string{}},
+		Result:        session.Result{Source: "last_turn", Format: "text"},
 	}
 }
 

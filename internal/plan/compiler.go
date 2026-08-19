@@ -38,9 +38,6 @@ func compile(plan session.Plan) (session.Plan, error) {
 	if err := session.ValidatePlan(plan); err != nil {
 		return session.Plan{}, fmt.Errorf("validate compiled plan: %w", err)
 	}
-	if err := validateCompilerSemantics(plan); err != nil {
-		return session.Plan{}, err
-	}
 	return plan, nil
 }
 
@@ -126,43 +123,6 @@ func normalizedSessionID(value string) string {
 	return value
 }
 
-func validateCompilerSemantics(plan session.Plan) error {
-	for _, actor := range plan.Actors {
-		if !knownBackend(actor.Backend) {
-			if strings.TrimSpace(actor.Backend) == "relay" {
-				return fmt.Errorf("relay backend is not supported for actor %q", actor.ID)
-			}
-			return fmt.Errorf("unknown backend %q for actor %q", actor.Backend, actor.ID)
-		}
-	}
-	if plan.Schedule.Kind == "dialogue" && len(participants(plan)) != 2 {
-		return fmt.Errorf("dialogue schedule requires exactly two participants, got %d", len(participants(plan)))
-	}
-	return nil
-}
-
-// participants derives schedule membership from the one authoritative source:
-// the sequence order, or actors that do not hold a dialogue control role.
-func participants(plan session.Plan) []string {
-	if plan.Schedule.Kind == "sequence" {
-		return append([]string{}, plan.Schedule.Order...)
-	}
-	controls := map[string]struct{}{}
-	if plan.Facilitator != nil {
-		controls[plan.Facilitator.Actor] = struct{}{}
-	}
-	if plan.Reducer != nil {
-		controls[plan.Reducer.Actor] = struct{}{}
-	}
-	result := make([]string, 0, len(plan.Actors))
-	for _, actor := range plan.Actors {
-		if _, control := controls[actor.ID]; !control {
-			result = append(result, actor.ID)
-		}
-	}
-	return result
-}
-
 func copyPlan(plan session.Plan) session.Plan {
 	plan.Actors = append([]session.Actor{}, plan.Actors...)
 	if plan.Actors == nil {
@@ -193,10 +153,6 @@ func copyPlan(plan session.Plan) session.Plan {
 		plan.Skills = []session.Input{}
 	}
 	plan.TaskPlan = append(json.RawMessage{}, plan.TaskPlan...)
-	plan.RequiredCapabilities = append([]string{}, plan.RequiredCapabilities...)
-	if plan.RequiredCapabilities == nil {
-		plan.RequiredCapabilities = []string{}
-	}
 	plan.MatchKeywords = append([]string{}, plan.MatchKeywords...)
 	if plan.MatchKeywords == nil {
 		plan.MatchKeywords = []string{}
@@ -211,22 +167,4 @@ func copyPlan(plan session.Plan) session.Plan {
 		plan.Lifecycle = &lifecycle
 	}
 	return plan
-}
-
-func findActor(actors []session.Actor, actorID string) (session.Actor, bool) {
-	for _, actor := range actors {
-		if actor.ID == actorID {
-			return actor, true
-		}
-	}
-	return session.Actor{}, false
-}
-
-func knownBackend(value string) bool {
-	switch strings.TrimSpace(value) {
-	case "claude", "codex", "gemini":
-		return true
-	default:
-		return false
-	}
 }

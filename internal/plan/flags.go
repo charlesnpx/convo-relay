@@ -18,14 +18,8 @@ func FromFlags(flags Flags) (session.Plan, error) {
 		return session.Plan{}, err
 	}
 
-	first, err := flagActor("slot_0", agents[0], flags.ModelA, flags.EffortA)
-	if err != nil {
-		return session.Plan{}, err
-	}
-	second, err := flagActor("slot_1", agents[1], flags.ModelB, flags.EffortB)
-	if err != nil {
-		return session.Plan{}, err
-	}
+	first := flagActor("slot_0", agents[0], flags.ModelA, flags.EffortA)
+	second := flagActor("slot_1", agents[1], flags.ModelB, flags.EffortB)
 	facilitatorBackend := strings.TrimSpace(flags.FacilitatorBackend)
 	if facilitatorBackend == "" {
 		if shorthand {
@@ -34,10 +28,7 @@ func FromFlags(flags Flags) (session.Plan, error) {
 			facilitatorBackend = "codex"
 		}
 	}
-	facilitator, err := flagActor("facilitator", facilitatorBackend, flags.FacilitatorModel, flags.FacilitatorEffort)
-	if err != nil {
-		return session.Plan{}, err
-	}
+	facilitator := flagActor("facilitator", facilitatorBackend, flags.FacilitatorModel, flags.FacilitatorEffort)
 
 	policy, err := policyFromDynamic(flags.ChildPolicy, flags.Dynamic)
 	if err != nil {
@@ -107,20 +98,13 @@ func flagSchedule(flags Flags) (int, bool, error) {
 	return flags.MaxRounds, true, nil
 }
 
-func flagActor(id string, backend string, model string, effort string) (session.Actor, error) {
-	backend = strings.TrimSpace(backend)
-	if !knownBackend(backend) {
-		if backend == "relay" {
-			return session.Actor{}, fmt.Errorf("relay backend is not supported for actor %q", id)
-		}
-		return session.Actor{}, fmt.Errorf("unknown backend %q", backend)
-	}
+func flagActor(id string, backend string, model string, effort string) session.Actor {
 	return session.Actor{
 		ID:      id,
-		Backend: backend,
+		Backend: strings.TrimSpace(backend),
 		Model:   strings.TrimSpace(model),
 		Effort:  strings.TrimSpace(effort),
-	}, nil
+	}
 }
 
 func policyFromDynamic(policy session.ChildPolicy, dynamic string) (session.ChildPolicy, error) {

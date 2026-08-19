@@ -141,12 +141,15 @@ func viewPlan() session.Plan {
 		Investigation: session.InvestigationAuto,
 		SchemaVersion: session.SchemaVersion,
 		SessionID:     "session-one",
-		Actors:        []session.Actor{{ID: "actor-a", Backend: "codex", Model: "model", Effort: "medium"}},
+		Actors: []session.Actor{
+			{ID: "actor-a", Backend: "codex", Model: "model", Effort: "medium"},
+			{ID: "actor-b", Backend: "claude", Model: "model", Effort: "medium"},
+		},
 		Schedule:      session.Schedule{Kind: "dialogue", Turns: 2},
 		ProviderRetry: session.ProviderRetry{Mode: "allow", MaxAttempts: 2},
 		Workspace:     session.Workspace{Mode: "current"},
 		Inputs:        []session.Input{},
-		ChildPolicy:   session.ChildPolicy{Mode: "disabled", AllowedRecipes: []string{}},
-		Result:        session.Result{Format: "text"},
+		ChildPolicy:   session.ChildPolicy{Mode: "deny", MaxDepth: 0, MaxChildren: 0, MaxTurns: 0, AllowedRecipes: []string{}},
+		Result:        session.Result{Source: "last_turn", Format: "text"},
 	}
 }

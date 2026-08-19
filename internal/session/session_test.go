@@ -204,12 +204,11 @@ func testPlan() Plan {
 		Mode:          ModeAdversarial,
 		Investigation: InvestigationAuto,
 		SchemaVersion: SchemaVersion,
-		Actors: []Actor{{
-			ID: "actor-a", Backend: "codex", Model: "test-model", Effort: "medium",
-		}},
+		Actors: []Actor{
+			{ID: "actor-a", Backend: "codex", Model: "test-model", Effort: "medium"},
+			{ID: "actor-b", Backend: "claude", Model: "test-model", Effort: "medium"},
+		},
 		Schedule:      Schedule{Kind: "dialogue", Turns: 2, StopOnConvergence: true},
-		Facilitator:   &Facilitator{Actor: "actor-a", Cadence: 1},
-		Reducer:       &Reducer{Actor: "actor-a"},
 		ProviderRetry: ProviderRetry{Mode: "allow", MaxAttempts: 2},
 		Workspace:     Workspace{Mode: "current"},
 		Inputs:        []Input{},
@@ -270,18 +269,69 @@ func TestValidatePlanRejectsInvalidSequenceOrder(t *testing.T) {
 	}
 }
 
-func TestValidatePlanRejectsUnknownChildPolicyMode(t *testing.T) {
+func TestValidatePlanSequenceCoversEveryNonControlActor(t *testing.T) {
 	plan := testPlan()
-	plan.SessionID = "child-policy-test"
-	plan.ChildPolicy.Mode = "explode"
-	if err := ValidatePlan(plan); err == nil || !strings.Contains(err.Error(), "deny, ask, or allow") {
-		t.Fatalf("ValidatePlan child-policy error = %v", err)
+	plan.SessionID = "sequence-coverage"
+	plan.Actors = []Actor{
+		{ID: "alpha", Backend: "codex", Model: "test-model", Effort: "medium"},
+		{ID: "beta", Backend: "claude", Model: "test-model", Effort: "medium"},
+	}
+	plan.Schedule = Schedule{Kind: "sequence", Turns: 3, Order: []string{"alpha", "beta", "alpha"}}
+	if err := ValidatePlan(plan); err != nil {
+		t.Fatalf("repeated sequence order was rejected: %v", err)
+	}
+
+	plan.Actors = append(plan.Actors, Actor{ID: "never-scheduled", Backend: "gemini", Model: "test-model", Effort: "medium"})
+	if err := ValidatePlan(plan); err == nil || !strings.Contains(err.Error(), "must include every actor") {
+		t.Fatalf("unused sequence actor error = %v", err)
 	}
 }
 
-func TestNormalizeNewPlanOnlySuppliesGeneratedSessionID(t *testing.T) {
-	plan := normalizeNewPlan(Plan{}, "generated-session")
-	if plan.SessionID != "generated-session" || plan.Kind != "" || plan.SchemaVersion != 0 || plan.ProviderRetry != (ProviderRetry{}) || plan.ChildPolicy.Mode != "" || plan.ChildPolicy.MaxDepth != 0 || plan.ChildPolicy.MaxChildren != 0 || plan.ChildPolicy.MaxTurns != 0 || len(plan.ChildPolicy.AllowedRecipes) != 0 {
-		t.Fatalf("normalizeNewPlan changed compiler-owned fields: %#v", plan)
+func TestValidatePlanRejectsUnsupportedActorBackend(t *testing.T) {
+	plan := testPlan()
+	plan.SessionID = "relay-plan"
+	plan.Actors[0].Backend = "relay"
+	if err := ValidatePlan(plan); err == nil || !strings.Contains(err.Error(), "not supported") {
+		t.Fatalf("ValidatePlan relay actor error = %v", err)
+	}
+
+	relayHome := filepath.Join(t.TempDir(), "relay-home")
+	if _, err := Create(relayHome, plan); err == nil || !strings.Contains(err.Error(), "not supported") {
+		t.Fatalf("Create relay actor error = %v", err)
+	}
+	matches, err := filepath.Glob(filepath.Join(relayHome, "*", SessionFilename))
+	if err != nil {
+		t.Fatalf("glob session files: %v", err)
+	}
+	if len(matches) != 0 {
+		t.Fatalf("Create persisted unsupported backend plan: %v", matches)
+	}
+}
+
+func TestValidatePlanRejectsForbiddenDynamicWithPermissiveChildPolicy(t *testing.T) {
+	plan := testPlan()
+	plan.SessionID = "forbidden-dynamic"
+	plan.Lifecycle = &Lifecycle{
+		Resume:             "allow",
+		Steering:           "allow",
+		Dynamic:            "forbid",
+		WorkspaceIsolation: "inherited",
+	}
+	plan.ChildPolicy = ChildPolicy{Mode: "allow", MaxDepth: 1, MaxChildren: 1, MaxTurns: 1, AllowedRecipes: []string{}}
+	if err := ValidatePlan(plan); err == nil || !strings.Contains(err.Error(), "dynamic forbid") {
+		t.Fatalf("lifecycle/child policy error = %v", err)
+	}
+}
+
+func TestValidatePlanRejectsUnknownChildPolicyMode(t *testing.T) {
+	for _, mode := range []string{"explode", "disabled"} {
+		t.Run(mode, func(t *testing.T) {
+			plan := testPlan()
+			plan.SessionID = "child-policy-" + mode
+			plan.ChildPolicy.Mode = mode
+			if err := ValidatePlan(plan); err == nil || !strings.Contains(err.Error(), "deny, ask, or allow") {
+				t.Fatalf("ValidatePlan child-policy error = %v", err)
+			}
+		})
 	}
 }
