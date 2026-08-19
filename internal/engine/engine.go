@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -21,35 +22,25 @@ import (
 	"github.com/charlesnpx/convo-relay/internal/plan"
 	"github.com/charlesnpx/convo-relay/internal/provider"
 	"github.com/charlesnpx/convo-relay/internal/session"
+	jsonschema "github.com/santhosh-tekuri/jsonschema/v6"
 )
 
 const (
 	statusCompleted = "completed"
 	statusFailed    = "failed"
 
-	stopCompleted           = "completed"
-	stopConverged           = "converged"
-	stopNoLedgerSignal      = "stalled_no_ledger_signal"
-	stopProviderFailed      = "provider_failed"
-	stopAbandonedAttempt    = "abandoned_attempt"
+	stopCompleted        = "completed"
+	stopConverged        = "converged"
+	stopNoLedgerSignal   = "stalled_no_ledger_signal"
+	stopProviderFailed   = "provider_failed"
+	stopAbandonedAttempt = "abandoned_attempt"
+	stopInvalidResult    = "invalid_result"
+
 	mediaTypePlainTextUTF8  = "text/plain; charset=utf-8"
 	mediaTypeChildResult    = "text/plain; charset=utf-8"
 	maxPromptTranscriptSize = 12
+	resultSchemaURL         = "https://convo-relay.invalid/engine-result-schema.json"
 )
-
-// Clock supplies event times. It is a dependency so an execution trace is
-// deterministic under test.
-type Clock interface {
-	Now() time.Time
-}
-
-// ClockFunc adapts a function into a Clock.
-type ClockFunc func() time.Time
-
-// Now implements Clock.
-func (f ClockFunc) Now() time.Time {
-	return f()
-}
 
 // BackendFactory creates a backend for one actor in one managed session.
 // It receives the session so workspace policy remains available to the edge
@@ -73,29 +64,15 @@ type ChildRequestExtractor func(session.Actor, eventlog.Role, provider.TurnResul
 // are used only to compile an admitted child plan.
 type Deps struct {
 	BackendFactory        BackendFactory
-	Clock                 Clock
 	Writer                *eventlog.Writer
 	Recipes               []plan.Recipe
 	ChildRequestExtractor ChildRequestExtractor
 }
 
-// AbandonedAttempt describes a persisted attempt.started record that did not
-// reach attempt.finished before a resume.
-type AbandonedAttempt struct {
-	ActorID string
-	Attempt int
-}
-
-// Outcome is the terminal or current result derived from the execution log.
-// Result is the selected textual result, while ResultRef names its durable
-// content when the result came from a completed turn.
+// Outcome contains the textual result needed by parent-child execution.
+// Status, diagnostics, and transcript details are derived through sessionview.
 type Outcome struct {
-	Status     string
-	StopReason string
-	Result     string
-	ResultRef  blobstore.BlobRef
-	Turns      int
-	Abandoned  []AbandonedAttempt
+	Result string
 }
 
 // Run starts an empty session log and executes its compiled plan to completion.
@@ -116,12 +93,15 @@ func Run(ctx context.Context, sess *session.Session, deps Deps) (Outcome, error)
 	if err := runner.append(eventlog.SessionStartedPayload{PlanDigest: runner.planDigest, SessionID: sess.Plan.SessionID}); err != nil {
 		return Outcome{}, err
 	}
-	return runner.execute(executionProgress{})
+	return runner.execute()
 }
 
 // Resume replays a started, nonterminal session and continues only the work
 // left by its immutable plan. The prompt is deliberately the only new input.
 func Resume(ctx context.Context, sess *session.Session, deps Deps, prompt string) (Outcome, error) {
+	if err := checkResumeLifecycle(sess, prompt); err != nil {
+		return Outcome{}, err
+	}
 	runner, err := newRunner(ctx, sess, deps)
 	if err != nil {
 		return Outcome{}, err
@@ -135,15 +115,11 @@ func Resume(ctx context.Context, sess *session.Session, deps Deps, prompt string
 	if len(events) == 0 {
 		return Outcome{}, errors.New("cannot resume a session with no session.started event")
 	}
-	if err := session.ValidateEventBindings(sess.Plan, events); err != nil {
+	if err := runner.rebuildExecutionState(events); err != nil {
 		return Outcome{}, err
 	}
-	progress, outcome, terminal, err := runner.replay(events)
-	if err != nil {
-		return Outcome{}, err
-	}
-	if terminal {
-		return outcome, nil
+	if runner.state.terminal != nil {
+		return runner.outcome(), nil
 	}
 	if text := strings.TrimSpace(prompt); text != "" {
 		ref, err := runner.putText(text)
@@ -153,10 +129,24 @@ func Resume(ctx context.Context, sess *session.Session, deps Deps, prompt string
 		if err := runner.append(eventlog.SteeringQueuedPayload{Prompt: ref}); err != nil {
 			return Outcome{}, err
 		}
-		progress.resumePrompt = text
-		progress.resumePromptRef = &ref
 	}
-	return runner.execute(progress)
+	return runner.execute()
+}
+
+func checkResumeLifecycle(sess *session.Session, prompt string) error {
+	if sess == nil {
+		return errors.New("session is required")
+	}
+	if sess.Plan.Lifecycle == nil {
+		return nil
+	}
+	if sess.Plan.Lifecycle.Resume == "forbid" {
+		return errors.New("plan lifecycle forbids resume")
+	}
+	if strings.TrimSpace(prompt) != "" && sess.Plan.Lifecycle.Steering == "forbid" {
+		return errors.New("plan lifecycle forbids steering")
+	}
+	return nil
 }
 
 type runner struct {
@@ -166,21 +156,68 @@ type runner struct {
 	blobs      *blobstore.Store
 	writer     *eventlog.Writer
 	closeLog   bool
-	clock      Clock
 	planDigest string
 
 	backends     map[string]provider.Backend
 	participants []session.Actor
 	actors       map[string]session.Actor
+	material     string
+	state        *executionState
+}
+
+type executionPhase string
+
+const (
+	phaseParticipant executionPhase = "participant"
+	phaseFacilitator executionPhase = "facilitator"
+	phaseReducer     executionPhase = "reducer"
+	phaseDone        executionPhase = "done"
+)
+
+// executionState is the complete execution decision state. It is populated
+// solely by reduceEvent for both durable replay and each successful live append.
+type executionState struct {
+	sessionStarted bool
+	terminal       *eventlog.SessionFinishedPayload
+	phase          executionPhase
+
+	participantTurns int
+	reducerDone      bool
+	active           *turnState
 
 	conversation []conversationTurn
-	childResults []string
 	ledger       model.Ledger
 	lastResult   completedTurn
-	material     string
+
+	requests     map[string]*childState
+	childResults []string
 	childrenUsed int
 	childTurns   int
-	requestIDs   map[string]struct{}
+
+	steering         []*steeringState
+	providerSessions map[string]string
+	result           *resultState
+}
+
+type turnState struct {
+	ActorID  string
+	Round    int
+	Role     eventlog.Role
+	Attempts map[int]*attemptState
+}
+
+type attemptState struct {
+	Attempt  int
+	Finished bool
+	Outcome  string
+	Content  blobstore.BlobRef
+	Failure  *providerFailureState
+}
+
+type providerFailureState struct {
+	Category        string
+	Retryable       bool
+	SanitizedDetail string
 }
 
 type conversationTurn struct {
@@ -193,29 +230,41 @@ type completedTurn struct {
 	Ref  blobstore.BlobRef
 }
 
-type executionProgress struct {
-	participantTurns int
-	sequenceTurns    int
-	reducerDone      bool
-	startedTurn      *startedTurn
-	abandoned        []AbandonedAttempt
-	resumePrompt     string
-	resumePromptRef  *blobstore.BlobRef
+type childState struct {
+	Request   eventlog.ChildRequestedPayload
+	Decided   bool
+	Admitted  bool
+	Completed bool
 }
 
-type startedTurn struct {
-	ActorID     string
-	Round       int
-	Role        eventlog.Role
-	NextAttempt int
+type steeringState struct {
+	Ref          blobstore.BlobRef
+	Text         string
+	AppliedRound int
+	Consumed     bool
 }
+
+type resultState struct {
+	ValidationOutcome string
+}
+
+type resultSchemaLoader struct{}
+
+func (resultSchemaLoader) Load(url string) (any, error) {
+	return nil, fmt.Errorf("external result schema loading is disabled: %s", url)
+}
+
+type executionFailure struct {
+	reason string
+	cause  error
+}
+
+func (e *executionFailure) Error() string { return e.cause.Error() }
+func (e *executionFailure) Unwrap() error { return e.cause }
 
 func newRunner(ctx context.Context, sess *session.Session, deps Deps) (*runner, error) {
 	if sess == nil {
 		return nil, errors.New("session is required")
-	}
-	if err := session.ValidatePlan(sess.Plan); err != nil {
-		return nil, fmt.Errorf("validate session plan: %w", err)
 	}
 	if deps.BackendFactory == nil {
 		return nil, errors.New("backend factory is required")
@@ -233,17 +282,6 @@ func newRunner(ctx context.Context, sess *session.Session, deps Deps) (*runner, 
 		}
 		closeLog = true
 	}
-	clock := deps.Clock
-	if clock == nil {
-		clock = ClockFunc(time.Now)
-	}
-	digest, err := session.PlanDigest(sess.Plan)
-	if err != nil {
-		if closeLog {
-			_ = writer.Close()
-		}
-		return nil, err
-	}
 	material, err := loadPromptMaterial(blobs, sess.Plan)
 	if err != nil {
 		if closeLog {
@@ -252,25 +290,32 @@ func newRunner(ctx context.Context, sess *session.Session, deps Deps) (*runner, 
 		return nil, err
 	}
 	runner := &runner{
-		ctx:        ctx,
-		sess:       sess,
-		deps:       deps,
-		blobs:      blobs,
-		writer:     writer,
-		closeLog:   closeLog,
-		clock:      clock,
-		planDigest: digest,
-		backends:   make(map[string]provider.Backend, len(sess.Plan.Actors)),
-		actors:     make(map[string]session.Actor, len(sess.Plan.Actors)),
-		ledger:     model.EmptyLedger(),
-		material:   material,
-		requestIDs: make(map[string]struct{}),
+		ctx:          ctx,
+		sess:         sess,
+		deps:         deps,
+		blobs:        blobs,
+		writer:       writer,
+		closeLog:     closeLog,
+		planDigest:   sess.Digest,
+		backends:     make(map[string]provider.Backend, len(sess.Plan.Actors)),
+		actors:       make(map[string]session.Actor, len(sess.Plan.Actors)),
+		material:     material,
+		state:        newExecutionState(),
+		participants: participantActors(sess.Plan),
 	}
 	for _, actor := range sess.Plan.Actors {
 		runner.actors[actor.ID] = actor
 	}
-	runner.participants = participantActors(sess.Plan)
 	return runner, nil
+}
+
+func newExecutionState() *executionState {
+	return &executionState{
+		phase:            phaseParticipant,
+		ledger:           model.EmptyLedger(),
+		requests:         make(map[string]*childState),
+		providerSessions: make(map[string]string),
+	}
 }
 
 func (r *runner) closeOwnedWriter() {
@@ -296,13 +341,18 @@ func participantActors(value session.Plan) []session.Actor {
 	return participants
 }
 
+// append makes an event durable, then updates exactly the same state reducer
+// that resume uses for durable history.
 func (r *runner) append(payload eventlog.Payload) error {
 	if r.writer == nil {
 		return errors.New("event writer is required")
 	}
 	identifier := fmt.Sprintf("engine-%d", r.writer.NextSeq())
-	_, err := r.writer.Append(eventlog.NewEvent(identifier, r.clock.Now(), payload))
-	return err
+	event, err := r.writer.Append(eventlog.NewEvent(identifier, time.Now(), payload))
+	if err != nil {
+		return err
+	}
+	return r.reduceEvent(event)
 }
 
 func (r *runner) putText(text string) (blobstore.BlobRef, error) {
@@ -323,163 +373,875 @@ func (r *runner) backend(actor session.Actor) (provider.Backend, error) {
 	if backend == nil {
 		return nil, fmt.Errorf("create backend for %s: nil backend", actor.ID)
 	}
+	if continuation := strings.TrimSpace(r.state.providerSessions[actor.ID]); continuation != "" {
+		if err := backend.RestoreState(providerState(actor.Backend, continuation), provider.SlotConfig{
+			Model:  actor.Model,
+			Effort: actor.Effort,
+		}); err != nil {
+			return nil, fmt.Errorf("restore backend continuation for %s: %w", actor.ID, err)
+		}
+	}
 	r.backends[actor.ID] = backend
 	return backend, nil
 }
 
-func (r *runner) execute(progress executionProgress) (Outcome, error) {
-	if r.sess.Plan.Schedule.Kind == "dialogue" {
-		return r.executeDialogue(progress)
+func providerState(backend, continuation string) provider.SlotState {
+	state := provider.SlotState{"started": true}
+	switch backend {
+	case "codex":
+		state["thread_id"] = continuation
+	case "gemini":
+		state["session_ref"] = continuation
+	default:
+		state["session_id"] = continuation
 	}
-	return r.executeSequence(progress)
+	return state
 }
 
-func (r *runner) executeDialogue(progress executionProgress) (Outcome, error) {
-	if progress.startedTurn != nil {
-		if err := r.applyResumePrompt(&progress, progress.startedTurn.Round); err != nil {
-			return Outcome{}, err
-		}
-		turn, outcome, done, err := r.resumeStartedTurn(progress)
-		if done || err != nil {
-			return outcome, err
-		}
-		switch progress.startedTurn.Role {
-		case eventlog.ParticipantRole:
-			progress.participantTurns++
-		case eventlog.FacilitatorRole:
-			r.ledger = parseLedger(turn.Text, r.ledger)
+func providerSessionID(backend provider.Backend) string {
+	if backend == nil {
+		return ""
+	}
+	state := backend.SessionState()
+	for _, key := range []string{"thread_id", "session_id", "session_ref"} {
+		if value := strings.TrimSpace(stringValue(state[key])); value != "" {
+			return value
 		}
 	}
-
-	for progress.participantTurns < r.sess.Plan.Schedule.Turns {
-		actor := r.participants[progress.participantTurns%len(r.participants)]
-		round := progress.participantTurns + 1
-		if err := r.applyResumePrompt(&progress, round); err != nil {
-			return Outcome{}, err
-		}
-		if _, err := r.runTurn(actor, round, eventlog.ParticipantRole, 1, true, progress.resumePrompt); err != nil {
-			return r.finishFailure(stopProviderFailed, progress.abandoned, err)
-		}
-		progress.resumePrompt = ""
-		progress.participantTurns++
-
-		if r.sess.Plan.Facilitator != nil && progress.participantTurns%r.sess.Plan.Facilitator.Cadence == 0 {
-			facilitator, err := r.actor(r.sess.Plan.Facilitator.Actor)
-			if err != nil {
-				return r.finishFailure(stopProviderFailed, progress.abandoned, err)
-			}
-			turn, err := r.runTurn(facilitator, round, eventlog.FacilitatorRole, 1, true, "")
-			if err != nil {
-				return r.finishFailure(stopProviderFailed, progress.abandoned, err)
-			}
-			r.ledger = parseLedger(turn.Text, r.ledger)
-		}
-
-		if r.sess.Plan.Schedule.StopOnConvergence {
-			if hasConverged(r.conversation, r.ledger) {
-				return r.finishSuccess(stopConverged, progress.abandoned)
-			}
-			if hasNoLedgerSignal(r.conversation, r.ledger) {
-				return r.finishSuccess(stopNoLedgerSignal, progress.abandoned)
-			}
-		}
-	}
-	if r.sess.Plan.Reducer != nil {
-		if err := r.applyResumePrompt(&progress, r.sess.Plan.Schedule.Turns+1); err != nil {
-			return Outcome{}, err
-		}
-		if _, err := r.runReducer(r.sess.Plan.Schedule.Turns+1, progress.resumePrompt); err != nil {
-			return r.finishFailure(stopProviderFailed, progress.abandoned, err)
-		}
-	}
-	return r.finishSuccess(stopCompleted, progress.abandoned)
+	return ""
 }
 
-func (r *runner) executeSequence(progress executionProgress) (Outcome, error) {
-	if progress.startedTurn != nil {
-		if err := r.applyResumePrompt(&progress, progress.startedTurn.Round); err != nil {
-			return Outcome{}, err
-		}
-		_, outcome, done, err := r.resumeStartedTurn(progress)
-		if done || err != nil {
-			return outcome, err
-		}
-		switch progress.startedTurn.Role {
-		case eventlog.ParticipantRole:
-			progress.sequenceTurns++
-		case eventlog.ReducerRole:
-			progress.reducerDone = true
-		}
-	}
-	for progress.sequenceTurns < len(r.sess.Plan.Schedule.Order) {
-		actor, err := r.actor(r.sess.Plan.Schedule.Order[progress.sequenceTurns])
-		if err != nil {
-			return r.finishFailure(stopProviderFailed, progress.abandoned, err)
-		}
-		round := progress.sequenceTurns + 1
-		if err := r.applyResumePrompt(&progress, round); err != nil {
-			return Outcome{}, err
-		}
-		if _, err := r.runTurn(actor, round, eventlog.ParticipantRole, 1, true, progress.resumePrompt); err != nil {
-			return r.finishFailure(stopProviderFailed, progress.abandoned, err)
-		}
-		progress.resumePrompt = ""
-		progress.sequenceTurns++
-	}
-	if r.sess.Plan.Reducer != nil && !progress.reducerDone {
-		if err := r.applyResumePrompt(&progress, len(r.sess.Plan.Schedule.Order)+1); err != nil {
-			return Outcome{}, err
-		}
-		if _, err := r.runReducer(len(r.sess.Plan.Schedule.Order)+1, progress.resumePrompt); err != nil {
-			return r.finishFailure(stopProviderFailed, progress.abandoned, err)
-		}
-	}
-	return r.finishSuccess(stopCompleted, progress.abandoned)
+func stringValue(value any) string {
+	text, _ := value.(string)
+	return text
 }
 
-func (r *runner) resumeStartedTurn(progress executionProgress) (completedTurn, Outcome, bool, error) {
-	started := progress.startedTurn
-	if started == nil {
-		return completedTurn{}, Outcome{}, false, nil
-	}
-	actor, err := r.actor(started.ActorID)
-	if err != nil {
-		outcome, finishErr := r.finishFailure(stopProviderFailed, progress.abandoned, err)
-		return completedTurn{}, outcome, true, finishErr
-	}
-	if len(progress.abandoned) > 0 {
-		last := progress.abandoned[len(progress.abandoned)-1]
-		if last.ActorID == actor.ID && (r.sess.Plan.ProviderRetry.Mode != "allow" || last.Attempt >= r.sess.Plan.ProviderRetry.MaxAttempts) {
-			err := fmt.Errorf("abandoned provider attempt %d for %s cannot be retried by plan policy", last.Attempt, actor.ID)
-			outcome, finishErr := r.finishFailure(stopAbandonedAttempt, progress.abandoned, err)
-			return completedTurn{}, outcome, true, finishErr
+// rebuildExecutionState is the sole replay path. It drives every event through
+// reduceEvent, which is also called by append during a live execution.
+func (r *runner) rebuildExecutionState(events []eventlog.Event) error {
+	r.state = newExecutionState()
+	for _, event := range events {
+		if err := r.reduceEvent(event); err != nil {
+			return err
 		}
 	}
-	turn, err := r.runTurn(actor, started.Round, started.Role, started.NextAttempt, false, progress.resumePrompt)
-	if err != nil {
-		outcome, finishErr := r.finishFailure(stopProviderFailed, progress.abandoned, err)
-		return completedTurn{}, outcome, true, finishErr
+	if !r.state.sessionStarted {
+		return errors.New("session has no session.started event")
 	}
-	return turn, Outcome{}, false, nil
-}
-
-func (r *runner) applyResumePrompt(progress *executionProgress, round int) error {
-	if progress == nil || progress.resumePromptRef == nil {
-		return nil
-	}
-	if err := r.append(eventlog.SteeringAppliedPayload{Prompt: *progress.resumePromptRef, Round: round}); err != nil {
-		return err
-	}
-	progress.resumePromptRef = nil
 	return nil
 }
 
-func (r *runner) runReducer(round int, resumePrompt string) (completedTurn, error) {
-	actor, err := r.actor(r.sess.Plan.Reducer.Actor)
-	if err != nil {
-		return completedTurn{}, err
+// reduceEvent is the one execution-state reducer for both the live and replay
+// paths. Event replay has normalized payloads to value form before returning.
+func (r *runner) reduceEvent(event eventlog.Event) error {
+	state := r.state
+	if state == nil {
+		return errors.New("execution state is required")
 	}
-	return r.runTurn(actor, round, eventlog.ReducerRole, 1, true, resumePrompt)
+	switch payload := event.Payload.(type) {
+	case eventlog.SessionStartedPayload:
+		if state.sessionStarted {
+			return errors.New("session has more than one session.started event")
+		}
+		if payload.PlanDigest != r.planDigest || payload.SessionID != r.sess.Plan.SessionID {
+			return errors.New("session.started does not match immutable plan")
+		}
+		state.sessionStarted = true
+		return nil
+	}
+	if !state.sessionStarted {
+		return errors.New("event precedes session.started")
+	}
+	switch payload := event.Payload.(type) {
+	case eventlog.TurnStartedPayload:
+		if state.terminal != nil {
+			return errors.New("turn.started follows session.finished")
+		}
+		if state.active != nil {
+			return errors.New("session has more than one unfinished turn")
+		}
+		turn := &turnState{
+			ActorID:  payload.ActorID,
+			Round:    payload.Round,
+			Role:     payload.Role,
+			Attempts: make(map[int]*attemptState),
+		}
+		state.active = turn
+		state.phase = phaseParticipant
+		if payload.Role == eventlog.FacilitatorRole {
+			state.phase = phaseFacilitator
+		} else if payload.Role == eventlog.ReducerRole {
+			state.phase = phaseReducer
+		}
+		return nil
+	case eventlog.AttemptStartedPayload:
+		turn, err := activeTurnForActor(state, payload.ActorID)
+		if err != nil {
+			return err
+		}
+		if _, exists := turn.Attempts[payload.Attempt]; exists {
+			return fmt.Errorf("duplicate attempt.started for %s attempt %d", payload.ActorID, payload.Attempt)
+		}
+		turn.Attempts[payload.Attempt] = &attemptState{Attempt: payload.Attempt}
+		return nil
+	case eventlog.AttemptFinishedPayload:
+		turn, err := activeTurnForActor(state, payload.ActorID)
+		if err != nil {
+			return err
+		}
+		attempt, exists := turn.Attempts[payload.Attempt]
+		if !exists {
+			return fmt.Errorf("attempt.finished for %s attempt %d has no attempt.started", payload.ActorID, payload.Attempt)
+		}
+		if attempt.Finished {
+			return fmt.Errorf("duplicate attempt.finished for %s attempt %d", payload.ActorID, payload.Attempt)
+		}
+		if payload.Outcome != "success" && payload.Outcome != "failed" {
+			return fmt.Errorf("attempt.finished outcome %q is unsupported", payload.Outcome)
+		}
+		attempt.Finished = true
+		attempt.Outcome = payload.Outcome
+		attempt.Content = payload.Content
+		if payload.Outcome == "success" && strings.TrimSpace(payload.ProviderSessionID) != "" {
+			state.providerSessions[payload.ActorID] = payload.ProviderSessionID
+		}
+		return nil
+	case eventlog.ProviderFailedPayload:
+		turn, err := activeTurnForActor(state, payload.ActorID)
+		if err != nil {
+			return err
+		}
+		attempt, exists := turn.Attempts[payload.Attempts]
+		if !exists {
+			return fmt.Errorf("provider.failed for %s attempt %d has no attempt.started", payload.ActorID, payload.Attempts)
+		}
+		attempt.Failure = &providerFailureState{
+			Category: payload.Category, Retryable: payload.Retryable, SanitizedDetail: payload.SanitizedDetail,
+		}
+		return nil
+	case eventlog.TurnFinishedPayload:
+		turn, err := activeTurnForActor(state, payload.ActorID)
+		if err != nil {
+			return err
+		}
+		if turn.Round != payload.Round {
+			return fmt.Errorf("turn.finished for %s/%d has no matching turn.started", payload.ActorID, payload.Round)
+		}
+		text, err := r.readBlob(payload.Content)
+		if err != nil {
+			return err
+		}
+		state.active = nil
+		completed := completedTurn{Text: text, Ref: payload.Content}
+		r.recordCompletedTurn(turn, completed)
+		for _, steering := range state.steering {
+			if steering.AppliedRound == turn.Round {
+				steering.Consumed = true
+			}
+		}
+		r.advancePhase(turn)
+		return nil
+	case eventlog.ChildRequestedPayload:
+		if _, exists := state.requests[payload.RequestID]; exists {
+			return fmt.Errorf("duplicate child request id %q", payload.RequestID)
+		}
+		state.requests[payload.RequestID] = &childState{Request: payload}
+		return nil
+	case eventlog.ChildDecidedPayload:
+		child, exists := state.requests[payload.RequestID]
+		if !exists {
+			return fmt.Errorf("child.decided for unknown request %q", payload.RequestID)
+		}
+		if child.Decided {
+			return fmt.Errorf("duplicate child.decided for request %q", payload.RequestID)
+		}
+		child.Decided = true
+		child.Admitted = payload.Admitted
+		if payload.Admitted {
+			turns, err := r.childTurnsFor(child, payload.BudgetState)
+			if err != nil {
+				return err
+			}
+			state.childrenUsed++
+			state.childTurns += turns
+		}
+		return nil
+	case eventlog.ChildCompletedPayload:
+		child, exists := state.requests[payload.RequestID]
+		if !exists {
+			return fmt.Errorf("child.completed for unknown request %q", payload.RequestID)
+		}
+		if child.Completed {
+			return fmt.Errorf("duplicate child.completed for request %q", payload.RequestID)
+		}
+		text, err := r.readBlob(payload.Result)
+		if err != nil {
+			return err
+		}
+		child.Completed = true
+		state.childResults = append(state.childResults, text)
+		return nil
+	case eventlog.SteeringQueuedPayload:
+		text, err := r.readBlob(payload.Prompt)
+		if err != nil {
+			return err
+		}
+		state.steering = append(state.steering, &steeringState{Ref: payload.Prompt, Text: text})
+		return nil
+	case eventlog.SteeringAppliedPayload:
+		for _, steering := range state.steering {
+			if steering.Consumed || steering.AppliedRound != 0 || !steering.Ref.Equal(payload.Prompt) {
+				continue
+			}
+			steering.AppliedRound = payload.Round
+			return nil
+		}
+		return errors.New("steering.applied has no queued prompt")
+	case eventlog.ResultProducedPayload:
+		if state.result != nil {
+			return errors.New("session has more than one result.produced event")
+		}
+		state.result = &resultState{
+			ValidationOutcome: payload.ValidationOutcome,
+		}
+		return nil
+	case eventlog.SessionFinishedPayload:
+		if state.terminal != nil {
+			return errors.New("session has more than one session.finished event")
+		}
+		finished := payload
+		state.terminal = &finished
+		return nil
+	default:
+		return nil
+	}
+}
+
+func activeTurnForActor(state *executionState, actorID string) (*turnState, error) {
+	if state.active == nil {
+		return nil, fmt.Errorf("event for %s has no unfinished turn", actorID)
+	}
+	if state.active.ActorID != actorID {
+		return nil, fmt.Errorf("event for %s does not match unfinished turn for %s", actorID, state.active.ActorID)
+	}
+	return state.active, nil
+}
+
+func (r *runner) recordCompletedTurn(turn *turnState, completed completedTurn) {
+	switch turn.Role {
+	case eventlog.ParticipantRole:
+		r.state.conversation = append(r.state.conversation, conversationTurn{ActorID: turn.ActorID, Text: completed.Text})
+		r.state.lastResult = completed
+	case eventlog.FacilitatorRole:
+		r.state.ledger = parseLedger(completed.Text, r.state.ledger)
+	case eventlog.ReducerRole:
+		r.state.reducerDone = true
+		if r.sess.Plan.Result.Source == "reducer" {
+			r.state.lastResult = completed
+		}
+	}
+}
+
+func (r *runner) advancePhase(turn *turnState) {
+	switch turn.Role {
+	case eventlog.ParticipantRole:
+		r.state.participantTurns++
+		if r.sess.Plan.Schedule.Kind == "dialogue" && r.sess.Plan.Facilitator != nil &&
+			r.state.participantTurns%r.sess.Plan.Facilitator.Cadence == 0 {
+			r.state.phase = phaseFacilitator
+			return
+		}
+		r.phaseAfterParticipants()
+	case eventlog.FacilitatorRole:
+		r.phaseAfterParticipants()
+	case eventlog.ReducerRole:
+		r.state.reducerDone = true
+		r.state.phase = phaseDone
+	}
+}
+
+func (r *runner) phaseAfterParticipants() {
+	if r.state.participantTurns < r.sess.Plan.Schedule.Turns {
+		r.state.phase = phaseParticipant
+		return
+	}
+	if r.sess.Plan.Reducer != nil && !r.state.reducerDone {
+		r.state.phase = phaseReducer
+		return
+	}
+	r.state.phase = phaseDone
+}
+
+func (r *runner) execute() (Outcome, error) {
+	for {
+		if r.state.terminal != nil {
+			return r.outcome(), nil
+		}
+		if r.state.active != nil {
+			if err := r.serviceActiveTurn(); err != nil {
+				reason := stopProviderFailed
+				var failure *executionFailure
+				if errors.As(err, &failure) {
+					reason = failure.reason
+				}
+				return r.finishFailure(reason, err)
+			}
+			continue
+		}
+		if err := r.servicePendingChildren(); err != nil {
+			return r.finishFailure(stopProviderFailed, err)
+		}
+		if reason := r.dialogueStopReason(); reason != "" {
+			return r.finishSuccess(reason)
+		}
+		if r.state.phase == phaseDone {
+			return r.finishSuccess(stopCompleted)
+		}
+		next, err := r.nextTurn()
+		if err != nil {
+			return r.finishFailure(stopProviderFailed, err)
+		}
+		if err := r.append(eventlog.TurnStartedPayload{ActorID: next.Actor.ID, Round: next.Round, Role: next.Role}); err != nil {
+			return Outcome{}, err
+		}
+	}
+}
+
+type turnSpec struct {
+	Actor session.Actor
+	Round int
+	Role  eventlog.Role
+}
+
+func (r *runner) nextTurn() (turnSpec, error) {
+	switch r.state.phase {
+	case phaseParticipant:
+		if r.state.participantTurns >= r.sess.Plan.Schedule.Turns {
+			return turnSpec{}, errors.New("participant phase has no remaining turn")
+		}
+		round := r.state.participantTurns + 1
+		if r.sess.Plan.Schedule.Kind == "dialogue" {
+			if len(r.participants) == 0 {
+				return turnSpec{}, errors.New("dialogue schedule has no participant actors")
+			}
+			return turnSpec{
+				Actor: r.participants[r.state.participantTurns%len(r.participants)],
+				Round: round,
+				Role:  eventlog.ParticipantRole,
+			}, nil
+		}
+		actor, err := r.actor(r.sess.Plan.Schedule.Order[r.state.participantTurns])
+		if err != nil {
+			return turnSpec{}, err
+		}
+		return turnSpec{Actor: actor, Round: round, Role: eventlog.ParticipantRole}, nil
+	case phaseFacilitator:
+		if r.sess.Plan.Facilitator == nil {
+			return turnSpec{}, errors.New("facilitator phase has no facilitator")
+		}
+		actor, err := r.actor(r.sess.Plan.Facilitator.Actor)
+		if err != nil {
+			return turnSpec{}, err
+		}
+		return turnSpec{Actor: actor, Round: r.state.participantTurns, Role: eventlog.FacilitatorRole}, nil
+	case phaseReducer:
+		if r.sess.Plan.Reducer == nil {
+			return turnSpec{}, errors.New("reducer phase has no reducer")
+		}
+		actor, err := r.actor(r.sess.Plan.Reducer.Actor)
+		if err != nil {
+			return turnSpec{}, err
+		}
+		return turnSpec{Actor: actor, Round: r.sess.Plan.Schedule.Turns + 1, Role: eventlog.ReducerRole}, nil
+	default:
+		return turnSpec{}, errors.New("execution has no next turn")
+	}
+}
+
+func (r *runner) dialogueStopReason() string {
+	if r.sess.Plan.Schedule.Kind != "dialogue" || !r.sess.Plan.Schedule.StopOnConvergence ||
+		r.state.active != nil || r.state.phase == phaseFacilitator {
+		return ""
+	}
+	if hasConverged(r.state.conversation, r.state.ledger) {
+		return stopConverged
+	}
+	if hasNoLedgerSignal(r.state.conversation, r.state.ledger) {
+		return stopNoLedgerSignal
+	}
+	return ""
+}
+
+func (r *runner) serviceActiveTurn() error {
+	turn := r.state.active
+	if turn == nil {
+		return nil
+	}
+	if success := turn.latest("success"); success != nil {
+		return r.finishActiveTurn(turn, success)
+	}
+	if abandoned := turn.latest(""); abandoned != nil {
+		if !r.retryAbandoned(abandoned.Attempt) {
+			return &executionFailure{
+				reason: stopAbandonedAttempt,
+				cause:  fmt.Errorf("abandoned provider attempt %d for %s cannot be retried by plan policy", abandoned.Attempt, turn.ActorID),
+			}
+		}
+		return r.callActiveAttempt(turn, turn.nextAttempt())
+	}
+	if failed := turn.latest("failed"); failed != nil {
+		if failed.Failure != nil && r.shouldRetry(failed.Failure, failed.Attempt) {
+			return r.callActiveAttempt(turn, turn.nextAttempt())
+		}
+		return &executionFailure{
+			reason: stopProviderFailed,
+			cause:  recordedFailure(turn, failed),
+		}
+	}
+	return r.callActiveAttempt(turn, turn.nextAttempt())
+}
+
+func (turn *turnState) latest(outcome string) *attemptState {
+	var selected *attemptState
+	for _, attempt := range turn.Attempts {
+		matches := !attempt.Finished
+		if outcome != "" {
+			matches = attempt.Finished && attempt.Outcome == outcome
+		}
+		if matches && (selected == nil || attempt.Attempt > selected.Attempt) {
+			selected = attempt
+		}
+	}
+	return selected
+}
+
+func (turn *turnState) nextAttempt() int {
+	next := 1
+	for number := range turn.Attempts {
+		if number >= next {
+			next = number + 1
+		}
+	}
+	return next
+}
+
+func recordedFailure(turn *turnState, attempt *attemptState) error {
+	if attempt.Failure == nil {
+		return fmt.Errorf("recorded failed provider attempt %d for %s has no retryability record", attempt.Attempt, turn.ActorID)
+	}
+	return fmt.Errorf(
+		"recorded provider failure for %s: %s (%s)",
+		turn.ActorID,
+		attempt.Failure.SanitizedDetail,
+		attempt.Failure.Category,
+	)
+}
+
+func (r *runner) retryAbandoned(attempt int) bool {
+	return r.sess.Plan.ProviderRetry.Mode == "allow" && attempt < r.sess.Plan.ProviderRetry.MaxAttempts
+}
+
+func (r *runner) shouldRetry(failure *providerFailureState, attempt int) bool {
+	return failure != nil &&
+		r.sess.Plan.ProviderRetry.Mode == "allow" &&
+		failure.Category != "auth" &&
+		failure.Retryable &&
+		attempt < r.sess.Plan.ProviderRetry.MaxAttempts
+}
+
+func (r *runner) callActiveAttempt(turn *turnState, attemptNumber int) error {
+	actor, err := r.actor(turn.ActorID)
+	if err != nil {
+		return err
+	}
+	resumePrompt, err := r.applySteering(turn.Round)
+	if err != nil {
+		return err
+	}
+	backend, err := r.backend(actor)
+	if err != nil {
+		return err
+	}
+	if err := r.append(eventlog.AttemptStartedPayload{ActorID: actor.ID, Attempt: attemptNumber}); err != nil {
+		return err
+	}
+	result, callErr := backend.RunTurn(r.ctx, r.promptFor(actor, turn.Round, turn.Role, resumePrompt), provider.TurnOptions{
+		TimeoutSeconds:      r.sess.Plan.Timeouts.TurnSeconds,
+		StallTimeoutSeconds: r.sess.Plan.Timeouts.StallSeconds,
+	})
+	ref, putErr := r.putText(result.Content)
+	if putErr != nil {
+		return putErr
+	}
+	if callErr == nil {
+		// Request extraction happens before the success event. If the process
+		// stops after extraction, the request survives; if it stops earlier,
+		// the unfinished provider attempt is retried and extracted again.
+		if err := r.persistChildRequests(turn, actor, result); err != nil {
+			return err
+		}
+		if err := r.append(eventlog.AttemptFinishedPayload{
+			ActorID:           actor.ID,
+			Attempt:           attemptNumber,
+			Outcome:           "success",
+			ProviderSessionID: providerSessionID(backend),
+			Content:           ref,
+		}); err != nil {
+			return err
+		}
+		return r.finishActiveTurn(r.state.active, r.state.active.Attempts[attemptNumber])
+	}
+	if err := r.append(eventlog.AttemptFinishedPayload{
+		ActorID: actor.ID,
+		Attempt: attemptNumber,
+		Outcome: "failed",
+		Content: ref,
+	}); err != nil {
+		return err
+	}
+	failure := provider.NewProviderFailure("turn", actor.ID, actor.Backend, callErr, provider.ProviderResultForTurn(actor.Backend, result))
+	return r.append(eventlog.ProviderFailedPayload{
+		ActorID:         actor.ID,
+		Backend:         actor.Backend,
+		Category:        failure.Category,
+		Retryable:       failure.Retryable,
+		Attempts:        attemptNumber,
+		RemediationCode: failure.RemediationCode,
+		SanitizedDetail: failure.SanitizedDetail,
+	})
+}
+
+func (r *runner) finishActiveTurn(turn *turnState, attempt *attemptState) error {
+	if turn == nil || attempt == nil || attempt.Outcome != "success" {
+		return errors.New("successful attempt is required to finish a turn")
+	}
+	return r.append(eventlog.TurnFinishedPayload{
+		ActorID: turn.ActorID,
+		Round:   turn.Round,
+		Content: attempt.Content,
+	})
+}
+
+func (r *runner) applySteering(round int) (string, error) {
+	steering := r.applicableSteering(round)
+	if steering == nil {
+		return "", nil
+	}
+	if steering.AppliedRound == 0 {
+		if err := r.append(eventlog.SteeringAppliedPayload{Prompt: steering.Ref, Round: round}); err != nil {
+			return "", err
+		}
+	}
+	return steering.Text, nil
+}
+
+func (r *runner) applicableSteering(round int) *steeringState {
+	for _, steering := range r.state.steering {
+		if steering.Consumed {
+			continue
+		}
+		if steering.AppliedRound == 0 || steering.AppliedRound == round {
+			return steering
+		}
+	}
+	return nil
+}
+
+func (r *runner) persistChildRequests(turn *turnState, actor session.Actor, result provider.TurnResult) error {
+	if r.deps.ChildRequestExtractor == nil || (turn.Role != eventlog.ParticipantRole && turn.Role != eventlog.FacilitatorRole) {
+		return nil
+	}
+	for index, child := range r.deps.ChildRequestExtractor(actor, turn.Role, result) {
+		requestID := strings.TrimSpace(child.ID)
+		if requestID == "" {
+			requestID = fmt.Sprintf("%s-child-%d-%d", actor.ID, turn.Round, index+1)
+		}
+		if _, exists := r.state.requests[requestID]; exists {
+			continue
+		}
+		recipeID := strings.TrimSpace(child.Request.RecipeID)
+		if recipeID == "" {
+			recipeID = "unspecified"
+		}
+		question, err := r.putText(child.Request.Question)
+		if err != nil {
+			return err
+		}
+		if err := r.append(eventlog.ChildRequestedPayload{
+			RequestID:        requestID,
+			RequesterActorID: actor.ID,
+			RecipeID:         recipeID,
+			Question:         question,
+		}); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (r *runner) servicePendingChildren() error {
+	requestIDs := make([]string, 0, len(r.state.requests))
+	for requestID := range r.state.requests {
+		requestIDs = append(requestIDs, requestID)
+	}
+	sort.Strings(requestIDs)
+	for _, requestID := range requestIDs {
+		child := r.state.requests[requestID]
+		if !child.Decided {
+			if err := r.decideChild(child); err != nil {
+				return err
+			}
+		}
+		if child.Admitted && !child.Completed {
+			if err := r.runChild(child); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func (r *runner) decideChild(child *childState) error {
+	if r.sess.Plan.ChildPolicy.Mode != "allow" {
+		return r.append(eventlog.ChildDecidedPayload{
+			RequestID:   child.Request.RequestID,
+			Admitted:    false,
+			Reason:      childDecisionReason(r.sess.Plan.ChildPolicy.Mode),
+			BudgetState: "not_admitted",
+		})
+	}
+	if r.state.childrenUsed >= r.sess.Plan.ChildPolicy.MaxChildren {
+		return r.append(eventlog.ChildDecidedPayload{
+			RequestID:   child.Request.RequestID,
+			Admitted:    false,
+			Reason:      "child capacity exhausted",
+			BudgetState: "children_exhausted",
+		})
+	}
+	childPlan, err := r.childPlanFor(child)
+	if err != nil {
+		return r.append(eventlog.ChildDecidedPayload{
+			RequestID:   child.Request.RequestID,
+			Admitted:    false,
+			Reason:      provider.SanitizeProviderFailureDetail(err.Error()),
+			BudgetState: "rejected",
+		})
+	}
+	if r.state.childTurns+childPlan.Schedule.Turns > r.sess.Plan.ChildPolicy.MaxTurns {
+		return r.append(eventlog.ChildDecidedPayload{
+			RequestID:   child.Request.RequestID,
+			Admitted:    false,
+			Reason:      "child turn budget exhausted",
+			BudgetState: "turns_exhausted",
+		})
+	}
+	return r.append(eventlog.ChildDecidedPayload{
+		RequestID:   child.Request.RequestID,
+		Admitted:    true,
+		Reason:      "admitted by child policy",
+		BudgetState: childBudgetState("available", childPlan.Schedule.Turns),
+	})
+}
+
+func (r *runner) childPlanFor(child *childState) (session.Plan, error) {
+	question, err := r.readBlob(child.Request.Question)
+	if err != nil {
+		return session.Plan{}, err
+	}
+	return plan.ForChild(r.sess.Plan, plan.ChildRequest{
+		SessionID: r.childSessionID(child.Request.RequestID),
+		RecipeID:  child.Request.RecipeID,
+		Question:  question,
+	}, r.deps.Recipes)
+}
+
+func (r *runner) childSessionID(requestID string) string {
+	return r.sess.Plan.SessionID + "-child-" + requestID
+}
+
+func childBudgetState(state string, turns int) string {
+	return state + ";child_turns=" + strconv.Itoa(turns)
+}
+
+func (r *runner) childTurnsFor(child *childState, budgetState string) (int, error) {
+	if _, suffix, found := strings.Cut(budgetState, ";child_turns="); found {
+		turns, err := strconv.Atoi(suffix)
+		if err != nil || turns < 0 {
+			return 0, fmt.Errorf("child.decided has invalid child turn count %q", suffix)
+		}
+		return turns, nil
+	}
+	childPlan, err := r.childPlanFor(child)
+	if err != nil {
+		return 0, fmt.Errorf("reconstruct child budget for %s: %w", child.Request.RequestID, err)
+	}
+	return childPlan.Schedule.Turns, nil
+}
+
+func (r *runner) runChild(child *childState) error {
+	childPlan, err := r.childPlanFor(child)
+	if err != nil {
+		return err
+	}
+	childSession, err := session.Create(filepath.Dir(r.sess.Root), childPlan)
+	if err != nil {
+		return err
+	}
+	childBlobs, err := childSession.BlobStore(blobstore.Limits{})
+	if err != nil {
+		return err
+	}
+	if err := copyPlanBlobs(r.blobs, childBlobs, session.BlobRefs(childPlan)); err != nil {
+		return err
+	}
+	childDeps := r.deps
+	childDeps.Writer = nil
+	childOutcome, childErr := Run(r.ctx, childSession, childDeps)
+	resultText := childOutcome.Result
+	if childErr != nil {
+		resultText = "child execution failed: " + provider.SanitizeProviderFailureDetail(childErr.Error())
+	}
+	resultRef, err := r.blobs.PutBytes([]byte(resultText), mediaTypeChildResult)
+	if err != nil {
+		return err
+	}
+	if err := r.append(eventlog.ChildCompletedPayload{
+		RequestID:      child.Request.RequestID,
+		ChildSessionID: childSession.Plan.SessionID,
+		Result:         resultRef,
+	}); err != nil {
+		return err
+	}
+	return childErr
+}
+
+func childDecisionReason(mode string) string {
+	switch mode {
+	case "deny":
+		return "child policy denies child plans"
+	case "ask":
+		return "child request requires operator approval"
+	default:
+		return "child policy does not admit request"
+	}
+}
+
+func copyPlanBlobs(source *blobstore.Store, destination *blobstore.Store, refs []blobstore.BlobRef) error {
+	for _, ref := range refs {
+		reader, err := source.Open(ref)
+		if err != nil {
+			return fmt.Errorf("open child plan blob %s: %w", ref.SHA256, err)
+		}
+		copied, putErr := destination.PutMediaType(reader, ref.MediaType)
+		closeErr := reader.Close()
+		if putErr != nil {
+			return fmt.Errorf("copy child plan blob %s: %w", ref.SHA256, putErr)
+		}
+		if closeErr != nil {
+			return fmt.Errorf("verify child plan blob %s: %w", ref.SHA256, closeErr)
+		}
+		if !copied.Equal(ref) {
+			return fmt.Errorf("copied child plan blob %s does not retain its reference", ref.SHA256)
+		}
+	}
+	return nil
+}
+
+func (r *runner) finishSuccess(reason string) (Outcome, error) {
+	if r.state.result == nil {
+		outcome := "valid"
+		validationErr := r.validateSelectedResult()
+		if validationErr != nil {
+			outcome = "invalid"
+		}
+		if err := r.append(eventlog.ResultProducedPayload{
+			Result:            r.state.lastResult.Ref,
+			Format:            r.sess.Plan.Result.Format,
+			ValidationOutcome: outcome,
+		}); err != nil {
+			return Outcome{}, err
+		}
+		if validationErr != nil {
+			return r.finishFailure(stopInvalidResult, validationErr)
+		}
+	}
+	if r.state.result.ValidationOutcome != "valid" {
+		return r.finishFailure(stopInvalidResult, errors.New("selected result failed declared format or schema validation"))
+	}
+	if err := r.append(eventlog.SessionFinishedPayload{Status: statusCompleted, StopReason: reason}); err != nil {
+		return Outcome{}, err
+	}
+	return r.outcome(), nil
+}
+
+func (r *runner) finishFailure(reason string, cause error) (Outcome, error) {
+	if r.state.terminal == nil {
+		appendErr := r.append(eventlog.SessionFinishedPayload{Status: statusFailed, StopReason: reason})
+		if appendErr != nil {
+			return r.outcome(), errors.Join(cause, appendErr)
+		}
+	}
+	if cause == nil {
+		cause = errors.New(reason)
+	}
+	return r.outcome(), cause
+}
+
+func (r *runner) outcome() Outcome {
+	return Outcome{Result: r.state.lastResult.Text}
+}
+
+func (r *runner) validateSelectedResult() error {
+	if r.state.lastResult.Ref == (blobstore.BlobRef{}) {
+		return errors.New("selected result has no durable content")
+	}
+	format := strings.ToLower(strings.TrimSpace(r.sess.Plan.Result.Format))
+	if format != "text" && format != "json" {
+		return fmt.Errorf("unsupported result format %q", r.sess.Plan.Result.Format)
+	}
+	if format == "text" && len(r.sess.Plan.Result.Schema) == 0 {
+		return nil
+	}
+	var value any
+	decoder := json.NewDecoder(strings.NewReader(r.state.lastResult.Text))
+	decoder.UseNumber()
+	if err := decoder.Decode(&value); err != nil {
+		return fmt.Errorf("result is not valid JSON: %w", err)
+	}
+	if err := ensureJSONEOF(decoder); err != nil {
+		return err
+	}
+	if len(r.sess.Plan.Result.Schema) == 0 {
+		return nil
+	}
+	var schema any
+	if err := json.Unmarshal(r.sess.Plan.Result.Schema, &schema); err != nil {
+		return fmt.Errorf("decode declared result schema: %w", err)
+	}
+	compiler := jsonschema.NewCompiler()
+	compiler.DefaultDraft(jsonschema.Draft2020)
+	compiler.UseLoader(resultSchemaLoader{})
+	if err := compiler.AddResource(resultSchemaURL, schema); err != nil {
+		return fmt.Errorf("register declared result schema: %w", err)
+	}
+	compiled, err := compiler.Compile(resultSchemaURL)
+	if err != nil {
+		return fmt.Errorf("compile declared result schema: %w", err)
+	}
+	if err := compiled.Validate(value); err != nil {
+		return fmt.Errorf("result does not match declared schema: %w", err)
+	}
+	return nil
+}
+
+func ensureJSONEOF(decoder *json.Decoder) error {
+	var extra any
+	if err := decoder.Decode(&extra); err == io.EOF {
+		return nil
+	} else if err != nil {
+		return fmt.Errorf("decode trailing result JSON: %w", err)
+	}
+	return errors.New("result JSON has trailing value")
 }
 
 func (r *runner) actor(identifier string) (session.Actor, error) {
@@ -488,92 +1250,6 @@ func (r *runner) actor(identifier string) (session.Actor, error) {
 		return session.Actor{}, fmt.Errorf("plan names unknown actor %q", identifier)
 	}
 	return actor, nil
-}
-
-func (r *runner) runTurn(actor session.Actor, round int, role eventlog.Role, firstAttempt int, appendStarted bool, resumePrompt string) (completedTurn, error) {
-	if appendStarted {
-		if err := r.append(eventlog.TurnStartedPayload{ActorID: actor.ID, Round: round, Role: role}); err != nil {
-			return completedTurn{}, err
-		}
-	}
-	backend, err := r.backend(actor)
-	if err != nil {
-		return completedTurn{}, err
-	}
-	prompt := r.promptFor(actor, round, role, resumePrompt)
-	for attempt := firstAttempt; ; attempt++ {
-		if err := r.append(eventlog.AttemptStartedPayload{ActorID: actor.ID, Attempt: attempt}); err != nil {
-			return completedTurn{}, err
-		}
-		result, callErr := backend.RunTurn(r.ctx, prompt, provider.TurnOptions{
-			TimeoutSeconds:      r.sess.Plan.Timeouts.TurnSeconds,
-			StallTimeoutSeconds: r.sess.Plan.Timeouts.StallSeconds,
-		})
-		ref, putErr := r.putText(result.Content)
-		if putErr != nil {
-			return completedTurn{}, putErr
-		}
-		if callErr == nil {
-			if err := r.append(eventlog.AttemptFinishedPayload{
-				ActorID: actor.ID,
-				Attempt: attempt,
-				Outcome: "success",
-				Content: ref,
-			}); err != nil {
-				return completedTurn{}, err
-			}
-			if err := r.append(eventlog.TurnFinishedPayload{ActorID: actor.ID, Round: round, Content: ref}); err != nil {
-				return completedTurn{}, err
-			}
-			turn := completedTurn{Text: result.Content, Ref: ref}
-			r.recordCompletedTurn(actor, role, turn)
-			if err := r.handleChildRequests(actor, role, result); err != nil {
-				return completedTurn{}, err
-			}
-			return turn, nil
-		}
-		if err := r.append(eventlog.AttemptFinishedPayload{
-			ActorID: actor.ID,
-			Attempt: attempt,
-			Outcome: "failed",
-			Content: ref,
-		}); err != nil {
-			return completedTurn{}, err
-		}
-		failure := provider.NewProviderFailure("turn", actor.ID, actor.Backend, callErr, provider.ProviderResultForTurn(actor.Backend, result))
-		if err := r.append(eventlog.ProviderFailedPayload{
-			ActorID:         actor.ID,
-			Backend:         actor.Backend,
-			Category:        failure.Category,
-			Retryable:       failure.Retryable,
-			Attempts:        attempt,
-			RemediationCode: failure.RemediationCode,
-			SanitizedDetail: failure.SanitizedDetail,
-		}); err != nil {
-			return completedTurn{}, err
-		}
-		if r.shouldRetry(failure, attempt) {
-			continue
-		}
-		return completedTurn{}, callErr
-	}
-}
-
-func (r *runner) shouldRetry(failure provider.ProviderFailure, attempt int) bool {
-	return r.sess.Plan.ProviderRetry.Mode == "allow" &&
-		failure.Category != "auth" &&
-		failure.Retryable &&
-		attempt < r.sess.Plan.ProviderRetry.MaxAttempts
-}
-
-func (r *runner) recordCompletedTurn(actor session.Actor, role eventlog.Role, turn completedTurn) {
-	if role == eventlog.ParticipantRole {
-		r.conversation = append(r.conversation, conversationTurn{ActorID: actor.ID, Text: turn.Text})
-		r.lastResult = turn
-	}
-	if role == eventlog.ReducerRole && r.sess.Plan.Result.Source == "reducer" {
-		r.lastResult = turn
-	}
 }
 
 func (r *runner) promptFor(actor session.Actor, round int, role eventlog.Role, resumePrompt string) string {
@@ -595,15 +1271,15 @@ func (r *runner) promptFor(actor session.Actor, round int, role eventlog.Role, r
 			builder.WriteString(transcript)
 		}
 	}
-	if len(r.childResults) > 0 {
+	if len(r.state.childResults) > 0 {
 		builder.WriteString("\nChild results:\n")
-		for _, result := range r.childResults {
+		for _, result := range r.state.childResults {
 			builder.WriteString(result)
 			builder.WriteByte('\n')
 		}
 	}
 	if role == eventlog.FacilitatorRole {
-		counts := r.ledger.Counts()
+		counts := r.state.ledger.Counts()
 		fmt.Fprintf(&builder, "\nReturn a JSON ledger with settled, contested, and withdrawn arrays. Current counts: settled=%d contested=%d withdrawn=%d.\n", counts.Settled, counts.Contested, counts.Withdrawn)
 	}
 	if role == eventlog.ReducerRole {
@@ -651,372 +1327,14 @@ func loadPromptMaterial(blobs *blobstore.Store, value session.Plan) (string, err
 
 func (r *runner) transcriptText() string {
 	start := 0
-	if len(r.conversation) > maxPromptTranscriptSize {
-		start = len(r.conversation) - maxPromptTranscriptSize
+	if len(r.state.conversation) > maxPromptTranscriptSize {
+		start = len(r.state.conversation) - maxPromptTranscriptSize
 	}
 	var builder strings.Builder
-	for _, turn := range r.conversation[start:] {
+	for _, turn := range r.state.conversation[start:] {
 		fmt.Fprintf(&builder, "%s: %s\n", turn.ActorID, turn.Text)
 	}
 	return builder.String()
-}
-
-func (r *runner) handleChildRequests(actor session.Actor, role eventlog.Role, result provider.TurnResult) error {
-	if r.deps.ChildRequestExtractor == nil || (role != eventlog.ParticipantRole && role != eventlog.FacilitatorRole) {
-		return nil
-	}
-	for index, child := range r.deps.ChildRequestExtractor(actor, role, result) {
-		if err := r.handleChildRequest(actor, child, index); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-func (r *runner) handleChildRequest(actor session.Actor, child ChildRequest, index int) error {
-	request := child.Request
-	requestID := strings.TrimSpace(child.ID)
-	if requestID == "" {
-		requestID = fmt.Sprintf("child-%d-%d", r.writer.NextSeq(), index+1)
-	}
-	if _, exists := r.requestIDs[requestID]; exists {
-		return fmt.Errorf("duplicate child request id %q", requestID)
-	}
-	r.requestIDs[requestID] = struct{}{}
-	recipeID := strings.TrimSpace(request.RecipeID)
-	if recipeID == "" {
-		recipeID = "unspecified"
-	}
-	question, err := r.putText(request.Question)
-	if err != nil {
-		return err
-	}
-	if err := r.append(eventlog.ChildRequestedPayload{
-		RequestID:        requestID,
-		RequesterActorID: actor.ID,
-		RecipeID:         recipeID,
-		Question:         question,
-	}); err != nil {
-		return err
-	}
-
-	if r.sess.Plan.ChildPolicy.Mode != "allow" {
-		return r.append(eventlog.ChildDecidedPayload{
-			RequestID:   requestID,
-			Admitted:    false,
-			Reason:      childDecisionReason(r.sess.Plan.ChildPolicy.Mode),
-			BudgetState: "not_admitted",
-		})
-	}
-	if r.childrenUsed >= r.sess.Plan.ChildPolicy.MaxChildren {
-		return r.append(eventlog.ChildDecidedPayload{
-			RequestID:   requestID,
-			Admitted:    false,
-			Reason:      "child capacity exhausted",
-			BudgetState: "children_exhausted",
-		})
-	}
-	if request.SessionID == "" {
-		request.SessionID = fmt.Sprintf("%s-child-%d", r.sess.Plan.SessionID, r.childrenUsed+1)
-	}
-	childPlan, compileErr := plan.ForChild(r.sess.Plan, request, r.deps.Recipes)
-	if compileErr != nil {
-		return r.append(eventlog.ChildDecidedPayload{
-			RequestID:   requestID,
-			Admitted:    false,
-			Reason:      provider.SanitizeProviderFailureDetail(compileErr.Error()),
-			BudgetState: "rejected",
-		})
-	}
-	if r.childTurns+childPlan.Schedule.Turns > r.sess.Plan.ChildPolicy.MaxTurns {
-		return r.append(eventlog.ChildDecidedPayload{
-			RequestID:   requestID,
-			Admitted:    false,
-			Reason:      "child turn budget exhausted",
-			BudgetState: "turns_exhausted",
-		})
-	}
-	if err := r.append(eventlog.ChildDecidedPayload{
-		RequestID:   requestID,
-		Admitted:    true,
-		Reason:      "admitted by child policy",
-		BudgetState: "available",
-	}); err != nil {
-		return err
-	}
-
-	childSession, err := session.Create(filepath.Dir(r.sess.Root), childPlan)
-	if err != nil {
-		return err
-	}
-	childBlobs, err := childSession.BlobStore(blobstore.Limits{})
-	if err != nil {
-		return err
-	}
-	if err := copyPlanBlobs(r.blobs, childBlobs, session.BlobRefs(childPlan)); err != nil {
-		return err
-	}
-	r.childrenUsed++
-	r.childTurns += childPlan.Schedule.Turns
-	childDeps := r.deps
-	childDeps.Writer = nil
-	childOutcome, childErr := Run(r.ctx, childSession, childDeps)
-	resultText := childOutcome.Result
-	if childErr != nil {
-		resultText = "child execution failed: " + provider.SanitizeProviderFailureDetail(childErr.Error())
-	}
-	resultRef, err := r.blobs.PutBytes([]byte(resultText), mediaTypeChildResult)
-	if err != nil {
-		return err
-	}
-	if err := r.append(eventlog.ChildCompletedPayload{
-		RequestID:      requestID,
-		ChildSessionID: childSession.Plan.SessionID,
-		Result:         resultRef,
-	}); err != nil {
-		return err
-	}
-	r.childResults = append(r.childResults, resultText)
-	if childErr != nil {
-		return childErr
-	}
-	return nil
-}
-
-func childDecisionReason(mode string) string {
-	switch mode {
-	case "deny":
-		return "child policy denies child plans"
-	case "ask":
-		return "child request requires operator approval"
-	default:
-		return "child policy does not admit request"
-	}
-}
-
-func copyPlanBlobs(source *blobstore.Store, destination *blobstore.Store, refs []blobstore.BlobRef) error {
-	for _, ref := range refs {
-		reader, err := source.Open(ref)
-		if err != nil {
-			return fmt.Errorf("open child plan blob %s: %w", ref.SHA256, err)
-		}
-		copied, putErr := destination.PutMediaType(reader, ref.MediaType)
-		closeErr := reader.Close()
-		if putErr != nil {
-			return fmt.Errorf("copy child plan blob %s: %w", ref.SHA256, putErr)
-		}
-		if closeErr != nil {
-			return fmt.Errorf("verify child plan blob %s: %w", ref.SHA256, closeErr)
-		}
-		if !copied.Equal(ref) {
-			return fmt.Errorf("copied child plan blob %s does not retain its reference", ref.SHA256)
-		}
-	}
-	return nil
-}
-
-func (r *runner) finishSuccess(reason string, abandoned []AbandonedAttempt) (Outcome, error) {
-	if err := r.append(eventlog.SessionFinishedPayload{Status: statusCompleted, StopReason: reason}); err != nil {
-		return Outcome{}, err
-	}
-	return Outcome{
-		Status:     statusCompleted,
-		StopReason: reason,
-		Result:     r.lastResult.Text,
-		ResultRef:  r.lastResult.Ref,
-		Turns:      len(r.conversation),
-		Abandoned:  append([]AbandonedAttempt{}, abandoned...),
-	}, nil
-}
-
-func (r *runner) finishFailure(reason string, abandoned []AbandonedAttempt, cause error) (Outcome, error) {
-	appendErr := r.append(eventlog.SessionFinishedPayload{Status: statusFailed, StopReason: reason})
-	outcome := Outcome{
-		Status:     statusFailed,
-		StopReason: reason,
-		Result:     r.lastResult.Text,
-		ResultRef:  r.lastResult.Ref,
-		Turns:      len(r.conversation),
-		Abandoned:  append([]AbandonedAttempt{}, abandoned...),
-	}
-	if appendErr != nil {
-		return outcome, errors.Join(cause, appendErr)
-	}
-	return outcome, cause
-}
-
-func (r *runner) replay(events []eventlog.Event) (executionProgress, Outcome, bool, error) {
-	progress := executionProgress{}
-	roles := make(map[string]eventlog.Role)
-	finished := make(map[string]bool)
-	started := make(map[string]startedTurn)
-	attempts := make(map[string]map[int]bool)
-	terminal := false
-	sessionStarted := false
-	outcome := Outcome{}
-
-	for _, event := range events {
-		switch payload := event.Payload.(type) {
-		case eventlog.SessionStartedPayload:
-			if sessionStarted {
-				return executionProgress{}, Outcome{}, false, errors.New("session has more than one session.started event")
-			}
-			if payload.PlanDigest != r.planDigest || payload.SessionID != r.sess.Plan.SessionID {
-				return executionProgress{}, Outcome{}, false, errors.New("session.started does not match immutable plan")
-			}
-			sessionStarted = true
-		case *eventlog.SessionStartedPayload:
-			if payload != nil {
-				if sessionStarted {
-					return executionProgress{}, Outcome{}, false, errors.New("session has more than one session.started event")
-				}
-				if payload.PlanDigest != r.planDigest || payload.SessionID != r.sess.Plan.SessionID {
-					return executionProgress{}, Outcome{}, false, errors.New("session.started does not match immutable plan")
-				}
-				sessionStarted = true
-			}
-		case eventlog.TurnStartedPayload:
-			key := turnKey(payload.ActorID, payload.Round)
-			roles[key] = payload.Role
-			started[key] = startedTurn{ActorID: payload.ActorID, Round: payload.Round, Role: payload.Role, NextAttempt: 1}
-		case *eventlog.TurnStartedPayload:
-			if payload != nil {
-				key := turnKey(payload.ActorID, payload.Round)
-				roles[key] = payload.Role
-				started[key] = startedTurn{ActorID: payload.ActorID, Round: payload.Round, Role: payload.Role, NextAttempt: 1}
-			}
-		case eventlog.AttemptStartedPayload:
-			for key, turn := range started {
-				if turn.ActorID != payload.ActorID || finished[key] {
-					continue
-				}
-				if attempts[key] == nil {
-					attempts[key] = make(map[int]bool)
-				}
-				attempts[key][payload.Attempt] = false
-				turn.NextAttempt = maxInt(turn.NextAttempt, payload.Attempt+1)
-				started[key] = turn
-			}
-		case *eventlog.AttemptStartedPayload:
-			if payload != nil {
-				for key, turn := range started {
-					if turn.ActorID != payload.ActorID || finished[key] {
-						continue
-					}
-					if attempts[key] == nil {
-						attempts[key] = make(map[int]bool)
-					}
-					attempts[key][payload.Attempt] = false
-					turn.NextAttempt = maxInt(turn.NextAttempt, payload.Attempt+1)
-					started[key] = turn
-				}
-			}
-		case eventlog.AttemptFinishedPayload:
-			for key, turn := range started {
-				if turn.ActorID == payload.ActorID && !finished[key] && attempts[key] != nil {
-					if _, exists := attempts[key][payload.Attempt]; exists {
-						attempts[key][payload.Attempt] = true
-					}
-				}
-			}
-		case *eventlog.AttemptFinishedPayload:
-			if payload != nil {
-				for key, turn := range started {
-					if turn.ActorID == payload.ActorID && !finished[key] && attempts[key] != nil {
-						if _, exists := attempts[key][payload.Attempt]; exists {
-							attempts[key][payload.Attempt] = true
-						}
-					}
-				}
-			}
-		case eventlog.TurnFinishedPayload:
-			if err := r.replayFinishedTurn(payload, roles, finished, &progress); err != nil {
-				return executionProgress{}, Outcome{}, false, err
-			}
-		case *eventlog.TurnFinishedPayload:
-			if payload != nil {
-				if err := r.replayFinishedTurn(*payload, roles, finished, &progress); err != nil {
-					return executionProgress{}, Outcome{}, false, err
-				}
-			}
-		case eventlog.ChildCompletedPayload:
-			text, err := r.readBlob(payload.Result)
-			if err != nil {
-				return executionProgress{}, Outcome{}, false, err
-			}
-			r.childResults = append(r.childResults, text)
-		case *eventlog.ChildCompletedPayload:
-			if payload != nil {
-				text, err := r.readBlob(payload.Result)
-				if err != nil {
-					return executionProgress{}, Outcome{}, false, err
-				}
-				r.childResults = append(r.childResults, text)
-			}
-		case eventlog.SessionFinishedPayload:
-			terminal = true
-			outcome = Outcome{Status: payload.Status, StopReason: payload.StopReason, Result: r.lastResult.Text, ResultRef: r.lastResult.Ref, Turns: len(r.conversation)}
-		case *eventlog.SessionFinishedPayload:
-			if payload != nil {
-				terminal = true
-				outcome = Outcome{Status: payload.Status, StopReason: payload.StopReason, Result: r.lastResult.Text, ResultRef: r.lastResult.Ref, Turns: len(r.conversation)}
-			}
-		}
-	}
-	if !sessionStarted {
-		return executionProgress{}, Outcome{}, false, errors.New("session has no session.started event")
-	}
-	if terminal {
-		return progress, outcome, true, nil
-	}
-	open := openStartedTurns(started, finished)
-	if len(open) > 1 {
-		return executionProgress{}, Outcome{}, false, errors.New("session has more than one unfinished turn")
-	}
-	if len(open) == 1 {
-		turn := open[0]
-		progress.startedTurn = &turn
-		for attempt, complete := range attempts[turnKey(turn.ActorID, turn.Round)] {
-			if !complete {
-				progress.abandoned = append(progress.abandoned, AbandonedAttempt{ActorID: turn.ActorID, Attempt: attempt})
-			}
-		}
-		sort.Slice(progress.abandoned, func(left, right int) bool {
-			return progress.abandoned[left].Attempt < progress.abandoned[right].Attempt
-		})
-	}
-	return progress, Outcome{}, false, nil
-}
-
-func (r *runner) replayFinishedTurn(payload eventlog.TurnFinishedPayload, roles map[string]eventlog.Role, finished map[string]bool, progress *executionProgress) error {
-	key := turnKey(payload.ActorID, payload.Round)
-	role, exists := roles[key]
-	if !exists {
-		return fmt.Errorf("turn.finished for %s has no turn.started", key)
-	}
-	finished[key] = true
-	text, err := r.readBlob(payload.Content)
-	if err != nil {
-		return err
-	}
-	actor, err := r.actor(payload.ActorID)
-	if err != nil {
-		return err
-	}
-	r.recordCompletedTurn(actor, role, completedTurn{Text: text, Ref: payload.Content})
-	switch role {
-	case eventlog.ParticipantRole:
-		if r.sess.Plan.Schedule.Kind == "dialogue" {
-			progress.participantTurns++
-		} else {
-			progress.sequenceTurns++
-		}
-	case eventlog.FacilitatorRole:
-		r.ledger = parseLedger(text, r.ledger)
-	case eventlog.ReducerRole:
-		progress.reducerDone = true
-	}
-	return nil
 }
 
 func (r *runner) readBlob(ref blobstore.BlobRef) (string, error) {
@@ -1043,50 +1361,18 @@ func readEvents(root string) ([]eventlog.Event, error) {
 	return eventlog.Replay(bytes.NewReader(body))
 }
 
-func openStartedTurns(started map[string]startedTurn, finished map[string]bool) []startedTurn {
-	open := make([]startedTurn, 0, len(started))
-	for key, turn := range started {
-		if !finished[key] {
-			open = append(open, turn)
-		}
-	}
-	sort.Slice(open, func(left, right int) bool {
-		if open[left].Round == open[right].Round {
-			return open[left].ActorID < open[right].ActorID
-		}
-		return open[left].Round < open[right].Round
-	})
-	return open
-}
-
-func turnKey(actorID string, round int) string {
-	return actorID + "\x00" + fmt.Sprintf("%d", round)
-}
-
-func maxInt(left int, right int) int {
-	if left > right {
-		return left
-	}
-	return right
-}
-
-var ledgerObject = regexp.MustCompile(`(?s)\{.*\}`)
+var ledgerObject = regexp.MustCompile("(?s)\\{.*\\}")
 
 func parseLedger(raw string, fallback model.Ledger) model.Ledger {
-	candidates := append([]string{strings.TrimSpace(raw)}, ledgerObject.FindAllString(raw, -1)...)
-	for _, candidate := range candidates {
-		if candidate == "" {
-			continue
-		}
-		var value any
-		if err := json.Unmarshal([]byte(candidate), &value); err != nil {
-			continue
-		}
-		if hasLedgerShape(value) {
-			return model.ParseLedger(value)
-		}
+	candidate := ledgerObject.FindString(raw)
+	if candidate == "" {
+		return fallback
 	}
-	return fallback
+	var decoded map[string]any
+	if err := json.Unmarshal([]byte(candidate), &decoded); err != nil || !hasLedgerShape(decoded) {
+		return fallback
+	}
+	return model.ParseLedger(decoded)
 }
 
 func hasLedgerShape(value any) bool {
@@ -1095,7 +1381,7 @@ func hasLedgerShape(value any) bool {
 		return false
 	}
 	for _, key := range []string{"settled", "contested", "withdrawn"} {
-		if _, exists := object[key].([]any); !exists {
+		if _, exists := object[key]; !exists {
 			return false
 		}
 	}
@@ -1115,29 +1401,24 @@ func hasConverged(turns []conversationTurn, ledger model.Ledger) bool {
 		return true
 	}
 	counts := ledger.Counts()
-	return (counts.Settled > 0 || counts.Withdrawn > 0) && counts.Contested == 0
+	return counts.Contested == 0 && (counts.Settled > 0 || counts.Withdrawn > 0)
 }
 
 func hasNoLedgerSignal(turns []conversationTurn, ledger model.Ledger) bool {
-	if len(turns) < 4 || !ledger.IsEmpty() {
+	if len(turns) < 4 {
 		return false
 	}
-	last := turns[len(turns)-1]
-	previous := turns[len(turns)-2]
-	return last.ActorID != previous.ActorID
+	counts := ledger.Counts()
+	if counts.Settled != 0 || counts.Contested != 0 || counts.Withdrawn != 0 {
+		return false
+	}
+	return !hasDoneSignal(turns[len(turns)-1].Text) && !hasDoneSignal(turns[len(turns)-2].Text)
 }
 
 func hasDoneSignal(text string) bool {
-	lowered := strings.ToLower(text)
-	for _, signal := range []string{
-		"task is complete",
-		"work is complete",
-		"no further changes",
-		"ready to merge",
-		"nothing else to add",
-		"this covers everything",
-	} {
-		if strings.Contains(lowered, signal) {
+	normalized := strings.ToLower(strings.TrimSpace(text))
+	for _, signal := range []string{"done", "complete", "converged", "resolved", "final answer"} {
+		if strings.Contains(normalized, signal) {
 			return true
 		}
 	}
