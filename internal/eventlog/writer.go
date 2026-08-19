@@ -15,6 +15,10 @@ import (
 
 const EventsFilename = "events.jsonl"
 
+// readEventLogFile is the sole log-read seam so tests can observe the real
+// recovery read and prove that Append does not scan the file again.
+var readEventLogFile = os.ReadFile
+
 // BlobVerifier establishes the blob-before-event ordering rule. blobstore.Store
 // implements it by opening, draining, and digest-verifying the payload.
 type BlobVerifier interface {
@@ -53,7 +57,7 @@ func (e *SequenceError) Error() string {
 	return fmt.Sprintf("event line %d has sequence %d, expected %d", e.Line, e.Actual, e.Expected)
 }
 
-// ReplayLineError identifies malformed non-final JSONL input.
+// ReplayLineError identifies a malformed complete JSONL record.
 type ReplayLineError struct {
 	Line  int
 	Cause error
@@ -65,84 +69,110 @@ func (e *ReplayLineError) Error() string {
 
 func (e *ReplayLineError) Unwrap() error { return e.Cause }
 
+// WriterLockedError means another Writer owns the runtime lease for this log.
+// Callers must close that writer before opening another one for the same log.
+type WriterLockedError struct{ Cause error }
+
+func (e *WriterLockedError) Error() string { return "event log already has an active writer" }
+
+func (e *WriterLockedError) Unwrap() error { return e.Cause }
+
+// WriterPoisonedError means an append reached a write or sync failure whose
+// durable result is ambiguous. The writer must be closed and reopened before
+// another append can safely receive a sequence number.
+type WriterPoisonedError struct{ Cause error }
+
+func (e *WriterPoisonedError) Error() string {
+	return "event writer is poisoned after an ambiguous append; reopen before appending"
+}
+
+func (e *WriterPoisonedError) Unwrap() error { return e.Cause }
+
+type appendFile interface {
+	Write([]byte) (int, error)
+	Sync() error
+	Close() error
+}
+
 // Writer keeps the append handle and next sequence in memory. It reads the
 // file once on OpenWriter; Append itself never replays or recounts the log.
 type Writer struct {
 	root    string
-	path    string
-	file    *os.File
+	file    appendFile
+	lease   *writerLease
 	blobs   BlobVerifier
 	nextSeq uint64
 	closed  bool
+	poison  error
 
 	mu sync.Mutex
-
-	startupEvents int
-	appendReads   uint64
-}
-
-// WriterStats makes the append complexity invariant observable in tests and
-// benchmarks. StartupEvents can be nonzero; AppendReadOperations must remain
-// zero regardless of log size.
-type WriterStats struct {
-	StartupEvents        int
-	AppendReadOperations uint64
 }
 
 // OpenWriter opens (or initializes) the log inside a session directory. A
-// malformed crash tail is discarded before future appends so it cannot become a
-// malformed middle line. This recovery read happens only at open time.
+// malformed, unterminated crash tail is discarded before future appends so it
+// cannot become a malformed middle line. This recovery read happens only at
+// open time.
 func OpenWriter(sessionDir string, blobs BlobVerifier) (*Writer, error) {
 	root := filepath.Clean(sessionDir)
+	lease, err := acquireWriterLease(root)
+	if err != nil {
+		return nil, err
+	}
 	filename := filepath.Join(root, EventsFilename)
 	if info, err := os.Lstat(filename); err == nil {
 		if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
+			_ = lease.Release()
 			return nil, fmt.Errorf("event log must be a regular file")
 		}
 	} else if !errors.Is(err, os.ErrNotExist) {
+		_ = lease.Release()
 		return nil, err
 	}
 
 	file, err := os.OpenFile(filename, os.O_CREATE|os.O_RDWR|os.O_APPEND, 0o600)
 	if err != nil {
+		_ = lease.Release()
 		return nil, err
 	}
-	body, err := os.ReadFile(filename)
-	if err != nil {
+	closeOpenFiles := func() {
 		_ = file.Close()
+		_ = lease.Release()
+	}
+	body, err := readEventLogFile(filename)
+	if err != nil {
+		closeOpenFiles()
 		return nil, err
 	}
 	events, validEnd, ignoredTail, terminalNewline, err := replayBytes(body)
 	if err != nil {
-		_ = file.Close()
+		closeOpenFiles()
 		return nil, err
 	}
 	if ignoredTail {
 		if err := file.Truncate(validEnd); err != nil {
-			_ = file.Close()
+			closeOpenFiles()
 			return nil, err
 		}
 		if err := file.Sync(); err != nil {
-			_ = file.Close()
+			closeOpenFiles()
 			return nil, err
 		}
 	} else if terminalNewline {
-		if _, err := file.Write([]byte("\n")); err != nil {
-			_ = file.Close()
+		if err := writeAll(file, []byte("\n")); err != nil {
+			closeOpenFiles()
 			return nil, err
 		}
 		if err := file.Sync(); err != nil {
-			_ = file.Close()
+			closeOpenFiles()
 			return nil, err
 		}
 	}
 	return &Writer{
-		root:          root,
-		path:          filename,
-		file:          file,
-		blobs:         blobs,
-		nextSeq:       uint64(len(events) + 1),
-		startupEvents: len(events),
+		root:    root,
+		file:    file,
+		lease:   lease,
+		blobs:   blobs,
+		nextSeq: uint64(len(events) + 1),
 	}, nil
 }
 
@@ -156,6 +186,9 @@ func (w *Writer) Append(event Event) (Event, error) {
 	defer w.mu.Unlock()
 	if w.closed {
 		return Event{}, os.ErrClosed
+	}
+	if w.poison != nil {
+		return Event{}, w.poison
 	}
 	if event.Seq != 0 && event.Seq != w.nextSeq {
 		return Event{}, &SequenceError{Expected: w.nextSeq, Actual: event.Seq}
@@ -179,13 +212,20 @@ func (w *Writer) Append(event Event) (Event, error) {
 	}
 	line = append(line, '\n')
 	if err := writeAll(w.file, line); err != nil {
-		return Event{}, err
+		return Event{}, w.poisonAfterAppendFailure(err)
 	}
 	if err := w.file.Sync(); err != nil {
-		return Event{}, err
+		return Event{}, w.poisonAfterAppendFailure(err)
 	}
 	w.nextSeq++
 	return normalized, nil
+}
+
+func (w *Writer) poisonAfterAppendFailure(cause error) error {
+	if w.poison == nil {
+		w.poison = &WriterPoisonedError{Cause: cause}
+	}
+	return w.poison
 }
 
 // NextSeq reports the sequence that a successful next Append will receive.
@@ -198,15 +238,6 @@ func (w *Writer) NextSeq() uint64 {
 	return w.nextSeq
 }
 
-func (w *Writer) Stats() WriterStats {
-	if w == nil {
-		return WriterStats{}
-	}
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	return WriterStats{StartupEvents: w.startupEvents, AppendReadOperations: w.appendReads}
-}
-
 func (w *Writer) Close() error {
 	if w == nil {
 		return nil
@@ -217,7 +248,13 @@ func (w *Writer) Close() error {
 		return nil
 	}
 	w.closed = true
-	return w.file.Close()
+	var closeErr error
+	if w.file != nil {
+		closeErr = w.file.Close()
+	}
+	leaseErr := w.lease.Release()
+	w.lease = nil
+	return errors.Join(closeErr, leaseErr)
 }
 
 // Replay reads canonical JSONL using the crash recovery rules. It never
@@ -241,7 +278,7 @@ func replayBytes(body []byte) ([]Event, int64, bool, bool, error) {
 	for index, line := range lines {
 		event, err := decodeEvent(line.body)
 		if err != nil {
-			if index == len(lines)-1 && recoverableFinalLine(err) {
+			if index == len(lines)-1 && !line.terminated && recoverableFinalLine(err) {
 				return events, validEnd, true, false, nil
 			}
 			return nil, 0, false, false, &ReplayLineError{Line: index + 1, Cause: err}
@@ -294,7 +331,7 @@ func recoverableFinalLine(err error) bool {
 	return true
 }
 
-func writeAll(file *os.File, body []byte) error {
+func writeAll(file appendFile, body []byte) error {
 	for len(body) > 0 {
 		count, err := file.Write(body)
 		if err != nil {

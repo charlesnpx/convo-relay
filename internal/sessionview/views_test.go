@@ -83,6 +83,36 @@ func TestAllViewsAreDerivedFromPlanEventsAndBlobs(t *testing.T) {
 	}
 }
 
+func TestGraphMarksOnlyMatchingActorRoundFinished(t *testing.T) {
+	plan := viewPlan()
+	plan.Actors = append(plan.Actors, session.Actor{ID: "actor-b", Backend: "claude", Model: "model", Effort: "medium"})
+	content := blobstore.BlobRef{SHA256: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", Size: 1, MediaType: "text/plain"}
+	events := []eventlog.Event{
+		{Seq: 1, Type: eventlog.TurnStarted, Payload: eventlog.TurnStartedPayload{ActorID: "actor-a", Round: 1, Role: eventlog.ParticipantRole}},
+		{Seq: 2, Type: eventlog.TurnStarted, Payload: eventlog.TurnStartedPayload{ActorID: "actor-b", Round: 1, Role: eventlog.ParticipantRole}},
+		{Seq: 3, Type: eventlog.TurnFinished, Payload: eventlog.TurnFinishedPayload{ActorID: "actor-b", Round: 1, Content: content}},
+	}
+	graph := Graph(plan, events)
+	if !hasNode(graph, "turn:1", "started") {
+		t.Fatalf("actor-a turn should remain started: %#v", graph)
+	}
+	if !hasNode(graph, "turn:2", "finished") {
+		t.Fatalf("actor-b turn should be finished: %#v", graph)
+	}
+}
+
+func TestProviderSessionsKeepsLatestSuccessfulSessionAfterFailure(t *testing.T) {
+	content := blobstore.BlobRef{SHA256: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", Size: 1, MediaType: "text/plain"}
+	events := []eventlog.Event{
+		{Seq: 1, Type: eventlog.AttemptFinished, Payload: eventlog.AttemptFinishedPayload{ActorID: "actor-a", Attempt: 1, Outcome: "success", ProviderSessionID: "successful-session", Content: content}},
+		{Seq: 2, Type: eventlog.AttemptFinished, Payload: eventlog.AttemptFinishedPayload{ActorID: "actor-a", Attempt: 2, Outcome: "failed", ProviderSessionID: "failed-session", Content: content}},
+	}
+	sessions := ProviderSessions(viewPlan(), events)
+	if got, want := sessions["actor-a"], "successful-session"; got != want {
+		t.Fatalf("provider session = %q, want %q", got, want)
+	}
+}
+
 func hasNode(graph GraphView, identifier string, status string) bool {
 	for _, node := range graph.Nodes {
 		if node.ID == identifier && node.Status == status {

@@ -6,7 +6,6 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
-	"math"
 	"math/big"
 	"os"
 	"os/user"
@@ -21,6 +20,7 @@ const digestPrefix = "sha256:"
 
 var semanticNumberPattern = regexp.MustCompile(`^(-?)(0|[1-9][0-9]*)(?:\.([0-9]+))?(?:[eE]([+-]?[0-9]+))?$`)
 var localPortPattern = regexp.MustCompile(`(?i)\bport\s*(?:=|:|\s)\s*[0-9]{1,5}\b`)
+var plausibleProcessIDPattern = regexp.MustCompile(`(?i)\b(?:pid|process(?:[_ -]?id))\b\s*(?:=|:|\bis\b)?\s*([1-9][0-9]{0,9})\b`)
 
 // SemanticJSONError reports malformed input or a value that cannot be
 // represented under the v2 semantic-json rules.
@@ -623,21 +623,7 @@ func localMarkers(explicit []string) []string {
 func validatePortableNode(node semanticNode, markers []string) error {
 	switch node.kind {
 	case semanticString:
-		if looksLikeAbsolutePath(node.text) {
-			return &PortableValueError{Value: node.text, Reason: "contains an absolute path"}
-		}
-		for _, marker := range markers {
-			marker = strings.TrimSpace(marker)
-			if len(marker) > 1 && strings.Contains(node.text, marker) {
-				return &PortableValueError{Value: node.text, Reason: "contains a current-machine value"}
-			}
-		}
-		if looksLikeLocalEndpoint(node.text) {
-			return &PortableValueError{Value: node.text, Reason: "contains a local endpoint"}
-		}
-		if looksLikeCurrentProcessID(node.text) {
-			return &PortableValueError{Value: node.text, Reason: "contains the current process id"}
-		}
+		return validatePortableText(node.text, markers)
 	case semanticArray:
 		for _, item := range node.array {
 			if err := validatePortableNode(item, markers); err != nil {
@@ -646,6 +632,9 @@ func validatePortableNode(node semanticNode, markers []string) error {
 		}
 	case semanticObject:
 		for _, member := range node.object {
+			if err := validatePortableText(member.key, markers); err != nil {
+				return err
+			}
 			if err := validatePortableNode(member.value, markers); err != nil {
 				return err
 			}
@@ -654,7 +643,29 @@ func validatePortableNode(node semanticNode, markers []string) error {
 	return nil
 }
 
+func validatePortableText(value string, markers []string) error {
+	if looksLikeAbsolutePath(value) {
+		return &PortableValueError{Value: value, Reason: "contains an absolute path"}
+	}
+	for _, marker := range markers {
+		marker = strings.TrimSpace(marker)
+		if len(marker) > 1 && strings.Contains(value, marker) {
+			return &PortableValueError{Value: value, Reason: "contains a current-machine value"}
+		}
+	}
+	if looksLikeLocalEndpoint(value) {
+		return &PortableValueError{Value: value, Reason: "contains a local endpoint"}
+	}
+	if looksLikePlausibleProcessID(value) {
+		return &PortableValueError{Value: value, Reason: "contains a plausible process id"}
+	}
+	return nil
+}
+
 func looksLikeAbsolutePath(value string) bool {
+	if strings.Contains(strings.ToLower(value), "file://") {
+		return true
+	}
 	if strings.HasPrefix(value, "\\\\") || strings.HasPrefix(value, "~/") {
 		return true
 	}
@@ -693,17 +704,17 @@ func looksLikeLocalEndpoint(value string) bool {
 	return strings.Contains(lower, "localhost:") || strings.Contains(lower, "127.0.0.1:") || strings.Contains(lower, "[::1]:") || localPortPattern.MatchString(value)
 }
 
-func looksLikeCurrentProcessID(value string) bool {
-	pid := strconv.Itoa(os.Getpid())
-	if value == pid {
+func looksLikePlausibleProcessID(value string) bool {
+	if value == strconv.Itoa(os.Getpid()) {
 		return true
 	}
-	lower := strings.ToLower(value)
-	return strings.Contains(lower, "pid="+pid) ||
-		strings.Contains(lower, "pid:"+pid) ||
-		strings.Contains(lower, "pid "+pid) ||
-		strings.Contains(lower, "process_id="+pid) ||
-		strings.Contains(lower, "process id="+pid)
+	for _, match := range plausibleProcessIDPattern.FindAllStringSubmatch(value, -1) {
+		identifier, err := strconv.ParseUint(match[1], 10, 32)
+		if err == nil && identifier > 0 {
+			return true
+		}
+	}
+	return false
 }
 
 // PortableValueError identifies a prohibited machine-local durable value.
@@ -714,15 +725,4 @@ type PortableValueError struct {
 
 func (e *PortableValueError) Error() string {
 	return "non-portable durable value: " + e.Reason
-}
-
-// SemanticFloat is available to typed callers that need to verify finite
-// floating-point input before semantic serialization. Plans intentionally do
-// not use floating-point fields.
-func SemanticFloat(value float64) error {
-	if math.IsNaN(value) || math.IsInf(value, 0) {
-		return &SemanticJSONError{Reason: "numbers must be finite"}
-	}
-	_, err := normalizeSemanticNumber(strconv.FormatFloat(value, 'g', -1, 64))
-	return err
 }

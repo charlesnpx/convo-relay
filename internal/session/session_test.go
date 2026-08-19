@@ -137,6 +137,16 @@ func TestPortableCanonicalRecordsContainNoLocalValues(t *testing.T) {
 	}
 }
 
+func TestCreateRejectsAbsolutePathSchemaObjectKey(t *testing.T) {
+	plan := testPlan()
+	plan.Result.Schema = json.RawMessage(`{"/machine/local/result-schema": {"type": "string"}}`)
+	_, err := Create(filepath.Join(t.TempDir(), "relay-home"), plan)
+	var local *eventlog.PortableValueError
+	if !errors.As(err, &local) {
+		t.Fatalf("schema object-key error = %v, want PortableValueError", err)
+	}
+}
+
 func walkJSONStrings(body []byte, visit func(string)) error {
 	decoder := json.NewDecoder(bytes.NewReader(body))
 	if err := walkJSONValue(decoder, visit); err != nil {

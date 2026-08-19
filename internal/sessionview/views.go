@@ -237,6 +237,7 @@ type GraphView struct {
 func Graph(plan session.Plan, events []eventlog.Event) GraphView {
 	nodes := make(map[string]GraphNode)
 	edges := make(map[string]GraphEdge)
+	turnNodes := make(map[string]string)
 	rootID := "session:" + plan.SessionID
 	nodes[rootID] = GraphNode{ID: rootID, Kind: "session", Status: "running"}
 	for _, actor := range plan.Actors {
@@ -255,16 +256,16 @@ func Graph(plan session.Plan, events []eventlog.Event) GraphView {
 				nodes[rootID] = root
 			}
 		case eventlog.TurnStartedPayload:
-			addTurnNode(nodes, edges, rootID, event.Seq, payload)
+			turnNodes[turnKey(payload.ActorID, payload.Round)] = addTurnNode(nodes, edges, rootID, event.Seq, payload)
 		case *eventlog.TurnStartedPayload:
 			if payload != nil {
-				addTurnNode(nodes, edges, rootID, event.Seq, *payload)
+				turnNodes[turnKey(payload.ActorID, payload.Round)] = addTurnNode(nodes, edges, rootID, event.Seq, *payload)
 			}
 		case eventlog.TurnFinishedPayload:
-			ensureActor(nodes, edges, rootID, payload.ActorID)
+			finishTurnNode(nodes, edges, rootID, turnNodes, payload)
 		case *eventlog.TurnFinishedPayload:
 			if payload != nil {
-				ensureActor(nodes, edges, rootID, payload.ActorID)
+				finishTurnNode(nodes, edges, rootID, turnNodes, *payload)
 			}
 		case eventlog.ChildRequestedPayload:
 			addChildRequest(nodes, edges, rootID, payload)
@@ -310,11 +311,26 @@ func ensureActor(nodes map[string]GraphNode, edges map[string]GraphEdge, rootID 
 	addEdge(edges, GraphEdge{From: rootID, To: actorNodeID, Kind: "actor"})
 }
 
-func addTurnNode(nodes map[string]GraphNode, edges map[string]GraphEdge, rootID string, seq uint64, payload eventlog.TurnStartedPayload) {
+func addTurnNode(nodes map[string]GraphNode, edges map[string]GraphEdge, rootID string, seq uint64, payload eventlog.TurnStartedPayload) string {
 	ensureActor(nodes, edges, rootID, payload.ActorID)
 	turnID := "turn:" + strconv.FormatUint(seq, 10)
 	nodes[turnID] = GraphNode{ID: turnID, Kind: "turn", ActorID: payload.ActorID, Round: payload.Round, Role: payload.Role, Status: "started"}
 	addEdge(edges, GraphEdge{From: "actor:" + payload.ActorID, To: turnID, Kind: "turn"})
+	return turnID
+}
+
+func finishTurnNode(nodes map[string]GraphNode, edges map[string]GraphEdge, rootID string, turnNodes map[string]string, payload eventlog.TurnFinishedPayload) {
+	ensureActor(nodes, edges, rootID, payload.ActorID)
+	turnID, found := turnNodes[turnKey(payload.ActorID, payload.Round)]
+	if !found {
+		return
+	}
+	node, found := nodes[turnID]
+	if !found {
+		return
+	}
+	node.Status = "finished"
+	nodes[turnID] = node
 }
 
 func addChildRequest(nodes map[string]GraphNode, edges map[string]GraphEdge, rootID string, payload eventlog.ChildRequestedPayload) {
@@ -409,7 +425,7 @@ func ProviderSessions(_ session.Plan, events []eventlog.Event) map[string]string
 	sessions := make(map[string]string)
 	for _, event := range events {
 		payload, ok := asAttemptFinished(event.Payload)
-		if !ok || strings.TrimSpace(payload.ProviderSessionID) == "" {
+		if !ok || payload.Outcome != "success" || strings.TrimSpace(payload.ProviderSessionID) == "" {
 			continue
 		}
 		sessions[payload.ActorID] = payload.ProviderSessionID

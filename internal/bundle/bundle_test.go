@@ -101,6 +101,51 @@ func TestVerifyRejectsEachTamperClass(t *testing.T) {
 	})
 }
 
+func TestCreateAndVerifyRejectMalformedTerminatedFinalRecord(t *testing.T) {
+	t.Run("create", func(t *testing.T) {
+		created := fixtureSourceSession(t)
+		filename := filepath.Join(created.Root, eventlog.EventsFilename)
+		body, err := os.ReadFile(filename)
+		if err != nil {
+			t.Fatalf("read source events: %v", err)
+		}
+		body = append(body, []byte("not-json\n")...)
+		if err := os.WriteFile(filename, body, 0o600); err != nil {
+			t.Fatalf("append malformed terminated tail: %v", err)
+		}
+		_, err = Create(created.Root, filepath.Join(t.TempDir(), "portable-bundle"))
+		var lineErr *eventlog.ReplayLineError
+		if !errors.As(err, &lineErr) {
+			t.Fatalf("create malformed-tail error = %v, want ReplayLineError", err)
+		}
+	})
+	t.Run("verify", func(t *testing.T) {
+		directory, manifest := fixtureBundle(t)
+		filename := filepath.Join(directory, eventlog.EventsFilename)
+		body, err := os.ReadFile(filename)
+		if err != nil {
+			t.Fatalf("read bundle events: %v", err)
+		}
+		body = append(body, []byte("not-json\n")...)
+		if err := os.WriteFile(filename, body, 0o600); err != nil {
+			t.Fatalf("append malformed bundle tail: %v", err)
+		}
+		manifest.EventsJSONLDigest = eventlog.RawBytesDigest(body)
+		manifestBody, err := eventlog.SemanticJSONBytes(manifest)
+		if err != nil {
+			t.Fatalf("encode updated manifest: %v", err)
+		}
+		if err := os.WriteFile(filepath.Join(directory, ManifestFilename), manifestBody, 0o600); err != nil {
+			t.Fatalf("write updated manifest: %v", err)
+		}
+		_, err = Verify(directory)
+		var lineErr *eventlog.ReplayLineError
+		if !errors.As(err, &lineErr) {
+			t.Fatalf("verify malformed-tail error = %v, want ReplayLineError", err)
+		}
+	})
+}
+
 func assertDigestMismatch(t *testing.T, directory string, path string) {
 	t.Helper()
 	_, err := Verify(directory)
@@ -111,6 +156,17 @@ func assertDigestMismatch(t *testing.T, directory string, path string) {
 }
 
 func fixtureBundle(t *testing.T) (string, *Manifest) {
+	t.Helper()
+	created := fixtureSourceSession(t)
+	target := filepath.Join(t.TempDir(), "portable-bundle")
+	manifest, err := Create(created.Root, target)
+	if err != nil {
+		t.Fatalf("create bundle: %v", err)
+	}
+	return target, manifest
+}
+
+func fixtureSourceSession(t *testing.T) *session.Session {
 	t.Helper()
 	relayHome := filepath.Join(t.TempDir(), "relay-home")
 	created, err := session.Create(relayHome, bundlePlan())
@@ -146,12 +202,7 @@ func fixtureBundle(t *testing.T) (string, *Manifest) {
 	if err := writer.Close(); err != nil {
 		t.Fatalf("close source log: %v", err)
 	}
-	target := filepath.Join(t.TempDir(), "portable-bundle")
-	manifest, err := Create(created.Root, target)
-	if err != nil {
-		t.Fatalf("create bundle: %v", err)
-	}
-	return target, manifest
+	return created
 }
 
 func bundlePlan() session.Plan {
