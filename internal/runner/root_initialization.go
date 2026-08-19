@@ -19,12 +19,39 @@ import (
 const (
 	rootInitializationJournalName = "initialization.json"
 	rootInitializationClaimName   = "initialization.claim"
+	rootInitializationOriginName  = "initialization.origin"
 )
 
 var rootInitializationAfterStage func(string) error
 var rootInitializationAfterMutation func(string) error
 var rootInitializationAfterWorktreeRemoval func() error
 var rootInitializationBeforeFileCommit func(string) error
+
+// rootInitializationBeforeDestinationCreate is a test-only synchronization
+// hook after a claimant has observed an absent destination but before it tries
+// to create that directory.
+var rootInitializationBeforeDestinationCreate func() error
+
+// rootInitializationAfterDestinationCreate is a test-only interruption seam
+// after a claimant has created a new destination and its in-root origin
+// marker, but before it can create the claim file.
+var rootInitializationAfterDestinationCreate func() error
+
+// rootInitializationBeforeRootRemoval is a test-only synchronization hook
+// after bootstrap controls have been removed but before a newly created root
+// is removed.
+var rootInitializationBeforeRootRemoval func() error
+
+// rootInitializationBeforeDestinationRootRemoval is a test-only
+// synchronization hook after the destination origin has been verified for
+// removal. It makes the final deletion race reproducible without changing
+// production behavior.
+var rootInitializationBeforeDestinationRootRemoval func() error
+
+// rootInitializationAfterDestinationOriginRemoval is a test-only interruption
+// seam after the owned origin is removed but before the empty session root is
+// removed.
+var rootInitializationAfterDestinationOriginRemoval func() error
 
 var rootInitializationOwnedEntries = []string{
 	".git",
@@ -35,6 +62,7 @@ var rootInitializationOwnedEntries = []string{
 	"graph.json",
 	rootInitializationClaimName,
 	rootInitializationJournalName,
+	rootInitializationOriginName,
 	"meta.json",
 	"transcript.json",
 }
@@ -72,15 +100,16 @@ func beginRootInitialization(preflight *recipePreflight) (*rootInitializationTra
 	if err != nil {
 		return nil, err
 	}
-	preExisting, err := claimRootInitializationDestination(sessionRoot, token)
+	destination, err := claimRootInitializationDestinationWithOrigin(sessionRoot, token)
 	if err != nil {
 		return nil, err
 	}
+	preExisting := destination.preExisting
 	mutationLock, err := lockSessionMutation(sessionRoot)
 	if err != nil {
 		_ = removeRootInitializationClaim(sessionRoot, token)
-		if !preExisting {
-			_ = os.Remove(sessionRoot)
+		if destination.origin != nil {
+			_ = removeRootInitializationDestinationOriginAndRoot(sessionRoot, destination.origin.entry)
 		}
 		return nil, err
 	}
@@ -95,8 +124,8 @@ func beginRootInitialization(preflight *recipePreflight) (*rootInitializationTra
 			_ = removeRootInitializationClaim(sessionRoot, token)
 			_ = mutationLock.Unlock()
 			_ = mutationLock.removePathAfterUnlock()
-			if !preExisting {
-				_ = os.Remove(sessionRoot)
+			if destination.origin != nil {
+				_ = removeRootInitializationDestinationOriginAndRoot(sessionRoot, destination.origin.entry)
 			}
 		}
 	}()
@@ -138,6 +167,9 @@ func beginRootInitialization(preflight *recipePreflight) (*rootInitializationTra
 		),
 		ownedEntries: map[string]rootInitializationOwnedEntry{},
 		mutationLock: mutationLock,
+	}
+	if destination.origin != nil {
+		transaction.ownedEntries[destination.origin.entry.Path] = destination.origin.entry
 	}
 	transaction.st = store.NewWithFileMutationObserver(sessionRoot, transaction)
 	if err := transaction.refreshOwnershipDigest(); err != nil {
@@ -380,16 +412,52 @@ func (t *rootInitializationTransaction) compensateWithoutMeta() error {
 	return t.compensateBootstrap()
 }
 
+type rootInitializationDestinationClaim struct {
+	preExisting bool
+	origin      *rootInitializationDestinationOrigin
+}
+
+type rootInitializationDestinationOrigin struct {
+	entry rootInitializationOwnedEntry
+}
+
 func claimRootInitializationDestination(sessionRoot string, token string) (bool, error) {
+	destination, err := claimRootInitializationDestinationWithOrigin(sessionRoot, token)
+	return destination.preExisting, err
+}
+
+func claimRootInitializationDestinationWithOrigin(sessionRoot string, token string) (result rootInitializationDestinationClaim, err error) {
+	var destination rootInitializationDestinationClaim
+	rootCreated := false
+	claimCreated := false
+	defer func() {
+		if err == nil || !rootCreated {
+			return
+		}
+		if cleanupErr := cleanupRootInitializationDestinationAttempt(sessionRoot, token, destination, claimCreated); cleanupErr != nil {
+			err = errors.Join(err, cleanupErr)
+		}
+	}()
+
 	info, statErr := os.Lstat(sessionRoot)
-	preExisting := statErr == nil
 	switch {
 	case os.IsNotExist(statErr):
+		if err := rejectInitializationSymlinkComponents(filepath.Dir(sessionRoot)); err != nil {
+			return rootInitializationDestinationClaim{}, err
+		}
 		if err := os.MkdirAll(filepath.Dir(sessionRoot), 0o755); err != nil {
-			return false, err
+			return rootInitializationDestinationClaim{}, err
+		}
+		if err := rejectInitializationSymlinkComponents(filepath.Dir(sessionRoot)); err != nil {
+			return rootInitializationDestinationClaim{}, err
+		}
+		if rootInitializationBeforeDestinationCreate != nil {
+			if err := rootInitializationBeforeDestinationCreate(); err != nil {
+				return rootInitializationDestinationClaim{}, err
+			}
 		}
 		if err := os.Mkdir(sessionRoot, 0o755); err != nil {
-			return false, rootRecipeDiagnostic(
+			return rootInitializationDestinationClaim{}, rootRecipeDiagnostic(
 				diagnosticCodeSessionPathInvalid,
 				contracts.DiagnosticPhasePolicy,
 				"/session_dir",
@@ -397,30 +465,51 @@ func claimRootInitializationDestination(sessionRoot string, token string) (bool,
 				map[string]any{"cause": err.Error()},
 			)
 		}
+		rootCreated = true
+		origin, originErr := establishRootInitializationDestinationOrigin(sessionRoot)
+		if origin.entry.Path != "" {
+			destination.origin = &origin
+		}
+		if originErr != nil {
+			return rootInitializationDestinationClaim{}, originErr
+		}
+		if rootInitializationAfterDestinationCreate != nil {
+			if err := rootInitializationAfterDestinationCreate(); err != nil {
+				return rootInitializationDestinationClaim{}, err
+			}
+		}
 	case statErr != nil:
-		return false, statErr
-	case info.Mode()&os.ModeSymlink != 0 || !info.IsDir():
-		return false, rootRecipeDiagnostic(diagnosticCodeSessionPathInvalid, contracts.DiagnosticPhasePolicy, "/session_dir", "The root initialization destination must be a real directory.", nil)
+		return rootInitializationDestinationClaim{}, statErr
 	default:
-		entries, err := os.ReadDir(sessionRoot)
-		if err != nil {
-			return false, err
+		if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
+			return rootInitializationDestinationClaim{}, rootRecipeDiagnostic(diagnosticCodeSessionPathInvalid, contracts.DiagnosticPhasePolicy, "/session_dir", "The root initialization destination must be a real directory.", nil)
 		}
-		if len(entries) != 0 {
-			return false, rootRecipeDiagnostic(diagnosticCodeSessionPathInvalid, contracts.DiagnosticPhasePolicy, "/session_dir", "The root initialization destination must remain empty until it is claimed.", nil)
+		destination.preExisting = true
+	}
+
+	info, err = os.Lstat(sessionRoot)
+	if err != nil {
+		return rootInitializationDestinationClaim{}, err
+	}
+	if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
+		return rootInitializationDestinationClaim{}, rootRecipeDiagnostic(diagnosticCodeSessionPathInvalid, contracts.DiagnosticPhasePolicy, "/session_dir", "The root initialization destination must be a real directory.", nil)
+	}
+	entries, err := os.ReadDir(sessionRoot)
+	if err != nil {
+		return rootInitializationDestinationClaim{}, err
+	}
+	if destination.preExisting {
+		if !rootInitializationDestinationEntriesMatch(entries) {
+			return rootInitializationDestinationClaim{}, rootRecipeDiagnostic(diagnosticCodeSessionPathInvalid, contracts.DiagnosticPhasePolicy, "/session_dir", "The root initialization destination must remain empty until it is claimed.", nil)
 		}
+	} else if !rootInitializationDestinationEntriesMatch(entries, rootInitializationOriginName) {
+		return rootInitializationDestinationClaim{}, rootRecipeDiagnostic(diagnosticCodeSessionPathInvalid, contracts.DiagnosticPhasePolicy, "/session_dir", "The root initialization destination changed while its origin was being recorded.", nil)
 	}
 	if err := rejectInitializationSymlinkComponents(sessionRoot); err != nil {
-		if !preExisting {
-			_ = os.Remove(sessionRoot)
-		}
-		return false, err
+		return rootInitializationDestinationClaim{}, err
 	}
 	if err := createRootInitializationClaim(sessionRoot, token); err != nil {
-		if !preExisting {
-			_ = os.Remove(sessionRoot)
-		}
-		return false, rootRecipeDiagnostic(
+		return rootInitializationDestinationClaim{}, rootRecipeDiagnostic(
 			diagnosticCodeSessionPathInvalid,
 			contracts.DiagnosticPhasePolicy,
 			"/session_dir",
@@ -428,20 +517,23 @@ func claimRootInitializationDestination(sessionRoot string, token string) (bool,
 			map[string]any{"cause": err.Error()},
 		)
 	}
-	entries, err := os.ReadDir(sessionRoot)
+	claimCreated = true
+	entries, err = os.ReadDir(sessionRoot)
 	if err != nil {
-		_ = removeRootInitializationClaim(sessionRoot, token)
-		if !preExisting {
-			_ = os.Remove(sessionRoot)
-		}
-		return false, err
+		return rootInitializationDestinationClaim{}, err
 	}
-	if len(entries) != 1 || entries[0].Name() != rootInitializationClaimName {
-		_ = removeRootInitializationClaim(sessionRoot, token)
-		if !preExisting {
-			_ = os.Remove(sessionRoot)
+	if destination.preExisting {
+		if !rootInitializationDestinationEntriesMatch(entries, rootInitializationClaimName) {
+			return rootInitializationDestinationClaim{}, rootRecipeDiagnostic(
+				diagnosticCodeSessionPathInvalid,
+				contracts.DiagnosticPhasePolicy,
+				"/session_dir",
+				"The root initialization destination changed while it was being claimed.",
+				nil,
+			)
 		}
-		return false, rootRecipeDiagnostic(
+	} else if !rootInitializationDestinationEntriesMatch(entries, rootInitializationClaimName, rootInitializationOriginName) {
+		return rootInitializationDestinationClaim{}, rootRecipeDiagnostic(
 			diagnosticCodeSessionPathInvalid,
 			contracts.DiagnosticPhasePolicy,
 			"/session_dir",
@@ -449,7 +541,183 @@ func claimRootInitializationDestination(sessionRoot string, token string) (bool,
 			nil,
 		)
 	}
-	return preExisting, nil
+	return destination, nil
+}
+
+func rootInitializationDestinationEntriesMatch(entries []os.DirEntry, expected ...string) bool {
+	if len(entries) != len(expected) {
+		return false
+	}
+	for index, name := range expected {
+		if entries[index].Name() != name {
+			return false
+		}
+	}
+	return true
+}
+
+func rootInitializationDestinationOriginPath(sessionRoot string) string {
+	return filepath.Join(sessionRoot, rootInitializationOriginName)
+}
+
+func establishRootInitializationDestinationOrigin(sessionRoot string) (origin rootInitializationDestinationOrigin, err error) {
+	path := rootInitializationDestinationOriginPath(sessionRoot)
+	if err := os.Mkdir(path, 0o700); err != nil {
+		return rootInitializationDestinationOrigin{}, err
+	}
+	origin.entry, err = rootInitializationDestinationOriginEntry(sessionRoot)
+	if err != nil {
+		return origin, err
+	}
+	if err := syncRootInitializationDirectory(sessionRoot); err != nil {
+		return origin, err
+	}
+	if err := syncRootInitializationDirectory(filepath.Dir(sessionRoot)); err != nil {
+		return origin, err
+	}
+	return origin, nil
+}
+
+func rootInitializationDestinationOriginEntry(sessionRoot string) (rootInitializationOwnedEntry, error) {
+	path := rootInitializationDestinationOriginPath(sessionRoot)
+	info, err := os.Lstat(path)
+	if err != nil {
+		return rootInitializationOwnedEntry{}, err
+	}
+	if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
+		return rootInitializationOwnedEntry{}, errors.New("root initialization destination origin must be an empty directory")
+	}
+	entries, err := os.ReadDir(path)
+	if err != nil {
+		return rootInitializationOwnedEntry{}, err
+	}
+	if len(entries) != 0 {
+		return rootInitializationOwnedEntry{}, errors.New("root initialization destination origin must remain empty")
+	}
+	return rootInitializationRecordPath(sessionRoot, rootInitializationOriginName)
+}
+
+func cleanupRootInitializationDestinationAttempt(
+	sessionRoot string,
+	token string,
+	destination rootInitializationDestinationClaim,
+	claimCreated bool,
+) error {
+	var failures []error
+	if claimCreated {
+		failures = append(failures, removeRootInitializationClaim(sessionRoot, token))
+	}
+	if destination.origin != nil {
+		failures = append(failures, removeRootInitializationDestinationOriginAndRoot(sessionRoot, destination.origin.entry))
+		return errors.Join(failures...)
+	}
+	entries, err := os.ReadDir(sessionRoot)
+	if err != nil {
+		return errors.Join(append(failures, err)...)
+	}
+	if len(entries) == 0 {
+		failures = append(failures, os.Remove(sessionRoot))
+	}
+	return errors.Join(failures...)
+}
+
+func removeRootInitializationDestinationOriginAndRoot(sessionRoot string, expected rootInitializationOwnedEntry) error {
+	if expected.Path != rootInitializationOriginName || expected.Kind != "directory" || expected.Identity == "" {
+		return errors.New("root initialization destination origin identity is invalid")
+	}
+	actual, err := rootInitializationDestinationOriginEntry(sessionRoot)
+	if err != nil {
+		return err
+	}
+	if !rootInitializationEntryMatches(expected, actual, true) {
+		return errors.New("root initialization destination origin changed before removal")
+	}
+	if rootInitializationBeforeDestinationRootRemoval != nil {
+		if err := rootInitializationBeforeDestinationRootRemoval(); err != nil {
+			return err
+		}
+	}
+	if err := os.Remove(rootInitializationDestinationOriginPath(sessionRoot)); err != nil {
+		return err
+	}
+	if rootInitializationAfterDestinationOriginRemoval != nil {
+		if err := rootInitializationAfterDestinationOriginRemoval(); err != nil {
+			return err
+		}
+	}
+	if err := os.Remove(sessionRoot); err != nil {
+		return err
+	}
+	return syncRootInitializationDirectory(filepath.Dir(sessionRoot))
+}
+
+func recoverRootInitializationDestinationOrigin(
+	sessionRoot string,
+	lock *sessionMutationLock,
+) (bool, error) {
+	if lock == nil || lock.file == nil {
+		return false, errors.New("root initialization origin recovery requires the session mutation lease")
+	}
+	origin, err := rootInitializationDestinationOriginEntry(sessionRoot)
+	if os.IsNotExist(err) {
+		return false, nil
+	}
+	if err != nil {
+		return true, err
+	}
+	entries, err := os.ReadDir(sessionRoot)
+	if err != nil {
+		return true, err
+	}
+	for _, entry := range entries {
+		if entry.Name() == rootInitializationOriginName {
+			continue
+		}
+		if !rootInitializationOrphanedControlPath(entry.Name()) {
+			return true, fmt.Errorf("root initialization origin recovery refused foreign entry %s", entry.Name())
+		}
+		info, err := os.Lstat(filepath.Join(sessionRoot, entry.Name()))
+		if err != nil {
+			return true, err
+		}
+		if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
+			return true, fmt.Errorf("root initialization origin recovery control path %s changed type", entry.Name())
+		}
+	}
+	for _, entry := range entries {
+		if entry.Name() == rootInitializationOriginName || entry.Name() == ".mutation.lock" {
+			continue
+		}
+		if err := os.Remove(filepath.Join(sessionRoot, entry.Name())); err != nil {
+			return true, err
+		}
+	}
+	if err := lock.Unlock(); err != nil {
+		return true, err
+	}
+	if err := lock.removePathAfterUnlock(); err != nil {
+		return true, err
+	}
+	return true, removeRootInitializationDestinationOriginAndRoot(sessionRoot, origin)
+}
+
+func rootInitializationOrphanedControlPath(name string) bool {
+	if name == ".mutation.lock" ||
+		name == rootInitializationClaimName ||
+		name == rootInitializationJournalName ||
+		name == "meta.json" {
+		return true
+	}
+	return strings.HasPrefix(name, "."+rootInitializationJournalName+".") && strings.HasSuffix(name, ".tmp")
+}
+
+func syncRootInitializationDirectory(path string) error {
+	directory, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	defer directory.Close()
+	return directory.Sync()
 }
 
 func createRootInitializationClaim(sessionRoot string, token string) (err error) {
@@ -683,7 +951,8 @@ func loadRootInitializationTransaction(
 	if err != nil {
 		return nil, fmt.Errorf("decode root initialization journal: %w", err)
 	}
-	if intFromAny(payload["schema_version"], 0) != rootInitializationJournalSchemaVersion {
+	schemaVersion := intFromAny(payload["schema_version"], 0)
+	if schemaVersion != rootInitializationJournalSchemaVersion && schemaVersion != rootInitializationLegacyJournalSchemaVersion {
 		return nil, errors.New("root initialization journal schema version is invalid")
 	}
 	hasMeta := len(meta) != 0
@@ -728,7 +997,7 @@ func loadRootInitializationTransaction(
 			return nil, fmt.Errorf("root initialization journal captured identity field %s does not match session metadata", field)
 		}
 	}
-	if err := validateRootInitializationOwnedEntries(payload["owned_top_level_entries"]); err != nil {
+	if err := validateRootInitializationOwnedEntries(payload["owned_top_level_entries"], schemaVersion); err != nil {
 		return nil, err
 	}
 	if strings.TrimSpace(stringFromAny(payload["initialization_claim"])) != rootInitializationClaimName ||
@@ -742,6 +1011,12 @@ func loadRootInitializationTransaction(
 	ownedEntries, err := parseRootInitializationOwnedEntries(payload["owned_entries"])
 	if err != nil {
 		return nil, err
+	}
+	if schemaVersion == rootInitializationJournalSchemaVersion && !preExisting {
+		origin, exists := ownedEntries[rootInitializationOriginName]
+		if !exists || origin.Kind != "directory" || origin.Identity == "" {
+			return nil, errors.New("root initialization journal destination origin is invalid")
+		}
 	}
 	ownedDigest := strings.TrimSpace(stringFromAny(payload["owned_inventory_digest"]))
 	computedDigest, err := rootInitializationOwnershipDigestForPayload(payload["owned_entries"])
@@ -800,16 +1075,30 @@ func cleanInitializationPath(value any) string {
 	return filepath.Clean(raw)
 }
 
-func validateRootInitializationOwnedEntries(value any) error {
+func validateRootInitializationOwnedEntries(value any, schemaVersion int) error {
+	expectedEntries := rootInitializationOwnedEntriesForSchema(schemaVersion)
 	raw, ok := value.([]any)
-	if !ok || len(raw) != len(rootInitializationOwnedEntries) {
+	if !ok || len(raw) != len(expectedEntries) {
 		return errors.New("root initialization journal owned-entry identity is invalid")
 	}
-	for index, expected := range rootInitializationOwnedEntries {
+	for index, expected := range expectedEntries {
 		actual, ok := raw[index].(string)
 		if !ok || actual != expected {
 			return errors.New("root initialization journal owned-entry identity is invalid")
 		}
 	}
 	return nil
+}
+
+func rootInitializationOwnedEntriesForSchema(schemaVersion int) []string {
+	if schemaVersion != rootInitializationLegacyJournalSchemaVersion {
+		return rootInitializationOwnedEntries
+	}
+	entries := make([]string, 0, len(rootInitializationOwnedEntries)-1)
+	for _, entry := range rootInitializationOwnedEntries {
+		if entry != rootInitializationOriginName {
+			entries = append(entries, entry)
+		}
+	}
+	return entries
 }
