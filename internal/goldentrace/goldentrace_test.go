@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -131,6 +130,36 @@ func (env *traceEnv) run(t *testing.T, args ...string) commandResult {
 	return result
 }
 
+func (env *traceEnv) runJSONArgs(args ...string) []string {
+	command := make([]string, 0, len(args)+8)
+	command = append(command, "run", "--home", env.relayHome)
+	command = append(command, args...)
+	command = append(command, "--timeout", "30", "--stall-timeout", "30", "--json")
+	return command
+}
+
+func (env *traceEnv) runJSON(t *testing.T, args ...string) (commandResult, map[string]any) {
+	t.Helper()
+	result := env.run(t, env.runJSONArgs(args...)...)
+	return result, mustJSON(t, result)
+}
+
+func (env *traceEnv) resumeJSON(t *testing.T, sessionID string, args ...string) (commandResult, map[string]any) {
+	t.Helper()
+	command := make([]string, 0, len(args)+9)
+	command = append(command, "resume", "--home", env.relayHome)
+	command = append(command, args...)
+	command = append(command, "--timeout", "30", "--stall-timeout", "30", "--json", sessionID)
+	result := env.run(t, command...)
+	return result, mustJSON(t, result)
+}
+
+func (env *traceEnv) showJSON(t *testing.T, sessionID string) (commandResult, map[string]any) {
+	t.Helper()
+	result := env.run(t, "show", "--home", env.relayHome, "--json", sessionID)
+	return result, mustJSON(t, result)
+}
+
 func traceBinaryFor(t *testing.T) string {
 	t.Helper()
 	traceBuildOnce.Do(func() {
@@ -147,8 +176,8 @@ func traceBinaryFor(t *testing.T) string {
 		traceBinary = filepath.Join(traceBuildDir, "convo-relay")
 		cmd := exec.Command("go", "build", "-o", traceBinary, "./cmd/convo-relay")
 		cmd.Dir = root
-		// Inherit the ambient Go environment. Pinning GOCACHE/GOMODCACHE or forcing
-		// GOPROXY=off here makes the build depend on one machine's pre-populated cache:
+		// Inherit the ambient Go environment. Pinning build settings or forcing offline
+		// module lookup here makes the build depend on one machine's pre-populated cache:
 		// it passes locally and fails anywhere the cache is cold, CI included.
 		cmd.Env = os.Environ()
 		output, buildErr := cmd.CombinedOutput()
@@ -233,6 +262,45 @@ func mustJSON(t *testing.T, result commandResult) map[string]any {
 	return value
 }
 
+func requiredJSONField(t *testing.T, object map[string]any, field string, label string) any {
+	t.Helper()
+	value, found := object[field]
+	if !found {
+		t.Fatalf("%s is missing required field %q: %#v", label, field, object)
+	}
+	return value
+}
+
+func resultStatus(t *testing.T, result map[string]any) string {
+	t.Helper()
+	return jsonString(t, requiredJSONField(t, result, "status", "result"), "result.status")
+}
+
+func resultRoot(t *testing.T, result map[string]any) map[string]any {
+	t.Helper()
+	return jsonMap(t, requiredJSONField(t, result, "root", "result"), "result.root")
+}
+
+func resultSummary(t *testing.T, result map[string]any) map[string]any {
+	t.Helper()
+	return jsonMap(t, requiredJSONField(t, result, "summary", "result"), "result.summary")
+}
+
+func resultActualRounds(t *testing.T, result map[string]any) int {
+	t.Helper()
+	return jsonInt(t, requiredJSONField(t, result, "actual_rounds", "result"), "result.actual_rounds")
+}
+
+func resultSource(t *testing.T, result map[string]any) string {
+	t.Helper()
+	return jsonString(t, requiredJSONField(t, result, "result_source", "result"), "result.result_source")
+}
+
+func resultValidationStatus(t *testing.T, result map[string]any) string {
+	t.Helper()
+	return jsonString(t, requiredJSONField(t, result, "validation_status", "result"), "result.validation_status")
+}
+
 func requireExit(t *testing.T, result commandResult, want int) {
 	t.Helper()
 	if result.exitCode != want {
@@ -282,7 +350,7 @@ func jsonInt(t *testing.T, value any, label string) int {
 
 func transcript(t *testing.T, report map[string]any) []map[string]any {
 	t.Helper()
-	raw := jsonSlice(t, report["transcript"], "transcript")
+	raw := jsonSlice(t, requiredJSONField(t, report, "transcript", "result"), "transcript")
 	entries := make([]map[string]any, 0, len(raw))
 	for index, item := range raw {
 		entries = append(entries, jsonMap(t, item, fmt.Sprintf("transcript[%d]", index)))
@@ -428,19 +496,19 @@ func TestTwoActorDialogue(t *testing.T) {
 		"facilitator": {ledger("TRACE_DIALOGUE_SETTLED")},
 	}))
 
-	run := env.run(t,
-		"run", "--home", env.relayHome, "--session-id", "two-actors",
+	run, report := env.runJSON(t,
+		"--session-id", "two-actors",
 		"--task", "TRACE_TWO_ACTOR_TASK", "--agents", "codex,claude", "--rounds", "2",
-		"--timeout", "2", "--stall-timeout", "2", "--facilitator-backend", "codex", "--json",
+		"--facilitator-backend", "codex",
 	)
 	requireExit(t, run, 0)
-	if got := mustJSON(t, run)["status"]; got != "completed" {
+	if got := resultStatus(t, report); got != "completed" {
 		t.Fatalf("run status = %#v", got)
 	}
 
-	show := env.run(t, "show", "--home", env.relayHome, "--json", "two-actors")
+	show, showReport := env.showJSON(t, "two-actors")
 	requireExit(t, show, 0)
-	entries := transcript(t, mustJSON(t, show))
+	entries := transcript(t, showReport)
 	if len(entries) != 2 || entries[0]["content"] != "TRACE_ACTOR_A_TURN1" || entries[1]["content"] != "TRACE_ACTOR_B_TURN2" || entries[0]["from"] == entries[1]["from"] {
 		t.Fatalf("public dialogue transcript = %#v", entries)
 	}
@@ -452,17 +520,16 @@ func TestFacilitatorTurn(t *testing.T) {
 		"facilitator": {ledger("TRACE_FACILITATOR_CONTRIBUTION")},
 	}))
 
-	run := env.run(t,
-		"run", "--home", env.relayHome, "--session-id", "facilitated",
+	run, _ := env.runJSON(t,
+		"--session-id", "facilitated",
 		"--task", "TRACE_FACILITATOR_TASK", "--recipe", "trace-facilitated",
 		"--settings", fixturePath(t, env, "root-recipes.toml"), "--launch-cwd", env.workDir,
-		"--timeout", "2", "--stall-timeout", "2", "--json",
 	)
 	requireExit(t, run, 0)
 
-	show := env.run(t, "show", "--home", env.relayHome, "--json", "facilitated")
+	show, showReport := env.showJSON(t, "facilitated")
 	requireExit(t, show, 0)
-	entries := transcript(t, mustJSON(t, show))
+	entries := transcript(t, showReport)
 	if len(entries) != 1 {
 		t.Fatalf("facilitated transcript = %#v", entries)
 	}
@@ -483,14 +550,12 @@ func TestConvergenceStop(t *testing.T) {
 		"facilitator": {ledger("TRACE_CONVERGENCE_SETTLED")},
 	}))
 
-	run := env.run(t,
-		"run", "--home", env.relayHome, "--session-id", "convergence",
+	run, report := env.runJSON(t,
+		"--session-id", "convergence",
 		"--task", "TRACE_CONVERGENCE_TASK", "--agents", "gemini", "--max-rounds", "8",
-		"--timeout", "2", "--stall-timeout", "2", "--json",
 	)
 	requireExit(t, run, 0)
-	report := mustJSON(t, run)
-	if report["status"] != "completed" || report["stop_reason"] != "converged" || jsonInt(t, report["actual_rounds"], "actual_rounds") >= 8 {
+	if resultStatus(t, report) != "completed" || requiredJSONField(t, report, "stop_reason", "result") != "converged" || resultActualRounds(t, report) >= 8 {
 		t.Fatalf("convergence result = %#v", report)
 	}
 }
@@ -502,15 +567,13 @@ func TestDeclarativeRecipeRun(t *testing.T) {
 		"facilitator": {ledger("TRACE_DECLARATIVE_LEDGER")},
 	}))
 
-	run := env.run(t,
-		"run", "--home", env.relayHome, "--session-id", "declarative",
+	run, report := env.runJSON(t,
+		"--session-id", "declarative",
 		"--task", "TRACE_DECLARATIVE_TASK", "--recipe", "trace-declarative",
 		"--settings", fixturePath(t, env, "root-recipes.toml"), "--launch-cwd", env.workDir,
-		"--timeout", "2", "--stall-timeout", "2", "--json",
 	)
 	requireExit(t, run, 0)
-	report := mustJSON(t, run)
-	if report["status"] != "completed" || jsonInt(t, report["actual_participant_turns"], "actual_participant_turns") != 2 {
+	if resultStatus(t, report) != "completed" || jsonInt(t, requiredJSONField(t, report, "actual_participant_turns", "result"), "result.actual_participant_turns") != 2 {
 		t.Fatalf("recipe run result = %#v", report)
 	}
 	slots := jsonSlice(t, report["slots"], "recipe slots")
@@ -518,11 +581,10 @@ func TestDeclarativeRecipeRun(t *testing.T) {
 		t.Fatalf("recipe actors did not come from fixture: %#v", slots)
 	}
 
-	show := env.run(t, "show", "--home", env.relayHome, "--json", "declarative")
+	show, showReport := env.showJSON(t, "declarative")
 	requireExit(t, show, 0)
-	showReport := mustJSON(t, show)
-	root := jsonMap(t, showReport["root"], "root report")
-	if jsonMap(t, root["recipe"], "recipe report")["id"] != "trace-declarative" || jsonInt(t, jsonMap(t, showReport["summary"], "summary")["actual_rounds"], "summary actual_rounds") != 2 {
+	root := resultRoot(t, showReport)
+	if jsonMap(t, requiredJSONField(t, root, "recipe", "result.root"), "recipe report")["id"] != "trace-declarative" || resultActualRounds(t, resultSummary(t, showReport)) != 2 {
 		t.Fatalf("recipe public report = %#v", showReport)
 	}
 }
@@ -561,29 +623,27 @@ func TestFixedSequenceWithReducer(t *testing.T) {
   }
 }`)
 
-	run := env.run(t,
-		"run", "--home", env.relayHome, "--session-id", "fixed-reducer",
+	run, report := env.runJSON(t,
+		"--session-id", "fixed-reducer",
 		"--task", "TRACE_FIXED_REDUCER_TASK", "--recipe", "trace-reducer",
 		"--settings", fixturePath(t, env, "root-recipes.toml"), "--integration-bundle", bundle,
-		"--launch-cwd", env.workDir, "--timeout", "2", "--stall-timeout", "2", "--json",
+		"--launch-cwd", env.workDir,
 	)
 	requireExit(t, run, 0)
-	report := mustJSON(t, run)
-	if report["status"] != "completed" || report["result_source"] != "reducer" || report["validation_status"] != "validated" {
+	if resultStatus(t, report) != "completed" || resultSource(t, report) != "reducer" || resultValidationStatus(t, report) != "validated" {
 		t.Fatalf("fixed reducer run result = %#v", report)
 	}
 
-	show := env.run(t, "show", "--home", env.relayHome, "--json", "fixed-reducer")
+	show, showReport := env.showJSON(t, "fixed-reducer")
 	requireExit(t, show, 0)
-	showReport := mustJSON(t, show)
 	entries := transcript(t, showReport)
 	if len(entries) != 2 || entries[0]["content"] != "TRACE_FIXED_SEQUENCE_FIRST" || entries[1]["content"] != "TRACE_FIXED_SEQUENCE_SECOND" {
 		t.Fatalf("fixed participant sequence = %#v", entries)
 	}
-	root := jsonMap(t, showReport["root"], "root report")
-	result := jsonMap(t, root["result"], "root result")
-	reducerAttempts := jsonMap(t, root["reducer_attempts"], "reducer attempts")
-	if result["source"] != "reducer" || result["validation_status"] != "validated" || jsonInt(t, reducerAttempts["count"], "reducer attempt count") != 1 {
+	root := resultRoot(t, showReport)
+	result := jsonMap(t, requiredJSONField(t, root, "result", "result.root"), "root result")
+	reducerAttempts := jsonMap(t, requiredJSONField(t, root, "reducer_attempts", "result.root"), "reducer attempts")
+	if jsonString(t, requiredJSONField(t, result, "source", "root result"), "root result.source") != "reducer" || resultValidationStatus(t, result) != "validated" || jsonInt(t, requiredJSONField(t, reducerAttempts, "count", "reducer attempts"), "reducer attempt count") != 1 {
 		t.Fatalf("public reducer result projection = %#v", root)
 	}
 }
@@ -597,20 +657,17 @@ func TestProviderSessionContinuation(t *testing.T) {
 	plan["strict_resume_roles"] = []string{"slot_0"}
 	env := newTraceEnv(t, plan)
 
-	first := env.run(t,
-		"run", "--home", env.relayHome, "--session-id", "provider-continuation",
+	first, firstReport := env.runJSON(t,
+		"--session-id", "provider-continuation",
 		"--task", "TRACE_PROVIDER_CONTINUATION", "--agents", "codex", "--rounds", "1",
-		"--timeout", "2", "--stall-timeout", "2", "--json",
 	)
 	requireExit(t, first, 0)
-	firstReport := mustJSON(t, first)
 	firstThread := slotThreadID(t, firstReport, "slot_0")
 
-	resumed := env.run(t,
-		"resume", "--home", env.relayHome, "--rounds", "2", "--timeout", "2", "--stall-timeout", "2", "--json", "provider-continuation",
+	resumed, resumedReport := env.resumeJSON(t, "provider-continuation",
+		"--rounds", "2",
 	)
 	requireExit(t, resumed, 0)
-	resumedReport := mustJSON(t, resumed)
 	if got := slotThreadID(t, resumedReport, "slot_0"); got != firstThread {
 		t.Fatalf("public codex thread identity changed: first=%q resumed=%q", firstThread, got)
 	}
@@ -625,22 +682,20 @@ func TestProviderRetryThenSuccess(t *testing.T) {
 		"facilitator": {ledger("TRACE_RETRY_LEDGER")},
 	}))
 
-	run := env.run(t,
-		"run", "--home", env.relayHome, "--session-id", "retry-success",
+	run, report := env.runJSON(t,
+		"--session-id", "retry-success",
 		"--task", "TRACE_RETRY_TASK", "--recipe", "trace-retry",
 		"--settings", fixturePath(t, env, "root-recipes.toml"), "--launch-cwd", env.workDir,
-		"--timeout", "2", "--stall-timeout", "2", "--json",
 	)
 	requireExit(t, run, 0)
-	report := mustJSON(t, run)
-	if report["status"] != "completed" || !hasText(transcript(t, report), "TRACE_RETRY_SUCCESS_AFTER_ATTEMPT_TWO") {
+	if resultStatus(t, report) != "completed" || !hasText(transcript(t, report), "TRACE_RETRY_SUCCESS_AFTER_ATTEMPT_TWO") {
 		t.Fatalf("retry success is not visible through the public transcript: %#v", report)
 	}
-	show := env.run(t, "show", "--home", env.relayHome, "--json", "retry-success")
+	show, showReport := env.showJSON(t, "retry-success")
 	requireExit(t, show, 0)
-	root := jsonMap(t, mustJSON(t, show)["root"], "root report")
-	invocations := jsonMap(t, root["invocations"], "provider invocations")
-	if root["provider_retry"] != "allow" || jsonInt(t, invocations["count"], "provider invocation count") != 3 {
+	root := resultRoot(t, showReport)
+	invocations := jsonMap(t, requiredJSONField(t, root, "invocations", "result.root"), "provider invocations")
+	if requiredJSONField(t, root, "provider_retry", "result.root") != "allow" || jsonInt(t, requiredJSONField(t, invocations, "count", "provider invocations"), "provider invocation count") != 3 {
 		t.Fatalf("public provider retry report = %#v", root)
 	}
 }
@@ -650,24 +705,22 @@ func TestAuthFailureIsNotRetried(t *testing.T) {
 		"slot_0": {failure("Authentication error: TRACE_AUTH_FAILURE"), reply("TRACE_AUTH_FAILURE_WAS_RETRIED")},
 	}))
 
-	run := env.run(t,
-		"run", "--home", env.relayHome, "--session-id", "auth-failure",
+	run, report := env.runJSON(t,
+		"--session-id", "auth-failure",
 		"--task", "TRACE_AUTH_TASK", "--agents", "gemini", "--rounds", "1",
-		"--timeout", "2", "--stall-timeout", "2", "--json",
 	)
 	if run.exitCode == 0 {
 		t.Fatalf("auth failure unexpectedly succeeded\nstdout:\n%s\nstderr:\n%s", run.stdout, run.stderr)
 	}
-	report := mustJSON(t, run)
-	if report["status"] != "failed" {
+	if resultStatus(t, report) != "failed" {
 		t.Fatalf("auth failure status = %#v", report)
 	}
-	failures := jsonSlice(t, report["provider_failures"], "provider_failures")
+	failures := jsonSlice(t, requiredJSONField(t, report, "provider_failures", "result"), "provider_failures")
 	if len(failures) != 1 {
 		t.Fatalf("auth provider failures = %#v", failures)
 	}
 	failureReport := jsonMap(t, failures[0], "auth failure")
-	if failureReport["category"] != "auth" || failureReport["retryable"] != false || jsonInt(t, failureReport["attempts"], "auth attempts") != 1 {
+	if requiredJSONField(t, failureReport, "category", "auth failure") != "auth" || requiredJSONField(t, failureReport, "retryable", "auth failure") != false || jsonInt(t, requiredJSONField(t, failureReport, "attempts", "auth failure"), "auth attempts") != 1 {
 		t.Fatalf("auth failure public report = %#v", failureReport)
 	}
 }
@@ -682,22 +735,31 @@ func TestResumeContinuesSession(t *testing.T) {
 		"facilitator": {ledger("TRACE_RESUME_LEDGER")},
 	}))
 
-	first := env.run(t,
-		"run", "--home", env.relayHome, "--session-id", "resume-session",
+	first, firstReport := env.runJSON(t,
+		"--session-id", "resume-session",
 		"--task", "TRACE_RESUME_TASK", "--agents", "codex", "--rounds", "1",
-		"--timeout", "2", "--stall-timeout", "2", "--json",
 	)
 	requireExit(t, first, 0)
-	firstReport := mustJSON(t, first)
 
-	resumed := env.run(t,
-		"resume", "--home", env.relayHome, "--prompt", "TRACE_RESUME_DIRECTION", "--rounds", "1",
-		"--timeout", "2", "--stall-timeout", "2", "--json", "resume-session",
+	resumed, resumedReport := env.resumeJSON(t, "resume-session",
+		"--prompt", "TRACE_RESUME_DIRECTION", "--rounds", "1",
 	)
 	requireExit(t, resumed, 0)
-	resumedReport := mustJSON(t, resumed)
-	if firstReport["session_id"] != resumedReport["session_id"] || !hasText(transcript(t, resumedReport), "TRACE_RESUME_FURTHER_PROMPT") {
+	if jsonString(t, requiredJSONField(t, firstReport, "session_id", "initial result"), "initial result.session_id") != jsonString(t, requiredJSONField(t, resumedReport, "session_id", "resumed result"), "resumed result.session_id") {
 		t.Fatalf("resume public result = %#v", resumedReport)
+	}
+	entries := transcript(t, resumedReport)
+	initialIndex, furtherIndex := -1, -1
+	for index, entry := range entries {
+		if strings.Contains(fmt.Sprint(entry["content"]), "TRACE_RESUME_INITIAL") {
+			initialIndex = index
+		}
+		if strings.Contains(fmt.Sprint(entry["content"]), "TRACE_RESUME_FURTHER_PROMPT") {
+			furtherIndex = index
+		}
+	}
+	if initialIndex < 0 || furtherIndex < 0 || initialIndex >= furtherIndex || resultActualRounds(t, resumedReport) != 2 {
+		t.Fatalf("resume history or round count = entries=%#v actual_rounds=%d", entries, resultActualRounds(t, resumedReport))
 	}
 }
 
@@ -711,19 +773,18 @@ func TestSteering(t *testing.T) {
 		"facilitator": {ledger("TRACE_STEERING_LEDGER")},
 	}))
 
-	seed := env.run(t,
-		"run", "--home", env.relayHome, "--session-id", "steering-session",
+	seed, _ := env.runJSON(t,
+		"--session-id", "steering-session",
 		"--task", "TRACE_STEERING_TASK", "--agents", "codex", "--rounds", "1",
-		"--timeout", "2", "--stall-timeout", "2", "--json",
 	)
 	requireExit(t, seed, 0)
 	queued := env.run(t, "steer", "--home", env.relayHome, "--json", "steering-session", "TRACE_STEERING_PROMPT")
 	requireExit(t, queued, 0)
-	resumed := env.run(t,
-		"resume", "--home", env.relayHome, "--rounds", "1", "--timeout", "2", "--stall-timeout", "2", "--json", "steering-session",
+	resumed, resumedReport := env.resumeJSON(t, "steering-session",
+		"--rounds", "1",
 	)
 	requireExit(t, resumed, 0)
-	if !hasText(transcript(t, mustJSON(t, resumed)), "TRACE_STEERING_DELIVERED") {
+	if !hasText(transcript(t, resumedReport), "TRACE_STEERING_DELIVERED") {
 		t.Fatalf("queued steering was not delivered to the next public conversation turn")
 	}
 }
@@ -732,11 +793,10 @@ func TestCancellation(t *testing.T) {
 	env := newTraceEnv(t, scriptedPlan(map[string][]map[string]any{
 		"slot_0": {{"mode": "wait"}},
 	}))
-	cmd := env.command(
-		"run", "--home", env.relayHome, "--session-id", "cancellation",
+	cmd := env.command(env.runJSONArgs(
+		"--session-id", "cancellation",
 		"--task", "TRACE_CANCELLATION_TASK", "--agents", "gemini", "--rounds", "1",
-		"--timeout", "2", "--stall-timeout", "2", "--json",
-	)
+	)...)
 	var stdout bytes.Buffer
 	var stderr bytes.Buffer
 	cmd.Stdout = &stdout
@@ -770,7 +830,7 @@ func TestCancellation(t *testing.T) {
 		result.exitCode = exitErr.ExitCode()
 	}
 	report := mustJSON(t, result)
-	if report["status"] != "interrupted" {
+	if resultStatus(t, report) != "interrupted" {
 		t.Fatalf("cancelled terminal result = %#v", report)
 	}
 }
@@ -782,38 +842,37 @@ func TestBoundedChildRelayWithAdmission(t *testing.T) {
 		"facilitator": {contestedLedger("TRACE_CHILD_CONTESTED")},
 	}))
 	settings := fixturePath(t, env, "root-recipes.toml")
-	parent := env.run(t,
-		"run", "--home", env.relayHome, "--session-id", "child-parent",
+	parent, _ := env.runJSON(t,
+		"--session-id", "child-parent",
 		"--task", "TRACE_CHILD_PARENT_TASK", "--agents", "codex", "--rounds", "2", "--dynamic", "ask",
-		"--settings", settings, "--timeout", "2", "--stall-timeout", "2", "--json",
+		"--settings", settings,
 	)
 	requireExit(t, parent, 0)
 	proposalID := graphProposalID(t, env, "child-parent")
 	beforeApproval := listSessions(t, env)
 	approval := env.run(t,
 		"approve", "--home", env.relayHome, "--proposal", proposalID, "--rounds", "1",
-		"--timeout", "2", "--stall-timeout", "2", "child-parent",
+		"--timeout", "30", "--stall-timeout", "30", "child-parent",
 	)
 	requireExit(t, approval, 0)
 	afterApproval := listSessions(t, env)
 	childSessionID := addedSessionID(t, beforeApproval, afterApproval)
-	if proposal := graphProposal(t, env, "child-parent", proposalID); proposal["status"] != "collapsed" {
+	if proposal := graphProposal(t, env, "child-parent", proposalID); jsonString(t, requiredJSONField(t, proposal, "status", "graph proposal"), "graph proposal.status") != "collapsed" {
 		t.Fatalf("approved child proposal was not collapsed: %#v", proposal)
 	}
 
-	parentShow := env.run(t, "show", "--home", env.relayHome, "--json", "child-parent")
+	parentShow, parentShowReport := env.showJSON(t, "child-parent")
 	requireExit(t, parentShow, 0)
-	parentEntries := transcript(t, mustJSON(t, parentShow))
+	parentEntries := transcript(t, parentShowReport)
 	if countText(parentEntries, "TRACE_CHILD_REPLY") != 1 {
 		t.Fatalf("child result did not appear exactly once in parent conversation: %#v", parentEntries)
 	}
 	if !containsSession(afterApproval, childSessionID) {
 		t.Fatalf("admitted child %q is not separately listed", childSessionID)
 	}
-	childShow := env.run(t, "show", "--home", env.relayHome, "--json", childSessionID)
+	childShow, childReport := env.showJSON(t, childSessionID)
 	requireExit(t, childShow, 0)
-	childReport := mustJSON(t, childShow)
-	if jsonInt(t, jsonMap(t, childReport["summary"], "child summary")["actual_rounds"], "child actual_rounds") != 1 || !hasText(transcript(t, childReport), "TRACE_CHILD_REPLY") {
+	if resultActualRounds(t, resultSummary(t, childReport)) != 1 || !hasText(transcript(t, childReport), "TRACE_CHILD_REPLY") {
 		t.Fatalf("separately inspected child omitted its response")
 	}
 
@@ -823,10 +882,10 @@ func TestBoundedChildRelayWithAdmission(t *testing.T) {
 		"facilitator": {contestedLedger("TRACE_CHILD_CONTESTED")},
 	}))
 	deniedSettings := fixturePath(t, denied, "root-recipes.toml")
-	seedDenied := denied.run(t,
-		"run", "--home", denied.relayHome, "--session-id", "denied-parent",
+	seedDenied, _ := denied.runJSON(t,
+		"--session-id", "denied-parent",
 		"--task", "TRACE_DENIED_CHILD_TASK", "--agents", "codex", "--rounds", "2", "--dynamic", "ask",
-		"--settings", deniedSettings, "--timeout", "2", "--stall-timeout", "2", "--json",
+		"--settings", deniedSettings,
 	)
 	requireExit(t, seedDenied, 0)
 	deniedProposalID := graphProposalID(t, denied, "denied-parent")
@@ -837,12 +896,12 @@ func TestBoundedChildRelayWithAdmission(t *testing.T) {
 	if len(after) != len(before) || !containsSession(after, "denied-parent") {
 		t.Fatalf("denied child changed public session list: before=%#v after=%#v", before, after)
 	}
-	if proposal := graphProposal(t, denied, "denied-parent", deniedProposalID); proposal["status"] != "rejected" {
+	if proposal := graphProposal(t, denied, "denied-parent", deniedProposalID); jsonString(t, requiredJSONField(t, proposal, "status", "graph proposal"), "graph proposal.status") != "rejected" {
 		t.Fatalf("denied child proposal was not rejected: %#v", proposal)
 	}
-	deniedShow := denied.run(t, "show", "--home", denied.relayHome, "--json", "denied-parent")
+	deniedShow, deniedShowReport := denied.showJSON(t, "denied-parent")
 	requireExit(t, deniedShow, 0)
-	if hasText(transcript(t, mustJSON(t, deniedShow)), "TRACE_DENIED_CHILD_MUST_NOT_RUN") {
+	if hasText(transcript(t, deniedShowReport), "TRACE_DENIED_CHILD_MUST_NOT_RUN") {
 		t.Fatalf("denied child executed despite rejection")
 	}
 }
@@ -866,30 +925,26 @@ func TestCommittedHeadExecution(t *testing.T) {
 		t.Fatalf("write committed fixture: %v", err)
 	}
 	traceGit(t, source, "init", "-q")
-	traceGit(t, source, "config", "user.email", "goldentrace@example.invalid")
-	traceGit(t, source, "config", "user.name", "goldentrace")
 	traceGit(t, source, "add", "trace-source.txt")
-	traceGit(t, source, "commit", "-qm", "trace committed source")
+	traceGit(t, source, "commit", "--no-verify", "-q", "-m", "trace committed source")
 	if err := os.WriteFile(filepath.Join(source, "trace-source.txt"), []byte("TRACE_DIRTY_BYTES\n"), 0o644); err != nil {
 		t.Fatalf("write uncommitted fixture edit: %v", err)
 	}
 
-	run := env.run(t,
-		"run", "--home", env.relayHome, "--session-id", "committed-head",
+	run, report := env.runJSON(t,
+		"--session-id", "committed-head",
 		"--task", "TRACE_COMMITTED_HEAD_TASK", "--recipe", "trace-isolated",
 		"--settings", fixturePath(t, env, "root-recipes.toml"), "--launch-cwd", source,
-		"--workspace-isolation", "ephemeral", "--allow-dirty-source", "--timeout", "2", "--stall-timeout", "2", "--json",
+		"--workspace-isolation", "ephemeral", "--allow-dirty-source",
 	)
 	requireExit(t, run, 0)
-	report := mustJSON(t, run)
-	if report["status"] != "completed" {
+	if resultStatus(t, report) != "completed" {
 		t.Fatalf("committed-head run = %#v", report)
 	}
-	show := env.run(t, "show", "--home", env.relayHome, "--json", "committed-head")
+	show, showReport := env.showJSON(t, "committed-head")
 	requireExit(t, show, 0)
-	showReport := mustJSON(t, show)
-	workspace := jsonMap(t, jsonMap(t, showReport["root"], "root report")["workspace"], "workspace report")
-	if workspace["workspace_content_source"] != "committed_head" || workspace["working_tree_changes_included"] != false {
+	workspace := jsonMap(t, requiredJSONField(t, resultRoot(t, showReport), "workspace", "result.root"), "workspace report")
+	if requiredJSONField(t, workspace, "workspace_content_source", "workspace report") != "committed_head" || requiredJSONField(t, workspace, "working_tree_changes_included", "workspace report") != false {
 		t.Fatalf("public workspace provenance = %#v", workspace)
 	}
 	entries := transcript(t, report)
@@ -903,50 +958,64 @@ func TestPortableExportRoundTripAndTamperDetection(t *testing.T) {
 		"slot_0":      {reply("TRACE_EXPORT_SOURCE")},
 		"facilitator": {ledger("TRACE_EXPORT_LEDGER")},
 	}))
-	run := env.run(t,
-		"run", "--home", env.relayHome, "--session-id", "portable-export",
+	run, _ := env.runJSON(t,
+		"--session-id", "portable-export",
 		"--task", "TRACE_PORTABLE_EXPORT_TASK", "--recipe", "trace-facilitated",
 		"--settings", fixturePath(t, env, "root-recipes.toml"), "--launch-cwd", env.workDir,
-		"--timeout", "2", "--stall-timeout", "2", "--json",
 	)
 	requireExit(t, run, 0)
 
 	bundle := filepath.Join(env.root, "portable-bundle")
 	exported := env.run(t, "export", "--home", env.relayHome, "--portable", "-o", bundle, "--json", "portable-export")
 	requireExit(t, exported, 0)
-	if got := mustJSON(t, exported)["output"]; got != bundle {
+	exportedReport := mustJSON(t, exported)
+	if got := requiredJSONField(t, exportedReport, "output", "portable export result"); got != bundle {
 		t.Fatalf("portable export output = %#v, want %q", got, bundle)
 	}
 	verified := env.run(t, "verify-export", "--json", bundle)
 	requireExit(t, verified, 0)
-	if mustJSON(t, verified)["status"] != "valid" {
-		t.Fatalf("portable verification = %#v", mustJSON(t, verified))
+	verifiedReport := mustJSON(t, verified)
+	if resultStatus(t, verifiedReport) != "valid" {
+		t.Fatalf("portable verification = %#v", verifiedReport)
 	}
 
-	target := firstExportedFile(t, bundle)
+	target := portableInventoryPayload(t, bundle, "participant_transcript")
 	data, err := os.ReadFile(target)
 	if err != nil {
 		t.Fatalf("read exported file %s: %v", target, err)
 	}
-	if len(data) == 0 {
-		data = []byte{0}
-	} else {
-		data[0] ^= 0x01
+	if !json.Valid(data) {
+		t.Fatalf("selected payload %s is not valid JSON", target)
 	}
-	if err := os.WriteFile(target, data, 0o644); err != nil {
+	tamperedData := bytes.Replace(data, []byte("TRACE_EXPORT_SOURCE"), []byte("TRACE_EXPORT_SOURCe"), 1)
+	if bytes.Count(data, []byte("TRACE_EXPORT_SOURCE")) != 1 || len(tamperedData) != len(data) || !json.Valid(tamperedData) {
+		t.Fatalf("payload tamper must replace exactly one same-length JSON string: %s", target)
+	}
+	if err := os.WriteFile(target, tamperedData, 0o644); err != nil {
 		t.Fatalf("tamper exported file %s: %v", target, err)
+	}
+	if info, statErr := os.Stat(target); statErr != nil || info.Size() != int64(len(data)) {
+		t.Fatalf("tampered payload size changed or cannot be read: info=%#v err=%v", info, statErr)
 	}
 	tampered := env.run(t, "verify-export", "--json", bundle)
 	if tampered.exitCode == 0 {
 		t.Fatalf("tampered portable export unexpectedly verified: %s", tampered.stdout)
 	}
-	if mustJSON(t, tampered)["status"] != "invalid" {
-		t.Fatalf("tampered verification result = %#v", mustJSON(t, tampered))
+	tamperedReport := mustJSON(t, tampered)
+	if resultStatus(t, tamperedReport) != "invalid" {
+		t.Fatalf("tampered verification result = %#v", tamperedReport)
+	}
+	integrityError := jsonString(t, requiredJSONField(t, tamperedReport, "error", "tampered verify-export result"), "tampered verify-export result.error")
+	if !strings.Contains(integrityError, "portable export payload") || !strings.Contains(integrityError, "size or digest mismatch") || strings.Contains(strings.ToLower(integrityError), "decode") {
+		t.Fatalf("tampered payload failed for the wrong reason: %q", integrityError)
 	}
 }
 
 func waitForTraceProvider(path string) bool {
-	deadline := time.Now().Add(2 * time.Second)
+	// Generous deadline on purpose: this is a poll loop, so a high ceiling costs
+	// nothing when the provider starts promptly, and a tight one turns ordinary
+	// machine load into a spurious failure. A 2s ceiling flaked under -race.
+	deadline := time.Now().Add(30 * time.Second)
 	for time.Now().Before(deadline) {
 		if _, err := os.Stat(path); err == nil {
 			return true
@@ -989,33 +1058,65 @@ func graphProposals(t *testing.T, env *traceEnv, sessionID string) map[string]an
 
 func traceGit(t *testing.T, dir string, args ...string) {
 	t.Helper()
-	cmd := exec.Command("git", args...)
+	fixtureRoot := filepath.Dir(dir)
+	home := filepath.Join(fixtureRoot, "fixture-git-home")
+	xdgConfig := filepath.Join(fixtureRoot, "fixture-git-xdg-config")
+	if err := os.MkdirAll(home, 0o755); err != nil {
+		t.Fatalf("create isolated git HOME: %v", err)
+	}
+	if err := os.MkdirAll(xdgConfig, 0o755); err != nil {
+		t.Fatalf("create isolated git XDG config: %v", err)
+	}
+	command := make([]string, 0, len(args)+4)
+	command = append(command,
+		"-c", "commit.gpgSign=false",
+		"-c", "core.hooksPath="+filepath.Join(fixtureRoot, "fixture-git-hooks-disabled"),
+	)
+	command = append(command, args...)
+	cmd := exec.Command("git", command...)
 	cmd.Dir = dir
+	cmd.Env = overlayEnv(os.Environ(), map[string]string{
+		"HOME":                home,
+		"XDG_CONFIG_HOME":     xdgConfig,
+		"GIT_CONFIG_GLOBAL":   filepath.Join(fixtureRoot, "fixture-git-global-config"),
+		"GIT_CONFIG_NOSYSTEM": "1",
+		"GIT_CONFIG_COUNT":    "0",
+		"GIT_AUTHOR_NAME":     "goldentrace",
+		"GIT_AUTHOR_EMAIL":    "goldentrace@example.invalid",
+		"GIT_COMMITTER_NAME":  "goldentrace",
+		"GIT_COMMITTER_EMAIL": "goldentrace@example.invalid",
+	})
 	output, err := cmd.CombinedOutput()
 	if err != nil {
 		t.Fatalf("git %s: %v\n%s", strings.Join(args, " "), err, output)
 	}
 }
 
-func firstExportedFile(t *testing.T, root string) string {
+func portableInventoryPayload(t *testing.T, root string, wantKind string) string {
 	t.Helper()
-	var target string
-	err := filepath.WalkDir(root, func(path string, entry fs.DirEntry, walkErr error) error {
-		if walkErr != nil {
-			return walkErr
-		}
-		if target == "" && entry.Type().IsRegular() {
-			target = path
-		}
-		return nil
-	})
+	manifestBody, err := os.ReadFile(filepath.Join(root, "manifest.json"))
 	if err != nil {
-		t.Fatalf("walk portable export: %v", err)
+		t.Fatalf("read portable manifest: %v", err)
 	}
-	if target == "" {
-		t.Fatal("portable export contained no regular file to tamper")
+	manifest := map[string]any{}
+	if err := json.Unmarshal(manifestBody, &manifest); err != nil {
+		t.Fatalf("decode portable manifest: %v", err)
 	}
-	return target
+	transcriptPath := jsonString(t, requiredJSONField(t, manifest, "transcript_payload", "portable manifest"), "portable manifest.transcript_payload")
+	inventory := jsonSlice(t, requiredJSONField(t, manifest, "payload_inventory", "portable manifest"), "portable manifest.payload_inventory")
+	for index, raw := range inventory {
+		entry := jsonMap(t, raw, fmt.Sprintf("portable manifest.payload_inventory[%d]", index))
+		if jsonString(t, requiredJSONField(t, entry, "kind", "portable inventory entry"), "portable inventory entry.kind") != wantKind {
+			continue
+		}
+		relative := jsonString(t, requiredJSONField(t, entry, "path", "portable inventory entry"), "portable inventory entry.path")
+		if wantKind == "participant_transcript" && relative != transcriptPath {
+			t.Fatalf("portable transcript inventory path = %q, want manifest path %q", relative, transcriptPath)
+		}
+		return filepath.Join(root, filepath.FromSlash(relative))
+	}
+	t.Fatalf("portable manifest inventory lacks %q payload", wantKind)
+	return ""
 }
 
 // traceProviderDriver is installed into each test's temporary PATH. It is
