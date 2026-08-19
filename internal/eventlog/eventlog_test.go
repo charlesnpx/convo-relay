@@ -20,6 +20,7 @@ func TestRoundTripEveryTypedEvent(t *testing.T) {
 	if err != nil {
 		t.Fatalf("put payload: %v", err)
 	}
+	planRef := ref
 	want := make([]Event, 0, 16)
 	for index, payload := range []Payload{
 		SessionStartedPayload{PlanDigest: RawBytesDigest([]byte("plan")), SessionID: "session-one"},
@@ -29,8 +30,8 @@ func TestRoundTripEveryTypedEvent(t *testing.T) {
 		AttemptFinishedPayload{ActorID: "actor-a", Attempt: 1, Outcome: "success", ProviderSessionID: "provider-a", Content: ref},
 		ProviderFailedPayload{ActorID: "actor-a", Backend: "codex", Category: "transport", Retryable: true, Attempts: 1, RemediationCode: "retry", SanitizedDetail: "temporary network failure"},
 		ChildRequestedPayload{RequestID: "request-one", RequesterActorID: "actor-a", RecipeID: "review", Question: ref},
-		ChildDecidedPayload{RequestID: "request-one", Admitted: true, Reason: "within budget", BudgetState: "remaining"},
-		ChildCompletedPayload{RequestID: "request-one", ChildSessionID: "child-one", Result: ref},
+		ChildDecidedPayload{RequestID: "request-one", Admitted: true, Reason: "within budget", BudgetState: "remaining", Plan: &planRef},
+		ChildCompletedPayload{RequestID: "request-one", ChildSessionID: "child-one", Result: ref, Status: "completed"},
 		SteeringQueuedPayload{Prompt: ref},
 		SteeringAppliedPayload{Prompt: ref, Round: 1},
 		CancelRequestedPayload{Source: "user", Force: false},
@@ -62,6 +63,25 @@ func TestRoundTripEveryTypedEvent(t *testing.T) {
 	}
 	if _, ok := got[0].Payload.(SessionStartedPayload); !ok {
 		t.Fatalf("replay left first payload untyped: %T", got[0].Payload)
+	}
+}
+
+func TestChildPayloadsRequireDurablePlanAndClassification(t *testing.T) {
+	_, store, writer := newTestWriter(t)
+	defer writer.Close()
+	ref, err := store.PutMediaType(bytes.NewReader([]byte("payload")), "text/plain")
+	if err != nil {
+		t.Fatalf("put payload: %v", err)
+	}
+	for index, payload := range []Payload{
+		ChildDecidedPayload{RequestID: "request-one", Admitted: true, Reason: "admitted", BudgetState: "available"},
+		ChildDecidedPayload{RequestID: "request-two", Admitted: false, Reason: "rejected", BudgetState: "rejected", Plan: &ref},
+		ChildCompletedPayload{RequestID: "request-three", ChildSessionID: "child-three", Result: ref},
+		ChildCompletedPayload{RequestID: "request-four", ChildSessionID: "child-four", Result: ref, Status: "running"},
+	} {
+		if _, err := writer.Append(NewEvent(fmt.Sprintf("invalid-child-%d", index), fixtureTime(index), payload)); err == nil {
+			t.Fatalf("Append(%T) unexpectedly accepted", payload)
+		}
 	}
 }
 

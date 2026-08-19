@@ -23,6 +23,7 @@ func TestAllViewsAreDerivedFromPlanEventsAndBlobs(t *testing.T) {
 	if err != nil {
 		t.Fatalf("put orphan: %v", err)
 	}
+	planRef := content
 	plan := viewPlan()
 	events := []eventlog.Event{
 		{Seq: 1, Type: eventlog.TurnStarted, Payload: eventlog.TurnStartedPayload{ActorID: "actor-a", Round: 1, Role: eventlog.ParticipantRole}},
@@ -32,8 +33,8 @@ func TestAllViewsAreDerivedFromPlanEventsAndBlobs(t *testing.T) {
 		{Seq: 5, Type: eventlog.AttemptFinished, Payload: eventlog.AttemptFinishedPayload{ActorID: "actor-a", Attempt: 2, Outcome: "success", ProviderSessionID: "provider-continuation", Content: content}},
 		{Seq: 6, Type: eventlog.ProviderFailed, Payload: eventlog.ProviderFailedPayload{ActorID: "actor-a", Backend: "codex", Category: "transport", Retryable: true, Attempts: 1, RemediationCode: "retry", SanitizedDetail: "transient"}},
 		{Seq: 7, Type: eventlog.ChildRequested, Payload: eventlog.ChildRequestedPayload{RequestID: "request-one", RequesterActorID: "actor-a", RecipeID: "review", Question: content}},
-		{Seq: 8, Type: eventlog.ChildDecided, Payload: eventlog.ChildDecidedPayload{RequestID: "request-one", Admitted: true, Reason: "budget available", BudgetState: "remaining"}},
-		{Seq: 9, Type: eventlog.ChildCompleted, Payload: eventlog.ChildCompletedPayload{RequestID: "request-one", ChildSessionID: "child-one", Result: content}},
+		{Seq: 8, Type: eventlog.ChildDecided, Payload: eventlog.ChildDecidedPayload{RequestID: "request-one", Admitted: true, Reason: "budget available", BudgetState: "remaining", Plan: &planRef}},
+		{Seq: 9, Type: eventlog.ChildCompleted, Payload: eventlog.ChildCompletedPayload{RequestID: "request-one", ChildSessionID: "child-one", Result: content, Status: "completed"}},
 		{Seq: 10, Type: eventlog.SessionFinished, Payload: eventlog.SessionFinishedPayload{Status: "completed", StopReason: "converged"}},
 	}
 
@@ -70,7 +71,7 @@ func TestAllViewsAreDerivedFromPlanEventsAndBlobs(t *testing.T) {
 	if err != nil {
 		t.Fatalf("diagnostics: %v", err)
 	}
-	if len(diagnostics.AbandonedAttempts) != 1 || diagnostics.AbandonedAttempts[0].Attempt != 1 {
+	if len(diagnostics.AbandonedAttempts) != 0 {
 		t.Fatalf("abandoned attempts = %#v", diagnostics.AbandonedAttempts)
 	}
 	if len(diagnostics.UnreferencedBlobs) != 1 || diagnostics.UnreferencedBlobs[0].SHA256 != orphan.SHA256 || diagnostics.BudgetState != "remaining" {
@@ -80,6 +81,22 @@ func TestAllViewsAreDerivedFromPlanEventsAndBlobs(t *testing.T) {
 	providerSessions := ProviderSessions(plan, events)
 	if providerSessions["actor-a"] != "provider-continuation" {
 		t.Fatalf("provider sessions = %#v", providerSessions)
+	}
+}
+
+func TestDiagnosticsClassifiedFailureIsNotReportedAbandoned(t *testing.T) {
+	events := []eventlog.Event{
+		{Seq: 1, Type: eventlog.AttemptStarted, Payload: eventlog.AttemptStartedPayload{ActorID: "actor-a", Attempt: 1}},
+		{Seq: 2, Type: eventlog.ProviderFailed, Payload: eventlog.ProviderFailedPayload{ActorID: "actor-a", Backend: "codex", Category: "transport", Retryable: true, Attempts: 1, RemediationCode: "retry", SanitizedDetail: "transient"}},
+		{Seq: 3, Type: eventlog.AttemptStarted, Payload: eventlog.AttemptStartedPayload{ActorID: "actor-a", Attempt: 2}},
+		{Seq: 4, Type: eventlog.AttemptFinished, Payload: eventlog.AttemptFinishedPayload{ActorID: "actor-a", Attempt: 2, Outcome: "success", Content: blobstore.BlobRef{SHA256: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", Size: 1, MediaType: "text/plain"}}},
+	}
+	diagnostics, err := Diagnostics(viewPlan(), events, nil)
+	if err != nil {
+		t.Fatalf("Diagnostics: %v", err)
+	}
+	if len(diagnostics.AbandonedAttempts) != 0 {
+		t.Fatalf("classified failure remained abandoned: %#v", diagnostics.AbandonedAttempts)
 	}
 }
 

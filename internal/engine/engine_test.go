@@ -422,6 +422,14 @@ func TestResumeServicesDueFacilitatorBeforeNextParticipant(t *testing.T) {
 func TestResumeRebuildsChildBudgets(t *testing.T) {
 	parent := dialoguePlan(2)
 	parent.ChildPolicy = session.ChildPolicy{Mode: "allow", MaxDepth: 1, MaxChildren: 1, MaxTurns: 1, AllowedRecipes: []string{"child"}}
+	childPlan, err := plan.ForChild(parent, plan.ChildRequest{
+		SessionID: parent.SessionID + "-child-child-one",
+		RecipeID:  "child",
+		Question:  "first child question",
+	}, []plan.Recipe{childRecipe()})
+	if err != nil {
+		t.Fatalf("compile child plan: %v", err)
+	}
 	sess := createSession(t, parent)
 	seedLog(t, sess, func(store *blobstore.Store, writer *eventlog.Writer) {
 		content := putSeedText(t, store, "first participant")
@@ -432,8 +440,8 @@ func TestResumeRebuildsChildBudgets(t *testing.T) {
 		appendEvent(t, writer, eventlog.ChildRequestedPayload{RequestID: "child-one", RequesterActorID: "alpha", RecipeID: "child", Question: question})
 		appendEvent(t, writer, eventlog.AttemptFinishedPayload{ActorID: "alpha", Attempt: 1, Outcome: "success", Content: content})
 		appendEvent(t, writer, eventlog.TurnFinishedPayload{ActorID: "alpha", Round: 1, Content: content})
-		appendEvent(t, writer, eventlog.ChildDecidedPayload{RequestID: "child-one", Admitted: true, Reason: "admitted", BudgetState: "available;child_turns=1"})
-		appendEvent(t, writer, eventlog.ChildCompletedPayload{RequestID: "child-one", ChildSessionID: "first-child", Result: childResult})
+		appendEvent(t, writer, eventlog.ChildDecidedPayload{RequestID: "child-one", Admitted: true, Reason: "admitted", BudgetState: "available;child_turns=1", Plan: putSeedChildPlan(t, store, childPlan)})
+		appendEvent(t, writer, eventlog.ChildCompletedPayload{RequestID: "child-one", ChildSessionID: childPlan.SessionID, Result: childResult, Status: statusCompleted})
 	})
 	alpha := &fakeBackend{name: "codex", slotID: "alpha"}
 	beta := &fakeBackend{name: "codex", slotID: "beta", responses: []fakeResponse{{content: "second participant"}}}
@@ -696,6 +704,9 @@ func TestChildRequestsAdmitAndRejectWithoutRunningDeniedChildren(t *testing.T) {
 			if test.wantAdmitted && decisions[0].BudgetState != "available;child_turns=1" {
 				t.Fatalf("admitted child budget state = %q", decisions[0].BudgetState)
 			}
+			if test.wantAdmitted && decisions[0].Plan == nil {
+				t.Fatal("admitted child decision did not bind a durable plan")
+			}
 			if test.wantAdmitted && indexOfType(sessionEvents(t, sess), eventlog.ChildRequested) > indexOfType(sessionEvents(t, sess), eventlog.TurnFinished) {
 				t.Fatal("child request was not durable before its parent turn finished")
 			}
@@ -750,7 +761,7 @@ func TestResumeCompletedChildBeforeParentCompletionReusesChildSession(t *testing
 		appendEvent(t, writer, eventlog.ChildRequestedPayload{RequestID: requestID, RequesterActorID: "alpha", RecipeID: "child", Question: question})
 		appendEvent(t, writer, eventlog.AttemptFinishedPayload{ActorID: "alpha", Attempt: 1, Outcome: "success", Content: content})
 		appendEvent(t, writer, eventlog.TurnFinishedPayload{ActorID: "alpha", Round: 1, Content: content})
-		appendEvent(t, writer, eventlog.ChildDecidedPayload{RequestID: requestID, Admitted: true, Reason: "admitted", BudgetState: "available;child_turns=1"})
+		appendEvent(t, writer, eventlog.ChildDecidedPayload{RequestID: requestID, Admitted: true, Reason: "admitted", BudgetState: "available;child_turns=1", Plan: putSeedChildPlan(t, store, childPlan)})
 	})
 	childSession := createSessionIn(t, home, childPlan)
 	child := &fakeBackend{name: "codex", slotID: "child-alpha", responses: []fakeResponse{{content: "completed child"}}}
@@ -778,6 +789,166 @@ func TestResumeCompletedChildBeforeParentCompletionReusesChildSession(t *testing
 	completed := childCompletions(sessionEvents(t, sess))
 	if len(completed) != 1 || completed[0].ChildSessionID != childPlan.SessionID {
 		t.Fatalf("child completions=%#v", completed)
+	}
+}
+
+func TestResumeTerminalFailedSessionReportsStatus(t *testing.T) {
+	sess := createSession(t, dialoguePlan(1))
+	failing := &fakeBackend{name: "codex", slotID: "alpha", responses: []fakeResponse{{err: provider.BackendRunError{Detail: "denied"}}}}
+	if _, err := Run(context.Background(), sess, testDeps(map[string]*fakeBackend{
+		"alpha": failing,
+		"beta":  {name: "codex", slotID: "beta"},
+	})); err == nil {
+		t.Fatal("Run unexpectedly completed a failed session")
+	}
+	resumedAlpha := &fakeBackend{name: "codex", slotID: "alpha"}
+	outcome, err := Resume(context.Background(), sess, testDeps(map[string]*fakeBackend{
+		"alpha": resumedAlpha,
+		"beta":  {name: "codex", slotID: "beta"},
+	}), "")
+	if err != nil {
+		t.Fatalf("Resume terminal failed session: %v", err)
+	}
+	if outcome.Status != statusFailed || len(resumedAlpha.prompts) != 0 {
+		t.Fatalf("terminal resume outcome=%#v calls=%d", outcome, len(resumedAlpha.prompts))
+	}
+}
+
+func TestResumeFailedTerminalChildFailsParent(t *testing.T) {
+	parent := childParentPlan()
+	home := t.TempDir()
+	sess := createSessionIn(t, home, parent)
+	const requestID = "child-request"
+	const question = "resolve the child question"
+	childPlan := compileAdmittedChildPlan(t, parent, requestID, question, []plan.Recipe{childRecipe()})
+	seedParentChildPrefix(t, sess, childPlan, requestID, question, "")
+
+	childSession := createSessionIn(t, home, childPlan)
+	child := &fakeBackend{name: "codex", slotID: "child-alpha", responses: []fakeResponse{{err: provider.BackendRunError{Detail: "child failed"}}}}
+	if _, err := Run(context.Background(), childSession, testDeps(map[string]*fakeBackend{"child-alpha": child})); err == nil {
+		t.Fatal("child Run unexpectedly succeeded")
+	}
+
+	outcome, err := Resume(context.Background(), sess, testDeps(map[string]*fakeBackend{
+		"alpha":       {name: "codex", slotID: "alpha"},
+		"beta":        {name: "codex", slotID: "beta"},
+		"child-alpha": child,
+	}), "")
+	if err == nil {
+		t.Fatal("parent Resume unexpectedly succeeded after failed terminal child")
+	}
+	completed := childCompletions(sessionEvents(t, sess))
+	if outcome.Status != statusFailed || len(completed) != 1 || completed[0].Status != statusFailed || sessionFinished(t, sessionEvents(t, sess)).Status != statusFailed {
+		t.Fatalf("outcome=%#v child.completed=%#v parent=%#v", outcome, completed, sessionFinished(t, sessionEvents(t, sess)))
+	}
+	if got := len(child.prompts); got != 1 {
+		t.Fatalf("terminal child was rerun: calls=%d", got)
+	}
+}
+
+func TestResumeFailedChildCompletionFailsParent(t *testing.T) {
+	parent := childParentPlan()
+	home := t.TempDir()
+	sess := createSessionIn(t, home, parent)
+	const requestID = "child-request"
+	const question = "resolve the child question"
+	childPlan := compileAdmittedChildPlan(t, parent, requestID, question, []plan.Recipe{childRecipe()})
+	seedParentChildPrefix(t, sess, childPlan, requestID, question, statusFailed)
+
+	child := &fakeBackend{name: "codex", slotID: "child-alpha"}
+	outcome, err := Resume(context.Background(), sess, testDeps(map[string]*fakeBackend{
+		"alpha":       {name: "codex", slotID: "alpha"},
+		"beta":        {name: "codex", slotID: "beta"},
+		"child-alpha": child,
+	}), "")
+	if err == nil {
+		t.Fatal("parent Resume unexpectedly succeeded after failed child.completed")
+	}
+	if outcome.Status != statusFailed || sessionFinished(t, sessionEvents(t, sess)).Status != statusFailed || len(child.prompts) != 0 {
+		t.Fatalf("outcome=%#v parent=%#v child calls=%d", outcome, sessionFinished(t, sessionEvents(t, sess)), len(child.prompts))
+	}
+}
+
+func TestResumeCreatesMissingChildFromDurablePlanAfterRecipeDrift(t *testing.T) {
+	parent := childParentPlan()
+	home := t.TempDir()
+	sess := createSessionIn(t, home, parent)
+	const requestID = "child-request"
+	const question = "resolve the child question"
+	admittedPlan := compileAdmittedChildPlan(t, parent, requestID, question, []plan.Recipe{childRecipe()})
+	seedParentChildPrefix(t, sess, admittedPlan, requestID, question, "")
+
+	driftedRecipe := childRecipe()
+	driftedRecipe.Actors = []session.Actor{{ID: "drifted-alpha", Backend: "codex"}}
+	driftedRecipe.Schedule.Order = []string{"drifted-alpha"}
+	original := &fakeBackend{name: "codex", slotID: "child-alpha", responses: []fakeResponse{{content: "original admitted plan"}}}
+	drifted := &fakeBackend{name: "codex", slotID: "drifted-alpha", responses: []fakeResponse{{content: "drifted plan"}}}
+	deps := testDeps(map[string]*fakeBackend{
+		"alpha":         {name: "codex", slotID: "alpha"},
+		"beta":          {name: "codex", slotID: "beta"},
+		"child-alpha":   original,
+		"drifted-alpha": drifted,
+	})
+	deps.Recipes = []plan.Recipe{driftedRecipe}
+	outcome, err := Resume(context.Background(), sess, deps, "")
+	if err != nil {
+		t.Fatalf("Resume: %v", err)
+	}
+	if outcome.Status != statusCompleted || len(original.prompts) != 1 || len(drifted.prompts) != 0 {
+		t.Fatalf("outcome=%#v original=%d drifted=%d", outcome, len(original.prompts), len(drifted.prompts))
+	}
+	created := findSessionByID(t, home, admittedPlan.SessionID)
+	if !created.Plan.Equal(admittedPlan) {
+		t.Fatalf("created child plan drifted: got=%#v want=%#v", created.Plan, admittedPlan)
+	}
+}
+
+func TestResumeRefusesChildRootWithMismatchedAdmittedPlan(t *testing.T) {
+	parent := childParentPlan()
+	home := t.TempDir()
+	sess := createSessionIn(t, home, parent)
+	const requestID = "child-request"
+	const question = "resolve the child question"
+	admittedPlan := compileAdmittedChildPlan(t, parent, requestID, question, []plan.Recipe{childRecipe()})
+	seedParentChildPrefix(t, sess, admittedPlan, requestID, question, "")
+
+	unrelatedPlan := admittedPlan
+	unrelatedPlan.Task = "WRONG UNRELATED RESULT"
+	createSessionIn(t, home, unrelatedPlan)
+	child := &fakeBackend{name: "codex", slotID: "child-alpha"}
+	outcome, err := Resume(context.Background(), sess, testDeps(map[string]*fakeBackend{
+		"alpha":       {name: "codex", slotID: "alpha"},
+		"beta":        {name: "codex", slotID: "beta"},
+		"child-alpha": child,
+	}), "")
+	if err == nil || !strings.Contains(err.Error(), "does not match the durable admitted plan") {
+		t.Fatalf("Resume error=%v, want admitted-plan refusal", err)
+	}
+	if outcome.Status != statusFailed || len(child.prompts) != 0 || sessionFinished(t, sessionEvents(t, sess)).Status != statusFailed {
+		t.Fatalf("outcome=%#v child calls=%d parent=%#v", outcome, len(child.prompts), sessionFinished(t, sessionEvents(t, sess)))
+	}
+}
+
+func TestResumeFinalizesDurableResultProduced(t *testing.T) {
+	sess := createSession(t, dialoguePlan(1))
+	seedLog(t, sess, func(store *blobstore.Store, writer *eventlog.Writer) {
+		content := putSeedText(t, store, "durable result")
+		appendEvent(t, writer, eventlog.TurnStartedPayload{ActorID: "alpha", Round: 1, Role: eventlog.ParticipantRole})
+		appendEvent(t, writer, eventlog.AttemptStartedPayload{ActorID: "alpha", Attempt: 1})
+		appendEvent(t, writer, eventlog.AttemptFinishedPayload{ActorID: "alpha", Attempt: 1, Outcome: "success", Content: content})
+		appendEvent(t, writer, eventlog.TurnFinishedPayload{ActorID: "alpha", Round: 1, Content: content})
+		appendEvent(t, writer, eventlog.ResultProducedPayload{Result: content, Format: "text", ValidationOutcome: "valid"})
+	})
+	outcome, err := Resume(context.Background(), sess, testDeps(map[string]*fakeBackend{
+		"alpha": {name: "codex", slotID: "alpha"},
+		"beta":  {name: "codex", slotID: "beta"},
+	}), "")
+	if err != nil {
+		t.Fatalf("Resume: %v", err)
+	}
+	events := sessionEvents(t, sess)
+	if outcome.Status != statusCompleted || countType(events, eventlog.ResultProduced) != 1 || sessionFinished(t, events).Status != statusCompleted {
+		t.Fatalf("outcome=%#v events=%v", outcome, eventTypes(events))
 	}
 }
 
@@ -1002,6 +1173,89 @@ func putSeedText(t *testing.T, store *blobstore.Store, text string) blobstore.Bl
 		t.Fatalf("put seed text: %v", err)
 	}
 	return ref
+}
+
+func putSeedChildPlan(t *testing.T, store *blobstore.Store, value session.Plan) *blobstore.BlobRef {
+	t.Helper()
+	body, err := session.CanonicalBytes(value)
+	if err != nil {
+		t.Fatalf("canonical child plan: %v", err)
+	}
+	ref, err := store.PutBytes(body, mediaTypeChildPlan)
+	if err != nil {
+		t.Fatalf("put child plan: %v", err)
+	}
+	return &ref
+}
+
+func childParentPlan() session.Plan {
+	parent := dialoguePlan(1)
+	parent.ChildPolicy = session.ChildPolicy{Mode: "allow", MaxDepth: 1, MaxChildren: 1, MaxTurns: 1, AllowedRecipes: []string{"child"}}
+	return parent
+}
+
+func compileAdmittedChildPlan(t *testing.T, parent session.Plan, requestID, question string, recipes []plan.Recipe) session.Plan {
+	t.Helper()
+	childPlan, err := plan.ForChild(parent, plan.ChildRequest{
+		SessionID: parent.SessionID + "-child-" + requestID,
+		RecipeID:  "child",
+		Question:  question,
+	}, recipes)
+	if err != nil {
+		t.Fatalf("compile admitted child plan: %v", err)
+	}
+	return childPlan
+}
+
+func seedParentChildPrefix(t *testing.T, sess *session.Session, childPlan session.Plan, requestID, question, completedStatus string) {
+	t.Helper()
+	seedLog(t, sess, func(store *blobstore.Store, writer *eventlog.Writer) {
+		content := putSeedText(t, store, "parent response")
+		questionRef := putSeedText(t, store, question)
+		appendEvent(t, writer, eventlog.TurnStartedPayload{ActorID: "alpha", Round: 1, Role: eventlog.ParticipantRole})
+		appendEvent(t, writer, eventlog.AttemptStartedPayload{ActorID: "alpha", Attempt: 1})
+		appendEvent(t, writer, eventlog.ChildRequestedPayload{RequestID: requestID, RequesterActorID: "alpha", RecipeID: "child", Question: questionRef})
+		appendEvent(t, writer, eventlog.AttemptFinishedPayload{ActorID: "alpha", Attempt: 1, Outcome: "success", Content: content})
+		appendEvent(t, writer, eventlog.TurnFinishedPayload{ActorID: "alpha", Round: 1, Content: content})
+		appendEvent(t, writer, eventlog.ChildDecidedPayload{
+			RequestID:   requestID,
+			Admitted:    true,
+			Reason:      "admitted",
+			BudgetState: childBudgetState("available", childPlan.Schedule.Turns),
+			Plan:        putSeedChildPlan(t, store, childPlan),
+		})
+		if completedStatus != "" {
+			result := putSeedText(t, store, "child execution failed")
+			appendEvent(t, writer, eventlog.ChildCompletedPayload{
+				RequestID:      requestID,
+				ChildSessionID: childPlan.SessionID,
+				Result:         result,
+				Status:         completedStatus,
+			})
+		}
+	})
+}
+
+func findSessionByID(t *testing.T, home, identifier string) *session.Session {
+	t.Helper()
+	entries, err := os.ReadDir(home)
+	if err != nil {
+		t.Fatalf("read session home: %v", err)
+	}
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		candidate, err := session.Open(filepath.Join(home, entry.Name()))
+		if err != nil {
+			t.Fatalf("open session candidate %q: %v", entry.Name(), err)
+		}
+		if candidate.Plan.SessionID == identifier {
+			return candidate
+		}
+	}
+	t.Fatalf("missing session %q", identifier)
+	return nil
 }
 
 func testDeps(backends map[string]*fakeBackend) Deps {

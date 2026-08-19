@@ -361,7 +361,7 @@ func applyChildCompletion(nodes map[string]GraphNode, payload eventlog.ChildComp
 	if !exists {
 		node = GraphNode{ID: identifier, Kind: "child", RequestID: payload.RequestID}
 	}
-	node.Status = "completed"
+	node.Status = payload.Status
 	node.ChildSessionID = payload.ChildSessionID
 	nodes[identifier] = node
 }
@@ -393,6 +393,11 @@ func Diagnostics(plan session.Plan, events []eventlog.Event, blobs *blobstore.St
 		}
 		if payload, ok := asAttemptFinished(event.Payload); ok {
 			delete(started, attemptKey(payload.ActorID, payload.Attempt))
+		}
+		if payload, ok := asProviderFailed(event.Payload); ok {
+			// provider.failed is a durable classified failed outcome even when
+			// interruption prevented the following attempt.finished event.
+			delete(started, attemptKey(payload.ActorID, payload.Attempts))
 		}
 		if payload, ok := asChildDecided(event.Payload); ok {
 			view.BudgetState = payload.BudgetState
