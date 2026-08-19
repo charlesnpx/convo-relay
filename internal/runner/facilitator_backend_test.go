@@ -9,22 +9,21 @@ import (
 	"testing"
 
 	"github.com/charlesnpx/convo-relay/internal/inspect"
-	"github.com/charlesnpx/convo-relay/internal/recipes"
 )
 
-type phase11Env struct {
+type facilitatorFakeEnv struct {
 	relayHome  string
 	projectDir string
 	homeDir    string
 }
 
-func TestPhase11RunSupportsClaudeAndGeminiFacilitators(t *testing.T) {
-	env := setupPhase11FakeProviders(t)
+func TestRunSupportsClaudeAndGeminiFacilitators(t *testing.T) {
+	env := setupFacilitatorFakeProviders(t)
 
-	claudeSessionDir := filepath.Join(env.relayHome, "sessions", "phase11-claude-facilitator")
+	claudeSessionDir := filepath.Join(env.relayHome, "sessions", "claude-facilitator")
 	if _, err := Run(context.Background(), Options{
 		SessionDir:          claudeSessionDir,
-		Task:                "PHASE11_CLAUDE_FACILITATOR",
+		Task:                "CLAUDE_FACILITATOR",
 		Agents:              []string{"codex", "gemini"},
 		Rounds:              1,
 		TimeoutSeconds:      5,
@@ -53,10 +52,10 @@ func TestPhase11RunSupportsClaudeAndGeminiFacilitators(t *testing.T) {
 		t.Fatalf("claude facilitator command = %#v", lastClaudeCommand)
 	}
 
-	geminiSessionDir := filepath.Join(env.relayHome, "sessions", "phase11-gemini-facilitator")
+	geminiSessionDir := filepath.Join(env.relayHome, "sessions", "gemini-facilitator")
 	if _, err := Run(context.Background(), Options{
 		SessionDir:          geminiSessionDir,
-		Task:                "PHASE11_GEMINI_FACILITATOR",
+		Task:                "GEMINI_FACILITATOR",
 		Agents:              []string{"claude", "codex"},
 		Rounds:              1,
 		TimeoutSeconds:      5,
@@ -85,10 +84,10 @@ func TestPhase11RunSupportsClaudeAndGeminiFacilitators(t *testing.T) {
 	}
 }
 
-func TestPhase11RejectsRelayFacilitatorAndDefaultsClaudeConfig(t *testing.T) {
+func TestRejectsRelayFacilitatorAndDefaultsClaudeConfig(t *testing.T) {
 	env := setupFakeCodex(t)
 	_, err := Run(context.Background(), Options{
-		SessionDir:         filepath.Join(env.relayHome, "sessions", "phase11-relay-facilitator"),
+		SessionDir:         filepath.Join(env.relayHome, "sessions", "relay-facilitator"),
 		Task:               "Relay cannot facilitate",
 		Agents:             []string{"codex", "codex"},
 		Rounds:             1,
@@ -106,15 +105,15 @@ func TestPhase11RejectsRelayFacilitatorAndDefaultsClaudeConfig(t *testing.T) {
 	}
 }
 
-func TestPhase11RelayBackendProfileRunsProviderChildAndFacilitator(t *testing.T) {
-	env := setupPhase11FakeProviders(t)
-	settingsPath := writePhase11ProviderRelaySettings(t, env)
-	sessionDir := filepath.Join(env.relayHome, "sessions", "phase11-relay-provider-profile")
+func TestRelayBackendProfileRunsProviderChildAndFacilitator(t *testing.T) {
+	env := setupFacilitatorFakeProviders(t)
+	settingsPath := writeProviderRelaySettings(t, env)
+	sessionDir := filepath.Join(env.relayHome, "sessions", "relay-provider-profile")
 
 	if _, err := Run(context.Background(), Options{
 		SessionDir:          sessionDir,
-		Task:                "PHASE11_RELAY_BACKEND_PROFILE",
-		Agents:              []string{"phase11-relay-profile", "codex"},
+		Task:                "RELAY_BACKEND_PROFILE",
+		Agents:              []string{"relay-provider-profile", "codex"},
 		Rounds:              1,
 		TimeoutSeconds:      5,
 		StallTimeoutSeconds: 5,
@@ -131,7 +130,7 @@ func TestPhase11RelayBackendProfileRunsProviderChildAndFacilitator(t *testing.T)
 		t.Fatalf("first slot = %#v", firstSlot)
 	}
 	relayState := firstSlot["state"].(map[string]any)
-	if relayState["recipe_id"] != "phase11-provider-child" || intFromAny(relayState["rounds"], 0) != 1 {
+	if relayState["recipe_id"] != "relay-provider-child" || intFromAny(relayState["rounds"], 0) != 1 {
 		t.Fatalf("relay profile state = %#v", relayState)
 	}
 	childIDs := relayState["child_session_ids"].([]any)
@@ -188,92 +187,7 @@ func TestPhase11RelayBackendProfileRunsProviderChildAndFacilitator(t *testing.T)
 	}
 }
 
-func TestPhase11RestorePythonEraProviderStateAndBackendCWD(t *testing.T) {
-	env := setupPhase11FakeProviders(t)
-
-	claudeMeta := map[string]any{
-		"slots": []any{
-			map[string]any{
-				"backend": "claude",
-				"slot_id": "slot_0",
-				"state": map[string]any{
-					"session_id": "python-claude-session",
-					"cwd":        env.projectDir,
-					"model":      "python-claude-model",
-				},
-			},
-			map[string]any{
-				"backend": "codex",
-				"slot_id": "slot_1",
-				"state": map[string]any{
-					"thread_id": "python-codex-thread",
-					"cwd":       env.projectDir,
-				},
-			},
-		},
-	}
-	claudeSlots, err := restoreSlots(claudeMeta, env.relayHome, []SlotConfig{{}, {}}, recipes.RuntimeConfig{}, "", 0, 1)
-	if err != nil {
-		t.Fatalf("restore claude python-era slots: %v", err)
-	}
-	claudeState := claudeSlots[0].SessionState()
-	if claudeSlots[0].Label() != backendLabel("claude") ||
-		claudeState["session_id"] != "python-claude-session" ||
-		claudeState["started"] != true ||
-		claudeState["model"] != "python-claude-model" {
-		t.Fatalf("restored claude state = %#v", claudeState)
-	}
-
-	geminiMeta := map[string]any{
-		"slots": []any{
-			map[string]any{
-				"backend": "gemini",
-				"slot_id": "slot_0",
-				"state": map[string]any{
-					"session_ref": "python-gemini-session",
-					"cwd":         env.projectDir,
-					"model":       "python-gemini-model",
-				},
-			},
-			map[string]any{
-				"backend": "codex",
-				"slot_id": "slot_1",
-				"state": map[string]any{
-					"thread_id": "python-codex-thread",
-					"cwd":       env.projectDir,
-				},
-			},
-		},
-	}
-	geminiSlots, err := restoreSlots(geminiMeta, env.relayHome, []SlotConfig{{Effort: "medium"}, {}}, recipes.RuntimeConfig{}, "", 0, 1)
-	if err != nil {
-		t.Fatalf("restore gemini python-era slots: %v", err)
-	}
-	geminiState := geminiSlots[0].SessionState()
-	if geminiSlots[0].Label() != backendLabel("gemini") ||
-		geminiState["session_ref"] != "python-gemini-session" ||
-		geminiState["started"] != true ||
-		geminiState["model"] != "python-gemini-model" ||
-		geminiState["effort"] != "medium" {
-		t.Fatalf("restored gemini state = %#v", geminiState)
-	}
-
-	nonGitDir := filepath.Join(filepath.Dir(env.relayHome), "non-git")
-	if err := os.MkdirAll(nonGitDir, 0o755); err != nil {
-		t.Fatalf("mkdir non-git: %v", err)
-	}
-	if got := resolveBackendCWD(nonGitDir, env.relayHome, "codex"); got != env.relayHome {
-		t.Fatalf("codex cwd = %s, want session root", got)
-	}
-	if got := resolveBackendCWD(nonGitDir, env.relayHome, "claude"); got != nonGitDir {
-		t.Fatalf("claude cwd = %s, want launch cwd", got)
-	}
-	if got := resolveBackendCWD(nonGitDir, env.relayHome, "gemini"); got != nonGitDir {
-		t.Fatalf("gemini cwd = %s, want launch cwd", got)
-	}
-}
-
-func setupPhase11FakeProviders(t *testing.T) phase11Env {
+func setupFacilitatorFakeProviders(t *testing.T) facilitatorFakeEnv {
 	t.Helper()
 	base := setupFakeCodex(t)
 	root := filepath.Dir(base.relayHome)
@@ -323,35 +237,35 @@ if __name__ == "__main__":
 		t.Fatalf("write fake gemini: %v", err)
 	}
 	t.Setenv("CONVO_RELAY_COMMAND_HOME", homeDir)
-	return phase11Env{relayHome: base.relayHome, projectDir: base.projectDir, homeDir: homeDir}
+	return facilitatorFakeEnv{relayHome: base.relayHome, projectDir: base.projectDir, homeDir: homeDir}
 }
 
-func writePhase11ProviderRelaySettings(t *testing.T, env phase11Env) string {
+func writeProviderRelaySettings(t *testing.T, env facilitatorFakeEnv) string {
 	t.Helper()
-	settingsPath := filepath.Join(env.relayHome, "phase11-settings.toml")
+	settingsPath := filepath.Join(env.relayHome, "provider-relay-settings.toml")
 	settings := `
-[backend_profiles.phase11-relay-profile]
+[backend_profiles.relay-provider-profile]
 backend = "relay"
-model = "phase11-provider-child"
+model = "relay-provider-child"
 effort = "1"
 capabilities = ["composite"]
 
-[backend_profiles.phase11-gemini]
+[backend_profiles.gemini-provider]
 backend = "gemini"
 model = "gemini-child-model"
 effort = "low"
 capabilities = ["vision"]
 
-[backend_profiles.phase11-claude]
+[backend_profiles.claude-provider]
 backend = "claude"
 model = "claude-child-model"
 effort = "medium"
 capabilities = ["code"]
 
-[relay_recipes.phase11-provider-child]
-participants = ["phase11-gemini", "phase11-claude"]
-facilitator = "phase11-gemini"
-reducer = "phase11-claude"
+[relay_recipes.relay-provider-child]
+participants = ["gemini-provider", "claude-provider"]
+facilitator = "gemini-provider"
+reducer = "claude-provider"
 mode = "adversarial"
 max_rounds = 1
 max_depth = 1

@@ -820,8 +820,6 @@ workspace_isolation = "inherited"
 		"--launch-cwd", launchCWD,
 		"--session-id", "compat-session",
 		"--home", compatibilityHome,
-		"--verbose",
-		"--stream",
 		"--output", compatibilityOutput,
 		"--json",
 	)

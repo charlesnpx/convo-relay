@@ -514,8 +514,8 @@ func TestResumePersistsInputBundlesAndInjectsPrompt(t *testing.T) {
 }
 
 func TestResumeSlotReplacementMaintainsLogicalAlternationAndHistory(t *testing.T) {
-	env := setupPhase11FakeProviders(t)
-	settingsPath := writePhase11ProviderRelaySettings(t, env)
+	env := setupFacilitatorFakeProviders(t)
+	settingsPath := writeProviderRelaySettings(t, env)
 	sessionDir := filepath.Join(env.relayHome, "sessions", "slot-replacement")
 
 	if _, err := Run(context.Background(), Options{
@@ -531,7 +531,7 @@ func TestResumeSlotReplacementMaintainsLogicalAlternationAndHistory(t *testing.T
 	}
 
 	if _, err := Resume(context.Background(), sessionDir, ResumeOptions{
-		ReplaceAgents:  []string{"phase11-gemini", ""},
+		ReplaceAgents:  []string{"gemini-provider", ""},
 		Rounds:         1,
 		TimeoutSeconds: 5,
 	}); err != nil {
@@ -578,7 +578,7 @@ func TestResumeSlotReplacementMaintainsLogicalAlternationAndHistory(t *testing.T
 		t.Fatalf("slot replacement history = %#v", history)
 	}
 	firstReplacement := history[0].(map[string]any)
-	if firstReplacement["previous_slot_id"] != "slot_0" || firstReplacement["new_slot_id"] != "slot_0_gen2" || firstReplacement["new_profile_id"] != "phase11-gemini" {
+	if firstReplacement["previous_slot_id"] != "slot_0" || firstReplacement["new_slot_id"] != "slot_0_gen2" || firstReplacement["new_profile_id"] != "gemini-provider" {
 		t.Fatalf("first replacement history = %#v", firstReplacement)
 	}
 	if firstReplacement["cleanup_preserves_artifacts"] != true || len(asSlice(firstReplacement["preserved_artifact_roots"])) == 0 {

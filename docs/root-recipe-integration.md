@@ -20,13 +20,13 @@ between checks and are not a security boundary.
 
 ## Portability gate
 
-Cross-compilation is a merge gate, not evidence of runtime certification.
+Cross-compilation is a release gate, not evidence of runtime certification.
 CI builds every production package and compiles practical test packages for
 `darwin/arm64` and `windows/amd64`. It does not execute foreign binaries and
 does not certify runtime support on macOS or Windows.
 
-The Linux test job keeps `go vet ./...`, `go test ./... -count=1`, and
-`make test-without-optional-defaults` as separate validation steps.
+The Linux test job keeps `go vet ./...` and `go test ./... -count=1` as
+separate validation steps.
 
 A live-process graceful stop is unsupported on Windows. The request returns
 an explicit error without changing session state or removing PID and cleanup

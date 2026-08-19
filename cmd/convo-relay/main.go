@@ -776,17 +776,11 @@ func runRelay(args []string) {
 	facilitatorEffort := flags.String("facilitator-effort", "", "Facilitator effort override")
 	taskPlanPath := flags.String("task-plan", "", "Attach a launch task plan from a JSON or text file")
 	quick := flags.Bool("quick", false, "Force exactly 3 rounds")
-	verbose := false
-	stream := false
 	output := ""
 	_ = flags.String("context", "", "Attach context text files; may be repeated. Limits: 1 MiB per file, 2 MiB total")
 	_ = flags.String("skill", "", "Attach capability text files; may be repeated")
 	_ = flags.String("recipe-file", "", "Attach a session-scoped transient recipe TOML file; may be repeated")
 	_ = flags.String("generated-recipe-file", "", "Attach a generated session-scoped transient recipe TOML file; may be repeated")
-	flags.BoolVar(&verbose, "verbose", false, "Accepted for Python CLI compatibility")
-	flags.BoolVar(&verbose, "v", false, "Accepted for Python CLI compatibility")
-	flags.BoolVar(&stream, "stream", false, "Accepted for Python CLI compatibility")
-	flags.BoolVar(&stream, "s", false, "Accepted for Python CLI compatibility")
 	flags.StringVar(&output, "output", "", "Write transcript or JSON export to file")
 	flags.StringVar(&output, "o", "", "Alias for --output")
 	modelA := flags.String("model-a", "", "Model for slot_0")
@@ -831,8 +825,6 @@ func runRelay(args []string) {
 			os.Exit(1)
 		}
 		transientRecipeSources := readTransientRecipeSourcesOrExit(recipeFiles, generatedRecipeFiles)
-		_ = verbose
-		_ = stream
 		ctx, stop := signal.NotifyContext(context.Background(), commandInterruptSignals()...)
 		defer stop()
 		result, err := runner.RunRecipe(ctx, runner.RecipeOptions{
@@ -893,8 +885,6 @@ func runRelay(args []string) {
 	if *quick {
 		effectiveRounds = 3
 	}
-	_ = verbose
-	_ = stream
 	ctx, stop := signal.NotifyContext(context.Background(), commandInterruptSignals()...)
 	defer stop()
 	result, err := runner.Run(ctx, runner.Options{
@@ -1152,10 +1142,7 @@ func runResume(args []string) {
 	facilitatorModel := flags.String("facilitator-model", "", "Facilitator model override")
 	facilitatorEffort := flags.String("facilitator-effort", "", "Facilitator effort override")
 	quick := flags.Bool("quick", false, "Force exactly 3 additional rounds")
-	verbose := false
 	output := ""
-	flags.BoolVar(&verbose, "verbose", false, "Accepted for Python CLI compatibility")
-	flags.BoolVar(&verbose, "v", false, "Accepted for Python CLI compatibility")
 	flags.StringVar(&output, "output", "", "Write transcript or JSON export to file")
 	flags.StringVar(&output, "o", "", "Alias for --output")
 	modelA := flags.String("model-a", "", "Model override for slot_0")
@@ -1194,7 +1181,6 @@ func runResume(args []string) {
 	if *quick {
 		effectiveRounds = 3
 	}
-	_ = verbose
 	ctx, stop := signal.NotifyContext(context.Background(), commandInterruptSignals()...)
 	defer stop()
 	result, err := runner.Resume(ctx, resolvedSessionDir, runner.ResumeOptions{

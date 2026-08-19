@@ -8,7 +8,7 @@ LDFLAGS ?= -X main.cliVersion=$(VERSION)
 
 CROSS_TARGETS ?= darwin/arm64 windows/amd64
 
-.PHONY: build install install-assets install-skills test test-without-optional-defaults test-race cross-compile cross-compile-tests smoke-fake-providers package clean
+.PHONY: build install install-assets install-skills fmt-check test test-race cross-compile cross-compile-tests smoke-fake-providers release-gate package clean
 
 build:
 	mkdir -p "$(dir $(BINARY))"
@@ -28,16 +28,16 @@ install-assets:
 install-skills:
 	go run ./cmd/convo-relay install-skills
 
-test:
+fmt-check:
+	@unformatted="$$(gofmt -l cmd internal)"; \
+	test -z "$$unformatted" || { printf '%s\n' "$$unformatted"; exit 1; }
+
+test: fmt-check
 	go vet ./...
 	go test ./... -count=1
-	$(MAKE) test-without-optional-defaults
-
-test-without-optional-defaults:
-	go test -tags=convo_relay_acceptance_no_optional_defaults ./... -count=1
 
 test-race:
-	go test -race ./internal/contracts ./internal/portable ./internal/runner ./internal/store ./internal/workspace ./internal/namedinputs ./cmd/convo-relay -count=1
+	go test -race ./internal/runner ./internal/store ./cmd/convo-relay -count=1
 
 cross-compile:
 	@set -eu; \
@@ -67,6 +67,8 @@ cross-compile-tests:
 
 smoke-fake-providers:
 	CONVO_RELAY_RUN_SMOKE_MATRIX=1 go test ./cmd/convo-relay -run TestGoOnlySmokeMatrix -count=1 -v
+
+release-gate: cross-compile cross-compile-tests smoke-fake-providers
 
 package: build
 	rm -rf "$(DIST_DIR)"

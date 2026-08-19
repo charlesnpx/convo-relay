@@ -1,5 +1,3 @@
-//go:build !convo_relay_acceptance_no_optional_defaults
-
 package main
 
 import (

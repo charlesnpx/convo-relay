@@ -84,9 +84,6 @@ func TestEveryDefaultRecipeRecordPassesGenericRegistryChecks(t *testing.T) {
 		integrationBound[recipeID] = rawRecord
 
 		recipe := config.RelayRecipes[recipeID]
-		if !includeOptionalRelayRecipeDefaults {
-			recipe = allRecipes[recipeID]
-		}
 		if recipe == nil {
 			t.Fatalf("default recipe %q was not normalized", recipeID)
 		}
