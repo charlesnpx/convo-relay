@@ -139,12 +139,6 @@ func traceBinaryFor(t *testing.T) string {
 			traceBuildErr = err
 			return
 		}
-		for _, dir := range []string{"/tmp/relay-gocache-u0t", "/tmp/relay-gotmp-u0t", "/tmp/relay-gomodcache-u0t"} {
-			if err := os.MkdirAll(dir, 0o755); err != nil {
-				traceBuildErr = fmt.Errorf("create Go cache %s: %w", dir, err)
-				return
-			}
-		}
 		traceBuildDir, err = os.MkdirTemp("", "convo-relay-goldentrace-bin-")
 		if err != nil {
 			traceBuildErr = err
@@ -153,13 +147,10 @@ func traceBinaryFor(t *testing.T) string {
 		traceBinary = filepath.Join(traceBuildDir, "convo-relay")
 		cmd := exec.Command("go", "build", "-o", traceBinary, "./cmd/convo-relay")
 		cmd.Dir = root
-		cmd.Env = overlayEnv(os.Environ(), map[string]string{
-			"GOCACHE":    "/tmp/relay-gocache-u0t",
-			"GOTMPDIR":   "/tmp/relay-gotmp-u0t",
-			"GOMODCACHE": "/tmp/relay-gomodcache-u0t",
-			"GOPROXY":    "off",
-			"GONOSUMDB":  "*",
-		})
+		// Inherit the ambient Go environment. Pinning GOCACHE/GOMODCACHE or forcing
+		// GOPROXY=off here makes the build depend on one machine's pre-populated cache:
+		// it passes locally and fails anywhere the cache is cold, CI included.
+		cmd.Env = os.Environ()
 		output, buildErr := cmd.CombinedOutput()
 		if buildErr != nil {
 			traceBuildErr = fmt.Errorf("build convo-relay trace binary: %w\n%s", buildErr, output)
