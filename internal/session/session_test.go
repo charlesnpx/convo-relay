@@ -198,21 +198,162 @@ func walkJSONValue(decoder *json.Decoder, visit func(string)) error {
 func testPlan() Plan {
 	return Plan{
 		Kind:          PlanKind,
+		Provenance:    ProvenanceOrdinary,
+		Task:          "trace task",
+		Timeouts:      Timeouts{TurnSeconds: 30, StallSeconds: 30},
+		Mode:          ModeAdversarial,
+		Investigation: InvestigationAuto,
 		SchemaVersion: SchemaVersion,
-		Actors: []Actor{{
-			ID: "actor-a", Backend: "codex", Model: "test-model", Effort: "medium",
-		}},
+		Actors: []Actor{
+			{ID: "actor-a", Backend: "codex", Model: "test-model", Effort: "medium"},
+			{ID: "actor-b", Backend: "claude", Model: "test-model", Effort: "medium"},
+		},
 		Schedule:      Schedule{Kind: "dialogue", Turns: 2, StopOnConvergence: true},
-		Facilitator:   &Facilitator{Actor: "actor-a", Cadence: 1},
-		Reducer:       &Reducer{Actor: "actor-a"},
 		ProviderRetry: ProviderRetry{Mode: "allow", MaxAttempts: 2},
 		Workspace:     Workspace{Mode: "current"},
 		Inputs:        []Input{},
-		ChildPolicy:   ChildPolicy{Mode: "disabled", MaxDepth: 0, MaxChildren: 0, MaxTurns: 0, AllowedRecipes: []string{}},
-		Result:        Result{Format: "text"},
+		ChildPolicy:   ChildPolicy{Mode: "deny", MaxDepth: 0, MaxChildren: 0, MaxTurns: 0, AllowedRecipes: []string{}},
+		Result:        Result{Source: "last_turn", Format: "text"},
 	}
 }
 
 func fixedTime() time.Time {
 	return time.Date(2026, 8, 18, 12, 0, 0, 0, time.UTC)
+}
+
+// Task carries operator prose that may deliberately name a path, so it is the one
+// field excluded from the portability walk. Every other field must still reject one.
+func TestTaskIsExemptFromPortabilityWalkButOtherFieldsAreNot(t *testing.T) {
+	plan := testPlan()
+	plan.SessionID = "task-exempt"
+	plan.Task = "review /Users/someone/project/main.go and report back"
+	if err := ValidatePlan(plan); err != nil {
+		t.Fatalf("operator task naming a path was rejected: %v", err)
+	}
+
+	leaky := testPlan()
+	leaky.SessionID = "task-exempt"
+	leaky.Provenance = ProvenanceRecipe
+	leaky.RecipeID = "/Users/someone/recipes/panel.toml"
+	if err := ValidatePlan(leaky); err == nil {
+		t.Fatal("an absolute path in recipe_id was accepted")
+	}
+}
+
+func TestValidatePlanRejectsInvalidSequenceOrder(t *testing.T) {
+	base := testPlan()
+	base.SessionID = "sequence-test"
+	base.Actors = []Actor{
+		{ID: "alpha", Backend: "codex", Model: "test-model", Effort: "medium"},
+		{ID: "facilitator", Backend: "codex", Model: "test-model", Effort: "medium"},
+		{ID: "reducer", Backend: "codex", Model: "test-model", Effort: "medium"},
+	}
+	base.Facilitator = &Facilitator{Actor: "facilitator", Cadence: 1}
+	base.Reducer = &Reducer{Actor: "reducer"}
+	for _, test := range []struct {
+		name  string
+		order []string
+		want  string
+	}{
+		{name: "wrong length", order: []string{"alpha"}, want: "exactly 2"},
+		{name: "facilitator", order: []string{"facilitator", "alpha"}, want: "control actor"},
+		{name: "reducer", order: []string{"reducer", "alpha"}, want: "control actor"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			plan := base
+			plan.Schedule = Schedule{Kind: "sequence", Turns: 2, Order: test.order}
+			if err := ValidatePlan(plan); err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("ValidatePlan error = %v, want %q", err, test.want)
+			}
+		})
+	}
+}
+
+func TestValidatePlanSequenceCoversEveryNonControlActor(t *testing.T) {
+	plan := testPlan()
+	plan.SessionID = "sequence-coverage"
+	plan.Actors = []Actor{
+		{ID: "alpha", Backend: "codex", Model: "test-model", Effort: "medium"},
+		{ID: "beta", Backend: "claude", Model: "test-model", Effort: "medium"},
+	}
+	plan.Schedule = Schedule{Kind: "sequence", Turns: 3, Order: []string{"alpha", "beta", "alpha"}}
+	if err := ValidatePlan(plan); err != nil {
+		t.Fatalf("repeated sequence order was rejected: %v", err)
+	}
+
+	plan.Actors = append(plan.Actors, Actor{ID: "never-scheduled", Backend: "gemini", Model: "test-model", Effort: "medium"})
+	if err := ValidatePlan(plan); err == nil || !strings.Contains(err.Error(), "must include every actor") {
+		t.Fatalf("unused sequence actor error = %v", err)
+	}
+}
+
+func TestValidatePlanRejectsUnsupportedActorBackend(t *testing.T) {
+	plan := testPlan()
+	plan.SessionID = "relay-plan"
+	plan.Actors[0].Backend = "relay"
+	if err := ValidatePlan(plan); err == nil || !strings.Contains(err.Error(), "not supported") {
+		t.Fatalf("ValidatePlan relay actor error = %v", err)
+	}
+
+	relayHome := filepath.Join(t.TempDir(), "relay-home")
+	if _, err := Create(relayHome, plan); err == nil || !strings.Contains(err.Error(), "not supported") {
+		t.Fatalf("Create relay actor error = %v", err)
+	}
+	matches, err := filepath.Glob(filepath.Join(relayHome, "*", SessionFilename))
+	if err != nil {
+		t.Fatalf("glob session files: %v", err)
+	}
+	if len(matches) != 0 {
+		t.Fatalf("Create persisted unsupported backend plan: %v", matches)
+	}
+}
+
+func TestValidatePlanRejectsForbiddenDynamicWithPermissiveChildPolicy(t *testing.T) {
+	plan := testPlan()
+	plan.SessionID = "forbidden-dynamic"
+	plan.Lifecycle = &Lifecycle{
+		Resume:             "allow",
+		Steering:           "allow",
+		Dynamic:            "forbid",
+		WorkspaceIsolation: "inherited",
+	}
+	plan.ChildPolicy = ChildPolicy{Mode: "allow", MaxDepth: 1, MaxChildren: 1, MaxTurns: 1, AllowedRecipes: []string{}}
+	if err := ValidatePlan(plan); err == nil || !strings.Contains(err.Error(), "dynamic forbid") {
+		t.Fatalf("lifecycle/child policy error = %v", err)
+	}
+}
+
+func TestValidatePlanRejectsUnknownChildPolicyMode(t *testing.T) {
+	for _, mode := range []string{"explode", "disabled"} {
+		t.Run(mode, func(t *testing.T) {
+			plan := testPlan()
+			plan.SessionID = "child-policy-" + mode
+			plan.ChildPolicy.Mode = mode
+			if err := ValidatePlan(plan); err == nil || !strings.Contains(err.Error(), "deny, ask, or allow") {
+				t.Fatalf("ValidatePlan child-policy error = %v", err)
+			}
+		})
+	}
+}
+
+// A recipe's workspace isolation is a minimum the executable workspace may
+// strengthen but not weaken. Both values are only visible on the plan, so the
+// plan validator owns the rule; Create and Open would otherwise persist a
+// contradiction the engine cannot execute unambiguously.
+func TestWorkspaceIsolationCannotWeakenTheRecipeMinimum(t *testing.T) {
+	weakened := testPlan()
+	weakened.SessionID = "workspace-minimum"
+	weakened.Lifecycle = &Lifecycle{Resume: "allow", Steering: "allow", Dynamic: "forbid", WorkspaceIsolation: "ephemeral"}
+	weakened.ChildPolicy.Mode = "deny"
+	weakened.Workspace.Isolation = "inherited"
+	if err := ValidatePlan(weakened); err == nil {
+		t.Fatal("a workspace isolation weaker than the recipe minimum was accepted")
+	}
+
+	strengthened := weakened
+	strengthened.Lifecycle = &Lifecycle{Resume: "allow", Steering: "allow", Dynamic: "forbid", WorkspaceIsolation: "read_only"}
+	strengthened.Workspace.Isolation = "ephemeral"
+	if err := ValidatePlan(strengthened); err != nil {
+		t.Fatalf("strengthening the recipe minimum was rejected: %v", err)
+	}
 }

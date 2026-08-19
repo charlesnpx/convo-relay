@@ -16,6 +16,27 @@ import (
 	"github.com/charlesnpx/convo-relay/internal/eventlog"
 )
 
+// Relay modes frame how actors address one another.
+const (
+	ModeAdversarial = "adversarial"
+	ModeCooperative = "cooperative"
+	ModeSteelman    = "steelman"
+)
+
+// Investigation levels control how much context an actor receives.
+const (
+	InvestigationAuto        = "auto"
+	InvestigationNormal      = "normal"
+	InvestigationContextOnly = "context_only"
+)
+
+// Provenance values. These label a plan's origin; they never select behaviour.
+const (
+	ProvenanceOrdinary = "ordinary"
+	ProvenanceRecipe   = "recipe"
+	ProvenanceChild    = "child"
+)
+
 const (
 	PlanKind        = "relay.plan/v1"
 	SchemaVersion   = 1
@@ -25,9 +46,33 @@ const (
 // Plan is the complete typed, portable compiled-plan document. It owns the
 // only schema_version; nested plan records deliberately have none.
 type Plan struct {
-	Kind          string        `json:"kind"`
-	SchemaVersion int           `json:"schema_version"`
-	SessionID     string        `json:"session_id"`
+	Kind          string `json:"kind"`
+	SchemaVersion int    `json:"schema_version"`
+	SessionID     string `json:"session_id"`
+	// Provenance records where the plan came from: ordinary, recipe, or child.
+	// It is a label for operators and inspectors. Nothing may branch on it to
+	// choose execution behaviour - one plan, one engine.
+	Provenance string `json:"provenance"`
+	// RecipeID names the recipe a plan was compiled from, when it was. The
+	// public run report surfaces it, so it is part of the operator contract.
+	RecipeID string `json:"recipe_id,omitempty"`
+	// Task is the operator's stated purpose for the run. It is deliberately a
+	// plain string rather than a blob reference so the compiler stays a pure
+	// function of its inputs and needs no blobstore. It is also the one field
+	// excluded from the portability walk: it is operator-authored prose that may
+	// legitimately name a path, and it reads identically on every machine, so it
+	// is intentional content rather than incidental machine state.
+	Task string `json:"task"`
+	// Timeouts govern one provider turn and its stall watchdog. They are compiler
+	// policy, fixed before this immutable boundary.
+	Timeouts Timeouts `json:"timeouts"`
+	// Mode frames how actors address each other: adversarial, cooperative, or
+	// steelman. It shapes prompts and is recorded per turn, so it is execution
+	// policy rather than presentation.
+	Mode string `json:"mode"`
+	// Investigation controls how much context an actor receives: auto, normal, or
+	// context_only.
+	Investigation string        `json:"investigation"`
 	Actors        []Actor       `json:"actors"`
 	Schedule      Schedule      `json:"schedule"`
 	Facilitator   *Facilitator  `json:"facilitator,omitempty"`
@@ -35,8 +80,19 @@ type Plan struct {
 	ProviderRetry ProviderRetry `json:"provider_retry"`
 	Workspace     Workspace     `json:"workspace"`
 	Inputs        []Input       `json:"inputs"`
-	ChildPolicy   ChildPolicy   `json:"child_policy"`
-	Result        Result        `json:"result"`
+	// Context and Skills are the durable, blob-addressed forms of --context and
+	// --skill. Their source paths deliberately do not enter the portable plan.
+	Context       []Input         `json:"context"`
+	Skills        []Input         `json:"skills"`
+	TaskPlan      json.RawMessage `json:"task_plan,omitempty"`
+	MatchKeywords []string        `json:"match_keywords"`
+	ChildPolicy   ChildPolicy     `json:"child_policy"`
+	Result        Result          `json:"result"`
+	// Lifecycle carries recipe controls that do not select a second execution
+	// path. Dynamic and workspace controls are also projected onto ChildPolicy
+	// and Workspace by the compiler.
+	Lifecycle           *Lifecycle `json:"lifecycle,omitempty"`
+	IntegrationContract string     `json:"integration_contract,omitempty"`
 }
 
 type Actor struct {
@@ -50,6 +106,17 @@ type Schedule struct {
 	Kind              string `json:"kind"`
 	Turns             int    `json:"turns"`
 	StopOnConvergence bool   `json:"stop_on_convergence"`
+	// Order is the explicit per-turn actor sequence for a sequence schedule. It
+	// exists so a fixed order is stated rather than inferred from the position of
+	// entries in Actors. It must be empty for a dialogue schedule.
+	Order []string `json:"order,omitempty"`
+}
+
+// Timeouts is measured in seconds. Zero is not valid: a plan states its own
+// limits rather than letting a downstream default decide.
+type Timeouts struct {
+	TurnSeconds  int `json:"turn_seconds"`
+	StallSeconds int `json:"stall_seconds"`
 }
 
 type Facilitator struct {
@@ -69,7 +136,8 @@ type ProviderRetry struct {
 }
 
 type Workspace struct {
-	Mode string `json:"mode"`
+	Mode      string `json:"mode"`
+	Isolation string `json:"isolation,omitempty"`
 }
 
 type Input struct {
@@ -86,8 +154,19 @@ type ChildPolicy struct {
 }
 
 type Result struct {
+	Source string          `json:"source"`
 	Format string          `json:"format"`
 	Schema json.RawMessage `json:"schema,omitempty"`
+}
+
+// Lifecycle is the canonical normalized recipe lifecycle projection. Runtime
+// enforcement remains with the execution unit; the plan records the policy
+// that it must enforce.
+type Lifecycle struct {
+	Resume             string `json:"resume"`
+	Steering           string `json:"steering"`
+	Dynamic            string `json:"dynamic"`
+	WorkspaceIsolation string `json:"workspace_isolation"`
 }
 
 // Session is a decoded immutable plan plus its machine-local directory. Root
@@ -131,11 +210,14 @@ func CreateWithOptions(options CreateOptions) (*Session, error) {
 		return nil, err
 	}
 
-	plan := normalizeNewPlan(options.Plan, filepath.Base(root))
+	plan := options.Plan
+	if plan.SessionID == "" {
+		plan.SessionID = filepath.Base(root)
+	}
 	if err := ValidatePlan(plan); err != nil {
 		return nil, err
 	}
-	if err := eventlog.ValidatePortableValue(plan, root, relayHome); err != nil {
+	if err := eventlog.ValidatePortableValue(portableProjection(plan), root, relayHome); err != nil {
 		return nil, err
 	}
 	if err := os.MkdirAll(filepath.Join(root, "runtime"), 0o700); err != nil {
@@ -162,28 +244,6 @@ func CreateWithOptions(options CreateOptions) (*Session, error) {
 		return nil, err
 	}
 	return &Session{Root: root, Plan: plan, Digest: digest}, nil
-}
-
-func normalizeNewPlan(plan Plan, generatedID string) Plan {
-	if plan.Kind == "" {
-		plan.Kind = PlanKind
-	}
-	if plan.SchemaVersion == 0 {
-		plan.SchemaVersion = SchemaVersion
-	}
-	if plan.SessionID == "" {
-		plan.SessionID = generatedID
-	}
-	if plan.ProviderRetry.Mode == "" {
-		plan.ProviderRetry.Mode = "allow"
-	}
-	if plan.ProviderRetry.MaxAttempts == 0 {
-		plan.ProviderRetry.MaxAttempts = 1
-	}
-	if plan.ChildPolicy.Mode == "" {
-		plan.ChildPolicy.Mode = "disabled"
-	}
-	return plan
 }
 
 func writeSessionOnce(root string, body []byte) error {
@@ -226,7 +286,7 @@ func Open(root string) (*Session, error) {
 	if err := ValidatePlan(plan); err != nil {
 		return nil, err
 	}
-	if err := eventlog.ValidatePortableValue(plan, cleaned); err != nil {
+	if err := eventlog.ValidatePortableValue(portableProjection(plan), cleaned); err != nil {
 		return nil, err
 	}
 	digest, err := eventlog.SemanticJSONDigestBytes(body)
@@ -264,9 +324,11 @@ func PlanDigest(plan Plan) (string, error) {
 
 // BlobRefs returns every plan-input reference, for bundle closure and sweep.
 func BlobRefs(plan Plan) []blobstore.BlobRef {
-	refs := make([]blobstore.BlobRef, 0, len(plan.Inputs))
-	for _, input := range plan.Inputs {
-		refs = append(refs, input.Content)
+	refs := make([]blobstore.BlobRef, 0, len(plan.Inputs)+len(plan.Context)+len(plan.Skills))
+	for _, inputs := range [][]Input{plan.Inputs, plan.Context, plan.Skills} {
+		for _, input := range inputs {
+			refs = append(refs, input.Content)
+		}
 	}
 	return refs
 }
@@ -310,13 +372,40 @@ func ValidatePlan(plan Plan) error {
 	if plan.SchemaVersion != SchemaVersion {
 		return fmt.Errorf("plan schema_version must be %d", SchemaVersion)
 	}
+	switch plan.Provenance {
+	case ProvenanceOrdinary, ProvenanceRecipe, ProvenanceChild:
+	default:
+		return fmt.Errorf("plan provenance must be one of %s, %s, %s", ProvenanceOrdinary, ProvenanceRecipe, ProvenanceChild)
+	}
+	if (plan.Provenance == ProvenanceRecipe || plan.Provenance == ProvenanceChild) && plan.RecipeID == "" {
+		return errors.New("plan compiled from a recipe must record recipe_id")
+	}
+	if strings.TrimSpace(plan.Task) == "" {
+		return errors.New("plan must state a task")
+	}
+	if plan.Timeouts.TurnSeconds <= 0 {
+		return errors.New("plan timeouts.turn_seconds must be positive")
+	}
+	if plan.Timeouts.StallSeconds <= 0 {
+		return errors.New("plan timeouts.stall_seconds must be positive")
+	}
+	switch plan.Mode {
+	case ModeAdversarial, ModeCooperative, ModeSteelman:
+	default:
+		return fmt.Errorf("plan mode must be one of %s, %s, %s", ModeAdversarial, ModeCooperative, ModeSteelman)
+	}
+	switch plan.Investigation {
+	case InvestigationAuto, InvestigationNormal, InvestigationContextOnly:
+	default:
+		return fmt.Errorf("plan investigation must be one of %s, %s, %s", InvestigationAuto, InvestigationNormal, InvestigationContextOnly)
+	}
 	if err := validateToken("session_id", plan.SessionID); err != nil {
 		return err
 	}
 	if len(plan.Actors) == 0 {
 		return errors.New("plan must contain at least one actor")
 	}
-	actorIDs := make(map[string]struct{}, len(plan.Actors))
+	actorIDs := make(map[string]bool, len(plan.Actors))
 	for _, actor := range plan.Actors {
 		if err := validateToken("actor.id", actor.ID); err != nil {
 			return err
@@ -324,19 +413,18 @@ func ValidatePlan(plan Plan) error {
 		if _, exists := actorIDs[actor.ID]; exists {
 			return fmt.Errorf("plan contains duplicate actor %q", actor.ID)
 		}
-		actorIDs[actor.ID] = struct{}{}
-		if err := validateToken("actor.backend", actor.Backend); err != nil {
+		actorIDs[actor.ID] = false
+		switch actor.Backend {
+		case "claude", "codex", "gemini":
+		default:
+			return fmt.Errorf("actor backend %q is not supported", actor.Backend)
+		}
+		if err := validateOptionalToken("actor.model", actor.Model); err != nil {
 			return err
 		}
-		if err := validateToken("actor.model", actor.Model); err != nil {
+		if err := validateOptionalToken("actor.effort", actor.Effort); err != nil {
 			return err
 		}
-		if err := validateToken("actor.effort", actor.Effort); err != nil {
-			return err
-		}
-	}
-	if plan.Schedule.Kind != "dialogue" && plan.Schedule.Kind != "sequence" {
-		return errors.New("schedule kind must be dialogue or sequence")
 	}
 	if plan.Schedule.Turns < 1 {
 		return errors.New("schedule turns must be positive")
@@ -354,43 +442,98 @@ func ValidatePlan(plan Plan) error {
 			return errors.New("reducer actor is not in actors")
 		}
 	}
+	controlActorCount := 0
+	if plan.Facilitator != nil {
+		controlActorCount++
+	}
+	if plan.Reducer != nil && (plan.Facilitator == nil || plan.Reducer.Actor != plan.Facilitator.Actor) {
+		controlActorCount++
+	}
+	switch plan.Schedule.Kind {
+	case "dialogue":
+		if len(plan.Schedule.Order) != 0 {
+			return errors.New("schedule.order is only valid for a sequence schedule")
+		}
+		if participants := len(plan.Actors) - controlActorCount; participants != 2 {
+			return fmt.Errorf("dialogue schedule requires exactly two participants, got %d", participants)
+		}
+	case "sequence":
+		if len(plan.Schedule.Order) != plan.Schedule.Turns {
+			return fmt.Errorf("sequence schedule order must contain exactly %d entries", plan.Schedule.Turns)
+		}
+		scheduledActorCount := 0
+		for _, actorID := range plan.Schedule.Order {
+			scheduled, exists := actorIDs[actorID]
+			if !exists {
+				return fmt.Errorf("schedule.order names unknown actor %q", actorID)
+			}
+			if (plan.Facilitator != nil && plan.Facilitator.Actor == actorID) || (plan.Reducer != nil && plan.Reducer.Actor == actorID) {
+				return fmt.Errorf("schedule.order must not name control actor %q", actorID)
+			}
+			if !scheduled {
+				actorIDs[actorID] = true
+				scheduledActorCount++
+			}
+		}
+		if scheduledActorCount != len(plan.Actors)-controlActorCount {
+			return errors.New("sequence schedule must include every actor that does not hold a control role")
+		}
+	default:
+		return errors.New("schedule kind must be dialogue or sequence")
+	}
 	if plan.ProviderRetry.Mode != "allow" && plan.ProviderRetry.Mode != "forbid" {
 		return errors.New("provider_retry mode must be allow or forbid")
 	}
 	if plan.ProviderRetry.MaxAttempts < 1 {
 		return errors.New("provider_retry max_attempts must be positive")
 	}
+	if plan.ProviderRetry.Mode == "forbid" && plan.ProviderRetry.MaxAttempts != 1 {
+		return errors.New("provider_retry forbid mode requires exactly one attempt")
+	}
 	if plan.Workspace.Mode != "current" && plan.Workspace.Mode != "head-copy" {
 		return errors.New("workspace mode must be current or head-copy")
 	}
-	inputNames := make(map[string]struct{}, len(plan.Inputs))
-	for _, input := range plan.Inputs {
-		if err := validateLogicalName(input.Name); err != nil {
-			return err
-		}
-		if _, exists := inputNames[input.Name]; exists {
-			return fmt.Errorf("plan contains duplicate input %q", input.Name)
-		}
-		inputNames[input.Name] = struct{}{}
-		if err := blobstore.ValidateRef(input.Content); err != nil {
+	if plan.Workspace.Isolation != "" && plan.Workspace.Isolation != "inherited" && plan.Workspace.Isolation != "read_only" && plan.Workspace.Isolation != "ephemeral" {
+		return errors.New("workspace isolation must be inherited, read_only, or ephemeral")
+	}
+	for _, group := range []struct {
+		label  string
+		inputs []Input
+	}{
+		{label: "input", inputs: plan.Inputs},
+		{label: "context", inputs: plan.Context},
+		{label: "skill", inputs: plan.Skills},
+	} {
+		if err := validateInputs(group.label, group.inputs); err != nil {
 			return err
 		}
 	}
-	if err := validateToken("child_policy.mode", plan.ChildPolicy.Mode); err != nil {
+	if err := validateUniqueTokens("match_keywords", plan.MatchKeywords); err != nil {
 		return err
+	}
+	if len(plan.TaskPlan) > 0 {
+		if _, err := eventlog.SemanticJSONBytesRaw(plan.TaskPlan); err != nil {
+			return fmt.Errorf("task_plan is not strict JSON: %w", err)
+		}
+	}
+	switch plan.ChildPolicy.Mode {
+	case "deny", "ask", "allow":
+	default:
+		return errors.New("child_policy mode must be deny, ask, or allow")
 	}
 	if plan.ChildPolicy.MaxDepth < 0 || plan.ChildPolicy.MaxChildren < 0 || plan.ChildPolicy.MaxTurns < 0 {
 		return errors.New("child policy limits must not be negative")
 	}
-	recipeIDs := make(map[string]struct{}, len(plan.ChildPolicy.AllowedRecipes))
-	for _, recipeID := range plan.ChildPolicy.AllowedRecipes {
-		if err := validateToken("child_policy.allowed_recipes", recipeID); err != nil {
-			return err
-		}
-		if _, exists := recipeIDs[recipeID]; exists {
-			return fmt.Errorf("child policy contains duplicate recipe %q", recipeID)
-		}
-		recipeIDs[recipeID] = struct{}{}
+	if err := validateUniqueTokens("child_policy.allowed_recipes", plan.ChildPolicy.AllowedRecipes); err != nil {
+		return err
+	}
+	switch plan.Result.Source {
+	case "last_turn", "reducer":
+	default:
+		return errors.New("result source must be last_turn or reducer")
+	}
+	if plan.Result.Source == "reducer" && plan.Reducer == nil {
+		return errors.New("reducer result source requires a reducer")
 	}
 	if err := validateToken("result.format", plan.Result.Format); err != nil {
 		return err
@@ -400,7 +543,32 @@ func ValidatePlan(plan Plan) error {
 			return fmt.Errorf("result schema is not strict JSON: %w", err)
 		}
 	}
-	return eventlog.ValidatePortableValue(plan)
+	if err := validateLifecycle(plan.Lifecycle); err != nil {
+		return err
+	}
+	if plan.Lifecycle != nil && plan.Lifecycle.Dynamic == "forbid" && plan.ChildPolicy.Mode != "deny" {
+		return errors.New("lifecycle dynamic forbid requires child_policy mode deny")
+	}
+	// A recipe's declared workspace isolation is a minimum. The executable
+	// workspace may strengthen it but never weaken it, per the documented
+	// operator contract. Validated here because the plan is the only place both
+	// values are visible: the compiler emits consistent pairs, but Create and
+	// Open would otherwise persist a contradiction the engine cannot execute
+	// unambiguously - it would have to choose between the recorded minimum and
+	// the weaker executable value.
+	if plan.Lifecycle != nil {
+		minimum, minimumKnown := workspaceIsolationRank(plan.Lifecycle.WorkspaceIsolation)
+		effective, effectiveKnown := workspaceIsolationRank(plan.Workspace.Isolation)
+		if minimumKnown && effectiveKnown && effective < minimum {
+			return fmt.Errorf("workspace isolation %q weakens the recipe minimum %q", plan.Workspace.Isolation, plan.Lifecycle.WorkspaceIsolation)
+		}
+	}
+	if plan.IntegrationContract != "" {
+		if err := validateToken("integration_contract", plan.IntegrationContract); err != nil {
+			return err
+		}
+	}
+	return eventlog.ValidatePortableValue(portableProjection(plan))
 }
 
 // ActorIDs returns deterministic actor ids without exposing an untyped map.
@@ -421,6 +589,71 @@ func validateToken(label string, value string) error {
 		return fmt.Errorf("%s contains a control character", label)
 	}
 	return nil
+}
+
+func validateOptionalToken(label string, value string) error {
+	if value == "" {
+		return nil
+	}
+	if strings.ContainsAny(value, "\r\n\x00") {
+		return fmt.Errorf("%s contains a control character", label)
+	}
+	return nil
+}
+
+func validateInputs(label string, inputs []Input) error {
+	names := make(map[string]struct{}, len(inputs))
+	for _, input := range inputs {
+		if err := validateLogicalName(input.Name); err != nil {
+			return fmt.Errorf("%s: %w", label, err)
+		}
+		if _, exists := names[input.Name]; exists {
+			return fmt.Errorf("plan contains duplicate %s %q", label, input.Name)
+		}
+		names[input.Name] = struct{}{}
+		if err := blobstore.ValidateRef(input.Content); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func validateUniqueTokens(label string, values []string) error {
+	seen := make(map[string]struct{}, len(values))
+	for _, value := range values {
+		if err := validateToken(label, value); err != nil {
+			return err
+		}
+		if _, exists := seen[value]; exists {
+			return fmt.Errorf("plan contains duplicate %s %q", label, value)
+		}
+		seen[value] = struct{}{}
+	}
+	return nil
+}
+
+func validateLifecycle(value *Lifecycle) error {
+	if value == nil {
+		return nil
+	}
+	for _, field := range []struct {
+		label string
+		value string
+	}{
+		{label: "lifecycle.resume", value: value.Resume},
+		{label: "lifecycle.steering", value: value.Steering},
+		{label: "lifecycle.dynamic", value: value.Dynamic},
+	} {
+		if field.value != "allow" && field.value != "forbid" {
+			return fmt.Errorf("%s must be allow or forbid", field.label)
+		}
+	}
+	switch value.WorkspaceIsolation {
+	case "inherited", "read_only", "ephemeral":
+		return nil
+	default:
+		return errors.New("lifecycle.workspace_isolation must be inherited, read_only, or ephemeral")
+	}
 }
 
 func validateLogicalName(value string) error {
@@ -473,4 +706,29 @@ func (plan Plan) Equal(other Plan) bool {
 	left, leftErr := CanonicalBytes(plan)
 	right, rightErr := CanonicalBytes(other)
 	return leftErr == nil && rightErr == nil && bytes.Equal(left, right)
+}
+
+// portableProjection returns the plan with Task cleared, for the portability walk
+// only. Task is operator-authored prose that may deliberately name a path; it is
+// identical on every machine, so it cannot break relocation of a bundle. Every
+// other field stays bound, including the recipe id and every input name.
+func portableProjection(plan Plan) Plan {
+	plan.Task = ""
+	return plan
+}
+
+// workspaceIsolationRank orders the isolation policies weakest to strongest,
+// matching internal/workspace.policyRank, which is the authority. An empty or
+// unrecognised value reports unknown so the enum checks own that rejection.
+func workspaceIsolationRank(value string) (int, bool) {
+	switch value {
+	case "inherited":
+		return 0, true
+	case "read_only":
+		return 1, true
+	case "ephemeral":
+		return 2, true
+	default:
+		return 0, false
+	}
 }
