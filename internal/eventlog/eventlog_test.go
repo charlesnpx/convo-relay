@@ -489,3 +489,25 @@ func canonicalLine(t *testing.T, event Event) []byte {
 func fixtureTime(offset int) time.Time {
 	return time.Date(2026, 8, 18, 12, 0, offset%60, 0, time.UTC)
 }
+
+func TestEmbeddedUNCPathIsRejected(t *testing.T) {
+	rejected := []string{
+		`failed to read \\fileserver\share\input.json`,
+		`\\host\share\x`,
+		`copied from \\BUILDBOX01\artifacts\out.bin then verified`,
+	}
+	for _, value := range rejected {
+		if err := ValidatePortableValue(value); err == nil {
+			t.Fatalf("embedded UNC path accepted: %q", value)
+		}
+	}
+	accepted := []string{
+		`escaped backslashes \\\\ are not a path`,
+		`plain prose with no path at all`,
+	}
+	for _, value := range accepted {
+		if err := ValidatePortableValue(value); err != nil {
+			t.Fatalf("false positive on %q: %v", value, err)
+		}
+	}
+}

@@ -679,6 +679,12 @@ func looksLikeAbsolutePath(value string) bool {
 		if index+2 < len(value) && isASCIIAlpha(value[index]) && value[index+1] == ':' && (value[index+2] == '/' || value[index+2] == '\\') && pathBoundary(value, index) {
 			return true
 		}
+		// UNC paths carry a host and share name, so an embedded one leaks
+		// machine-specific data just as a leading one does. The prefix check
+		// above only catches it at offset zero.
+		if index+2 < len(value) && value[index] == '\\' && value[index+1] == '\\' && value[index+2] != '\\' && pathBoundary(value, index) {
+			return true
+		}
 	}
 	return false
 }
