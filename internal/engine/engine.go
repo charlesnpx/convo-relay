@@ -181,9 +181,7 @@ type executionState struct {
 	terminal       *eventlog.SessionFinishedPayload
 	phase          executionPhase
 
-	participantTurns int
-	reducerDone      bool
-	active           *turnState
+	active *turnState
 
 	conversation []conversationTurn
 	ledger       model.Ledger
@@ -207,11 +205,10 @@ type turnState struct {
 }
 
 type attemptState struct {
-	Attempt  int
-	Finished bool
-	Outcome  string
-	Content  blobstore.BlobRef
-	Failure  *providerFailureState
+	Attempt int
+	Outcome string
+	Content blobstore.BlobRef
+	Failure *providerFailureState
 }
 
 type providerFailureState struct {
@@ -467,12 +464,6 @@ func (r *runner) reduceEvent(event eventlog.Event) error {
 			Attempts: make(map[int]*attemptState),
 		}
 		state.active = turn
-		state.phase = phaseParticipant
-		if payload.Role == eventlog.FacilitatorRole {
-			state.phase = phaseFacilitator
-		} else if payload.Role == eventlog.ReducerRole {
-			state.phase = phaseReducer
-		}
 		return nil
 	case eventlog.AttemptStartedPayload:
 		turn, err := activeTurnForActor(state, payload.ActorID)
@@ -493,13 +484,15 @@ func (r *runner) reduceEvent(event eventlog.Event) error {
 		if !exists {
 			return fmt.Errorf("attempt.finished for %s attempt %d has no attempt.started", payload.ActorID, payload.Attempt)
 		}
-		if attempt.Finished {
+		if attempt.Outcome != "" && (attempt.Outcome != "failed" || payload.Outcome != "failed" || attempt.Content != (blobstore.BlobRef{})) {
 			return fmt.Errorf("duplicate attempt.finished for %s attempt %d", payload.ActorID, payload.Attempt)
 		}
 		if payload.Outcome != "success" && payload.Outcome != "failed" {
 			return fmt.Errorf("attempt.finished outcome %q is unsupported", payload.Outcome)
 		}
-		attempt.Finished = true
+		if attempt.Failure != nil && payload.Outcome != "failed" {
+			return fmt.Errorf("attempt.finished for %s attempt %d conflicts with provider.failed", payload.ActorID, payload.Attempt)
+		}
 		attempt.Outcome = payload.Outcome
 		attempt.Content = payload.Content
 		if payload.Outcome == "success" && strings.TrimSpace(payload.ProviderSessionID) != "" {
@@ -515,6 +508,16 @@ func (r *runner) reduceEvent(event eventlog.Event) error {
 		if !exists {
 			return fmt.Errorf("provider.failed for %s attempt %d has no attempt.started", payload.ActorID, payload.Attempts)
 		}
+		if attempt.Failure != nil {
+			return fmt.Errorf("duplicate provider.failed for %s attempt %d", payload.ActorID, payload.Attempts)
+		}
+		if attempt.Outcome != "" && attempt.Outcome != "failed" {
+			return fmt.Errorf("provider.failed for %s attempt %d conflicts with attempt.finished", payload.ActorID, payload.Attempts)
+		}
+		// A classified provider failure is itself a durable failed outcome. This
+		// lets replay decide retry policy even if the subsequent attempt.finished
+		// event was not written before interruption.
+		attempt.Outcome = "failed"
 		attempt.Failure = &providerFailureState{
 			Category: payload.Category, Retryable: payload.Retryable, SanitizedDetail: payload.SanitizedDetail,
 		}
@@ -558,7 +561,7 @@ func (r *runner) reduceEvent(event eventlog.Event) error {
 		child.Decided = true
 		child.Admitted = payload.Admitted
 		if payload.Admitted {
-			turns, err := r.childTurnsFor(child, payload.BudgetState)
+			turns, err := r.childTurnsFor(payload.BudgetState)
 			if err != nil {
 				return err
 			}
@@ -635,7 +638,6 @@ func (r *runner) recordCompletedTurn(turn *turnState, completed completedTurn) {
 	case eventlog.FacilitatorRole:
 		r.state.ledger = parseLedger(completed.Text, r.state.ledger)
 	case eventlog.ReducerRole:
-		r.state.reducerDone = true
 		if r.sess.Plan.Result.Source == "reducer" {
 			r.state.lastResult = completed
 		}
@@ -645,9 +647,8 @@ func (r *runner) recordCompletedTurn(turn *turnState, completed completedTurn) {
 func (r *runner) advancePhase(turn *turnState) {
 	switch turn.Role {
 	case eventlog.ParticipantRole:
-		r.state.participantTurns++
 		if r.sess.Plan.Schedule.Kind == "dialogue" && r.sess.Plan.Facilitator != nil &&
-			r.state.participantTurns%r.sess.Plan.Facilitator.Cadence == 0 {
+			len(r.state.conversation)%r.sess.Plan.Facilitator.Cadence == 0 {
 			r.state.phase = phaseFacilitator
 			return
 		}
@@ -655,17 +656,16 @@ func (r *runner) advancePhase(turn *turnState) {
 	case eventlog.FacilitatorRole:
 		r.phaseAfterParticipants()
 	case eventlog.ReducerRole:
-		r.state.reducerDone = true
 		r.state.phase = phaseDone
 	}
 }
 
 func (r *runner) phaseAfterParticipants() {
-	if r.state.participantTurns < r.sess.Plan.Schedule.Turns {
+	if len(r.state.conversation) < r.sess.Plan.Schedule.Turns {
 		r.state.phase = phaseParticipant
 		return
 	}
-	if r.sess.Plan.Reducer != nil && !r.state.reducerDone {
+	if r.sess.Plan.Reducer != nil {
 		r.state.phase = phaseReducer
 		return
 	}
@@ -716,21 +716,21 @@ type turnSpec struct {
 func (r *runner) nextTurn() (turnSpec, error) {
 	switch r.state.phase {
 	case phaseParticipant:
-		if r.state.participantTurns >= r.sess.Plan.Schedule.Turns {
+		if len(r.state.conversation) >= r.sess.Plan.Schedule.Turns {
 			return turnSpec{}, errors.New("participant phase has no remaining turn")
 		}
-		round := r.state.participantTurns + 1
+		round := len(r.state.conversation) + 1
 		if r.sess.Plan.Schedule.Kind == "dialogue" {
 			if len(r.participants) == 0 {
 				return turnSpec{}, errors.New("dialogue schedule has no participant actors")
 			}
 			return turnSpec{
-				Actor: r.participants[r.state.participantTurns%len(r.participants)],
+				Actor: r.participants[len(r.state.conversation)%len(r.participants)],
 				Round: round,
 				Role:  eventlog.ParticipantRole,
 			}, nil
 		}
-		actor, err := r.actor(r.sess.Plan.Schedule.Order[r.state.participantTurns])
+		actor, err := r.actor(r.sess.Plan.Schedule.Order[len(r.state.conversation)])
 		if err != nil {
 			return turnSpec{}, err
 		}
@@ -743,7 +743,7 @@ func (r *runner) nextTurn() (turnSpec, error) {
 		if err != nil {
 			return turnSpec{}, err
 		}
-		return turnSpec{Actor: actor, Round: r.state.participantTurns, Role: eventlog.FacilitatorRole}, nil
+		return turnSpec{Actor: actor, Round: len(r.state.conversation), Role: eventlog.FacilitatorRole}, nil
 	case phaseReducer:
 		if r.sess.Plan.Reducer == nil {
 			return turnSpec{}, errors.New("reducer phase has no reducer")
@@ -780,6 +780,15 @@ func (r *runner) serviceActiveTurn() error {
 	if success := turn.latest("success"); success != nil {
 		return r.finishActiveTurn(turn, success)
 	}
+	if failed := turn.latest("failed"); failed != nil {
+		if failed.Failure != nil && r.shouldRetry(failed.Failure, failed.Attempt) {
+			return r.callActiveAttempt(turn, len(turn.Attempts)+1)
+		}
+		return &executionFailure{
+			reason: stopProviderFailed,
+			cause:  recordedFailure(turn, failed),
+		}
+	}
 	if abandoned := turn.latest(""); abandoned != nil {
 		if !r.retryAbandoned(abandoned.Attempt) {
 			return &executionFailure{
@@ -787,42 +796,19 @@ func (r *runner) serviceActiveTurn() error {
 				cause:  fmt.Errorf("abandoned provider attempt %d for %s cannot be retried by plan policy", abandoned.Attempt, turn.ActorID),
 			}
 		}
-		return r.callActiveAttempt(turn, turn.nextAttempt())
+		return r.callActiveAttempt(turn, len(turn.Attempts)+1)
 	}
-	if failed := turn.latest("failed"); failed != nil {
-		if failed.Failure != nil && r.shouldRetry(failed.Failure, failed.Attempt) {
-			return r.callActiveAttempt(turn, turn.nextAttempt())
-		}
-		return &executionFailure{
-			reason: stopProviderFailed,
-			cause:  recordedFailure(turn, failed),
-		}
-	}
-	return r.callActiveAttempt(turn, turn.nextAttempt())
+	return r.callActiveAttempt(turn, len(turn.Attempts)+1)
 }
 
 func (turn *turnState) latest(outcome string) *attemptState {
 	var selected *attemptState
 	for _, attempt := range turn.Attempts {
-		matches := !attempt.Finished
-		if outcome != "" {
-			matches = attempt.Finished && attempt.Outcome == outcome
-		}
-		if matches && (selected == nil || attempt.Attempt > selected.Attempt) {
+		if attempt.Outcome == outcome && (selected == nil || attempt.Attempt > selected.Attempt) {
 			selected = attempt
 		}
 	}
 	return selected
-}
-
-func (turn *turnState) nextAttempt() int {
-	next := 1
-	for number := range turn.Attempts {
-		if number >= next {
-			next = number + 1
-		}
-	}
-	return next
 }
 
 func recordedFailure(turn *turnState, attempt *attemptState) error {
@@ -891,16 +877,8 @@ func (r *runner) callActiveAttempt(turn *turnState, attemptNumber int) error {
 		}
 		return r.finishActiveTurn(r.state.active, r.state.active.Attempts[attemptNumber])
 	}
-	if err := r.append(eventlog.AttemptFinishedPayload{
-		ActorID: actor.ID,
-		Attempt: attemptNumber,
-		Outcome: "failed",
-		Content: ref,
-	}); err != nil {
-		return err
-	}
 	failure := provider.NewProviderFailure("turn", actor.ID, actor.Backend, callErr, provider.ProviderResultForTurn(actor.Backend, result))
-	return r.append(eventlog.ProviderFailedPayload{
+	if err := r.append(eventlog.ProviderFailedPayload{
 		ActorID:         actor.ID,
 		Backend:         actor.Backend,
 		Category:        failure.Category,
@@ -908,6 +886,14 @@ func (r *runner) callActiveAttempt(turn *turnState, attemptNumber int) error {
 		Attempts:        attemptNumber,
 		RemediationCode: failure.RemediationCode,
 		SanitizedDetail: failure.SanitizedDetail,
+	}); err != nil {
+		return err
+	}
+	return r.append(eventlog.AttemptFinishedPayload{
+		ActorID: actor.ID,
+		Attempt: attemptNumber,
+		Outcome: "failed",
+		Content: ref,
 	})
 }
 
@@ -1063,7 +1049,7 @@ func childBudgetState(state string, turns int) string {
 	return state + ";child_turns=" + strconv.Itoa(turns)
 }
 
-func (r *runner) childTurnsFor(child *childState, budgetState string) (int, error) {
+func (r *runner) childTurnsFor(budgetState string) (int, error) {
 	if _, suffix, found := strings.Cut(budgetState, ";child_turns="); found {
 		turns, err := strconv.Atoi(suffix)
 		if err != nil || turns < 0 {
@@ -1071,32 +1057,34 @@ func (r *runner) childTurnsFor(child *childState, budgetState string) (int, erro
 		}
 		return turns, nil
 	}
-	childPlan, err := r.childPlanFor(child)
-	if err != nil {
-		return 0, fmt.Errorf("reconstruct child budget for %s: %w", child.Request.RequestID, err)
-	}
-	return childPlan.Schedule.Turns, nil
+	return 0, errors.New("child.decided has no child turn count")
 }
 
 func (r *runner) runChild(child *childState) error {
-	childPlan, err := r.childPlanFor(child)
+	childSession, err := r.openOrCreateChildSession(child)
 	if err != nil {
-		return err
-	}
-	childSession, err := session.Create(filepath.Dir(r.sess.Root), childPlan)
-	if err != nil {
-		return err
-	}
-	childBlobs, err := childSession.BlobStore(blobstore.Limits{})
-	if err != nil {
-		return err
-	}
-	if err := copyPlanBlobs(r.blobs, childBlobs, session.BlobRefs(childPlan)); err != nil {
 		return err
 	}
 	childDeps := r.deps
 	childDeps.Writer = nil
-	childOutcome, childErr := Run(r.ctx, childSession, childDeps)
+	childEvents, err := readEvents(childSession.Root)
+	if err != nil {
+		return err
+	}
+	var childOutcome Outcome
+	var childErr error
+	if len(childEvents) == 0 {
+		childBlobs, err := childSession.BlobStore(blobstore.Limits{})
+		if err != nil {
+			return err
+		}
+		if err := copyPlanBlobs(r.blobs, childBlobs, session.BlobRefs(childSession.Plan)); err != nil {
+			return err
+		}
+		childOutcome, childErr = Run(r.ctx, childSession, childDeps)
+	} else {
+		childOutcome, childErr = Resume(r.ctx, childSession, childDeps, "")
+	}
 	resultText := childOutcome.Result
 	if childErr != nil {
 		resultText = "child execution failed: " + provider.SanitizeProviderFailureDetail(childErr.Error())
@@ -1113,6 +1101,46 @@ func (r *runner) runChild(child *childState) error {
 		return err
 	}
 	return childErr
+}
+
+// openOrCreateChildSession reuses the child whose deterministic session ID is
+// bound by child.decided and the immutable parent plan. This consumes an
+// already-completed child instead of allocating a new managed session root.
+func (r *runner) openOrCreateChildSession(child *childState) (*session.Session, error) {
+	childSessionID := r.childSessionID(child.Request.RequestID)
+	home := filepath.Dir(r.sess.Root)
+	entries, err := os.ReadDir(home)
+	if err != nil {
+		return nil, fmt.Errorf("read child session home: %w", err)
+	}
+	var found *session.Session
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		candidate, openErr := session.Open(filepath.Join(home, entry.Name()))
+		if errors.Is(openErr, os.ErrNotExist) {
+			continue
+		}
+		if openErr != nil {
+			return nil, fmt.Errorf("open child session candidate %q: %w", entry.Name(), openErr)
+		}
+		if candidate.Plan.SessionID != childSessionID {
+			continue
+		}
+		if found != nil {
+			return nil, fmt.Errorf("multiple child sessions match admitted plan %q", childSessionID)
+		}
+		found = candidate
+	}
+	if found != nil {
+		return found, nil
+	}
+	childPlan, err := r.childPlanFor(child)
+	if err != nil {
+		return nil, err
+	}
+	return session.Create(home, childPlan)
 }
 
 func childDecisionReason(mode string) string {
@@ -1194,6 +1222,9 @@ func (r *runner) outcome() Outcome {
 func (r *runner) validateSelectedResult() error {
 	if r.state.lastResult.Ref == (blobstore.BlobRef{}) {
 		return errors.New("selected result has no durable content")
+	}
+	if strings.TrimSpace(r.state.lastResult.Text) == "" {
+		return errors.New("selected result is blank")
 	}
 	format := strings.ToLower(strings.TrimSpace(r.sess.Plan.Result.Format))
 	if format != "text" && format != "json" {

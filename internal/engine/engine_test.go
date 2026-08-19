@@ -220,12 +220,16 @@ func TestProviderRetryAndAuthFailure(t *testing.T) {
 			if (err != nil) != test.wantError {
 				t.Fatalf("Run error = %v, want error=%t", err, test.wantError)
 			}
-			if sessionFinished(t, sessionEvents(t, sess)).Status != test.wantStatus || len(alpha.prompts) != test.wantCalls {
+			events := sessionEvents(t, sess)
+			if sessionFinished(t, events).Status != test.wantStatus || len(alpha.prompts) != test.wantCalls {
 				t.Fatalf("outcome=%#v calls=%d", outcome, len(alpha.prompts))
 			}
-			failures := providerFailures(sessionEvents(t, sess))
+			failures := providerFailures(events)
 			if len(failures) != 1 || failures[0].Category != test.wantCategory {
 				t.Fatalf("provider failures = %#v", failures)
+			}
+			if indexOfType(events, eventlog.ProviderFailed) >= indexOfType(events, eventlog.AttemptFinished) {
+				t.Fatalf("provider.failed must classify the failure before attempt.finished: %v", eventTypes(events))
 			}
 		})
 	}
@@ -330,6 +334,60 @@ func TestResumeRecordedAuthFailureIsTerminal(t *testing.T) {
 	events := sessionEvents(t, sess)
 	if len(alpha.prompts) != 0 || sessionFinished(t, events).Status != statusFailed {
 		t.Fatalf("auth replay calls=%d status=%s", len(alpha.prompts), sessionFinished(t, events).Status)
+	}
+}
+
+func TestResumeClassifiedFailureBeforeAttemptFinished(t *testing.T) {
+	for _, test := range []struct {
+		name       string
+		failure    eventlog.ProviderFailedPayload
+		responses  []fakeResponse
+		wantCalls  int
+		wantStatus string
+		wantError  bool
+	}{
+		{
+			name: "retryable retries",
+			failure: eventlog.ProviderFailedPayload{
+				ActorID: "alpha", Backend: "codex", Category: "transient", Retryable: true, Attempts: 1,
+				RemediationCode: "retry", SanitizedDetail: "temporary failure",
+			},
+			responses: []fakeResponse{{content: "recovered"}}, wantCalls: 1, wantStatus: statusCompleted,
+		},
+		{
+			name: "auth remains terminal",
+			failure: eventlog.ProviderFailedPayload{
+				ActorID: "alpha", Backend: "codex", Category: "auth", Retryable: false, Attempts: 1,
+				RemediationCode: "authenticate", SanitizedDetail: "unauthorized",
+			},
+			wantCalls: 0, wantStatus: statusFailed, wantError: true,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			plan := dialoguePlan(1)
+			sess := createSession(t, plan)
+			seedLog(t, sess, func(_ *blobstore.Store, writer *eventlog.Writer) {
+				appendEvent(t, writer, eventlog.TurnStartedPayload{ActorID: "alpha", Round: 1, Role: eventlog.ParticipantRole})
+				appendEvent(t, writer, eventlog.AttemptStartedPayload{ActorID: "alpha", Attempt: 1})
+				appendEvent(t, writer, test.failure)
+			})
+			alpha := &fakeBackend{name: "codex", slotID: "alpha", responses: test.responses}
+			beta := &fakeBackend{name: "codex", slotID: "beta"}
+			outcome, err := Resume(context.Background(), sess, testDeps(map[string]*fakeBackend{"alpha": alpha, "beta": beta}), "")
+			if (err != nil) != test.wantError {
+				t.Fatalf("Resume error=%v, want error=%t", err, test.wantError)
+			}
+			if got := len(alpha.prompts); got != test.wantCalls {
+				t.Fatalf("provider calls=%d, want %d", got, test.wantCalls)
+			}
+			events := sessionEvents(t, sess)
+			if finished := sessionFinished(t, events); finished.Status != test.wantStatus {
+				t.Fatalf("session.finished=%#v", finished)
+			}
+			if test.wantCalls == 1 && (outcome.Result != "recovered" || countType(events, eventlog.AttemptStarted) != 2) {
+				t.Fatalf("outcome=%#v events=%v", outcome, eventTypes(events))
+			}
+		})
 	}
 }
 
@@ -486,6 +544,23 @@ func TestResultValidationRecordsValidAndInvalidOutcomes(t *testing.T) {
 	}
 }
 
+func TestEmptyReducerResultIsInvalid(t *testing.T) {
+	plan := sequencePlan()
+	sess := createSession(t, plan)
+	alpha := &fakeBackend{name: "codex", slotID: "alpha", responses: []fakeResponse{{content: "first"}}}
+	beta := &fakeBackend{name: "codex", slotID: "beta", responses: []fakeResponse{{content: "second"}}}
+	reducer := &fakeBackend{name: "codex", slotID: "reducer", responses: []fakeResponse{{content: ""}}}
+	if _, err := Run(context.Background(), sess, testDeps(map[string]*fakeBackend{"alpha": alpha, "beta": beta, "reducer": reducer})); err == nil {
+		t.Fatal("Run accepted an empty reducer result")
+	}
+	events := sessionEvents(t, sess)
+	produced, found := producedResult(events)
+	finished := sessionFinished(t, events)
+	if !found || produced.ValidationOutcome != "invalid" || finished.Status != statusFailed || finished.StopReason != stopInvalidResult {
+		t.Fatalf("result=%#v found=%t finished=%#v", produced, found, finished)
+	}
+}
+
 func TestResumeLifecycleGuardsBeforeMutation(t *testing.T) {
 	for _, test := range []struct {
 		name     string
@@ -618,6 +693,9 @@ func TestChildRequestsAdmitAndRejectWithoutRunningDeniedChildren(t *testing.T) {
 			if len(decisions) != 1 || decisions[0].Admitted != test.wantAdmitted {
 				t.Fatalf("child decisions = %#v", decisions)
 			}
+			if test.wantAdmitted && decisions[0].BudgetState != "available;child_turns=1" {
+				t.Fatalf("admitted child budget state = %q", decisions[0].BudgetState)
+			}
 			if test.wantAdmitted && indexOfType(sessionEvents(t, sess), eventlog.ChildRequested) > indexOfType(sessionEvents(t, sess), eventlog.TurnFinished) {
 				t.Fatal("child request was not durable before its parent turn finished")
 			}
@@ -647,6 +725,59 @@ func TestChildRequestsAdmitAndRejectWithoutRunningDeniedChildren(t *testing.T) {
 				t.Fatalf("denied child completed = %#v", completed)
 			}
 		})
+	}
+}
+
+func TestResumeCompletedChildBeforeParentCompletionReusesChildSession(t *testing.T) {
+	parent := dialoguePlan(1)
+	parent.ChildPolicy = session.ChildPolicy{Mode: "allow", MaxDepth: 1, MaxChildren: 1, MaxTurns: 1, AllowedRecipes: []string{"child"}}
+	home := t.TempDir()
+	sess := createSessionIn(t, home, parent)
+	const requestID = "child-request"
+	childPlan, err := plan.ForChild(parent, plan.ChildRequest{
+		SessionID: parent.SessionID + "-child-" + requestID,
+		RecipeID:  "child",
+		Question:  "resolve the child question",
+	}, []plan.Recipe{childRecipe()})
+	if err != nil {
+		t.Fatalf("compile child plan: %v", err)
+	}
+	seedLog(t, sess, func(store *blobstore.Store, writer *eventlog.Writer) {
+		content := putSeedText(t, store, "parent response")
+		question := putSeedText(t, store, "resolve the child question")
+		appendEvent(t, writer, eventlog.TurnStartedPayload{ActorID: "alpha", Round: 1, Role: eventlog.ParticipantRole})
+		appendEvent(t, writer, eventlog.AttemptStartedPayload{ActorID: "alpha", Attempt: 1})
+		appendEvent(t, writer, eventlog.ChildRequestedPayload{RequestID: requestID, RequesterActorID: "alpha", RecipeID: "child", Question: question})
+		appendEvent(t, writer, eventlog.AttemptFinishedPayload{ActorID: "alpha", Attempt: 1, Outcome: "success", Content: content})
+		appendEvent(t, writer, eventlog.TurnFinishedPayload{ActorID: "alpha", Round: 1, Content: content})
+		appendEvent(t, writer, eventlog.ChildDecidedPayload{RequestID: requestID, Admitted: true, Reason: "admitted", BudgetState: "available;child_turns=1"})
+	})
+	childSession := createSessionIn(t, home, childPlan)
+	child := &fakeBackend{name: "codex", slotID: "child-alpha", responses: []fakeResponse{{content: "completed child"}}}
+	if _, err := Run(context.Background(), childSession, testDeps(map[string]*fakeBackend{"child-alpha": child})); err != nil {
+		t.Fatalf("run child: %v", err)
+	}
+	alpha := &fakeBackend{name: "codex", slotID: "alpha"}
+	beta := &fakeBackend{name: "codex", slotID: "beta"}
+	deps := testDeps(map[string]*fakeBackend{"alpha": alpha, "beta": beta, "child-alpha": child})
+	// The completed child is found by the admitted deterministic identity; it
+	// must not need the recipe list to be recomputed during parent recovery.
+	if _, err := Resume(context.Background(), sess, deps, ""); err != nil {
+		t.Fatalf("resume parent: %v", err)
+	}
+	if got := len(child.prompts); got != 1 {
+		t.Fatalf("completed child was rerun: calls=%d", got)
+	}
+	entries, err := os.ReadDir(home)
+	if err != nil {
+		t.Fatalf("read child session home: %v", err)
+	}
+	if got := len(entries); got != 2 {
+		t.Fatalf("session roots=%d, want 2", got)
+	}
+	completed := childCompletions(sessionEvents(t, sess))
+	if len(completed) != 1 || completed[0].ChildSessionID != childPlan.SessionID {
+		t.Fatalf("child completions=%#v", completed)
 	}
 }
 
