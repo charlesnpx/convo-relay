@@ -1,79 +1,40 @@
 package plan
 
 import (
-	"bytes"
-	"encoding/json"
 	"fmt"
-	"io"
 	"strings"
 
 	"github.com/charlesnpx/convo-relay/internal/session"
 )
 
-// FromRecipe compiles either a catalog-named or inline typed recipe into the
-// same target document as FromFlags.
+// FromRecipe compiles a typed canonical normalized recipe into the same target
+// document as FromFlags. It deliberately accepts no raw configuration data.
 func FromRecipe(input RecipeInput) (session.Plan, error) {
 	recipe, err := selectRecipe(input)
 	if err != nil {
 		return session.Plan{}, err
 	}
-	schedule := copySchedule(recipe.Schedule)
-	if strings.TrimSpace(schedule.Kind) == "" {
-		schedule.Kind = "dialogue"
+	if err := validateRecipeProjection(recipe); err != nil {
+		return session.Plan{}, err
 	}
-	if schedule.Turns == 0 {
-		schedule.Turns = 1
-	}
-	return compile(planSpec{
-		sessionID:     input.SessionID,
-		provenance:    session.ProvenanceRecipe,
-		recipeID:      recipe.ID,
-		task:          input.Task,
-		timeouts:      input.Timeouts,
-		mode:          recipe.Mode,
-		investigation: recipe.Investigation,
-		actors:        recipe.Actors,
-		participants:  append([]string{}, recipe.Participants...),
-		schedule:      schedule,
-		facilitator:   recipe.Facilitator,
-		reducer:       recipe.Reducer,
-		retry:         recipe.ProviderRetry,
-		workspace:     recipe.Workspace,
-		inputs:        recipe.Inputs,
-		childPolicy:   recipe.ChildPolicy,
-		result:        recipe.Result,
-	})
+	return compile(planFromRecipe(input, recipe, session.ProvenanceRecipe))
 }
 
 func selectRecipe(input RecipeInput) (Recipe, error) {
 	requestedID := strings.TrimSpace(input.RecipeID)
 	if input.Inline != nil {
-		if len(input.Catalog.Recipes) != 0 || len(input.Raw) != 0 {
-			return Recipe{}, fmt.Errorf("inline recipe cannot be combined with a catalog or raw recipe document")
+		if len(input.Recipes) != 0 {
+			return Recipe{}, fmt.Errorf("inline recipe cannot be combined with named recipes")
 		}
-		recipe := copyRecipe(*input.Inline)
-		if strings.TrimSpace(recipe.ID) == "" {
+		if strings.TrimSpace(input.Inline.ID) == "" {
 			return Recipe{}, fmt.Errorf("inline recipe id is required")
 		}
-		if requestedID != "" && requestedID != recipe.ID {
-			return Recipe{}, fmt.Errorf("requested recipe %q does not match inline recipe %q", requestedID, recipe.ID)
+		if requestedID != "" && requestedID != input.Inline.ID {
+			return Recipe{}, fmt.Errorf("requested recipe %q does not match inline recipe %q", requestedID, input.Inline.ID)
 		}
-		return recipe, nil
+		return *input.Inline, nil
 	}
-	if len(input.Raw) != 0 {
-		if len(input.Catalog.Recipes) != 0 {
-			return Recipe{}, fmt.Errorf("catalog and raw recipe document cannot both be supplied")
-		}
-		recipes, err := decodeRawRecipes(input.Raw)
-		if err != nil {
-			return Recipe{}, err
-		}
-		if requestedID == "" && len(recipes) == 1 {
-			return copyRecipe(recipes[0]), nil
-		}
-		return selectNamedRecipe(requestedID, recipes)
-	}
-	return selectNamedRecipe(requestedID, input.Catalog.Recipes)
+	return selectNamedRecipe(requestedID, input.Recipes)
 }
 
 func selectNamedRecipe(requestedID string, recipes []Recipe) (Recipe, error) {
@@ -82,65 +43,124 @@ func selectNamedRecipe(requestedID string, recipes []Recipe) (Recipe, error) {
 	}
 	for _, recipe := range recipes {
 		if recipe.ID == requestedID {
-			return copyRecipe(recipe), nil
+			return recipe, nil
 		}
 	}
-	return Recipe{}, fmt.Errorf("recipe %q was not found in the catalog", requestedID)
+	return Recipe{}, fmt.Errorf("recipe %q was not found in the supplied recipes", requestedID)
 }
 
-func decodeRawRecipes(raw json.RawMessage) ([]Recipe, error) {
-	var envelope struct {
-		Recipes json.RawMessage `json:"recipes"`
+func validateRecipeProjection(recipe Recipe) error {
+	if recipe.Kind != "" && recipe.Kind != "recipe" {
+		return fmt.Errorf("recipe kind must be recipe")
 	}
-	if err := json.Unmarshal(raw, &envelope); err != nil {
-		return nil, fmt.Errorf("decode raw recipe document: %w", err)
-	}
-	if len(envelope.Recipes) != 0 {
-		var catalog Catalog
-		if err := decodeStrictJSON(raw, &catalog); err != nil {
-			return nil, fmt.Errorf("decode raw recipe catalog: %w", err)
-		}
-		if len(catalog.Recipes) == 0 {
-			return nil, fmt.Errorf("raw recipe catalog contains no recipes")
-		}
-		return catalog.Recipes, nil
-	}
-	var recipe Recipe
-	if err := decodeStrictJSON(raw, &recipe); err != nil {
-		return nil, fmt.Errorf("decode raw inline recipe: %w", err)
+	if recipe.SchemaVersion != 0 && recipe.SchemaVersion != 1 && recipe.SchemaVersion != 2 {
+		return fmt.Errorf("recipe schema_version must be 1 or 2")
 	}
 	if strings.TrimSpace(recipe.ID) == "" {
-		return nil, fmt.Errorf("raw inline recipe id is required")
-	}
-	return []Recipe{recipe}, nil
-}
-
-func decodeStrictJSON(raw json.RawMessage, target any) error {
-	decoder := json.NewDecoder(bytes.NewReader(raw))
-	decoder.DisallowUnknownFields()
-	if err := decoder.Decode(target); err != nil {
-		return err
-	}
-	if err := decoder.Decode(&struct{}{}); err != io.EOF {
-		if err == nil {
-			return fmt.Errorf("multiple JSON values")
-		}
-		return err
+		return fmt.Errorf("recipe id is required")
 	}
 	return nil
 }
 
-func copyRecipe(value Recipe) Recipe {
-	value.Actors = copyActors(value.Actors)
-	value.Participants = append([]string{}, value.Participants...)
-	if value.Participants == nil {
-		value.Participants = []string{}
+func planFromRecipe(input RecipeInput, recipe Recipe, provenance string) session.Plan {
+	schedule := recipe.Schedule
+	if strings.TrimSpace(schedule.Kind) == "" {
+		schedule.Kind = "dialogue"
 	}
-	value.Schedule = copySchedule(value.Schedule)
-	value.Facilitator = copyFacilitator(value.Facilitator)
-	value.Reducer = copyReducer(value.Reducer)
-	value.Inputs = copyInputs(value.Inputs)
-	value.ChildPolicy = normalizeChildPolicy(value.ChildPolicy)
-	value.Result = normalizeResult(value.Result)
-	return value
+	if recipe.ParticipantTurns != 0 {
+		schedule.Turns = recipe.ParticipantTurns
+	} else if schedule.Turns == 0 && recipe.MaxRounds != 0 {
+		schedule.Turns = recipe.MaxRounds
+	}
+	if schedule.Turns == 0 {
+		schedule.Turns = 1
+	}
+
+	result := recipe.Result
+	if strings.TrimSpace(recipe.ResultSource) != "" {
+		result.Source = strings.TrimSpace(recipe.ResultSource)
+	}
+	policy := recipeChildPolicy(recipe)
+	workspace := recipe.Workspace
+	lifecycle := recipeLifecycle(recipe.Lifecycle)
+	if lifecycle != nil {
+		workspace = workspaceForLifecycle(workspace, *lifecycle)
+	}
+
+	return session.Plan{
+		Provenance:           provenance,
+		SessionID:            input.SessionID,
+		RecipeID:             recipe.ID,
+		Task:                 input.Task,
+		Timeouts:             input.Timeouts,
+		Mode:                 recipe.Mode,
+		Investigation:        recipe.Investigation,
+		Actors:               recipe.Actors,
+		Schedule:             schedule,
+		Facilitator:          recipe.Facilitator,
+		Reducer:              recipe.Reducer,
+		ProviderRetry:        recipe.ProviderRetry,
+		Workspace:            workspace,
+		Inputs:               recipe.Inputs,
+		Context:              input.Context,
+		Skills:               input.Skills,
+		TaskPlan:             input.TaskPlan,
+		RequiredCapabilities: recipe.RequiredCapabilities,
+		MatchKeywords:        recipe.MatchKeywords,
+		ChildPolicy:          policy,
+		Result:               result,
+		Lifecycle:            lifecycle,
+		IntegrationContract:  recipe.IntegrationContract,
+	}
+}
+
+func recipeChildPolicy(recipe Recipe) session.ChildPolicy {
+	policy := recipe.ChildPolicy
+	unconfigured := strings.TrimSpace(policy.Mode) == "" && policy.MaxDepth == 0 && policy.MaxChildren == 0 && policy.MaxTurns == 0 && len(policy.AllowedRecipes) == 0
+	if unconfigured {
+		policy = normalizeChildPolicy(policy)
+		policy.Mode = childPolicyMode(recipe.AutoApproval)
+	}
+	if strings.TrimSpace(policy.Mode) == "" {
+		policy.Mode = childPolicyMode(recipe.AutoApproval)
+	}
+	if recipe.MaxDepth != 0 {
+		policy.MaxDepth = recipe.MaxDepth
+	}
+	if recipe.Lifecycle.Dynamic == "forbid" {
+		policy.Mode = "deny"
+	}
+	return policy
+}
+
+func childPolicyMode(autoApproval string) string {
+	switch strings.TrimSpace(autoApproval) {
+	case "", "never":
+		return "deny"
+	case "ask":
+		return "ask"
+	case "auto-safe":
+		return "allow"
+	default:
+		return strings.TrimSpace(autoApproval)
+	}
+}
+
+func recipeLifecycle(value session.Lifecycle) *session.Lifecycle {
+	if value.Resume == "" && value.Steering == "" && value.Dynamic == "" && value.WorkspaceIsolation == "" {
+		return nil
+	}
+	copy := value
+	return &copy
+}
+
+func workspaceForLifecycle(workspace session.Workspace, lifecycle session.Lifecycle) session.Workspace {
+	workspace.Isolation = lifecycle.WorkspaceIsolation
+	switch lifecycle.WorkspaceIsolation {
+	case "inherited", "read_only":
+		workspace.Mode = "current"
+	case "ephemeral":
+		workspace.Mode = "head-copy"
+	}
+	return workspace
 }

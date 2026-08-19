@@ -213,8 +213,8 @@ func testPlan() Plan {
 		ProviderRetry: ProviderRetry{Mode: "allow", MaxAttempts: 2},
 		Workspace:     Workspace{Mode: "current"},
 		Inputs:        []Input{},
-		ChildPolicy:   ChildPolicy{Mode: "disabled", MaxDepth: 0, MaxChildren: 0, MaxTurns: 0, AllowedRecipes: []string{}},
-		Result:        Result{Format: "text"},
+		ChildPolicy:   ChildPolicy{Mode: "deny", MaxDepth: 0, MaxChildren: 0, MaxTurns: 0, AllowedRecipes: []string{}},
+		Result:        Result{Source: "last_turn", Format: "text"},
 	}
 }
 
@@ -238,5 +238,50 @@ func TestTaskIsExemptFromPortabilityWalkButOtherFieldsAreNot(t *testing.T) {
 	leaky.RecipeID = "/Users/someone/recipes/panel.toml"
 	if err := ValidatePlan(leaky); err == nil {
 		t.Fatal("an absolute path in recipe_id was accepted")
+	}
+}
+
+func TestValidatePlanRejectsInvalidSequenceOrder(t *testing.T) {
+	base := testPlan()
+	base.SessionID = "sequence-test"
+	base.Actors = []Actor{
+		{ID: "alpha", Backend: "codex", Model: "test-model", Effort: "medium"},
+		{ID: "facilitator", Backend: "codex", Model: "test-model", Effort: "medium"},
+		{ID: "reducer", Backend: "codex", Model: "test-model", Effort: "medium"},
+	}
+	base.Facilitator = &Facilitator{Actor: "facilitator", Cadence: 1}
+	base.Reducer = &Reducer{Actor: "reducer"}
+	for _, test := range []struct {
+		name  string
+		order []string
+		want  string
+	}{
+		{name: "wrong length", order: []string{"alpha"}, want: "exactly 2"},
+		{name: "facilitator", order: []string{"facilitator", "alpha"}, want: "control actor"},
+		{name: "reducer", order: []string{"reducer", "alpha"}, want: "control actor"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			plan := base
+			plan.Schedule = Schedule{Kind: "sequence", Turns: 2, Order: test.order}
+			if err := ValidatePlan(plan); err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("ValidatePlan error = %v, want %q", err, test.want)
+			}
+		})
+	}
+}
+
+func TestValidatePlanRejectsUnknownChildPolicyMode(t *testing.T) {
+	plan := testPlan()
+	plan.SessionID = "child-policy-test"
+	plan.ChildPolicy.Mode = "explode"
+	if err := ValidatePlan(plan); err == nil || !strings.Contains(err.Error(), "deny, ask, or allow") {
+		t.Fatalf("ValidatePlan child-policy error = %v", err)
+	}
+}
+
+func TestNormalizeNewPlanOnlySuppliesGeneratedSessionID(t *testing.T) {
+	plan := normalizeNewPlan(Plan{}, "generated-session")
+	if plan.SessionID != "generated-session" || plan.Kind != "" || plan.SchemaVersion != 0 || plan.ProviderRetry != (ProviderRetry{}) || plan.ChildPolicy.Mode != "" || plan.ChildPolicy.MaxDepth != 0 || plan.ChildPolicy.MaxChildren != 0 || plan.ChildPolicy.MaxTurns != 0 || len(plan.ChildPolicy.AllowedRecipes) != 0 {
+		t.Fatalf("normalizeNewPlan changed compiler-owned fields: %#v", plan)
 	}
 }

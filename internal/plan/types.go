@@ -35,51 +35,59 @@ type Flags struct {
 	Dynamic             string
 	Workspace           session.Workspace
 	Inputs              []session.Input
+	Context             []session.Input
+	Skills              []session.Input
+	TaskPlan            json.RawMessage
 	ChildPolicy         session.ChildPolicy
 	Result              session.Result
 }
 
-// Catalog is the typed collection used to resolve a named recipe. Inline
-// recipes bypass it; neither route exposes an untyped configuration value.
-type Catalog struct {
-	Recipes []Recipe `json:"recipes"`
-}
-
-// Recipe is a fully resolved recipe. Actors includes participants and any
-// distinct facilitator or reducer actor. Participants identifies which actor
-// ids belong to the schedule. Role actors must be separate from scheduled
-// participants, even when they use the same backend, model, and effort.
+// Recipe is the typed, resolved projection of a canonical normalized recipe.
+// Actor/profile resolution happens before this boundary; the plan compiler
+// never parses raw recipe JSON or carries profile references.
 type Recipe struct {
-	ID            string               `json:"id"`
+	Kind          string `json:"kind"`
+	SchemaVersion int    `json:"schema_version"`
+	ID            string `json:"id"`
+	Purpose       string `json:"purpose"`
+
 	Actors        []session.Actor      `json:"actors"`
-	Participants  []string             `json:"participants"`
 	Schedule      session.Schedule     `json:"schedule"`
 	Mode          string               `json:"mode"`
-	Investigation string               `json:"investigation"`
+	Investigation string               `json:"investigation,omitempty"`
 	Facilitator   *session.Facilitator `json:"facilitator,omitempty"`
 	Reducer       *session.Reducer     `json:"reducer,omitempty"`
 
-	ProviderRetry session.ProviderRetry `json:"provider_retry"`
-	Workspace     session.Workspace     `json:"workspace"`
-	Inputs        []session.Input       `json:"inputs"`
-	ChildPolicy   session.ChildPolicy   `json:"child_policy"`
-	Result        session.Result        `json:"result"`
+	MaxRounds            int                   `json:"max_rounds"`
+	ParticipantTurns     int                   `json:"participant_turns"`
+	ResultSource         string                `json:"result_source"`
+	ProviderRetry        session.ProviderRetry `json:"provider_retry"`
+	IntegrationContract  string                `json:"integration_contract,omitempty"`
+	MaxDepth             int                   `json:"max_depth"`
+	RequiredCapabilities []string              `json:"required_capabilities"`
+	AutoApproval         string                `json:"auto_approval"`
+	MatchKeywords        []string              `json:"match_keywords"`
+	Lifecycle            session.Lifecycle     `json:"lifecycle"`
+
+	Workspace   session.Workspace   `json:"workspace"`
+	Inputs      []session.Input     `json:"inputs"`
+	ChildPolicy session.ChildPolicy `json:"child_policy"`
+	Result      session.Result      `json:"result"`
 }
 
-// RecipeInput selects either a named recipe from Catalog or the fully typed
-// Inline recipe. Timeouts are launch policy rather than recipe content, just as
-// they are supplied alongside --recipe by the current CLI.
+// RecipeInput selects either a named recipe from the typed normalized recipe
+// list or a fully typed inline recipe. Timeouts and prompt inputs are launch
+// policy rather than recipe content.
 type RecipeInput struct {
 	SessionID string
 	Task      string
 	RecipeID  string
 	Inline    *Recipe
-	Catalog   Catalog
-	// Raw is either one Recipe JSON object or a Catalog JSON object. It is
-	// decoded exactly once inside this package before compilation; callers never
-	// receive an untyped decoded representation.
-	Raw      json.RawMessage
-	Timeouts session.Timeouts
+	Recipes   []Recipe
+	Timeouts  session.Timeouts
+	Context   []session.Input
+	Skills    []session.Input
+	TaskPlan  json.RawMessage
 }
 
 // ChildRequest supplies the operator-approved child identity and question.
@@ -89,4 +97,12 @@ type ChildRequest struct {
 	RecipeID  string
 	Question  string
 	Turns     int
+}
+
+// ResumeInput is deliberately prompt-only. Structural overrides create a new
+// launch plan instead of changing an existing session's execution shape.
+type ResumeInput struct {
+	Prompt  string
+	Context []session.Input
+	Skills  []session.Input
 }

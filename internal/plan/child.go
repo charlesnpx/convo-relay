@@ -7,10 +7,9 @@ import (
 	"github.com/charlesnpx/convo-relay/internal/session"
 )
 
-// ForChild derives a child plan from a validated parent. It does not select an
-// execution path from parent provenance or kind: it carries the same typed
-// plan data forward with bounded budget and child provenance for inspection.
-func ForChild(parent session.Plan, request ChildRequest) (session.Plan, error) {
+// ForChild resolves the requested typed recipe and compiles that recipe's
+// execution behaviour under the remaining parent child budget.
+func ForChild(parent session.Plan, request ChildRequest, recipes []Recipe) (session.Plan, error) {
 	if err := session.ValidatePlan(parent); err != nil {
 		return session.Plan{}, fmt.Errorf("validate parent plan: %w", err)
 	}
@@ -21,54 +20,36 @@ func ForChild(parent session.Plan, request ChildRequest) (session.Plan, error) {
 	if request.Turns < 0 {
 		return session.Plan{}, fmt.Errorf("child turns must not be negative")
 	}
+	recipe, err := selectNamedRecipe(recipeID, recipes)
+	if err != nil {
+		return session.Plan{}, err
+	}
+	if err := validateRecipeProjection(recipe); err != nil {
+		return session.Plan{}, err
+	}
 	if err := childRequestAllowed(parent.ChildPolicy, recipeID); err != nil {
 		return session.Plan{}, err
 	}
 
-	turns, err := childTurns(parent.Schedule.Turns, parent.ChildPolicy.MaxTurns, request.Turns)
-	if err != nil {
-		return session.Plan{}, err
-	}
-	participants, err := participantsFromParent(parent)
-	if err != nil {
-		return session.Plan{}, err
-	}
-	schedule := copySchedule(parent.Schedule)
-	schedule.Turns = turns
-	if schedule.Kind == "sequence" {
-		if len(schedule.Order) < turns {
-			return session.Plan{}, fmt.Errorf("parent sequence order has %d actors for child budget %d", len(schedule.Order), turns)
-		}
-		schedule.Order = append([]string{}, schedule.Order[:turns]...)
-	}
-
-	childPolicy := copyChildPolicy(parent.ChildPolicy)
-	childPolicy.MaxDepth--
-	childPolicy.MaxChildren--
-	childPolicy.MaxTurns--
 	childSessionID := strings.TrimSpace(request.SessionID)
 	if childSessionID == "" {
 		childSessionID = parent.SessionID + "-child"
 	}
-	return compile(planSpec{
-		sessionID:     childSessionID,
-		provenance:    session.ProvenanceChild,
-		recipeID:      recipeID,
-		task:          request.Question,
-		timeouts:      parent.Timeouts,
-		mode:          parent.Mode,
-		investigation: parent.Investigation,
-		actors:        parent.Actors,
-		participants:  participants,
-		schedule:      schedule,
-		facilitator:   parent.Facilitator,
-		reducer:       parent.Reducer,
-		retry:         parent.ProviderRetry,
-		workspace:     parent.Workspace,
-		inputs:        parent.Inputs,
-		childPolicy:   childPolicy,
-		result:        parent.Result,
-	})
+	child := planFromRecipe(RecipeInput{
+		SessionID: childSessionID,
+		Task:      request.Question,
+		Timeouts:  parent.Timeouts,
+		Context:   parent.Context,
+		Skills:    parent.Skills,
+		TaskPlan:  parent.TaskPlan,
+	}, recipe, session.ProvenanceChild)
+	child.Inputs = parent.Inputs
+	if strings.TrimSpace(child.Investigation) == "" {
+		child.Investigation = parent.Investigation
+	}
+	child.Schedule = boundedChildSchedule(child.Schedule, parent, request.Turns)
+	child.ChildPolicy = remainingChildPolicy(normalizeChildPolicy(child.ChildPolicy), parent.ChildPolicy)
+	return compile(child)
 }
 
 func childRequestAllowed(policy session.ChildPolicy, recipeID string) error {
@@ -99,47 +80,52 @@ func childRequestAllowed(policy session.ChildPolicy, recipeID string) error {
 	return fmt.Errorf("child recipe %q is not allowed by parent policy", recipeID)
 }
 
-func childTurns(parentTurns int, maxTurns int, requestedTurns int) (int, error) {
-	if parentTurns <= 0 {
-		return 0, fmt.Errorf("parent schedule has no turn budget")
+func boundedChildSchedule(schedule session.Schedule, parent session.Plan, requestedTurns int) session.Schedule {
+	limit := parent.Schedule.Turns
+	if parent.ChildPolicy.MaxTurns < limit {
+		limit = parent.ChildPolicy.MaxTurns
 	}
-	if maxTurns <= 0 {
-		return 0, fmt.Errorf("child policy has no remaining turn budget")
+	if requestedTurns > 0 && requestedTurns < limit {
+		limit = requestedTurns
 	}
-	budget := maxTurns
-	if parentTurns < budget {
-		budget = parentTurns
+	if schedule.Turns > limit {
+		schedule.Turns = limit
 	}
-	if requestedTurns == 0 || requestedTurns > budget {
-		return budget, nil
+	if schedule.Kind == "sequence" && len(schedule.Order) > schedule.Turns {
+		schedule.Order = schedule.Order[:schedule.Turns]
 	}
-	return requestedTurns, nil
+	return schedule
 }
 
-func copyChildPolicy(value session.ChildPolicy) session.ChildPolicy {
-	value.AllowedRecipes = append([]string{}, value.AllowedRecipes...)
-	if value.AllowedRecipes == nil {
-		value.AllowedRecipes = []string{}
-	}
-	return value
+func remainingChildPolicy(policy session.ChildPolicy, parent session.ChildPolicy) session.ChildPolicy {
+	policy.MaxDepth = minimum(policy.MaxDepth, parent.MaxDepth-1)
+	policy.MaxChildren = minimum(policy.MaxChildren, parent.MaxChildren-1)
+	policy.MaxTurns = minimum(policy.MaxTurns, parent.MaxTurns-1)
+	return policy
 }
 
-func participantsFromParent(parent session.Plan) ([]string, error) {
-	roleActors := make(map[string]struct{}, 2)
-	if parent.Facilitator != nil {
-		roleActors[parent.Facilitator.Actor] = struct{}{}
+func minimum(left int, right int) int {
+	if left < right {
+		return left
 	}
-	if parent.Reducer != nil {
-		roleActors[parent.Reducer.Actor] = struct{}{}
+	return right
+}
+
+// ForResume accepts only prompt material. Any structural variation must be
+// compiled as a new launch plan instead of being smuggled into a resume.
+func ForResume(parent session.Plan, input ResumeInput) (ResumeInput, error) {
+	if err := session.ValidatePlan(parent); err != nil {
+		return ResumeInput{}, fmt.Errorf("validate parent plan: %w", err)
 	}
-	participants := make([]string, 0, len(parent.Actors))
-	for _, actor := range parent.Actors {
-		if _, role := roleActors[actor.ID]; !role {
-			participants = append(participants, actor.ID)
-		}
+	candidate := parent
+	candidate.Context = input.Context
+	candidate.Skills = input.Skills
+	if err := session.ValidatePlan(candidate); err != nil {
+		return ResumeInput{}, fmt.Errorf("validate resume prompt inputs: %w", err)
 	}
-	if len(participants) == 0 {
-		return nil, fmt.Errorf("parent plan has no scheduled participants outside control roles")
-	}
-	return participants, nil
+	return ResumeInput{
+		Prompt:  input.Prompt,
+		Context: append([]session.Input{}, input.Context...),
+		Skills:  append([]session.Input{}, input.Skills...),
+	}, nil
 }

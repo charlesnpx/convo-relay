@@ -28,7 +28,7 @@ func FromFlags(flags Flags) (session.Plan, error) {
 	}
 	facilitatorBackend := strings.TrimSpace(flags.FacilitatorBackend)
 	if facilitatorBackend == "" {
-		if shorthand && agents[0] != "relay" {
+		if shorthand {
 			facilitatorBackend = agents[0]
 		} else {
 			facilitatorBackend = "codex"
@@ -38,35 +38,32 @@ func FromFlags(flags Flags) (session.Plan, error) {
 	if err != nil {
 		return session.Plan{}, err
 	}
-	if facilitator.Backend == "relay" {
-		return session.Plan{}, fmt.Errorf("facilitator backend %q is not supported", facilitator.Backend)
-	}
 
 	policy, err := policyFromDynamic(flags.ChildPolicy, flags.Dynamic)
 	if err != nil {
 		return session.Plan{}, err
 	}
-	return compile(planSpec{
-		sessionID:     flags.SessionID,
-		provenance:    session.ProvenanceOrdinary,
-		task:          flags.Task,
-		timeouts:      session.Timeouts{TurnSeconds: flags.TimeoutSeconds, StallSeconds: flags.StallTimeoutSeconds},
-		mode:          flags.Mode,
-		investigation: flags.Investigation,
-		actors:        []session.Actor{first, second, facilitator},
-		participants:  []string{"slot_0", "slot_1"},
-		schedule: session.Schedule{
+	return compile(session.Plan{
+		Provenance:    session.ProvenanceOrdinary,
+		SessionID:     flags.SessionID,
+		Task:          flags.Task,
+		Timeouts:      session.Timeouts{TurnSeconds: flags.TimeoutSeconds, StallSeconds: flags.StallTimeoutSeconds},
+		Mode:          flags.Mode,
+		Investigation: flags.Investigation,
+		Actors:        []session.Actor{first, second, facilitator},
+		Schedule: session.Schedule{
 			Kind:              "dialogue",
 			Turns:             turns,
 			StopOnConvergence: stopOnConvergence,
-			Order:             []string{},
 		},
-		facilitator: &session.Facilitator{Actor: "facilitator", Cadence: 1},
-		retry:       session.ProviderRetry{},
-		workspace:   flags.Workspace,
-		inputs:      flags.Inputs,
-		childPolicy: policy,
-		result:      flags.Result,
+		Facilitator: &session.Facilitator{Actor: "facilitator", Cadence: 1},
+		Workspace:   flags.Workspace,
+		Inputs:      flags.Inputs,
+		Context:     flags.Context,
+		Skills:      flags.Skills,
+		TaskPlan:    flags.TaskPlan,
+		ChildPolicy: policy,
+		Result:      flags.Result,
 	})
 }
 
@@ -112,37 +109,18 @@ func flagSchedule(flags Flags) (int, bool, error) {
 
 func flagActor(id string, backend string, model string, effort string) (session.Actor, error) {
 	backend = strings.TrimSpace(backend)
-	defaults, found := actorDefaults(backend)
-	if !found {
+	if !knownBackend(backend) {
+		if backend == "relay" {
+			return session.Actor{}, fmt.Errorf("relay backend is not supported for actor %q", id)
+		}
 		return session.Actor{}, fmt.Errorf("unknown backend %q", backend)
 	}
-	if strings.TrimSpace(model) == "" {
-		model = defaults.model
-	}
-	if strings.TrimSpace(effort) == "" {
-		effort = defaults.effort
-	}
-	return session.Actor{ID: id, Backend: backend, Model: model, Effort: effort}, nil
-}
-
-type backendDefaults struct {
-	model  string
-	effort string
-}
-
-func actorDefaults(backend string) (backendDefaults, bool) {
-	switch backend {
-	case "codex":
-		return backendDefaults{model: "gpt-5.5", effort: "medium"}, true
-	case "claude":
-		return backendDefaults{model: "sonnet", effort: "medium"}, true
-	case "gemini":
-		return backendDefaults{model: "gemini-2.5-pro", effort: "medium"}, true
-	case "relay":
-		return backendDefaults{model: "review-panel", effort: "2"}, true
-	default:
-		return backendDefaults{}, false
-	}
+	return session.Actor{
+		ID:      id,
+		Backend: backend,
+		Model:   strings.TrimSpace(model),
+		Effort:  strings.TrimSpace(effort),
+	}, nil
 }
 
 func policyFromDynamic(policy session.ChildPolicy, dynamic string) (session.ChildPolicy, error) {

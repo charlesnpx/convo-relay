@@ -19,168 +19,59 @@ const (
 	defaultRetryAttempts       = 7
 )
 
-type planSpec struct {
-	sessionID     string
-	provenance    string
-	recipeID      string
-	task          string
-	timeouts      session.Timeouts
-	mode          string
-	investigation string
-	actors        []session.Actor
-	participants  []string
-	schedule      session.Schedule
-	facilitator   *session.Facilitator
-	reducer       *session.Reducer
-	retry         session.ProviderRetry
-	workspace     session.Workspace
-	inputs        []session.Input
-	childPolicy   session.ChildPolicy
-	result        session.Result
-}
+// compile is the only constructor for the target document. Each input path
+// builds the target shape directly; this boundary makes one defensive copy,
+// applies compiler-owned defaults, and delegates structure to ValidatePlan.
+func compile(plan session.Plan) (session.Plan, error) {
+	plan = copyPlan(plan)
+	plan.Kind = session.PlanKind
+	plan.SchemaVersion = session.SchemaVersion
+	plan.SessionID = normalizedSessionID(plan.SessionID)
+	plan.Timeouts = normalizeTimeouts(plan.Timeouts)
+	plan.Mode = normalizedMode(plan.Mode)
+	plan.Investigation = normalizedInvestigation(plan.Investigation)
+	plan.ProviderRetry = normalizeRetry(plan.ProviderRetry)
+	plan.Workspace = normalizeWorkspace(plan.Workspace)
+	plan.ChildPolicy = normalizeChildPolicy(plan.ChildPolicy)
+	plan.Result = normalizeResult(plan.Result)
 
-// compile is the only constructor for the target document. Input-specific
-// functions convert their own syntax to planSpec, then all plans receive the
-// same defaults, semantic checks, and session-owned structural validation.
-func compile(spec planSpec) (session.Plan, error) {
-	timeouts, err := normalizeTimeouts(spec.timeouts)
-	if err != nil {
-		return session.Plan{}, err
-	}
-	retry, err := normalizeRetry(spec.retry)
-	if err != nil {
-		return session.Plan{}, err
-	}
-	mode := strings.TrimSpace(spec.mode)
-	if mode == "" {
-		mode = session.ModeAdversarial
-	}
-	investigation := strings.TrimSpace(spec.investigation)
-	if investigation == "" {
-		investigation = session.InvestigationAuto
-	}
-
-	plan := session.Plan{
-		Kind:          session.PlanKind,
-		SchemaVersion: session.SchemaVersion,
-		SessionID:     normalizedSessionID(spec.sessionID),
-		Provenance:    spec.provenance,
-		RecipeID:      strings.TrimSpace(spec.recipeID),
-		Task:          spec.task,
-		Timeouts:      timeouts,
-		Mode:          mode,
-		Investigation: investigation,
-		Actors:        copyActors(spec.actors),
-		Schedule:      copySchedule(spec.schedule),
-		Facilitator:   copyFacilitator(spec.facilitator),
-		Reducer:       copyReducer(spec.reducer),
-		ProviderRetry: retry,
-		Workspace:     normalizeWorkspace(spec.workspace),
-		Inputs:        copyInputs(spec.inputs),
-		ChildPolicy:   normalizeChildPolicy(spec.childPolicy),
-		Result:        normalizeResult(spec.result),
-	}
 	if err := session.ValidatePlan(plan); err != nil {
 		return session.Plan{}, fmt.Errorf("validate compiled plan: %w", err)
 	}
-	if err := validateCompilerSemantics(plan, spec.participants); err != nil {
+	if err := validateCompilerSemantics(plan); err != nil {
 		return session.Plan{}, err
 	}
 	return plan, nil
 }
 
-func validateCompilerSemantics(plan session.Plan, participants []string) error {
-	actorIDs := make(map[string]struct{}, len(plan.Actors))
-	for _, actor := range plan.Actors {
-		if !knownBackend(actor.Backend) {
-			return fmt.Errorf("unknown backend %q for actor %q", actor.Backend, actor.ID)
-		}
-		actorIDs[actor.ID] = struct{}{}
-	}
-
-	participantIDs := make(map[string]struct{}, len(participants))
-	for _, participant := range participants {
-		if _, exists := actorIDs[participant]; !exists {
-			return fmt.Errorf("schedule participant %q is not in actors", participant)
-		}
-		if _, duplicate := participantIDs[participant]; duplicate {
-			return fmt.Errorf("schedule contains duplicate participant %q", participant)
-		}
-		participantIDs[participant] = struct{}{}
-	}
-
-	switch plan.Schedule.Kind {
-	case "dialogue":
-		if len(participants) != 2 {
-			return fmt.Errorf("dialogue schedule requires exactly two participants, got %d", len(participants))
-		}
-	case "sequence":
-		if len(participants) == 0 {
-			return fmt.Errorf("sequence schedule requires at least one participant")
-		}
-	}
-
-	roleActors := make(map[string]struct{}, 2)
-	for _, role := range []struct {
-		name  string
-		actor string
-	}{
-		{name: "facilitator", actor: facilitatorActor(plan.Facilitator)},
-		{name: "reducer", actor: reducerActor(plan.Reducer)},
-	} {
-		if role.actor == "" {
-			continue
-		}
-		actor, found := findActor(plan.Actors, role.actor)
-		if !found {
-			return fmt.Errorf("validated plan is missing %s actor %q", role.name, role.actor)
-		}
-		if _, scheduled := participantIDs[role.actor]; scheduled {
-			return fmt.Errorf("%s actor %q must be separate from scheduled participants", role.name, role.actor)
-		}
-		if actor.Backend == "relay" {
-			return fmt.Errorf("%s actor %q cannot use relay backend", role.name, role.actor)
-		}
-		roleActors[role.actor] = struct{}{}
-	}
-	for _, actor := range plan.Actors {
-		if _, participant := participantIDs[actor.ID]; participant {
-			continue
-		}
-		if _, role := roleActors[actor.ID]; role {
-			continue
-		}
-		return fmt.Errorf("actor %q is neither scheduled nor assigned a control role", actor.ID)
-	}
-	return nil
-}
-
-func normalizeTimeouts(value session.Timeouts) (session.Timeouts, error) {
-	if value.TurnSeconds < 0 {
-		return session.Timeouts{}, fmt.Errorf("timeout seconds must not be negative")
-	}
-	if value.StallSeconds < 0 {
-		return session.Timeouts{}, fmt.Errorf("stall timeout seconds must not be negative")
-	}
+func normalizeTimeouts(value session.Timeouts) session.Timeouts {
 	if value.TurnSeconds == 0 {
 		value.TurnSeconds = defaultTimeoutSeconds
 	}
 	if value.StallSeconds == 0 {
 		value.StallSeconds = defaultStallTimeoutSeconds
 	}
-	return value, nil
+	return value
 }
 
-func normalizeRetry(value session.ProviderRetry) (session.ProviderRetry, error) {
+func normalizedMode(value string) string {
+	if strings.TrimSpace(value) == "" {
+		return session.ModeAdversarial
+	}
+	return strings.TrimSpace(value)
+}
+
+func normalizedInvestigation(value string) string {
+	if strings.TrimSpace(value) == "" {
+		return session.InvestigationAuto
+	}
+	return strings.TrimSpace(value)
+}
+
+func normalizeRetry(value session.ProviderRetry) session.ProviderRetry {
 	value.Mode = strings.TrimSpace(value.Mode)
 	if value.Mode == "" {
 		value.Mode = "allow"
-	}
-	if value.Mode != "allow" && value.Mode != "forbid" {
-		return session.ProviderRetry{}, fmt.Errorf("provider retry mode must be allow or forbid")
-	}
-	if value.MaxAttempts < 0 {
-		return session.ProviderRetry{}, fmt.Errorf("provider retry max attempts must not be negative")
 	}
 	if value.MaxAttempts == 0 {
 		if value.Mode == "forbid" {
@@ -189,7 +80,7 @@ func normalizeRetry(value session.ProviderRetry) (session.ProviderRetry, error) 
 			value.MaxAttempts = defaultRetryAttempts
 		}
 	}
-	return value, nil
+	return value
 }
 
 func normalizeWorkspace(value session.Workspace) session.Workspace {
@@ -212,7 +103,6 @@ func normalizeChildPolicy(value session.ChildPolicy) session.ChildPolicy {
 	if strings.TrimSpace(value.Mode) == "" {
 		value.Mode = "deny"
 	}
-	value.AllowedRecipes = append([]string{}, value.AllowedRecipes...)
 	if value.AllowedRecipes == nil {
 		value.AllowedRecipes = []string{}
 	}
@@ -220,10 +110,12 @@ func normalizeChildPolicy(value session.ChildPolicy) session.ChildPolicy {
 }
 
 func normalizeResult(value session.Result) session.Result {
+	if strings.TrimSpace(value.Source) == "" {
+		value.Source = "last_turn"
+	}
 	if strings.TrimSpace(value.Format) == "" {
 		value.Format = "text"
 	}
-	value.Schema = append(json.RawMessage{}, value.Schema...)
 	return value
 }
 
@@ -234,44 +126,91 @@ func normalizedSessionID(value string) string {
 	return value
 }
 
-func copyActors(value []session.Actor) []session.Actor {
-	result := append([]session.Actor{}, value...)
-	if result == nil {
-		return []session.Actor{}
+func validateCompilerSemantics(plan session.Plan) error {
+	for _, actor := range plan.Actors {
+		if !knownBackend(actor.Backend) {
+			if strings.TrimSpace(actor.Backend) == "relay" {
+				return fmt.Errorf("relay backend is not supported for actor %q", actor.ID)
+			}
+			return fmt.Errorf("unknown backend %q for actor %q", actor.Backend, actor.ID)
+		}
+	}
+	if plan.Schedule.Kind == "dialogue" && len(participants(plan)) != 2 {
+		return fmt.Errorf("dialogue schedule requires exactly two participants, got %d", len(participants(plan)))
+	}
+	return nil
+}
+
+// participants derives schedule membership from the one authoritative source:
+// the sequence order, or actors that do not hold a dialogue control role.
+func participants(plan session.Plan) []string {
+	if plan.Schedule.Kind == "sequence" {
+		return append([]string{}, plan.Schedule.Order...)
+	}
+	controls := map[string]struct{}{}
+	if plan.Facilitator != nil {
+		controls[plan.Facilitator.Actor] = struct{}{}
+	}
+	if plan.Reducer != nil {
+		controls[plan.Reducer.Actor] = struct{}{}
+	}
+	result := make([]string, 0, len(plan.Actors))
+	for _, actor := range plan.Actors {
+		if _, control := controls[actor.ID]; !control {
+			result = append(result, actor.ID)
+		}
 	}
 	return result
 }
 
-func copySchedule(value session.Schedule) session.Schedule {
-	value.Order = append([]string{}, value.Order...)
-	if value.Order == nil {
-		value.Order = []string{}
+func copyPlan(plan session.Plan) session.Plan {
+	plan.Actors = append([]session.Actor{}, plan.Actors...)
+	if plan.Actors == nil {
+		plan.Actors = []session.Actor{}
 	}
-	return value
-}
-
-func copyFacilitator(value *session.Facilitator) *session.Facilitator {
-	if value == nil {
-		return nil
+	plan.Schedule.Order = append([]string{}, plan.Schedule.Order...)
+	if plan.Schedule.Order == nil {
+		plan.Schedule.Order = []string{}
 	}
-	copy := *value
-	return &copy
-}
-
-func copyReducer(value *session.Reducer) *session.Reducer {
-	if value == nil {
-		return nil
+	if plan.Facilitator != nil {
+		facilitator := *plan.Facilitator
+		plan.Facilitator = &facilitator
 	}
-	copy := *value
-	return &copy
-}
-
-func copyInputs(value []session.Input) []session.Input {
-	result := append([]session.Input{}, value...)
-	if result == nil {
-		return []session.Input{}
+	if plan.Reducer != nil {
+		reducer := *plan.Reducer
+		plan.Reducer = &reducer
 	}
-	return result
+	plan.Inputs = append([]session.Input{}, plan.Inputs...)
+	if plan.Inputs == nil {
+		plan.Inputs = []session.Input{}
+	}
+	plan.Context = append([]session.Input{}, plan.Context...)
+	if plan.Context == nil {
+		plan.Context = []session.Input{}
+	}
+	plan.Skills = append([]session.Input{}, plan.Skills...)
+	if plan.Skills == nil {
+		plan.Skills = []session.Input{}
+	}
+	plan.TaskPlan = append(json.RawMessage{}, plan.TaskPlan...)
+	plan.RequiredCapabilities = append([]string{}, plan.RequiredCapabilities...)
+	if plan.RequiredCapabilities == nil {
+		plan.RequiredCapabilities = []string{}
+	}
+	plan.MatchKeywords = append([]string{}, plan.MatchKeywords...)
+	if plan.MatchKeywords == nil {
+		plan.MatchKeywords = []string{}
+	}
+	plan.ChildPolicy.AllowedRecipes = append([]string{}, plan.ChildPolicy.AllowedRecipes...)
+	if plan.ChildPolicy.AllowedRecipes == nil {
+		plan.ChildPolicy.AllowedRecipes = []string{}
+	}
+	plan.Result.Schema = append(json.RawMessage{}, plan.Result.Schema...)
+	if plan.Lifecycle != nil {
+		lifecycle := *plan.Lifecycle
+		plan.Lifecycle = &lifecycle
+	}
+	return plan
 }
 
 func findActor(actors []session.Actor, actorID string) (session.Actor, bool) {
@@ -283,23 +222,9 @@ func findActor(actors []session.Actor, actorID string) (session.Actor, bool) {
 	return session.Actor{}, false
 }
 
-func facilitatorActor(value *session.Facilitator) string {
-	if value == nil {
-		return ""
-	}
-	return value.Actor
-}
-
-func reducerActor(value *session.Reducer) string {
-	if value == nil {
-		return ""
-	}
-	return value.Actor
-}
-
 func knownBackend(value string) bool {
 	switch strings.TrimSpace(value) {
-	case "claude", "codex", "gemini", "relay":
+	case "claude", "codex", "gemini":
 		return true
 	default:
 		return false
