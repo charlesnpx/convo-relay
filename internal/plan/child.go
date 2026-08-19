@@ -43,10 +43,6 @@ func ForChild(parent session.Plan, request ChildRequest, recipes []Recipe) (sess
 		Skills:    parent.Skills,
 		TaskPlan:  parent.TaskPlan,
 	}, recipe, session.ProvenanceChild)
-	child.Inputs = parent.Inputs
-	if strings.TrimSpace(child.Investigation) == "" {
-		child.Investigation = parent.Investigation
-	}
 	child.Schedule = boundedChildSchedule(child.Schedule, parent, request.Turns)
 	child.ChildPolicy = remainingChildPolicy(normalizeChildPolicy(child.ChildPolicy), parent.ChildPolicy)
 	return compile(child)
@@ -111,8 +107,8 @@ func minimum(left int, right int) int {
 	return right
 }
 
-// ForResume accepts only prompt material. Any structural variation must be
-// compiled as a new launch plan instead of being smuggled into a resume.
+// ForResume accepts only prompt material. Structural variation creates a new
+// launch plan instead of being smuggled into a resume.
 func ForResume(parent session.Plan, input ResumeInput) (ResumeInput, error) {
 	if err := session.ValidatePlan(parent); err != nil {
 		return ResumeInput{}, fmt.Errorf("validate parent plan: %w", err)

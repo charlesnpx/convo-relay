@@ -82,13 +82,12 @@ type Plan struct {
 	Inputs        []Input       `json:"inputs"`
 	// Context and Skills are the durable, blob-addressed forms of --context and
 	// --skill. Their source paths deliberately do not enter the portable plan.
-	Context              []Input         `json:"context"`
-	Skills               []Input         `json:"skills"`
-	TaskPlan             json.RawMessage `json:"task_plan,omitempty"`
-	RequiredCapabilities []string        `json:"required_capabilities"`
-	MatchKeywords        []string        `json:"match_keywords"`
-	ChildPolicy          ChildPolicy     `json:"child_policy"`
-	Result               Result          `json:"result"`
+	Context       []Input         `json:"context"`
+	Skills        []Input         `json:"skills"`
+	TaskPlan      json.RawMessage `json:"task_plan,omitempty"`
+	MatchKeywords []string        `json:"match_keywords"`
+	ChildPolicy   ChildPolicy     `json:"child_policy"`
+	Result        Result          `json:"result"`
 	// Lifecycle carries recipe controls that do not select a second execution
 	// path. Dynamic and workspace controls are also projected onto ChildPolicy
 	// and Workspace by the compiler.
@@ -211,15 +210,9 @@ func CreateWithOptions(options CreateOptions) (*Session, error) {
 		return nil, err
 	}
 
-	plan := normalizeNewPlan(options.Plan, filepath.Base(root))
-	// "disabled" was the old spelling for a policy that denies all child
-	// execution. Keep Create able to open programmatic v1-style callers while
-	// ValidatePlan remains strict for every persisted plan and compiler result.
-	if plan.ChildPolicy.Mode == "disabled" {
-		plan.ChildPolicy.Mode = "deny"
-	}
-	if plan.Result.Source == "" {
-		plan.Result.Source = "last_turn"
+	plan := options.Plan
+	if plan.SessionID == "" {
+		plan.SessionID = filepath.Base(root)
 	}
 	if err := ValidatePlan(plan); err != nil {
 		return nil, err
@@ -251,13 +244,6 @@ func CreateWithOptions(options CreateOptions) (*Session, error) {
 		return nil, err
 	}
 	return &Session{Root: root, Plan: plan, Digest: digest}, nil
-}
-
-func normalizeNewPlan(plan Plan, generatedID string) Plan {
-	if plan.SessionID == "" {
-		plan.SessionID = generatedID
-	}
-	return plan
 }
 
 func writeSessionOnce(root string, body []byte) error {
@@ -419,7 +405,7 @@ func ValidatePlan(plan Plan) error {
 	if len(plan.Actors) == 0 {
 		return errors.New("plan must contain at least one actor")
 	}
-	actorIDs := make(map[string]struct{}, len(plan.Actors))
+	actorIDs := make(map[string]bool, len(plan.Actors))
 	for _, actor := range plan.Actors {
 		if err := validateToken("actor.id", actor.ID); err != nil {
 			return err
@@ -427,9 +413,12 @@ func ValidatePlan(plan Plan) error {
 		if _, exists := actorIDs[actor.ID]; exists {
 			return fmt.Errorf("plan contains duplicate actor %q", actor.ID)
 		}
-		actorIDs[actor.ID] = struct{}{}
+		actorIDs[actor.ID] = false
 		if err := validateToken("actor.backend", actor.Backend); err != nil {
 			return err
+		}
+		if !supportedActorBackend(actor.Backend) {
+			return fmt.Errorf("actor backend %q is not supported", actor.Backend)
 		}
 		if err := validateOptionalToken("actor.model", actor.Model); err != nil {
 			return err
@@ -444,25 +433,6 @@ func ValidatePlan(plan Plan) error {
 	if plan.Schedule.Turns < 1 {
 		return errors.New("schedule turns must be positive")
 	}
-	// Order rules were documented on the field but never enforced here, so a plan
-	// built outside the compiler could carry an invalid sequence. Enforce them at
-	// the type that owns them.
-	if plan.Schedule.Kind == "sequence" {
-		if len(plan.Schedule.Order) != plan.Schedule.Turns {
-			return fmt.Errorf("sequence schedule order must contain exactly %d entries", plan.Schedule.Turns)
-		}
-		known := make(map[string]struct{}, len(plan.Actors))
-		for _, actor := range plan.Actors {
-			known[actor.ID] = struct{}{}
-		}
-		for _, id := range plan.Schedule.Order {
-			if _, ok := known[id]; !ok {
-				return fmt.Errorf("schedule.order names unknown actor %q", id)
-			}
-		}
-	} else if len(plan.Schedule.Order) != 0 {
-		return errors.New("schedule.order is only valid for a sequence schedule")
-	}
 	if plan.Facilitator != nil {
 		if _, exists := actorIDs[plan.Facilitator.Actor]; !exists {
 			return errors.New("facilitator actor is not in actors")
@@ -476,18 +446,41 @@ func ValidatePlan(plan Plan) error {
 			return errors.New("reducer actor is not in actors")
 		}
 	}
-	if plan.Schedule.Kind == "sequence" {
-		controlActors := map[string]struct{}{}
-		if plan.Facilitator != nil {
-			controlActors[plan.Facilitator.Actor] = struct{}{}
+	controlActorCount := 0
+	if plan.Facilitator != nil {
+		controlActorCount++
+	}
+	if plan.Reducer != nil && (plan.Facilitator == nil || plan.Reducer.Actor != plan.Facilitator.Actor) {
+		controlActorCount++
+	}
+	switch plan.Schedule.Kind {
+	case "dialogue":
+		if len(plan.Schedule.Order) != 0 {
+			return errors.New("schedule.order is only valid for a sequence schedule")
 		}
-		if plan.Reducer != nil {
-			controlActors[plan.Reducer.Actor] = struct{}{}
+		if participants := len(plan.Actors) - controlActorCount; participants != 2 {
+			return fmt.Errorf("dialogue schedule requires exactly two participants, got %d", participants)
 		}
+	case "sequence":
+		if len(plan.Schedule.Order) != plan.Schedule.Turns {
+			return fmt.Errorf("sequence schedule order must contain exactly %d entries", plan.Schedule.Turns)
+		}
+		scheduledActorCount := 0
 		for _, actorID := range plan.Schedule.Order {
-			if _, control := controlActors[actorID]; control {
+			scheduled, exists := actorIDs[actorID]
+			if !exists {
+				return fmt.Errorf("schedule.order names unknown actor %q", actorID)
+			}
+			if (plan.Facilitator != nil && plan.Facilitator.Actor == actorID) || (plan.Reducer != nil && plan.Reducer.Actor == actorID) {
 				return fmt.Errorf("schedule.order must not name control actor %q", actorID)
 			}
+			if !scheduled {
+				actorIDs[actorID] = true
+				scheduledActorCount++
+			}
+		}
+		if scheduledActorCount != len(plan.Actors)-controlActorCount {
+			return errors.New("sequence schedule must include every actor that does not hold a control role")
 		}
 	}
 	if plan.ProviderRetry.Mode != "allow" && plan.ProviderRetry.Mode != "forbid" {
@@ -517,16 +510,8 @@ func ValidatePlan(plan Plan) error {
 			return err
 		}
 	}
-	for _, group := range []struct {
-		label  string
-		values []string
-	}{
-		{label: "required_capabilities", values: plan.RequiredCapabilities},
-		{label: "match_keywords", values: plan.MatchKeywords},
-	} {
-		if err := validateUniqueTokens(group.label, group.values); err != nil {
-			return err
-		}
+	if err := validateUniqueTokens("match_keywords", plan.MatchKeywords); err != nil {
+		return err
 	}
 	if len(plan.TaskPlan) > 0 {
 		if _, err := eventlog.SemanticJSONBytesRaw(plan.TaskPlan); err != nil {
@@ -541,15 +526,8 @@ func ValidatePlan(plan Plan) error {
 	if plan.ChildPolicy.MaxDepth < 0 || plan.ChildPolicy.MaxChildren < 0 || plan.ChildPolicy.MaxTurns < 0 {
 		return errors.New("child policy limits must not be negative")
 	}
-	recipeIDs := make(map[string]struct{}, len(plan.ChildPolicy.AllowedRecipes))
-	for _, recipeID := range plan.ChildPolicy.AllowedRecipes {
-		if err := validateToken("child_policy.allowed_recipes", recipeID); err != nil {
-			return err
-		}
-		if _, exists := recipeIDs[recipeID]; exists {
-			return fmt.Errorf("child policy contains duplicate recipe %q", recipeID)
-		}
-		recipeIDs[recipeID] = struct{}{}
+	if err := validateUniqueTokens("child_policy.allowed_recipes", plan.ChildPolicy.AllowedRecipes); err != nil {
+		return err
 	}
 	switch plan.Result.Source {
 	case "last_turn", "reducer":
@@ -570,12 +548,24 @@ func ValidatePlan(plan Plan) error {
 	if err := validateLifecycle(plan.Lifecycle); err != nil {
 		return err
 	}
+	if plan.Lifecycle != nil && plan.Lifecycle.Dynamic == "forbid" && plan.ChildPolicy.Mode != "deny" {
+		return errors.New("lifecycle dynamic forbid requires child_policy mode deny")
+	}
 	if plan.IntegrationContract != "" {
 		if err := validateToken("integration_contract", plan.IntegrationContract); err != nil {
 			return err
 		}
 	}
 	return eventlog.ValidatePortableValue(portableProjection(plan))
+}
+
+func supportedActorBackend(value string) bool {
+	switch value {
+	case "claude", "codex", "gemini":
+		return true
+	default:
+		return false
+	}
 }
 
 // ActorIDs returns deterministic actor ids without exposing an untyped map.

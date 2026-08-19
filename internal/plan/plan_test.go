@@ -2,6 +2,7 @@ package plan
 
 import (
 	"encoding/json"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -62,7 +63,7 @@ func TestFromRecipeCompilesCanonicalNormalizedProjection(t *testing.T) {
 	if compiled.Schedule.Turns != 3 || compiled.Result.Source != "reducer" || compiled.Reducer == nil {
 		t.Fatalf("schedule/result projection = %#v/%#v", compiled.Schedule, compiled.Result)
 	}
-	if compiled.IntegrationContract != "example/review-v2" || compiled.Lifecycle == nil || compiled.Lifecycle.Resume != "forbid" || len(compiled.RequiredCapabilities) != 1 || len(compiled.MatchKeywords) != 1 {
+	if compiled.IntegrationContract != "example/review-v2" || compiled.Lifecycle == nil || compiled.Lifecycle.Resume != "forbid" || len(compiled.MatchKeywords) != 1 {
 		t.Fatalf("contract/lifecycle projection = %#v", compiled)
 	}
 	if compiled.Workspace.Mode != "head-copy" || compiled.Workspace.Isolation != "ephemeral" || compiled.ChildPolicy.Mode != "allow" {
@@ -111,9 +112,7 @@ func TestForChildUsesRequestedRecipeAndParentBudget(t *testing.T) {
 	if child.Provenance != session.ProvenanceChild || child.RecipeID != childRecipe.ID || child.Mode != session.ModeCooperative {
 		t.Fatalf("child identity/behaviour = %#v", child)
 	}
-	if _, found := findActor(child.Actors, "child-alpha"); !found {
-		t.Fatalf("child did not use requested recipe actors: %#v", child.Actors)
-	}
+	actor(t, child, "child-alpha")
 	if child.Schedule.Turns != 2 || child.ChildPolicy.MaxDepth != 1 || child.ChildPolicy.MaxChildren != 2 || child.ChildPolicy.MaxTurns != 1 {
 		t.Fatalf("child bounds = schedule %#v policy %#v", child.Schedule, child.ChildPolicy)
 	}
@@ -122,10 +121,58 @@ func TestForChildUsesRequestedRecipeAndParentBudget(t *testing.T) {
 	}
 }
 
-func TestCompilerRejectsRelayActors(t *testing.T) {
-	_, err := FromFlags(Flags{Task: "invalid backend", Agents: "relay,relay"})
-	if err == nil || !strings.Contains(err.Error(), "relay backend") {
-		t.Fatalf("relay actor error = %v", err)
+func TestForChildPreservesRecipeInputsAndInvestigation(t *testing.T) {
+	recipe := canonicalRecipe("child-owned-inputs")
+	recipe.Investigation = ""
+	recipe.Inputs = []session.Input{input("recipe-input", "a")}
+	launchContext := input("launch-context", "b")
+	launchSkill := input("launch-skill", "c")
+	taskPlan := json.RawMessage(`{"steps":["inspect"]}`)
+	root, err := FromRecipe(RecipeInput{
+		SessionID: "recipe-root",
+		Task:      "compile the recipe directly",
+		Inline:    &recipe,
+		Timeouts:  session.Timeouts{TurnSeconds: 30, StallSeconds: 15},
+		Context:   []session.Input{launchContext},
+		Skills:    []session.Input{launchSkill},
+		TaskPlan:  taskPlan,
+	})
+	if err != nil {
+		t.Fatalf("FromRecipe root: %v", err)
+	}
+	parent, err := FromFlags(Flags{
+		SessionID:     "input-parent",
+		Task:          "delegate to the recipe",
+		Agents:        "codex,claude",
+		Investigation: session.InvestigationContextOnly,
+		Inputs:        []session.Input{input("parent-input", "d")},
+		Context:       []session.Input{launchContext},
+		Skills:        []session.Input{launchSkill},
+		TaskPlan:      taskPlan,
+		Dynamic:       "auto-safe",
+		ChildPolicy: session.ChildPolicy{
+			MaxDepth:       2,
+			MaxChildren:    2,
+			MaxTurns:       3,
+			AllowedRecipes: []string{},
+		},
+	})
+	if err != nil {
+		t.Fatalf("FromFlags parent: %v", err)
+	}
+	child, err := ForChild(parent, ChildRequest{
+		SessionID: "recipe-child",
+		RecipeID:  recipe.ID,
+		Question:  "compile the same recipe as a child",
+	}, []Recipe{recipe})
+	if err != nil {
+		t.Fatalf("ForChild: %v", err)
+	}
+	if !reflect.DeepEqual(child.Inputs, root.Inputs) {
+		t.Fatalf("child inputs = %#v, root recipe inputs = %#v", child.Inputs, root.Inputs)
+	}
+	if child.Investigation != root.Investigation || child.Investigation != session.InvestigationAuto {
+		t.Fatalf("child investigation = %q, root/default = %q/%q", child.Investigation, root.Investigation, session.InvestigationAuto)
 	}
 }
 
@@ -234,9 +281,11 @@ func input(name string, suffix string) session.Input {
 
 func actor(t *testing.T, compiled session.Plan, id string) session.Actor {
 	t.Helper()
-	value, found := findActor(compiled.Actors, id)
-	if !found {
-		t.Fatalf("actor %q not found in %#v", id, compiled.Actors)
+	for _, value := range compiled.Actors {
+		if value.ID == id {
+			return value
+		}
 	}
-	return value
+	t.Fatalf("actor %q not found in %#v", id, compiled.Actors)
+	return session.Actor{}
 }
