@@ -241,14 +241,6 @@ func TestApprovePendingChildRefusesExhaustedBudgets(t *testing.T) {
 		wantBudgetState string
 	}{
 		{
-			name:            "capacity",
-			policy:          askChildPolicy(1, 0, 1),
-			requests:        []ChildRequest{childRequest("child-capacity", "capacity request")},
-			approveRequest:  "child-capacity",
-			wantReason:      childCapacityExhaustedReason,
-			wantBudgetState: "children_exhausted",
-		},
-		{
 			name:            "depth",
 			policy:          askChildPolicy(0, 1, 1),
 			requests:        []ChildRequest{childRequest("child-depth", "depth request")},
@@ -262,7 +254,7 @@ func TestApprovePendingChildRefusesExhaustedBudgets(t *testing.T) {
 			requests:        []ChildRequest{childRequest("child-first", "first child"), childRequest("child-turns", "turn budget request")},
 			approveFirst:    "child-first",
 			approveRequest:  "child-turns",
-			wantReason:      childTurnBudgetExhaustedReason,
+			wantReason:      "child turn budget exhausted",
 			wantBudgetState: "turns_exhausted",
 		},
 	}

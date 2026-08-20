@@ -549,6 +549,9 @@ func ValidatePlan(plan Plan) error {
 	if plan.Lifecycle != nil && plan.Lifecycle.Dynamic == "forbid" && plan.ChildPolicy.Mode != "deny" {
 		return errors.New("lifecycle dynamic forbid requires child_policy mode deny")
 	}
+	if plan.Lifecycle != nil && plan.Lifecycle.Resume == "forbid" && plan.ChildPolicy.Mode == "ask" {
+		return errors.New("lifecycle.resume forbid is incompatible with child_policy.mode ask")
+	}
 	// A recipe's declared workspace isolation is a minimum. The executable
 	// workspace may strengthen it but never weaken it, per the documented
 	// operator contract. Validated here because the plan is the only place both

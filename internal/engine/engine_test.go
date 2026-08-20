@@ -456,29 +456,43 @@ func TestResumeRebuildsChildBudgets(t *testing.T) {
 	}
 }
 
-func TestExtractedChildRequestSurvivesBeforeParentCompletion(t *testing.T) {
+func TestFinishedAttemptChildRequestRemainsDecidableBeforeParentCompletion(t *testing.T) {
 	parent := dialoguePlan(1)
-	parent.ChildPolicy = session.ChildPolicy{Mode: "allow", MaxDepth: 1, MaxChildren: 1, MaxTurns: 1, AllowedRecipes: []string{"child"}}
+	parent.ProviderRetry = session.ProviderRetry{Mode: "forbid", MaxAttempts: 1}
+	parent.ChildPolicy = session.ChildPolicy{Mode: "ask", MaxDepth: 1, MaxChildren: 1, MaxTurns: 1, AllowedRecipes: []string{"child"}}
 	sess := createSession(t, parent)
 	seedLog(t, sess, func(store *blobstore.Store, writer *eventlog.Writer) {
 		content := putSeedText(t, store, "parent response")
 		question := putSeedText(t, store, "durable child request")
 		appendEvent(t, writer, eventlog.TurnStartedPayload{ActorID: "alpha", Round: 1, Role: eventlog.ParticipantRole})
 		appendEvent(t, writer, eventlog.AttemptStartedPayload{ActorID: "alpha", Attempt: 1})
-		appendEvent(t, writer, eventlog.ChildRequestedPayload{RequestID: "child-one", RequesterActorID: "alpha", RecipeID: "child", Question: question})
 		appendEvent(t, writer, eventlog.AttemptFinishedPayload{ActorID: "alpha", Attempt: 1, Outcome: "success", Content: content})
+		appendEvent(t, writer, eventlog.ChildRequestedPayload{RequestID: "child-one", RequesterActorID: "alpha", RecipeID: "child", Question: question})
 	})
 	alpha := &fakeBackend{name: "codex", slotID: "alpha"}
 	beta := &fakeBackend{name: "codex", slotID: "beta"}
-	child := &fakeBackend{name: "codex", slotID: "child-alpha", responses: []fakeResponse{{content: "recovered child"}}}
-	deps := testDeps(map[string]*fakeBackend{"alpha": alpha, "beta": beta, "child-alpha": child})
+	deps := testDeps(map[string]*fakeBackend{"alpha": alpha, "beta": beta})
 	deps.Recipes = []plan.Recipe{childRecipe()}
-	if _, err := Resume(context.Background(), sess, deps, ""); err != nil {
+	outcome, err := Resume(context.Background(), sess, deps, "")
+	if err != nil {
 		t.Fatalf("Resume: %v", err)
 	}
+	if outcome.Status != statusAwaitingDecision {
+		t.Fatalf("Resume outcome = %#v, want awaiting decision", outcome)
+	}
 	events := sessionEvents(t, sess)
-	if len(alpha.prompts) != 0 || len(child.prompts) != 1 || countType(events, eventlog.TurnFinished) != 1 || countType(events, eventlog.ChildCompleted) != 1 {
-		t.Fatalf("alpha=%d child=%d events=%#v", len(alpha.prompts), len(child.prompts), eventTypes(events))
+	if started, finished, requested, turnFinished := indexOfType(events, eventlog.AttemptStarted), indexOfType(events, eventlog.AttemptFinished), indexOfType(events, eventlog.ChildRequested), indexOfType(events, eventlog.TurnFinished); !(started < finished && finished < requested && requested < turnFinished) {
+		t.Fatalf("child request prefix order = %v", eventTypes(events))
+	}
+	if countType(events, eventlog.SessionFinished) != 0 {
+		t.Fatalf("resumed parent became terminal: %v", eventTypes(events))
+	}
+	pending, err := PendingChildren(sess)
+	if err != nil || len(pending) != 1 || pending[0].RequestID != "child-one" {
+		t.Fatalf("pending children = %#v err=%v", pending, err)
+	}
+	if err := ApproveChild(context.Background(), sess, "child-one", deps.Recipes); err != nil {
+		t.Fatalf("ApproveChild: %v", err)
 	}
 }
 

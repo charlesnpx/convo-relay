@@ -37,13 +37,11 @@ const (
 	stopAbandonedAttempt = "abandoned_attempt"
 	stopInvalidResult    = "invalid_result"
 
-	mediaTypePlainTextUTF8         = "text/plain; charset=utf-8"
-	mediaTypeChildResult           = "text/plain; charset=utf-8"
-	mediaTypeChildPlan             = "application/vnd.convo-relay.plan+json"
-	childCapacityExhaustedReason   = "child capacity exhausted"
-	childTurnBudgetExhaustedReason = "child turn budget exhausted"
-	maxPromptTranscriptSize        = 12
-	resultSchemaURL                = "https://convo-relay.invalid/engine-result-schema.json"
+	mediaTypePlainTextUTF8  = "text/plain; charset=utf-8"
+	mediaTypeChildResult    = "text/plain; charset=utf-8"
+	mediaTypeChildPlan      = "application/vnd.convo-relay.plan+json"
+	maxPromptTranscriptSize = 12
+	resultSchemaURL         = "https://convo-relay.invalid/engine-result-schema.json"
 )
 
 // BackendFactory creates a backend for one actor in one managed session.
@@ -827,7 +825,7 @@ func (r *runner) execute() (Outcome, error) {
 			}
 			return r.finishFailure(reason, err)
 		}
-		if awaitingChild || r.awaitingChildDecision() {
+		if awaitingChild {
 			outcome := r.outcome()
 			outcome.Status = statusAwaitingDecision
 			return outcome, nil
@@ -1001,12 +999,6 @@ func (r *runner) callActiveAttempt(turn *turnState, attemptNumber int) error {
 		return putErr
 	}
 	if callErr == nil {
-		// Request extraction happens before the success event. If the process
-		// stops after extraction, the request survives; if it stops earlier,
-		// the unfinished provider attempt is retried and extracted again.
-		if err := r.persistChildRequests(turn, actor, result); err != nil {
-			return err
-		}
 		if err := r.append(eventlog.AttemptFinishedPayload{
 			ActorID:           actor.ID,
 			Attempt:           attemptNumber,
@@ -1014,6 +1006,12 @@ func (r *runner) callActiveAttempt(turn *turnState, attemptNumber int) error {
 			ProviderSessionID: providerSessionID(backend),
 			Content:           ref,
 		}); err != nil {
+			return err
+		}
+		// A child request is derived from a successful turn, so record the
+		// successful attempt first. This keeps every durable request prefix
+		// resumable without treating its producing attempt as abandoned.
+		if err := r.persistChildRequests(turn, actor, result); err != nil {
 			return err
 		}
 		return r.finishActiveTurn(r.state.active, r.state.active.Attempts[attemptNumber])
@@ -1112,19 +1110,23 @@ func (r *runner) servicePendingChildren() (bool, error) {
 		requestIDs = append(requestIDs, requestID)
 	}
 	sort.Strings(requestIDs)
+	awaitingDecision := false
 	for _, requestID := range requestIDs {
 		child := r.state.requests[requestID]
 		if !child.decided() {
 			if err := r.decideChild(child); err != nil {
 				return false, err
 			}
+			if !child.decided() {
+				awaitingDecision = true
+			}
 		}
 		if child.admitted() && !child.completed() {
-			awaitingDecision, err := r.runChild(child)
+			childAwaitingDecision, err := r.runChild(child)
 			if err != nil {
 				return false, err
 			}
-			if awaitingDecision {
+			if childAwaitingDecision {
 				return true, nil
 			}
 		}
@@ -1135,7 +1137,7 @@ func (r *runner) servicePendingChildren() (bool, error) {
 			}
 		}
 	}
-	return false, nil
+	return awaitingDecision, nil
 }
 
 func (r *runner) decideChild(child *childState) error {
@@ -1159,7 +1161,7 @@ func (r *runner) admitChild(child *childState, reason string) error {
 		return r.append(eventlog.ChildDecidedPayload{
 			RequestID:   child.Request.RequestID,
 			Admitted:    false,
-			Reason:      childCapacityExhaustedReason,
+			Reason:      "child capacity exhausted",
 			BudgetState: "children_exhausted",
 		})
 	}
@@ -1176,7 +1178,7 @@ func (r *runner) admitChild(child *childState, reason string) error {
 		return r.append(eventlog.ChildDecidedPayload{
 			RequestID:   child.Request.RequestID,
 			Admitted:    false,
-			Reason:      childTurnBudgetExhaustedReason,
+			Reason:      "child turn budget exhausted",
 			BudgetState: "turns_exhausted",
 		})
 	}
@@ -1191,15 +1193,6 @@ func (r *runner) admitChild(child *childState, reason string) error {
 		BudgetState: "available",
 		Plan:        &planRef,
 	})
-}
-
-func (r *runner) awaitingChildDecision() bool {
-	for _, child := range r.state.requests {
-		if !child.decided() {
-			return true
-		}
-	}
-	return false
 }
 
 func (r *runner) pendingChildForOperatorDecision(requestID string) (*childState, error) {
@@ -1450,8 +1443,6 @@ func (r *runner) outcome() Outcome {
 	status := ""
 	if r.state.terminal != nil {
 		status = r.state.terminal.Status
-	} else if r.awaitingChildDecision() {
-		status = statusAwaitingDecision
 	}
 	return Outcome{Result: r.state.lastResult.Text, Status: status}
 }
