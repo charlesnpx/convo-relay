@@ -52,8 +52,6 @@ func main() {
 		runHealth(os.Args[2:])
 	case "contracts":
 		runContracts(os.Args[2:])
-	case "show-graph":
-		runShowGraph(os.Args[2:])
 	case "recipes":
 		runRecipes(os.Args[2:])
 	case "backends":
@@ -68,20 +66,8 @@ func main() {
 		runRelay(os.Args[2:])
 	case "resume":
 		runResume(os.Args[2:])
-	case "steer":
-		runSteer(os.Args[2:])
-	case "proposals":
-		runProposals(os.Args[2:])
-	case "approve":
-		runApprove(os.Args[2:])
-	case "reject":
-		runReject(os.Args[2:])
-	case "stop":
-		runStop(os.Args[2:], false)
-	case "kill":
-		runStop(os.Args[2:], true)
-	case "diff":
-		runDiff(os.Args[2:])
+	case "control":
+		runControl(os.Args[2:])
 	case "clean":
 		runClean(os.Args[2:])
 	case "cleanup":
@@ -174,37 +160,6 @@ func runContracts(args []string) {
 		return
 	}
 	fmt.Println(inspect.FormatContractsReport(report))
-}
-
-func runShowGraph(args []string) {
-	flags := flag.NewFlagSet("show-graph", flag.ExitOnError)
-	sessionDir := flags.String("session-dir", "", "Session directory to inspect")
-	sessionID := flags.String("session-id", "", "Session id or prefix under --home")
-	relayHome := flags.String("home", "", "Optional relay home; defaults to CODEX_CLAUDE_HOME or ~/.codex-claude")
-	jsonOutput := flags.Bool("json", false, "Emit machine-readable graph JSON")
-	if err := parseFlags(flags, args); err != nil {
-		os.Exit(2)
-	}
-	if *sessionID == "" && *sessionDir == "" && len(flags.Args()) > 0 {
-		*sessionID = flags.Args()[0]
-	}
-	resolvedSessionDir := resolveSessionDirOrExit(*sessionDir, *sessionID, *relayHome)
-
-	report, err := inspect.BuildShowGraphReport(resolvedSessionDir)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "error: %s\n", err)
-		os.Exit(1)
-	}
-	if *jsonOutput {
-		data, err := json.MarshalIndent(report, "", "  ")
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "error: %s\n", err)
-			os.Exit(1)
-		}
-		fmt.Println(string(data))
-		return
-	}
-	fmt.Println(inspect.FormatGraphSummary(report))
 }
 
 func runCompileRecipe(args []string) {
@@ -587,10 +542,22 @@ func runShow(args []string) {
 	relayHome := flags.String("home", "", "Optional relay home; defaults to CODEX_CLAUDE_HOME or ~/.codex-claude")
 	jsonOutput := flags.Bool("json", false, "Emit machine-readable JSON")
 	graphOutput := flags.Bool("graph", false, "Show durable relay graph instead of transcript")
+	diffOutput := flags.Bool("diff", false, "Show the durable-session diff")
+	proposalsOutput := flags.Bool("proposals", false, "Show spawn proposals")
 	traceNodeID := flags.String("trace", "", "Show raw child trace artifact for a graph node")
 	fromRound := flags.Int("from-round", 0, "Show only rounds from N onward")
 	roundsSpec := flags.String("rounds", "", "Filter rounds: '5+', '3-7', or '5,6'")
 	if err := parseFlags(flags, args); err != nil {
+		os.Exit(2)
+	}
+	viewCount := 0
+	for _, selected := range []bool{*graphOutput, *diffOutput, *proposalsOutput, *traceNodeID != ""} {
+		if selected {
+			viewCount++
+		}
+	}
+	if viewCount > 1 {
+		fmt.Fprintln(os.Stderr, "error: show accepts only one of --graph, --diff, --proposals, or --trace")
 		os.Exit(2)
 	}
 	if *sessionID == "" && *sessionDir == "" && len(flags.Args()) > 0 {
@@ -617,6 +584,38 @@ func runShow(args []string) {
 			return
 		}
 		fmt.Println(inspect.FormatGraphSummary(report))
+		return
+	}
+	if *diffOutput {
+		text, err := inspect.RenderDiff(resolvedSessionDir)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "error: %s\n", err)
+			os.Exit(1)
+		}
+		fmt.Print(text)
+		return
+	}
+	if *proposalsOutput {
+		report, err := runner.Proposals(resolvedSessionDir)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "error: %s\n", err)
+			os.Exit(1)
+		}
+		if *jsonOutput {
+			writeJSON(report)
+			return
+		}
+		proposals, _ := report["proposals"].([]any)
+		if len(proposals) == 0 {
+			fmt.Printf("No spawn proposals for %s.\n", report["session_id"])
+			return
+		}
+		for _, rawProposal := range proposals {
+			proposal, _ := rawProposal.(map[string]any)
+			fmt.Printf("%v  %-10v  %v\n", proposal["proposal_id"], proposal["status"], proposal["selected_recipe_id"])
+			fmt.Printf("  reason: %v\n", proposal["reason"])
+			fmt.Printf("  question: %v\n", proposal["delegated_question"])
+		}
 		return
 	}
 	report, err := inspect.BuildShowTranscriptReport(resolvedSessionDir, *fromRound, *roundsSpec)
@@ -1004,43 +1003,28 @@ func anchorRecipeCLIPath(sourceAnchor string, value string) string {
 	return filepath.Join(sourceAnchor, value)
 }
 
-func runProposals(args []string) {
-	flags := flag.NewFlagSet("proposals", flag.ExitOnError)
-	sessionDir := flags.String("session-dir", "", "Session directory")
-	sessionID := flags.String("session-id", "", "Session id under --home")
-	relayHome := flags.String("home", "", "Optional relay home; defaults to CODEX_CLAUDE_HOME or ~/.codex-claude")
-	jsonOutput := flags.Bool("json", false, "Emit machine-readable proposal JSON")
-	if err := parseFlags(flags, args); err != nil {
+func runControl(args []string) {
+	if len(args) == 0 {
+		fmt.Fprintln(os.Stderr, "error: control requires a subcommand: steer, approve, reject, or cancel")
 		os.Exit(2)
 	}
-	if *sessionID == "" && *sessionDir == "" && len(flags.Args()) > 0 {
-		*sessionID = flags.Args()[0]
-	}
-	resolvedSessionDir := resolveSessionDirOrExit(*sessionDir, *sessionID, *relayHome)
-	report, err := runner.Proposals(resolvedSessionDir)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "error: %s\n", err)
-		os.Exit(1)
-	}
-	if jsonOutput != nil && *jsonOutput {
-		writeJSON(report)
-		return
-	}
-	proposals, _ := report["proposals"].([]any)
-	if len(proposals) == 0 {
-		fmt.Printf("No spawn proposals for %s.\n", report["session_id"])
-		return
-	}
-	for _, rawProposal := range proposals {
-		proposal, _ := rawProposal.(map[string]any)
-		fmt.Printf("%v  %-10v  %v\n", proposal["proposal_id"], proposal["status"], proposal["selected_recipe_id"])
-		fmt.Printf("  reason: %v\n", proposal["reason"])
-		fmt.Printf("  question: %v\n", proposal["delegated_question"])
+	switch args[0] {
+	case "steer":
+		runControlSteer(args[1:])
+	case "approve":
+		runControlApprove(args[1:])
+	case "reject":
+		runControlReject(args[1:])
+	case "cancel":
+		runControlCancel(args[1:])
+	default:
+		fmt.Fprintf(os.Stderr, "error: unknown control subcommand %q\n", args[0])
+		os.Exit(2)
 	}
 }
 
-func runApprove(args []string) {
-	flags := flag.NewFlagSet("approve", flag.ExitOnError)
+func runControlApprove(args []string) {
+	flags := flag.NewFlagSet("control approve", flag.ExitOnError)
 	sessionDir := flags.String("session-dir", "", "Session directory")
 	sessionID := flags.String("session-id", "", "Session id under --home")
 	relayHome := flags.String("home", "", "Optional relay home; defaults to CODEX_CLAUDE_HOME or ~/.codex-claude")
@@ -1063,7 +1047,7 @@ func runApprove(args []string) {
 	}
 	resolvedSessionDir := resolveSessionDirOrExit(*sessionDir, *sessionID, *relayHome)
 	if *proposalID == "" {
-		fmt.Fprintln(os.Stderr, "error: approve requires a session and proposal id")
+		fmt.Fprintln(os.Stderr, "error: control approve requires a session and proposal id")
 		os.Exit(2)
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), commandInterruptSignals()...)
@@ -1089,8 +1073,8 @@ func runApprove(args []string) {
 	fmt.Printf("Approved %v and %v child %v into %v.\n", report["proposal_id"], report["status"], report["child_node_id"], report["session_id"])
 }
 
-func runReject(args []string) {
-	flags := flag.NewFlagSet("reject", flag.ExitOnError)
+func runControlReject(args []string) {
+	flags := flag.NewFlagSet("control reject", flag.ExitOnError)
 	sessionDir := flags.String("session-dir", "", "Session directory")
 	sessionID := flags.String("session-id", "", "Session id under --home")
 	relayHome := flags.String("home", "", "Optional relay home; defaults to CODEX_CLAUDE_HOME or ~/.codex-claude")
@@ -1110,7 +1094,7 @@ func runReject(args []string) {
 	}
 	resolvedSessionDir := resolveSessionDirOrExit(*sessionDir, *sessionID, *relayHome)
 	if *proposalID == "" {
-		fmt.Fprintln(os.Stderr, "error: reject requires a session and proposal id")
+		fmt.Fprintln(os.Stderr, "error: control reject requires a session and proposal id")
 		os.Exit(2)
 	}
 	report, err := runner.RejectProposal(resolvedSessionDir, runner.RejectOptions{ProposalID: *proposalID, Reason: *reason})
@@ -1202,13 +1186,13 @@ func runResume(args []string) {
 	writeRunnerResult(result, err, *jsonOutput, output)
 }
 
-func runStop(args []string, forceKill bool) {
-	flags := flag.NewFlagSet("stop", flag.ExitOnError)
-	sessionDir := flags.String("session-dir", "", "Session directory to stop")
+func runControlCancel(args []string) {
+	flags := flag.NewFlagSet("control cancel", flag.ExitOnError)
+	sessionDir := flags.String("session-dir", "", "Session directory to cancel")
 	sessionID := flags.String("session-id", "", "Session id under --home when --session-dir is omitted")
 	relayHome := flags.String("home", "", "Optional relay home; defaults to CODEX_CLAUDE_HOME or ~/.codex-claude")
-	killFlag := flags.Bool("kill", forceKill, "Force-kill and mark killed instead of requesting graceful stop")
-	jsonOutput := flags.Bool("json", false, "Emit machine-readable stop JSON")
+	force := flags.Bool("force", false, "Force-kill and mark killed instead of requesting graceful cancellation")
+	jsonOutput := flags.Bool("json", false, "Emit machine-readable cancellation JSON")
 	if err := parseFlags(flags, args); err != nil {
 		os.Exit(2)
 	}
@@ -1216,7 +1200,7 @@ func runStop(args []string, forceKill bool) {
 		*sessionID = flags.Args()[0]
 	}
 	resolvedSessionDir := resolveSessionDirOrExit(*sessionDir, *sessionID, *relayHome)
-	report, err := runner.Stop(resolvedSessionDir, runner.StopOptions{ForceKill: *killFlag})
+	report, err := runner.Stop(resolvedSessionDir, runner.StopOptions{ForceKill: *force})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error: %s\n", err)
 		os.Exit(1)
@@ -1228,8 +1212,8 @@ func runStop(args []string, forceKill bool) {
 	fmt.Printf("Session %s: %s\n", report["session_id"], report["status"])
 }
 
-func runSteer(args []string) {
-	flags := flag.NewFlagSet("steer", flag.ExitOnError)
+func runControlSteer(args []string) {
+	flags := flag.NewFlagSet("control steer", flag.ExitOnError)
 	sessionDir := flags.String("session-dir", "", "Session directory")
 	sessionID := flags.String("session-id", "", "Session id or prefix under --home")
 	relayHome := flags.String("home", "", "Optional relay home; defaults to CODEX_CLAUDE_HOME or ~/.codex-claude")
@@ -1258,26 +1242,6 @@ func runSteer(args []string) {
 		return
 	}
 	fmt.Printf("Queued steering for %.8s: %.8s\n", report["session_id"], item["id"])
-}
-
-func runDiff(args []string) {
-	flags := flag.NewFlagSet("diff", flag.ExitOnError)
-	sessionDir := flags.String("session-dir", "", "Session directory")
-	sessionID := flags.String("session-id", "", "Session id or prefix under --home")
-	relayHome := flags.String("home", "", "Optional relay home; defaults to CODEX_CLAUDE_HOME or ~/.codex-claude")
-	if err := parseFlags(flags, args); err != nil {
-		os.Exit(2)
-	}
-	if *sessionID == "" && *sessionDir == "" && len(flags.Args()) > 0 {
-		*sessionID = flags.Args()[0]
-	}
-	resolvedSessionDir := resolveSessionDirOrExit(*sessionDir, *sessionID, *relayHome)
-	text, err := inspect.RenderDiff(resolvedSessionDir)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "error: %s\n", err)
-		os.Exit(1)
-	}
-	fmt.Print(text)
 }
 
 func runClean(args []string) {

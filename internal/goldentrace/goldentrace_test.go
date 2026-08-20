@@ -778,7 +778,7 @@ func TestSteering(t *testing.T) {
 		"--task", "TRACE_STEERING_TASK", "--agents", "codex", "--rounds", "1",
 	)
 	requireExit(t, seed, 0)
-	queued := env.run(t, "steer", "--home", env.relayHome, "--json", "steering-session", "TRACE_STEERING_PROMPT")
+	queued := env.run(t, "control", "steer", "--home", env.relayHome, "--json", "steering-session", "TRACE_STEERING_PROMPT")
 	requireExit(t, queued, 0)
 	resumed, resumedReport := env.resumeJSON(t, "steering-session",
 		"--rounds", "1",
@@ -851,7 +851,7 @@ func TestBoundedChildRelayWithAdmission(t *testing.T) {
 	proposalID := graphProposalID(t, env, "child-parent")
 	beforeApproval := listSessions(t, env)
 	approval := env.run(t,
-		"approve", "--home", env.relayHome, "--proposal", proposalID, "--rounds", "1",
+		"control", "approve", "--home", env.relayHome, "--proposal", proposalID, "--rounds", "1",
 		"--timeout", "30", "--stall-timeout", "30", "child-parent",
 	)
 	requireExit(t, approval, 0)
@@ -890,7 +890,7 @@ func TestBoundedChildRelayWithAdmission(t *testing.T) {
 	requireExit(t, seedDenied, 0)
 	deniedProposalID := graphProposalID(t, denied, "denied-parent")
 	before := listSessions(t, denied)
-	rejected := denied.run(t, "reject", "--home", denied.relayHome, "--proposal", deniedProposalID, "denied-parent")
+	rejected := denied.run(t, "control", "reject", "--home", denied.relayHome, "--proposal", deniedProposalID, "denied-parent")
 	requireExit(t, rejected, 0)
 	after := listSessions(t, denied)
 	if len(after) != len(before) || !containsSession(after, "denied-parent") {
@@ -1049,7 +1049,7 @@ func graphProposal(t *testing.T, env *traceEnv, sessionID string, proposalID str
 
 func graphProposals(t *testing.T, env *traceEnv, sessionID string) map[string]any {
 	t.Helper()
-	result := env.run(t, "show-graph", "--home", env.relayHome, "--json", sessionID)
+	result := env.run(t, "show", "--graph", "--home", env.relayHome, "--json", sessionID)
 	requireExit(t, result, 0)
 	graph := jsonMap(t, mustJSON(t, result)["graph"], "graph")
 	proposals := jsonMap(t, graph["proposals"], "graph proposals")
