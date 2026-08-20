@@ -47,17 +47,17 @@ either target. An integration-bound recipe needs a matching bundle for the
 root target and returns the typed `recipes.RootOnlyRecipeError` for the child
 target.
 
-The CLI makes the same decision explicitly:
+The CLI exposes the root-plan preflight shape:
 
 ```text
-convo-relay compile-recipe --recipe <id> --target root|child
+convo-relay recipes compile <id> [--integration-bundle <path>]
 ```
 
-Omitting `--target` defaults to `child`, preserving the existing compile
-command contract. `--target root` enables root-plan compilation and bundle
-binding. `run --recipe` has no target flag because it always selects the root
-target. Nested relay profiles, relay-backed participants, proposal children,
-and dynamic children always select the child target.
+`recipes compile` does not execute a provider or create a session. It always
+emits the root plan and binds a matching bundle when the recipe declares a
+contract. Internal callers still select explicit targets; nested relay
+profiles, relay-backed participants, proposal children, and dynamic children
+always select the child target.
 
 ## Running a root recipe
 
@@ -291,18 +291,15 @@ root or child plan digests.
 
 Existing administration commands use the same generic projection:
 
-- `show`, `list`, and `export` report root execution and validation state.
-- `contracts` digest-validates refs; `contracts --raw` is the only inspection
-  mode that exposes raw artifact payloads.
-- `health` checks artifacts, input bytes, checkpoints, retained workspace,
-  source integrity, recovery, and cleanup state.
-- `display` labels reducer output and canonical output separately.
+- `show`, `list`, and `export create` report root execution and validation
+  state.
+- `doctor` checks artifacts, input bytes, checkpoints, retained workspace,
+  source integrity, recovery, cleanup state, and backend readiness.
 - `clean` restores provider-owned resources, removes the managed workspace,
   and only then removes session files; retryable failures retain the session.
 
-Backend readiness remains independent from recipe structure. Use
-`convo-relay backends status` for installation-only probes and add
-`--probe-auth` when an explicit supported authentication probe is needed.
+Add `doctor --probe-auth` when an explicit supported authentication probe is
+needed.
 
 ## Compatibility
 

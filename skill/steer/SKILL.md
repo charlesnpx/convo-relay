@@ -1,10 +1,10 @@
 ---
 name: "relay:steer"
-description: "Queue new operator context or direction into an already running convo-relay session with `convo-relay steer`. Use when the user invokes /relay:steer or asks to steer, redirect, add context to, or pass instructions into the current running relay."
+description: "Queue new operator context or direction into an already running convo-relay session with `convo-relay control steer`. Use when the user invokes /relay:steer or asks to steer, redirect, add context to, or pass instructions into the current running relay."
 argument-hint: "<new context or direction for the running relay>"
 ---
 
-You are steering an already-running `convo-relay` session. Your job is to identify the intended live session, distill the user's new direction, and queue it with `convo-relay steer`.
+You are steering an already-running `convo-relay` session. Your job is to identify the intended live session, distill the user's new direction, and queue it with `convo-relay control steer`.
 
 ## Identify the target relay
 
@@ -45,7 +45,7 @@ Distill the user's new context into a concise steering prompt. Include the concr
 Run:
 
 ```bash
-convo-relay steer <session-id> "<new direction>"
+convo-relay control steer <session-id> "<new direction>"
 ```
 
 Report that steering was queued, include the session ID, and summarize the queued direction in one sentence.

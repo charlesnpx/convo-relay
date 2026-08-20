@@ -9,13 +9,11 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"runtime"
 	"sort"
 	"strings"
 	"testing"
 
 	"github.com/charlesnpx/convo-relay/internal/contracts"
-	"github.com/charlesnpx/convo-relay/internal/recipes"
 	"github.com/charlesnpx/convo-relay/internal/store"
 )
 
@@ -68,24 +66,12 @@ func TestRecipeCLIValidators(t *testing.T) {
 	if err := validateRecipeView("raw"); err == nil {
 		t.Fatalf("invalid view accepted")
 	}
-	for input, want := range map[string]recipes.CompileTarget{
-		"":      recipes.CompileTargetChild,
-		"child": recipes.CompileTargetChild,
-		"root":  recipes.CompileTargetRoot,
-	} {
-		if got, err := parseCompileTarget(input); err != nil || got != want {
-			t.Fatalf("target %q = %q, %v; want %q", input, got, err, want)
-		}
-	}
-	if _, err := parseCompileTarget("automatic"); err == nil {
-		t.Fatal("invalid compile target accepted")
-	}
 	if got := strings.Join(stringItemsLocal([]any{"codex", "gemini"}), ","); got != "codex,gemini" {
 		t.Fatalf("stringItemsLocal = %q", got)
 	}
 }
 
-func TestBackendsStatusJSONRunsOnlyVersionProbesByDefault(t *testing.T) {
+func TestDoctorJSONRetainsBackendReadinessByDefault(t *testing.T) {
 	dir := t.TempDir()
 	logPath := filepath.Join(dir, "backends.log")
 	t.Setenv("BACKENDS_TEST_LOG", logPath)
@@ -107,12 +93,17 @@ esac`)
 	t.Setenv("PATH", dir)
 
 	oldArgs := os.Args
-	os.Args = []string{"convo-relay", "backends", "status", "--json"}
+	os.Args = []string{"convo-relay", "doctor", "--json"}
 	defer func() { os.Args = oldArgs }()
 	output := captureStdout(t, main)
-	report := decodeJSONObject(t, output)
-	if report["scope"] != "backends" || report["probe_auth"] != false {
-		t.Fatalf("backend report metadata = %#v", report)
+	doctor := decodeJSONObject(t, output)
+	health, ok := doctor["health"].(map[string]any)
+	if !ok || health["scope"] != "global" {
+		t.Fatalf("doctor health report = %#v", doctor["health"])
+	}
+	report, ok := doctor["backends"].(map[string]any)
+	if !ok || report["scope"] != "backends" || report["probe_auth"] != false {
+		t.Fatalf("doctor backend report metadata = %#v", doctor["backends"])
 	}
 	backends, ok := report["backends"].([]any)
 	if !ok || len(backends) != 4 {
@@ -135,7 +126,7 @@ esac`)
 	assertBackendProbeLog(t, logPath, []string{"claude:--version", "codex:--version", "gemini:--version"})
 }
 
-func TestCapabilitiesJSONMatchesRegistryWithoutProviderProbes(t *testing.T) {
+func TestVersionJSONReportsFlatFormatsWithoutProviderProbes(t *testing.T) {
 	dir := t.TempDir()
 	logPath := filepath.Join(dir, "provider.log")
 	t.Setenv("BACKENDS_TEST_LOG", logPath)
@@ -145,47 +136,31 @@ func TestCapabilitiesJSONMatchesRegistryWithoutProviderProbes(t *testing.T) {
 	t.Setenv("PATH", dir)
 
 	oldArgs := os.Args
-	os.Args = []string{"convo-relay", "capabilities", "--json"}
+	os.Args = []string{"convo-relay", "version", "--json"}
 	defer func() { os.Args = oldArgs }()
 	output := captureStdout(t, main)
+	registry := contracts.PublicVersionRegistry()
+	formats := map[string]any{}
+	for _, format := range registry.NumericContracts() {
+		formats[format] = registry.Numeric(format)
+	}
+	for _, format := range registry.StringContracts() {
+		formats[format] = registry.Strings(format)
+	}
 	want := map[string]any{
-		"schema_version":      contracts.CapabilitiesV1,
-		"convo_relay_version": cliVersion,
-		"build_platform":      map[string]any{"goos": runtime.GOOS, "goarch": runtime.GOARCH},
-		"contracts": map[string]any{
-			"recipe":                        []int{1, 2},
-			"root_recipe_plan":              []int{1, 2},
-			"integration_bundle":            []string{contracts.IntegrationBundleV1, contracts.IntegrationBundleV2},
-			"selected_integration_contract": []int{1, 2},
-			"root_artifact":                 []int{1, 2},
-			"execution_workspace":           []int{1, 2},
-			"root_session_result":           []int{1, 2},
-		},
-		"prompt_policy":             []string{contracts.PromptPolicyV1, contracts.PromptPolicyV2},
-		"prompt_context_projection": []string{contracts.PromptContextProjectionV1},
-		"provider_retry_policy":     []string{contracts.ProviderRetryPolicyV1},
-		"provider_invocation":       []string{contracts.ProviderInvocationV2},
-		"rendered_prompt":           []string{contracts.RenderedPromptV1},
-		"portable_export":           []string{contracts.PortableExportV2},
-		"digest_profile":            []string{contracts.DigestProfileV1},
-		"workspace_mechanisms":      []string{"inherited", "detached_writable_git_worktree"},
-		"isolation_report":          []string{contracts.WorkspaceIsolationReportV1},
+		"version": cliVersion,
+		"formats": formats,
 	}
 	wantBody, err := json.MarshalIndent(want, "", "  ")
 	if err != nil || output != string(wantBody)+"\n" {
-		t.Fatalf("capabilities output = %s, want %s, marshal error %v", output, wantBody, err)
+		t.Fatalf("version output = %s, want %s, marshal error %v", output, wantBody, err)
 	}
 	if _, err := os.Stat(logPath); !os.IsNotExist(err) {
-		t.Fatalf("capabilities probed a provider: %v", err)
-	}
-	_, err = contracts.BuildCapabilityAdvertisement(cliVersion, runtime.GOOS, runtime.GOARCH, "relay-capabilities-v2")
-	var diagnosticErr *contracts.DiagnosticError
-	if !errors.As(err, &diagnosticErr) || diagnosticErr.Diagnostics[0].Code != contracts.DiagnosticCodeUnsupportedContractVersion {
-		t.Fatalf("unsupported schema error = %T %v", err, err)
+		t.Fatalf("version probed a provider: %v", err)
 	}
 }
 
-func TestVerifyExportJSONReportsPortableV2(t *testing.T) {
+func TestExportVerifyJSONReportsPortableV2(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "portable")
 	payloads := []struct {
 		kind  string
@@ -243,26 +218,26 @@ func TestVerifyExportJSONReportsPortableV2(t *testing.T) {
 	}
 
 	oldArgs := os.Args
-	os.Args = []string{"convo-relay", "verify-export", dir, "--json"}
+	os.Args = []string{"convo-relay", "export", "verify", dir, "--json"}
 	defer func() { os.Args = oldArgs }()
 	output := captureStdout(t, main)
 	var report map[string]any
 	if err := json.Unmarshal([]byte(output), &report); err != nil {
-		t.Fatalf("decode verify-export output %q: %v", output, err)
+		t.Fatalf("decode export verify output %q: %v", output, err)
 	}
 	if report["status"] != "valid" || report["schema_version"] != contracts.PortableExportV2 {
-		t.Fatalf("verify-export report = %#v", report)
+		t.Fatalf("export verify report = %#v", report)
 	}
 }
 
-func TestVerifyExportJSONFailureIsMachineReadable(t *testing.T) {
+func TestExportVerifyJSONFailureIsMachineReadable(t *testing.T) {
 	binary := filepath.Join(t.TempDir(), "convo-relay")
 	build := exec.Command("go", "build", "-o", binary, ".")
 	if output, err := build.CombinedOutput(); err != nil {
 		t.Fatalf("build CLI: %v\n%s", err, output)
 	}
 
-	command := exec.Command(binary, "verify-export", t.TempDir(), "--json")
+	command := exec.Command(binary, "export", "verify", t.TempDir(), "--json")
 	var stdout bytes.Buffer
 	var stderr bytes.Buffer
 	command.Stdout = &stdout
@@ -270,18 +245,18 @@ func TestVerifyExportJSONFailureIsMachineReadable(t *testing.T) {
 	err := command.Run()
 	var exitErr *exec.ExitError
 	if !errors.As(err, &exitErr) || exitErr.ExitCode() != 1 {
-		t.Fatalf("verify-export invalid exit = %v, stdout=%q, stderr=%q", err, stdout.String(), stderr.String())
+		t.Fatalf("export verify invalid exit = %v, stdout=%q, stderr=%q", err, stdout.String(), stderr.String())
 	}
 	if stderr.Len() != 0 {
-		t.Fatalf("verify-export invalid stderr = %q", stderr.String())
+		t.Fatalf("export verify invalid stderr = %q", stderr.String())
 	}
 	report := decodeJSONObject(t, stdout.String())
 	if report["schema_version"] != contracts.PortableExportV2 || report["status"] != "invalid" || strings.TrimSpace(stringValue(report["error"])) == "" {
-		t.Fatalf("verify-export invalid report = %#v", report)
+		t.Fatalf("export verify invalid report = %#v", report)
 	}
 }
 
-func TestBackendsStatusProbeAuthHumanOutput(t *testing.T) {
+func TestDoctorProbeAuthHumanOutput(t *testing.T) {
 	dir := t.TempDir()
 	logPath := filepath.Join(dir, "backends.log")
 	t.Setenv("BACKENDS_TEST_LOG", logPath)
@@ -305,9 +280,9 @@ esac`)
 	t.Setenv("PATH", dir)
 
 	output := captureStdout(t, func() {
-		runBackends([]string{"status", "--probe-auth"})
+		runDoctor([]string{"--probe-auth"})
 	})
-	for _, expected := range []string{"Backend readiness:", "claude  ready", "codex   auth_failed", "gemini  unsupported_probe", "relay   ready", "auth=unauthenticated", "auth=unsupported"} {
+	for _, expected := range []string{"Health:", "Backend readiness:", "claude  ready", "codex   auth_failed", "gemini  unsupported_probe", "relay   ready", "auth=unauthenticated", "auth=unsupported"} {
 		if !strings.Contains(output, expected) {
 			t.Fatalf("human backend output missing %q:\n%s", expected, output)
 		}
@@ -354,8 +329,8 @@ auto_approval = "auto-safe"
 `
 	withStdin(t, generatedTOML, func() {
 		output := captureStdout(t, func() {
-			runCompileRecipe([]string{
-				"--recipe", "gen-cli-review",
+			runRecipesCompile([]string{
+				"gen-cli-review",
 				"--settings", filepath.Join(t.TempDir(), "missing.toml"),
 				"--generated-recipe-file", "-",
 				"--json",
@@ -390,8 +365,8 @@ auto_approval = "auto-safe"
 		t.Fatalf("write ordinary recipe file: %v", err)
 	}
 	output := captureStdout(t, func() {
-		runCompileRecipe([]string{
-			"--recipe", "cli-review",
+		runRecipesCompile([]string{
+			"cli-review",
 			"--settings", filepath.Join(t.TempDir(), "missing.toml"),
 			"--recipe-file", recipePath,
 			"--json",
@@ -1198,143 +1173,6 @@ func TestWriteExportOutputWritesMarkdownAndJSON(t *testing.T) {
 	}
 }
 
-func TestDisplayOutputPaths(t *testing.T) {
-	htmlPath, pdfPath, openPath := displayOutputPaths("/tmp/session", "", true)
-	if htmlPath != "/tmp/session/transcript.html" || pdfPath != "" || openPath != htmlPath {
-		t.Fatalf("html paths = %q, %q, %q", htmlPath, pdfPath, openPath)
-	}
-
-	htmlPath, pdfPath, openPath = displayOutputPaths("/tmp/session", "/tmp/out.pdf", false)
-	if htmlPath != "/tmp/session/transcript.html" || pdfPath != "/tmp/out.pdf" || openPath != pdfPath {
-		t.Fatalf("pdf paths = %q, %q, %q", htmlPath, pdfPath, openPath)
-	}
-}
-
-func TestWriteDisplayPDFUsesHelperAndCleansFailedOutput(t *testing.T) {
-	tempDir := t.TempDir()
-	successHelper := filepath.Join(tempDir, "pdf-helper")
-	successScript := "#!/bin/sh\n" +
-		"test -f \"$1\" || exit 3\n" +
-		"mkdir -p \"$(dirname \"$2\")\"\n" +
-		"printf 'pdf:%s' \"$(cat \"$1\")\" > \"$2\"\n"
-	if err := os.WriteFile(successHelper, []byte(successScript), 0o755); err != nil {
-		t.Fatalf("write success helper: %v", err)
-	}
-	htmlPath := filepath.Join(tempDir, "session", "transcript.html")
-	pdfPath := filepath.Join(tempDir, "session", "transcript.pdf")
-	if err := writeDisplayPDF("<html>ok</html>", htmlPath, pdfPath, successHelper); err != nil {
-		t.Fatalf("write display pdf: %v", err)
-	}
-	if data, err := os.ReadFile(htmlPath); err != nil || string(data) != "<html>ok</html>" {
-		t.Fatalf("html data = %q, err = %v", data, err)
-	}
-	if data, err := os.ReadFile(pdfPath); err != nil || string(data) != "pdf:<html>ok</html>" {
-		t.Fatalf("pdf data = %q, err = %v", data, err)
-	}
-
-	failHelper := filepath.Join(tempDir, "failing-helper")
-	failScript := "#!/bin/sh\nprintf partial > \"$2\"\necho helper unavailable >&2\nexit 7\n"
-	if err := os.WriteFile(failHelper, []byte(failScript), 0o755); err != nil {
-		t.Fatalf("write failing helper: %v", err)
-	}
-	failedHTML := filepath.Join(tempDir, "failed", "transcript.html")
-	failedPDF := filepath.Join(tempDir, "failed", "transcript.pdf")
-	err := writeDisplayPDF("<html>fail</html>", failedHTML, failedPDF, failHelper)
-	if err == nil || !strings.Contains(err.Error(), "helper unavailable") {
-		t.Fatalf("failing helper err = %v", err)
-	}
-	if _, err := os.Stat(failedHTML); !os.IsNotExist(err) {
-		t.Fatalf("failed html should not exist, err = %v", err)
-	}
-	if _, err := os.Stat(failedPDF); !os.IsNotExist(err) {
-		t.Fatalf("failed pdf should be removed, err = %v", err)
-	}
-}
-
-func TestResolveDisplayPDFHelperEnvMissingIsClear(t *testing.T) {
-	t.Setenv(displayPDFHelperEnv, filepath.Join(t.TempDir(), "missing-helper.py"))
-	_, err := resolveDisplayPDFHelper()
-	if err == nil || !strings.Contains(err.Error(), displayPDFHelperEnv) {
-		t.Fatalf("helper error = %v", err)
-	}
-}
-
-func TestResolveDisplayPDFHelperDefaultMissingIsClear(t *testing.T) {
-	_, err := resolveDisplayPDFHelperFromCandidates([]string{filepath.Join(t.TempDir(), "scripts", "render_display_pdf.py")})
-	if err == nil ||
-		!strings.Contains(err.Error(), "scripts/render_display_pdf.py") ||
-		!strings.Contains(err.Error(), "Playwright") ||
-		!strings.Contains(err.Error(), "--html-only") {
-		t.Fatalf("helper error = %v", err)
-	}
-}
-
-func TestResolveDisplayPDFHelperUsesSourceAndInstalledCandidates(t *testing.T) {
-	tempDir := t.TempDir()
-	sourceHelper := filepath.Join(tempDir, "scripts", "render_display_pdf.py")
-	if err := os.MkdirAll(filepath.Dir(sourceHelper), 0o755); err != nil {
-		t.Fatalf("mkdir source helper: %v", err)
-	}
-	if err := os.WriteFile(sourceHelper, []byte("#!/bin/sh\n"), 0o755); err != nil {
-		t.Fatalf("write source helper: %v", err)
-	}
-	resolved, err := resolveDisplayPDFHelperFromCandidates([]string{sourceHelper})
-	if err != nil || resolved != sourceHelper {
-		t.Fatalf("source helper resolved = %q, err = %v", resolved, err)
-	}
-
-	executable := filepath.Join(tempDir, "pkg", "bin", "convo-relay")
-	installedHelper := filepath.Join(filepath.Dir(executable), "..", "share", installedShareDir, "scripts", "render_display_pdf.py")
-	if err := os.MkdirAll(filepath.Dir(installedHelper), 0o755); err != nil {
-		t.Fatalf("mkdir installed helper: %v", err)
-	}
-	if err := os.WriteFile(installedHelper, []byte("#!/bin/sh\n"), 0o755); err != nil {
-		t.Fatalf("write installed helper: %v", err)
-	}
-	resolved, err = resolveDisplayPDFHelperFromCandidates(displayPDFHelperCandidatesForExecutable(executable))
-	if err != nil || resolved != installedHelper {
-		t.Fatalf("installed helper resolved = %q, err = %v", resolved, err)
-	}
-}
-
-func TestInstalledAssetDiscoveryCandidates(t *testing.T) {
-	executable := filepath.Join(t.TempDir(), "bin", "convo-relay")
-
-	pdfCandidates := displayPDFHelperCandidatesForExecutable(executable)
-	expectedPDF := filepath.Join(filepath.Dir(executable), "..", "share", installedShareDir, "scripts", "render_display_pdf.py")
-	if !containsPath(pdfCandidates, expectedPDF) {
-		t.Fatalf("PDF helper candidates = %#v, want %q", pdfCandidates, expectedPDF)
-	}
-
-	skillCandidates := skillBundleCandidatesForExecutable(executable)
-	expectedSkill := filepath.Join(filepath.Dir(executable), "..", "share", installedShareDir, "skill")
-	if !containsPath(skillCandidates, expectedSkill) {
-		t.Fatalf("skill candidates = %#v, want %q", skillCandidates, expectedSkill)
-	}
-}
-
-func containsPath(paths []string, target string) bool {
-	for _, path := range paths {
-		if path == target {
-			return true
-		}
-	}
-	return false
-}
-
-func TestPDFHelperDoesNotImportRelayOrchestration(t *testing.T) {
-	data, err := os.ReadFile(filepath.Join("..", "..", "scripts", "render_display_pdf.py"))
-	if err != nil {
-		t.Fatalf("read helper: %v", err)
-	}
-	text := string(data)
-	for _, forbidden := range []string{"\nimport relay", "\nfrom relay", "\nimport convo_relay", "\nfrom convo_relay", "\nimport display", "\nfrom display"} {
-		if strings.Contains(text, forbidden) {
-			t.Fatalf("pdf helper imports orchestration boundary %q", forbidden)
-		}
-	}
-}
-
 func captureStdout(t *testing.T, fn func()) string {
 	t.Helper()
 	oldStdout := os.Stdout
@@ -1398,68 +1236,4 @@ func runCLITestGit(t *testing.T, root string, args ...string) string {
 		t.Fatalf("git %s: %v\n%s", strings.Join(args, " "), err, output)
 	}
 	return strings.TrimSpace(string(output))
-}
-
-func TestDelegatedInstallSkillsPlanUsesInstallRoot(t *testing.T) {
-	stage := filepath.Join(t.TempDir(), "stage")
-	result, err := delegatedInstallSkillsResult("plan", "all", stage, false)
-	if err != nil {
-		t.Fatalf("install skills plan: %v", err)
-	}
-	if result.Operation != "plan" || result.Name != "convo-relay" || result.Kind != "delegated" {
-		t.Fatalf("unexpected result metadata: %#v", result)
-	}
-	claude := result.Targets["claude"].Files
-	codex := result.Targets["codex"].Files
-	tools := result.Targets["tools"].Files
-	if len(claude) != 2 || len(codex) != 2 {
-		t.Fatalf("target files claude=%#v codex=%#v", claude, codex)
-	}
-	if len(tools) < 6 {
-		t.Fatalf("tools target should include binary and bundled assets: %#v", tools)
-	}
-	if !strings.Contains(claude[0].Path, filepath.Join("stage", ".claude", "skills")) {
-		t.Fatalf("claude install path does not use stage root: %#v", claude)
-	}
-	if !strings.Contains(codex[0].Path, filepath.Join("stage", ".codex", "skills")) {
-		t.Fatalf("codex install path does not use stage root: %#v", codex)
-	}
-	if !strings.Contains(tools[0].Path, filepath.Join("stage", ".local", "bin", "convo-relay")) {
-		t.Fatalf("tools binary path does not use stage root: %#v", tools)
-	}
-	if claude[0].SHA256 != "" || codex[0].SHA256 != "" || tools[0].SHA256 != "" {
-		t.Fatalf("plan should not hash missing destination files: claude=%#v codex=%#v tools=%#v", claude, codex, tools)
-	}
-}
-
-func TestDelegatedInstallSkillsCopiesAndHashes(t *testing.T) {
-	stage := filepath.Join(t.TempDir(), "stage")
-	result, err := delegatedInstallSkillsResult("install", "codex", stage, true)
-	if err != nil {
-		t.Fatalf("install codex skills: %v", err)
-	}
-	toolFiles := result.Targets["tools"].Files
-	if len(toolFiles) < 6 {
-		t.Fatalf("tools files = %#v", toolFiles)
-	}
-	if _, err := os.Stat(filepath.Join(stage, ".local", "bin", "convo-relay")); err != nil {
-		t.Fatalf("installed convo-relay tool: %v", err)
-	}
-	for _, file := range toolFiles {
-		if len(file.SHA256) != 64 || strings.HasPrefix(file.SHA256, "sha256:") {
-			t.Fatalf("missing tool sha for %s: %#v", file.Path, file)
-		}
-	}
-	files := result.Targets["codex"].Files
-	if len(files) != 2 {
-		t.Fatalf("codex files = %#v", files)
-	}
-	for _, file := range files {
-		if _, err := os.Stat(file.Path); err != nil {
-			t.Fatalf("installed file %s: %v", file.Path, err)
-		}
-		if len(file.SHA256) != 64 || strings.HasPrefix(file.SHA256, "sha256:") {
-			t.Fatalf("missing sha for %s: %#v", file.Path, file)
-		}
-	}
 }

@@ -121,25 +121,24 @@ Report completed rounds, session status, latest turn summary, ledger counts, and
 
 Status handling should be practical and non-refusal-shaped: perform the requested status check, wait for the active command handle, or state the current known session ID and what command can be run externally.
 
-### Graph and contract inspection
+### Graph and portable export inspection
 
-Use the transcript commands for ordinary status and summaries. Use graph/contract commands only when the user asks to inspect execution internals, child relay artifacts, portable contracts, or debug state:
+Use the transcript commands for ordinary status and summaries. Use graph or portable-export commands only when the user asks to inspect execution internals, child relay artifacts, a portable export, or debug state:
 
 ```bash
 convo-relay show <session-id> --graph --json
-convo-relay contracts <session-id>
-convo-relay contracts <session-id> --json
-convo-relay contracts <session-id> --ref <artifact-ref-id> --digest sha256:...
+convo-relay export create <session-id> --portable -o <bundle-directory> --json
+convo-relay export verify <bundle-directory> --json
 ```
 
-`show --graph --json` returns raw v1 `session_event` objects with `event_type`, `timestamp`, and `payload`; do not expect legacy flattened `type` or `ts` fields. Public artifact values are `artifact_ref` objects with `id` and `digest`, not filesystem path strings. Use `contracts` to verify strict v1 event validation, artifact index entries, relay-backend child contract bundles, dynamic child contract bundles, and whether recipe/compiled-plan/invocation/result refs load and digest-check.
+`show --graph --json` returns raw v1 `session_event` objects with `event_type`, `timestamp`, and `payload`; do not expect legacy flattened `type` or `ts` fields. Public artifact values are `artifact_ref` objects with `id` and `digest`, not filesystem path strings. Use `export verify` to validate a portable export directory and its manifest.
 
 ### Status interpretation
 
 - If the relay is still running with no completed rounds yet, say that the opening turn is still in progress rather than speculating that the relay is stuck.
 - Never say you cannot summarize until the relay finishes. Summarize what is known, label what is pending.
 - Long silent periods are normal. One backend may think for minutes before the transcript changes.
-- Do not kill or restart a relay just because the first turn is taking several minutes.
+- Do not cancel or restart a relay just because the first turn is taking several minutes.
 - `started: false`, empty transcript, or missing session subdirectories are **not** sufficient evidence of failure while the relay process is still alive.
 
 ## Step 5: Present results
@@ -189,10 +188,10 @@ Treat resume exactly like a fresh long-running relay:
 If the user wants to steer a relay that is already running, queue the direction instead of restarting:
 
 ```bash
-convo-relay steer <session-id> "<new direction>"
+convo-relay control steer <session-id> "<new direction>"
 ```
 
-If the user asks to stop a running relay, use `convo-relay stop <session-id>`. Use `convo-relay kill <session-id>` only when they explicitly want a force kill.
+If the user asks to stop a running relay, use `convo-relay control cancel <session-id>`. Add `--force` only when they explicitly want a force cancellation.
 
 ## Error handling
 
