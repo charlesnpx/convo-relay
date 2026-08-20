@@ -213,12 +213,7 @@ func RejectChild(ctx context.Context, sess *session.Session, requestID string) e
 	if err != nil {
 		return err
 	}
-	return runner.append(eventlog.ChildDecidedPayload{
-		RequestID:   child.Request.RequestID,
-		Admitted:    false,
-		Reason:      "rejected by operator",
-		BudgetState: "rejected",
-	})
+	return runner.rejectChild(child, "rejected by operator", "rejected")
 }
 
 func checkResumeLifecycle(sess *session.Session, prompt string) error {
@@ -917,6 +912,17 @@ func (r *runner) serviceActiveTurn() error {
 		return nil
 	}
 	if success := turn.latest("success"); success != nil {
+		actor, err := r.actor(turn.ActorID)
+		if err != nil {
+			return err
+		}
+		content, err := r.readBlob(success.Content)
+		if err != nil {
+			return err
+		}
+		if err := r.persistChildRequests(turn, actor, provider.TurnResult{Content: content}); err != nil {
+			return err
+		}
 		return r.finishActiveTurn(turn, success)
 	}
 	if failed := turn.latest("failed"); failed != nil {
@@ -1147,40 +1153,20 @@ func (r *runner) decideChild(child *childState) error {
 	case "allow":
 		return r.admitChild(child, "admitted by child policy")
 	default:
-		return r.append(eventlog.ChildDecidedPayload{
-			RequestID:   child.Request.RequestID,
-			Admitted:    false,
-			Reason:      "child policy denies child plans",
-			BudgetState: "not_admitted",
-		})
+		return r.rejectChild(child, "child policy denies child plans", "not_admitted")
 	}
 }
 
 func (r *runner) admitChild(child *childState, reason string) error {
 	if r.state.childrenUsed >= r.sess.Plan.ChildPolicy.MaxChildren {
-		return r.append(eventlog.ChildDecidedPayload{
-			RequestID:   child.Request.RequestID,
-			Admitted:    false,
-			Reason:      "child capacity exhausted",
-			BudgetState: "children_exhausted",
-		})
+		return r.rejectChild(child, "child capacity exhausted", "children_exhausted")
 	}
 	childPlan, err := r.childPlanFor(child)
 	if err != nil {
-		return r.append(eventlog.ChildDecidedPayload{
-			RequestID:   child.Request.RequestID,
-			Admitted:    false,
-			Reason:      provider.SanitizeProviderFailureDetail(err.Error()),
-			BudgetState: "rejected",
-		})
+		return r.rejectChild(child, provider.SanitizeProviderFailureDetail(err.Error()), "rejected")
 	}
 	if r.state.childTurns+childPlan.Schedule.Turns > r.sess.Plan.ChildPolicy.MaxTurns {
-		return r.append(eventlog.ChildDecidedPayload{
-			RequestID:   child.Request.RequestID,
-			Admitted:    false,
-			Reason:      "child turn budget exhausted",
-			BudgetState: "turns_exhausted",
-		})
+		return r.rejectChild(child, "child turn budget exhausted", "turns_exhausted")
 	}
 	planRef, err := r.persistAdmittedChildPlan(childPlan)
 	if err != nil {
@@ -1192,6 +1178,15 @@ func (r *runner) admitChild(child *childState, reason string) error {
 		Reason:      reason,
 		BudgetState: "available",
 		Plan:        &planRef,
+	})
+}
+
+func (r *runner) rejectChild(child *childState, reason, budgetState string) error {
+	return r.append(eventlog.ChildDecidedPayload{
+		RequestID:   child.Request.RequestID,
+		Admitted:    false,
+		Reason:      reason,
+		BudgetState: budgetState,
 	})
 }
 
