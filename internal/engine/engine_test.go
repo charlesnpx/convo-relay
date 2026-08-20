@@ -448,6 +448,56 @@ func TestResumeServicesDueFacilitatorBeforeNextParticipant(t *testing.T) {
 	}
 }
 
+func TestResumeRejectsTurnBudgetGrantWithDueFacilitatorWithoutMutatingLog(t *testing.T) {
+	plan := dialoguePlan(2)
+	plan.Actors = append(plan.Actors, session.Actor{ID: "facilitator", Backend: "codex"})
+	plan.Facilitator = &session.Facilitator{Actor: "facilitator", Cadence: 1}
+	sess := createSession(t, plan)
+	seedLog(t, sess, func(store *blobstore.Store, writer *eventlog.Writer) {
+		content := putSeedText(t, store, "first participant")
+		appendEvent(t, writer, eventlog.TurnStartedPayload{ActorID: "alpha", Round: 1, Role: eventlog.ParticipantRole})
+		appendEvent(t, writer, eventlog.AttemptStartedPayload{ActorID: "alpha", Attempt: 1})
+		appendEvent(t, writer, eventlog.AttemptFinishedPayload{ActorID: "alpha", Attempt: 1, Outcome: "success", Content: content})
+		appendEvent(t, writer, eventlog.TurnFinishedPayload{ActorID: "alpha", Round: 1, Content: content})
+	})
+	callOrder := []string{}
+	beta := &fakeBackend{name: "codex", slotID: "beta", calls: &callOrder, responses: []fakeResponse{{content: "second participant"}}}
+	facilitator := &fakeBackend{name: "codex", slotID: "facilitator", calls: &callOrder, responses: []fakeResponse{
+		{content: `{"settled":[],"contested":[],"withdrawn":[]}`},
+		{content: `{"settled":[],"contested":[],"withdrawn":[]}`},
+	}}
+	deps := testDeps(map[string]*fakeBackend{
+		"alpha":       {name: "codex", slotID: "alpha"},
+		"beta":        beta,
+		"facilitator": facilitator,
+	})
+	eventsPath := filepath.Join(sess.Root, eventlog.EventsFilename)
+	before, err := os.ReadFile(eventsPath)
+	if err != nil {
+		t.Fatalf("read events before rejected due-facilitator grant: %v", err)
+	}
+	if _, err := Resume(context.Background(), sess, deps, "do not append this steering", 1); err == nil || !strings.Contains(err.Error(), "scheduled work is outstanding") {
+		t.Fatalf("due-facilitator grant error = %v", err)
+	}
+	after, err := os.ReadFile(eventsPath)
+	if err != nil {
+		t.Fatalf("read events after rejected due-facilitator grant: %v", err)
+	}
+	if !bytes.Equal(before, after) {
+		t.Fatal("rejected due-facilitator grant changed events.jsonl")
+	}
+	if len(callOrder) != 0 {
+		t.Fatalf("rejected due-facilitator grant called providers %v", callOrder)
+	}
+
+	if _, err := Resume(context.Background(), sess, deps, "", 0); err != nil {
+		t.Fatalf("Resume after rejected due-facilitator grant: %v", err)
+	}
+	if want := []string{"facilitator", "beta", "facilitator"}; !reflect.DeepEqual(callOrder, want) {
+		t.Fatalf("call order = %v, want %v", callOrder, want)
+	}
+}
+
 func TestResumeRebuildsChildBudgets(t *testing.T) {
 	parent := dialoguePlan(2)
 	parent.ChildPolicy = session.ChildPolicy{Mode: "allow", MaxDepth: 1, MaxChildren: 1, MaxTurns: 1, AllowedRecipes: []string{"child"}}
@@ -953,7 +1003,7 @@ func TestResumeRejectsTurnBudgetGrantForActiveParticipantWithoutMutatingLog(t *t
 	alpha := &fakeBackend{name: "codex", slotID: "alpha", responses: []fakeResponse{{content: "must not run"}}}
 	beta := &fakeBackend{name: "codex", slotID: "beta", responses: []fakeResponse{{content: "must not run"}}}
 
-	if _, err := Resume(context.Background(), sess, testDeps(map[string]*fakeBackend{"alpha": alpha, "beta": beta}), "do not append this steering", 1); err == nil || !strings.Contains(err.Error(), "turn is active") {
+	if _, err := Resume(context.Background(), sess, testDeps(map[string]*fakeBackend{"alpha": alpha, "beta": beta}), "do not append this steering", 1); err == nil || !strings.Contains(err.Error(), "scheduled work is outstanding") {
 		t.Fatalf("active participant grant error = %v", err)
 	}
 	after, err := os.ReadFile(eventsPath)
@@ -965,48 +1015,6 @@ func TestResumeRejectsTurnBudgetGrantForActiveParticipantWithoutMutatingLog(t *t
 	}
 	if len(alpha.prompts) != 0 || len(beta.prompts) != 0 {
 		t.Fatalf("active participant grant called providers alpha=%d beta=%d", len(alpha.prompts), len(beta.prompts))
-	}
-}
-
-func TestResumeRejectsTurnBudgetGrantForActiveReducerWithoutMutatingLog(t *testing.T) {
-	sess := createSession(t, sequencePlan())
-	seedLog(t, sess, func(store *blobstore.Store, writer *eventlog.Writer) {
-		first := putSeedText(t, store, "first participant")
-		second := putSeedText(t, store, "second participant")
-		reduced := putSeedText(t, store, "successful active reducer")
-		appendEvent(t, writer, eventlog.TurnStartedPayload{ActorID: "alpha", Round: 1, Role: eventlog.ParticipantRole})
-		appendEvent(t, writer, eventlog.AttemptStartedPayload{ActorID: "alpha", Attempt: 1})
-		appendEvent(t, writer, eventlog.AttemptFinishedPayload{ActorID: "alpha", Attempt: 1, Outcome: "success", Content: first})
-		appendEvent(t, writer, eventlog.TurnFinishedPayload{ActorID: "alpha", Round: 1, Content: first})
-		appendEvent(t, writer, eventlog.TurnStartedPayload{ActorID: "beta", Round: 2, Role: eventlog.ParticipantRole})
-		appendEvent(t, writer, eventlog.AttemptStartedPayload{ActorID: "beta", Attempt: 1})
-		appendEvent(t, writer, eventlog.AttemptFinishedPayload{ActorID: "beta", Attempt: 1, Outcome: "success", Content: second})
-		appendEvent(t, writer, eventlog.TurnFinishedPayload{ActorID: "beta", Round: 2, Content: second})
-		appendEvent(t, writer, eventlog.TurnStartedPayload{ActorID: "reducer", Round: 3, Role: eventlog.ReducerRole})
-		appendEvent(t, writer, eventlog.AttemptStartedPayload{ActorID: "reducer", Attempt: 1})
-		appendEvent(t, writer, eventlog.AttemptFinishedPayload{ActorID: "reducer", Attempt: 1, Outcome: "success", Content: reduced})
-	})
-	eventsPath := filepath.Join(sess.Root, eventlog.EventsFilename)
-	before, err := os.ReadFile(eventsPath)
-	if err != nil {
-		t.Fatalf("read events before rejected active reducer grant: %v", err)
-	}
-	alpha := &fakeBackend{name: "codex", slotID: "alpha", responses: []fakeResponse{{content: "must not run"}}}
-	beta := &fakeBackend{name: "codex", slotID: "beta", responses: []fakeResponse{{content: "must not run"}}}
-	reducer := &fakeBackend{name: "codex", slotID: "reducer", responses: []fakeResponse{{content: "must not run"}}}
-
-	if _, err := Resume(context.Background(), sess, testDeps(map[string]*fakeBackend{"alpha": alpha, "beta": beta, "reducer": reducer}), "do not append this steering", 1); err == nil || !strings.Contains(err.Error(), "turn is active") {
-		t.Fatalf("active reducer grant error = %v", err)
-	}
-	after, err := os.ReadFile(eventsPath)
-	if err != nil {
-		t.Fatalf("read events after rejected active reducer grant: %v", err)
-	}
-	if !bytes.Equal(before, after) {
-		t.Fatal("rejected active reducer grant changed events.jsonl")
-	}
-	if len(alpha.prompts) != 0 || len(beta.prompts) != 0 || len(reducer.prompts) != 0 {
-		t.Fatalf("active reducer grant called providers alpha=%d beta=%d reducer=%d", len(alpha.prompts), len(beta.prompts), len(reducer.prompts))
 	}
 }
 
@@ -1200,6 +1208,22 @@ func TestResumeCompletedSessionWithExtraTurnBudget(t *testing.T) {
 	if runner.state.grantedTurns != 1 || runner.effectiveTurnBudget() != 2 || sess.Plan.Schedule.Turns != 1 {
 		t.Fatalf("derived turn budget = grants %d effective %d plan %d", runner.state.grantedTurns, runner.effectiveTurnBudget(), sess.Plan.Schedule.Turns)
 	}
+	eventsPath := filepath.Join(sess.Root, eventlog.EventsFilename)
+	beforeTerminalResume, err := os.ReadFile(eventsPath)
+	if err != nil {
+		t.Fatalf("read events before terminal resume: %v", err)
+	}
+	recordedOutcome, err := Resume(context.Background(), sess, deps, "", 0)
+	if err != nil {
+		t.Fatalf("Resume recorded terminal: %v", err)
+	}
+	afterTerminalResume, err := os.ReadFile(eventsPath)
+	if err != nil {
+		t.Fatalf("read events after terminal resume: %v", err)
+	}
+	if recordedOutcome != outcome || !bytes.Equal(beforeTerminalResume, afterTerminalResume) {
+		t.Fatalf("terminal resume outcome=%#v events changed=%t", recordedOutcome, !bytes.Equal(beforeTerminalResume, afterTerminalResume))
+	}
 }
 
 func TestResumeAccumulatesSuccessiveTurnBudgetGrants(t *testing.T) {
@@ -1211,7 +1235,21 @@ func TestResumeAccumulatesSuccessiveTurnBudgetGrants(t *testing.T) {
 		t.Fatalf("Run: %v", err)
 	}
 	appendTurnBudgetGrant(t, sess, 1)
+	outcome, err := Resume(context.Background(), sess, deps, "", 0)
+	if err != nil {
+		t.Fatalf("Resume after first grant: %v", err)
+	}
+	if outcome.Status != statusCompleted || outcome.Result != "second reply" {
+		t.Fatalf("first grant outcome=%#v", outcome)
+	}
 	appendTurnBudgetGrant(t, sess, 1)
+	outcome, err = Resume(context.Background(), sess, deps, "", 0)
+	if err != nil {
+		t.Fatalf("Resume after second grant: %v", err)
+	}
+	if outcome.Status != statusCompleted || outcome.Result != "third reply" || countType(sessionEvents(t, sess), eventlog.TurnFinished) != 3 {
+		t.Fatalf("accumulated grant outcome=%#v events=%v", outcome, eventTypes(sessionEvents(t, sess)))
+	}
 	events := sessionEvents(t, sess)
 	runner, err := newStateRunner(sess)
 	if err != nil {
@@ -1220,16 +1258,8 @@ func TestResumeAccumulatesSuccessiveTurnBudgetGrants(t *testing.T) {
 	if err := runner.rebuildExecutionState(events); err != nil {
 		t.Fatalf("replay grants: %v", err)
 	}
-	if runner.state.terminal != nil || runner.state.grantedTurns != 2 || runner.effectiveTurnBudget() != 3 {
+	if runner.state.terminal == nil || runner.state.terminal.Status != statusCompleted || runner.state.grantedTurns != 2 || runner.effectiveTurnBudget() != 3 {
 		t.Fatalf("replayed grants terminal=%#v granted=%d effective=%d", runner.state.terminal, runner.state.grantedTurns, runner.effectiveTurnBudget())
-	}
-
-	outcome, err := Resume(context.Background(), sess, deps, "", 0)
-	if err != nil {
-		t.Fatalf("Resume after successive grants: %v", err)
-	}
-	if outcome.Status != statusCompleted || outcome.Result != "third reply" || countType(sessionEvents(t, sess), eventlog.TurnFinished) != 3 {
-		t.Fatalf("accumulated grant outcome=%#v events=%v", outcome, eventTypes(sessionEvents(t, sess)))
 	}
 }
 

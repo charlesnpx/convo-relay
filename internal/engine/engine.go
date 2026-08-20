@@ -137,11 +137,11 @@ func Resume(ctx context.Context, sess *session.Session, deps Deps, prompt string
 	if err := runner.rebuildExecutionState(events); err != nil {
 		return Outcome{}, err
 	}
-	if runner.state.terminal != nil && requestedTurns == 0 {
+	if runner.state.terminal != nil && !runner.hasUnstartedGrantedWork() && requestedTurns == 0 {
 		return runner.outcome(), nil
 	}
 	if requestedTurns > 0 {
-		if err := runner.preflightTurnBudgetGrant(requestedTurns); err != nil {
+		if err := runner.turnBudgetGrantApplicable(requestedTurns); err != nil {
 			return Outcome{}, err
 		}
 		if err := runner.append(eventlog.TurnBudgetGrantedPayload{GrantedBy: "operator", Turns: requestedTurns}); err != nil {
@@ -582,11 +582,15 @@ func (r *runner) reduceEvent(event eventlog.Event) error {
 	}
 	switch payload := event.Payload.(type) {
 	case eventlog.TurnStartedPayload:
-		if state.terminal != nil {
+		if state.terminal != nil && !r.hasUnstartedGrantedWork() {
 			return errors.New("turn.started follows session.finished")
 		}
 		if state.active != nil {
 			return errors.New("session has more than one unfinished turn")
+		}
+		if state.terminal != nil {
+			state.terminal = nil
+			state.resultValidation = ""
 		}
 		turn := &turnState{
 			ActorID:  payload.ActorID,
@@ -745,9 +749,6 @@ func (r *runner) reduceEvent(event eventlog.Event) error {
 		}
 		state.grantedTurns += payload.Turns
 		state.conversationAtGrant = len(state.conversation)
-		state.terminal = nil
-		state.resultValidation = ""
-		r.phaseAfterParticipants()
 		return nil
 	case eventlog.ResultProducedPayload:
 		if state.resultValidation != "" {
@@ -823,10 +824,6 @@ func (r *runner) effectiveTurnBudget() int {
 	return r.sess.Plan.Schedule.Turns + r.state.grantedTurns
 }
 
-func (r *runner) preflightTurnBudgetGrant(turns int) error {
-	return r.turnBudgetGrantApplicable(turns)
-}
-
 // turnBudgetGrantApplicable reports whether the current replayed execution
 // state can consume a turn-budget grant without reopening incompatible work.
 func (r *runner) turnBudgetGrantApplicable(turns int) error {
@@ -836,8 +833,11 @@ func (r *runner) turnBudgetGrantApplicable(turns int) error {
 	if r.state.terminal != nil && r.state.terminal.Status != statusCompleted {
 		return fmt.Errorf("cannot grant turns to a %s session; retry or fork it", r.state.terminal.Status)
 	}
-	if r.state.active != nil {
-		return errors.New("cannot grant turns while a turn is active")
+	if r.hasScheduledWorkOutstanding() {
+		return errors.New("cannot grant turns while scheduled work is outstanding")
+	}
+	if r.state.terminal == nil {
+		return errors.New("turn budget grants require a completed terminal session")
 	}
 	return nil
 }
@@ -848,9 +848,24 @@ func (r *runner) turnBudgetGrantExceedsIntegerRange(turns int) bool {
 
 func maximumInt() int { return int(^uint(0) >> 1) }
 
+// hasScheduledWorkOutstanding answers whether replay already left work due.
+// A terminal makes future participant turns non-due, but it cannot suppress a
+// facilitator or reducer phase that was already selected. Once a grant makes
+// a completed terminal historical, the effective budget determines whether a
+// participant turn is newly due.
+func (r *runner) hasScheduledWorkOutstanding() bool {
+	return r.state.active != nil || r.hasUnstartedGrantedWork() ||
+		r.state.phase == phaseFacilitator || r.state.phase == phaseReducer
+}
+
+func (r *runner) hasUnstartedGrantedWork() bool {
+	return r.state.terminal != nil && r.state.terminal.Status == statusCompleted &&
+		r.state.grantedTurns > 0 && len(r.state.conversation) == r.state.conversationAtGrant
+}
+
 func (r *runner) execute() (Outcome, error) {
 	for {
-		if r.state.terminal != nil {
+		if r.state.terminal != nil && !r.hasUnstartedGrantedWork() {
 			return r.outcome(), nil
 		}
 		if r.state.active != nil {
@@ -882,7 +897,7 @@ func (r *runner) execute() (Outcome, error) {
 		if reason != "" {
 			return r.finishSuccess(reason)
 		}
-		if r.state.phase == phaseDone {
+		if r.state.phase == phaseDone && !r.hasUnstartedGrantedWork() {
 			return r.finishSuccess(stopCompleted)
 		}
 		next, err := r.nextTurn()
@@ -902,7 +917,11 @@ type turnSpec struct {
 }
 
 func (r *runner) nextTurn() (turnSpec, error) {
-	switch r.state.phase {
+	phase := r.state.phase
+	if phase == phaseDone && r.hasUnstartedGrantedWork() {
+		phase = phaseParticipant
+	}
+	switch phase {
 	case phaseParticipant:
 		if len(r.state.conversation) >= r.effectiveTurnBudget() {
 			return turnSpec{}, errors.New("participant phase has no remaining turn")
