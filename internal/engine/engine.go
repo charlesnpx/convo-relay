@@ -740,8 +740,8 @@ func (r *runner) reduceEvent(event eventlog.Event) error {
 		}
 		return errors.New("steering.applied has no queued prompt")
 	case eventlog.TurnBudgetGrantedPayload:
-		if r.turnBudgetGrantExceedsIntegerRange(payload.Turns) {
-			return errors.New("turn budget grants exceed integer range")
+		if err := r.turnBudgetGrantApplicable(payload.Turns); err != nil {
+			return fmt.Errorf("turn_budget.granted is inapplicable: %w", err)
 		}
 		state.grantedTurns += payload.Turns
 		state.conversationAtGrant = len(state.conversation)
@@ -824,11 +824,20 @@ func (r *runner) effectiveTurnBudget() int {
 }
 
 func (r *runner) preflightTurnBudgetGrant(turns int) error {
+	return r.turnBudgetGrantApplicable(turns)
+}
+
+// turnBudgetGrantApplicable reports whether the current replayed execution
+// state can consume a turn-budget grant without reopening incompatible work.
+func (r *runner) turnBudgetGrantApplicable(turns int) error {
 	if r.turnBudgetGrantExceedsIntegerRange(turns) {
 		return errors.New("turn budget grants exceed integer range")
 	}
 	if r.state.terminal != nil && r.state.terminal.Status != statusCompleted {
 		return fmt.Errorf("cannot grant turns to a %s session; retry or fork it", r.state.terminal.Status)
+	}
+	if r.state.active != nil {
+		return errors.New("cannot grant turns while a turn is active")
 	}
 	return nil
 }

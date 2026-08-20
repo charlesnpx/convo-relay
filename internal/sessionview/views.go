@@ -54,12 +54,6 @@ func Status(_ session.Plan, events []eventlog.Event) StatusView {
 			view.Terminal = false
 			view.Status = "running"
 			view.StopReason = ""
-		case *eventlog.TurnBudgetGrantedPayload:
-			if payload != nil {
-				view.Terminal = false
-				view.Status = "running"
-				view.StopReason = ""
-			}
 		case eventlog.TurnStartedPayload:
 			view.Counts.TurnsStarted++
 			view.CurrentRound = max(view.CurrentRound, payload.Round)
