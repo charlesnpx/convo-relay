@@ -818,7 +818,8 @@ func (r *runner) execute() (Outcome, error) {
 			}
 			continue
 		}
-		if err := r.servicePendingChildren(); err != nil {
+		awaitingChild, err := r.servicePendingChildren()
+		if err != nil {
 			reason := stopProviderFailed
 			var failure *executionFailure
 			if errors.As(err, &failure) {
@@ -826,8 +827,10 @@ func (r *runner) execute() (Outcome, error) {
 			}
 			return r.finishFailure(reason, err)
 		}
-		if r.awaitingChildDecision() {
-			return r.outcome(), nil
+		if awaitingChild || r.awaitingChildDecision() {
+			outcome := r.outcome()
+			outcome.Status = statusAwaitingDecision
+			return outcome, nil
 		}
 		if reason := r.dialogueStopReason(); reason != "" {
 			return r.finishSuccess(reason)
@@ -1103,7 +1106,7 @@ func (r *runner) persistChildRequests(turn *turnState, actor session.Actor, resu
 	return nil
 }
 
-func (r *runner) servicePendingChildren() error {
+func (r *runner) servicePendingChildren() (bool, error) {
 	requestIDs := make([]string, 0, len(r.state.requests))
 	for requestID := range r.state.requests {
 		requestIDs = append(requestIDs, requestID)
@@ -1113,22 +1116,26 @@ func (r *runner) servicePendingChildren() error {
 		child := r.state.requests[requestID]
 		if !child.decided() {
 			if err := r.decideChild(child); err != nil {
-				return err
+				return false, err
 			}
 		}
 		if child.admitted() && !child.completed() {
-			if err := r.runChild(child); err != nil {
-				return err
+			awaitingDecision, err := r.runChild(child)
+			if err != nil {
+				return false, err
+			}
+			if awaitingDecision {
+				return true, nil
 			}
 		}
 		if child.completed() && child.Status == statusFailed {
-			return &executionFailure{
+			return false, &executionFailure{
 				reason: stopChildFailed,
 				cause:  fmt.Errorf("child request %q finished failed", child.Request.RequestID),
 			}
 		}
 	}
-	return nil
+	return false, nil
 }
 
 func (r *runner) decideChild(child *childState) error {
@@ -1141,7 +1148,7 @@ func (r *runner) decideChild(child *childState) error {
 		return r.append(eventlog.ChildDecidedPayload{
 			RequestID:   child.Request.RequestID,
 			Admitted:    false,
-			Reason:      childDecisionReason(r.sess.Plan.ChildPolicy.Mode),
+			Reason:      "child policy denies child plans",
 			BudgetState: "not_admitted",
 		})
 	}
@@ -1271,26 +1278,26 @@ func (r *runner) childSessionID(requestID string) string {
 	return r.sess.Plan.SessionID + "-child-" + requestID
 }
 
-func (r *runner) runChild(child *childState) error {
+func (r *runner) runChild(child *childState) (bool, error) {
 	childSession, err := r.openOrCreateChildSession(child)
 	if err != nil {
-		return err
+		return false, err
 	}
 	childDeps := r.deps
 	childDeps.Writer = nil
 	childEvents, err := readEvents(childSession.Root)
 	if err != nil {
-		return err
+		return false, err
 	}
 	var childOutcome Outcome
 	var childErr error
 	if len(childEvents) == 0 {
 		childBlobs, err := childSession.BlobStore(blobstore.Limits{})
 		if err != nil {
-			return err
+			return false, err
 		}
 		if err := copyPlanBlobs(r.blobs, childBlobs, session.BlobRefs(childSession.Plan)); err != nil {
-			return err
+			return false, err
 		}
 		childOutcome, childErr = Run(r.ctx, childSession, childDeps)
 	} else {
@@ -1306,6 +1313,8 @@ func (r *runner) runChild(child *childState) error {
 		if childErr == nil {
 			childErr = fmt.Errorf("child session %q finished failed", childSession.Plan.SessionID)
 		}
+	case statusAwaitingDecision:
+		return true, nil
 	default:
 		childStatus = statusFailed
 		childErr = fmt.Errorf("child session %q did not report a terminal status", childSession.Plan.SessionID)
@@ -1316,7 +1325,7 @@ func (r *runner) runChild(child *childState) error {
 	}
 	resultRef, err := r.blobs.PutBytes([]byte(resultText), mediaTypeChildResult)
 	if err != nil {
-		return err
+		return false, err
 	}
 	if err := r.append(eventlog.ChildCompletedPayload{
 		RequestID:      child.Request.RequestID,
@@ -1324,9 +1333,9 @@ func (r *runner) runChild(child *childState) error {
 		Result:         resultRef,
 		Status:         childStatus,
 	}); err != nil {
-		return err
+		return false, err
 	}
-	return childErr
+	return false, childErr
 }
 
 // openOrCreateChildSession reuses only a child root whose immutable plan binds
@@ -1374,17 +1383,6 @@ func (r *runner) openOrCreateChildSession(child *childState) (*session.Session, 
 		return found, nil
 	}
 	return session.Create(home, admittedPlan)
-}
-
-func childDecisionReason(mode string) string {
-	switch mode {
-	case "deny":
-		return "child policy denies child plans"
-	case "ask":
-		return "child request requires operator approval"
-	default:
-		return "child policy does not admit request"
-	}
 }
 
 func copyPlanBlobs(source *blobstore.Store, destination *blobstore.Store, refs []blobstore.BlobRef) error {

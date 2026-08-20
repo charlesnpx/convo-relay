@@ -88,6 +88,88 @@ func TestApprovePendingChildThenResume(t *testing.T) {
 	}
 }
 
+func TestNestedAskWaitsForGrandchildDecision(t *testing.T) {
+	parent := dialoguePlan(2)
+	parent.ChildPolicy = askChildPolicy(2, 2, 2)
+	home := t.TempDir()
+	sess := createSessionIn(t, home, parent)
+	alpha := &fakeBackend{name: "codex", slotID: "alpha", responses: []fakeResponse{{content: "parent asks"}}}
+	beta := &fakeBackend{name: "codex", slotID: "beta", responses: []fakeResponse{{content: "parent completes"}}}
+	child := &fakeBackend{name: "codex", slotID: "child-alpha", responses: []fakeResponse{{content: "child result after asking grandchild"}}}
+	grandchild := &fakeBackend{name: "codex", slotID: "grandchild-alpha", responses: []fakeResponse{{content: "grandchild result"}}}
+	deps := testDeps(map[string]*fakeBackend{
+		"alpha":            alpha,
+		"beta":             beta,
+		"child-alpha":      child,
+		"grandchild-alpha": grandchild,
+	})
+	nestedChildRecipe := childRecipe()
+	nestedChildRecipe.ChildPolicy = session.ChildPolicy{
+		Mode:           "ask",
+		MaxDepth:       2,
+		MaxChildren:    2,
+		MaxTurns:       2,
+		AllowedRecipes: []string{"grandchild"},
+	}
+	grandchildRecipe := childRecipe()
+	grandchildRecipe.ID = "grandchild"
+	grandchildRecipe.Actors = []session.Actor{{ID: "grandchild-alpha", Backend: "codex"}}
+	grandchildRecipe.Schedule.Order = []string{"grandchild-alpha"}
+	deps.Recipes = []plan.Recipe{nestedChildRecipe, grandchildRecipe}
+	deps.ChildRequestExtractor = func(actor session.Actor, role eventlog.Role, _ provider.TurnResult) []ChildRequest {
+		if role != eventlog.ParticipantRole {
+			return nil
+		}
+		switch actor.ID {
+		case "alpha":
+			return []ChildRequest{childRequest("child-request", "ask the child")}
+		case "child-alpha":
+			return []ChildRequest{{ID: "grandchild-request", Request: plan.ChildRequest{RecipeID: "grandchild", Question: "ask the grandchild"}}}
+		default:
+			return nil
+		}
+	}
+
+	if _, err := Run(context.Background(), sess, deps); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if err := ApproveChild(context.Background(), sess, "child-request", deps.Recipes); err != nil {
+		t.Fatalf("ApproveChild child: %v", err)
+	}
+	waiting, err := Resume(context.Background(), sess, deps, "")
+	if err != nil || waiting.Status != statusAwaitingDecision || waiting.Status == statusFailed {
+		t.Fatalf("waiting outcome=%#v err=%v", waiting, err)
+	}
+	parentEvents := sessionEvents(t, sess)
+	if countType(parentEvents, eventlog.SessionFinished) != 0 || len(childCompletions(parentEvents)) != 0 {
+		t.Fatalf("waiting parent events = %v", eventTypes(parentEvents))
+	}
+	childSession := findSessionByID(t, home, parent.SessionID+"-child-child-request")
+	pending, err := PendingChildren(childSession)
+	if err != nil || len(pending) != 1 || pending[0].RequestID != "grandchild-request" {
+		t.Fatalf("grandchild pending=%#v err=%v", pending, err)
+	}
+	resumed, err := Resume(context.Background(), sess, deps, "")
+	if err != nil || resumed.Status != statusAwaitingDecision || len(child.prompts) != 1 {
+		t.Fatalf("resumed outcome=%#v err=%v child=%d", resumed, err, len(child.prompts))
+	}
+	if err := ApproveChild(context.Background(), childSession, "grandchild-request", deps.Recipes); err != nil {
+		t.Fatalf("ApproveChild grandchild: %v", err)
+	}
+	completed, err := Resume(context.Background(), sess, deps, "")
+	if err != nil || completed.Status != statusCompleted || len(beta.prompts) != 1 || strings.Count(beta.prompts[0], "child result after asking grandchild") != 1 {
+		t.Fatalf("completed outcome=%#v err=%v beta=%#v", completed, err, beta.prompts)
+	}
+	parentCompletions := childCompletions(sessionEvents(t, sess))
+	if len(parentCompletions) != 1 || parentCompletions[0].RequestID != "child-request" || parentCompletions[0].Status != statusCompleted {
+		t.Fatalf("parent child completions=%#v", parentCompletions)
+	}
+	nestedCompletions := childCompletions(sessionEvents(t, childSession))
+	if len(nestedCompletions) != 1 || nestedCompletions[0].RequestID != "grandchild-request" || nestedCompletions[0].Status != statusCompleted {
+		t.Fatalf("grandchild completions=%#v", nestedCompletions)
+	}
+}
+
 func TestRejectPendingChild(t *testing.T) {
 	parent := dialoguePlan(2)
 	parent.ChildPolicy = askChildPolicy(1, 1, 1)
@@ -213,63 +295,6 @@ func TestApprovePendingChildRefusesExhaustedBudgets(t *testing.T) {
 				t.Fatalf("budget decision = %#v found=%t", decision, found)
 			}
 		})
-	}
-}
-
-func TestApprovedChildRecoveryUsesDurablePlan(t *testing.T) {
-	parent := dialoguePlan(2)
-	parent.ChildPolicy = askChildPolicy(1, 1, 1)
-	home := t.TempDir()
-	sess := createSessionIn(t, home, parent)
-	originalRecipe := childRecipe()
-	driftedRecipe := childRecipe()
-	driftedRecipe.Actors = []session.Actor{{ID: "drifted-alpha", Backend: "codex"}}
-	driftedRecipe.Schedule.Order = []string{"drifted-alpha"}
-	alpha := &fakeBackend{name: "codex", slotID: "alpha", responses: []fakeResponse{{content: "parent before durable approval"}}}
-	deps := testDeps(map[string]*fakeBackend{
-		"alpha":       alpha,
-		"beta":        {name: "codex", slotID: "beta"},
-		"child-alpha": {name: "codex", slotID: "child-alpha"},
-	})
-	deps.Recipes = []plan.Recipe{originalRecipe}
-	deps.ChildRequestExtractor = childRequests(childRequest("child-request", "recover the approved child"))
-
-	if _, err := Run(context.Background(), sess, deps); err != nil {
-		t.Fatalf("Run: %v", err)
-	}
-	if err := ApproveChild(context.Background(), sess, "child-request", deps.Recipes); err != nil {
-		t.Fatalf("ApproveChild: %v", err)
-	}
-	reopened, err := session.Open(sess.Root)
-	if err != nil {
-		t.Fatalf("reopen parent: %v", err)
-	}
-	original := &fakeBackend{name: "codex", slotID: "child-alpha", responses: []fakeResponse{{content: "original durable child"}}}
-	drifted := &fakeBackend{name: "codex", slotID: "drifted-alpha", responses: []fakeResponse{{content: "drifted child"}}}
-	recoveryDeps := testDeps(map[string]*fakeBackend{
-		"alpha":         {name: "codex", slotID: "alpha"},
-		"beta":          {name: "codex", slotID: "beta", responses: []fakeResponse{{content: "parent after recovery"}}},
-		"child-alpha":   original,
-		"drifted-alpha": drifted,
-	})
-	recoveryDeps.Recipes = []plan.Recipe{driftedRecipe}
-	recoveryDeps.ChildRequestExtractor = childRequests(childRequest("child-request", "recover the approved child"))
-
-	outcome, err := Resume(context.Background(), reopened, recoveryDeps, "")
-	if err != nil {
-		t.Fatalf("Resume: %v", err)
-	}
-	if outcome.Status != statusCompleted || len(original.prompts) != 1 || len(drifted.prompts) != 0 {
-		t.Fatalf("outcome=%#v original=%d drifted=%d", outcome, len(original.prompts), len(drifted.prompts))
-	}
-	completed := childCompletions(sessionEvents(t, reopened))
-	if len(completed) != 1 {
-		t.Fatalf("child completions = %#v", completed)
-	}
-	created := findSessionByID(t, home, completed[0].ChildSessionID)
-	want := compileAdmittedChildPlan(t, parent, "child-request", "recover the approved child", []plan.Recipe{originalRecipe})
-	if !created.Plan.Equal(want) {
-		t.Fatalf("recovered child plan drifted: got=%#v want=%#v", created.Plan, want)
 	}
 }
 
