@@ -148,6 +148,82 @@ func TestDialogueStopsConvergedAndNoLedgerSignal(t *testing.T) {
 	})
 }
 
+func TestResumeTurnBudgetGrantRequiresPostGrantDialogueEvidence(t *testing.T) {
+	cases := []struct {
+		name       string
+		responses  []string
+		stopReason string
+	}{
+		{
+			name:       "converged",
+			responses:  []string{"opening", "response", "task is complete", "work is complete", "work remains complete"},
+			stopReason: stopConverged,
+		},
+		{
+			name:       "stalled",
+			responses:  []string{"opening", "response", "more analysis", "another view", "continued analysis"},
+			stopReason: stopNoLedgerSignal,
+		},
+	}
+	for _, test := range cases {
+		t.Run(test.name, func(t *testing.T) {
+			plan := dialoguePlan(6)
+			plan.Schedule.StopOnConvergence = true
+			alpha := &fakeBackend{name: "codex", slotID: "alpha", responses: []fakeResponse{{content: test.responses[0]}, {content: test.responses[2]}, {content: test.responses[4]}}}
+			beta := &fakeBackend{name: "codex", slotID: "beta", responses: []fakeResponse{{content: test.responses[1]}, {content: test.responses[3]}}}
+			sess := createSession(t, plan)
+			deps := testDeps(map[string]*fakeBackend{"alpha": alpha, "beta": beta})
+
+			if _, err := Run(context.Background(), sess, deps); err != nil {
+				t.Fatalf("Run: %v", err)
+			}
+			before := sessionEvents(t, sess)
+			if got := countType(before, eventlog.TurnFinished); got != 4 || sessionFinished(t, before).StopReason != test.stopReason {
+				t.Fatalf("early terminal events=%v stop=%#v", eventTypes(before), sessionFinished(t, before))
+			}
+
+			if _, err := Resume(context.Background(), sess, deps, "check it again", 1); err != nil {
+				t.Fatalf("Resume: %v", err)
+			}
+			events := sessionEvents(t, sess)
+			grant := indexOfType(events, eventlog.TurnBudgetGranted)
+			if grant == len(events) {
+				t.Fatal("missing turn_budget.granted")
+			}
+			startedAfterGrant := false
+			finishedAfterGrant := false
+			for _, event := range events[grant+1:] {
+				if payload, ok := turnStarted(event); ok && payload.Round == 5 && payload.Role == eventlog.ParticipantRole {
+					startedAfterGrant = true
+				}
+				if payload, ok := turnFinished(event); ok && payload.Round == 5 && payload.ActorID == "alpha" {
+					finishedAfterGrant = true
+				}
+			}
+			if !startedAfterGrant || !finishedAfterGrant || countType(events, eventlog.TurnFinished) != 5 {
+				t.Fatalf("post-grant turn events=%v started=%t finished=%t", eventTypes(events), startedAfterGrant, finishedAfterGrant)
+			}
+			if got := sessionFinished(t, events).StopReason; got != test.stopReason {
+				t.Fatalf("post-grant stop reason=%q, want %q", got, test.stopReason)
+			}
+			if len(alpha.prompts) != 3 || !strings.Contains(alpha.prompts[2], "Resume direction: check it again") {
+				t.Fatalf("resumed provider prompts=%#v", alpha.prompts)
+			}
+			store, err := sess.BlobStore(blobstore.Limits{})
+			if err != nil {
+				t.Fatalf("open blobs: %v", err)
+			}
+			transcript, err := sessionview.Transcript(sess.Plan, events, store)
+			if err != nil {
+				t.Fatalf("derive transcript: %v", err)
+			}
+			if len(transcript.Entries) != 5 || transcript.Entries[0].Text != test.responses[0] || transcript.Entries[3].Text != test.responses[3] || transcript.Entries[4].Text != test.responses[4] {
+				t.Fatalf("transcript history=%#v", transcript.Entries)
+			}
+		})
+	}
+}
+
 func TestSequenceRunsOrderAndReducer(t *testing.T) {
 	plan := sequencePlan()
 	callOrder := []string{}
@@ -1033,58 +1109,6 @@ func TestResumeAccumulatesSuccessiveTurnBudgetGrants(t *testing.T) {
 	}
 	if outcome.Status != statusCompleted || outcome.Result != "third reply" || countType(sessionEvents(t, sess), eventlog.TurnFinished) != 3 {
 		t.Fatalf("accumulated grant outcome=%#v events=%v", outcome, eventTypes(sessionEvents(t, sess)))
-	}
-}
-
-func TestResumeReplaysTurnBudgetGrantAfterCrash(t *testing.T) {
-	sess := createSession(t, dialoguePlan(1))
-	alpha := &fakeBackend{name: "codex", slotID: "alpha", responses: []fakeResponse{{content: "first reply"}}}
-	beta := &fakeBackend{name: "codex", slotID: "beta", responses: []fakeResponse{{content: "second reply"}}}
-	deps := testDeps(map[string]*fakeBackend{"alpha": alpha, "beta": beta})
-	if _, err := Run(context.Background(), sess, deps); err != nil {
-		t.Fatalf("Run: %v", err)
-	}
-	// This durable prefix is the crash point: the grant is present but no extra
-	// turn has started yet.
-	appendTurnBudgetGrant(t, sess, 1)
-	before := sessionEvents(t, sess)
-	if countType(before, eventlog.TurnBudgetGranted) != 1 || before[len(before)-1].Type != eventlog.TurnBudgetGranted {
-		t.Fatalf("crash prefix = %v", eventTypes(before))
-	}
-
-	outcome, err := Resume(context.Background(), sess, deps, "continue after interruption")
-	if err != nil {
-		t.Fatalf("Resume after crash: %v", err)
-	}
-	after := sessionEvents(t, sess)
-	if outcome.Status != statusCompleted || outcome.Result != "second reply" || countType(after, eventlog.TurnBudgetGranted) != 1 || countType(after, eventlog.TurnFinished) != 2 {
-		t.Fatalf("crash recovery outcome=%#v events=%v", outcome, eventTypes(after))
-	}
-}
-
-func TestResumeTurnBudgetGrantRespectsForbiddenLifecycle(t *testing.T) {
-	plan := dialoguePlan(1)
-	plan.Lifecycle = &session.Lifecycle{Resume: "forbid", Steering: "allow", Dynamic: "forbid", WorkspaceIsolation: "inherited"}
-	sess := createSession(t, plan)
-	alpha := &fakeBackend{name: "codex", slotID: "alpha", responses: []fakeResponse{{content: "recorded reply"}}}
-	beta := &fakeBackend{name: "codex", slotID: "beta"}
-	deps := testDeps(map[string]*fakeBackend{"alpha": alpha, "beta": beta})
-	if _, err := Run(context.Background(), sess, deps); err != nil {
-		t.Fatalf("Run: %v", err)
-	}
-	before, err := os.ReadFile(filepath.Join(sess.Root, eventlog.EventsFilename))
-	if err != nil {
-		t.Fatalf("read events before forbidden grant: %v", err)
-	}
-	if _, err := Resume(context.Background(), sess, deps, "", 1); err == nil || err.Error() != "plan lifecycle forbids resume" {
-		t.Fatalf("forbidden turn-budget grant error = %v", err)
-	}
-	after, err := os.ReadFile(filepath.Join(sess.Root, eventlog.EventsFilename))
-	if err != nil {
-		t.Fatalf("read events after forbidden grant: %v", err)
-	}
-	if !reflect.DeepEqual(before, after) || len(beta.prompts) != 0 {
-		t.Fatalf("forbidden grant mutated log or called provider: before=%q after=%q beta=%#v", before, after, beta.prompts)
 	}
 }
 

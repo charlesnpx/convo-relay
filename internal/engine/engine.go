@@ -115,8 +115,8 @@ func Run(ctx context.Context, sess *session.Session, deps Deps) (Outcome, error)
 // immutable plan plus an optional explicit turn-budget extension. The variadic
 // form keeps existing prompt-only callers source compatible while allowing one
 // extra turn count at the execution boundary.
-func Resume(ctx context.Context, sess *session.Session, deps Deps, prompt string, requestedExtraTurns ...int) (Outcome, error) {
-	extraTurns, err := resumeExtraTurns(requestedExtraTurns)
+func Resume(ctx context.Context, sess *session.Session, deps Deps, prompt string, requestedTurns ...int) (Outcome, error) {
+	additionalTurns, err := resumeTurnBudget(requestedTurns)
 	if err != nil {
 		return Outcome{}, err
 	}
@@ -139,11 +139,11 @@ func Resume(ctx context.Context, sess *session.Session, deps Deps, prompt string
 	if err := runner.rebuildExecutionState(events); err != nil {
 		return Outcome{}, err
 	}
-	if runner.state.terminal != nil && extraTurns == 0 {
+	if runner.state.terminal != nil && additionalTurns == 0 {
 		return runner.outcome(), nil
 	}
-	if extraTurns > 0 {
-		if err := runner.append(eventlog.TurnBudgetGrantedPayload{GrantedBy: "operator", Turns: extraTurns}); err != nil {
+	if additionalTurns > 0 {
+		if err := runner.append(eventlog.TurnBudgetGrantedPayload{GrantedBy: "operator", Turns: additionalTurns}); err != nil {
 			return Outcome{}, err
 		}
 	}
@@ -159,7 +159,7 @@ func Resume(ctx context.Context, sess *session.Session, deps Deps, prompt string
 	return runner.execute()
 }
 
-func resumeExtraTurns(requested []int) (int, error) {
+func resumeTurnBudget(requested []int) (int, error) {
 	if len(requested) > 1 {
 		return 0, errors.New("resume accepts at most one extra turn budget")
 	}
@@ -865,7 +865,11 @@ func (r *runner) execute() (Outcome, error) {
 			outcome.Status = statusAwaitingDecision
 			return outcome, nil
 		}
-		if reason := r.dialogueStopReason(); reason != "" {
+		reason, err := r.dialogueStopReason()
+		if err != nil {
+			return r.finishFailure(stopProviderFailed, err)
+		}
+		if reason != "" {
 			return r.finishSuccess(reason)
 		}
 		if r.state.phase == phaseDone {
@@ -935,18 +939,59 @@ func (r *runner) nextTurn() (turnSpec, error) {
 	}
 }
 
-func (r *runner) dialogueStopReason() string {
+func (r *runner) dialogueStopReason() (string, error) {
 	if r.sess.Plan.Schedule.Kind != "dialogue" || !r.sess.Plan.Schedule.StopOnConvergence ||
 		r.state.active != nil || r.state.phase == phaseFacilitator {
-		return ""
+		return "", nil
 	}
+	reason := ""
 	if hasConverged(r.state.conversation, r.state.ledger) {
-		return stopConverged
+		reason = stopConverged
 	}
-	if hasNoLedgerSignal(r.state.conversation, r.state.ledger) {
-		return stopNoLedgerSignal
+	if reason == "" && hasNoLedgerSignal(r.state.conversation, r.state.ledger) {
+		reason = stopNoLedgerSignal
 	}
-	return ""
+	if reason == "" || r.state.grantedTurns == 0 {
+		return reason, nil
+	}
+	conversationAtGrant, err := r.conversationAtLatestTurnBudgetGrant()
+	if err != nil {
+		return "", err
+	}
+	if len(r.state.conversation) <= conversationAtGrant {
+		return "", nil
+	}
+	return reason, nil
+}
+
+// conversationAtLatestTurnBudgetGrant derives the participant conversation
+// count at the most recent durable grant. It deliberately replays the log
+// instead of storing a checkpoint alongside the conversation history.
+func (r *runner) conversationAtLatestTurnBudgetGrant() (int, error) {
+	events, err := readEvents(r.sess.Root)
+	if err != nil {
+		return 0, err
+	}
+	type turnKey struct {
+		actorID string
+		round   int
+	}
+	roles := make(map[turnKey]eventlog.Role)
+	conversation := 0
+	conversationAtGrant := 0
+	for _, event := range events {
+		switch payload := event.Payload.(type) {
+		case eventlog.TurnStartedPayload:
+			roles[turnKey{actorID: payload.ActorID, round: payload.Round}] = payload.Role
+		case eventlog.TurnFinishedPayload:
+			if roles[turnKey{actorID: payload.ActorID, round: payload.Round}] == eventlog.ParticipantRole {
+				conversation++
+			}
+		case eventlog.TurnBudgetGrantedPayload:
+			conversationAtGrant = conversation
+		}
+	}
+	return conversationAtGrant, nil
 }
 
 func (r *runner) serviceActiveTurn() error {

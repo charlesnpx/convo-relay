@@ -120,15 +120,20 @@ func TestGraphMarksOnlyMatchingActorRoundFinished(t *testing.T) {
 
 func TestTurnBudgetGrantReopensDerivedStatusAndGraph(t *testing.T) {
 	plan := viewPlan()
-	events := []eventlog.Event{
+	finished := []eventlog.Event{
 		{Seq: 1, Type: eventlog.SessionFinished, Payload: eventlog.SessionFinishedPayload{Status: "completed", StopReason: "completed"}},
-		{Seq: 2, Type: eventlog.TurnBudgetGranted, Payload: eventlog.TurnBudgetGrantedPayload{GrantedBy: "operator", Turns: 1}},
 	}
+	if status := Status(plan, finished); !status.Terminal || status.Status != "completed" || !hasNode(Graph(plan, finished), "session:"+plan.SessionID, status.Status) {
+		t.Fatalf("finished status and graph disagree: status=%#v graph=%#v", status, Graph(plan, finished))
+	}
+	events := append(finished,
+		eventlog.Event{Seq: 2, Type: eventlog.TurnBudgetGranted, Payload: eventlog.TurnBudgetGrantedPayload{GrantedBy: "operator", Turns: 1}},
+	)
 	status := Status(plan, events)
 	if status.Terminal || status.Status != "running" || status.StopReason != "" {
 		t.Fatalf("status after turn grant = %#v", status)
 	}
-	if !hasNode(Graph(plan, events), "session:"+plan.SessionID, "running") {
+	if !hasNode(Graph(plan, events), "session:"+plan.SessionID, status.Status) {
 		t.Fatalf("graph did not reopen root: %#v", Graph(plan, events))
 	}
 }

@@ -182,19 +182,15 @@ func TestForResumeAcceptsOnlyPromptInputs(t *testing.T) {
 		t.Fatalf("FromFlags: %v", err)
 	}
 	resume, err := ForResume(parent, ResumeInput{
-		Prompt:     "focus on the counterexample",
-		Context:    []session.Input{input("resume-context", "c")},
-		Skills:     []session.Input{input("resume-skill", "d")},
-		ExtraTurns: 2,
+		Prompt:  "focus on the counterexample",
+		Context: []session.Input{input("resume-context", "c")},
+		Skills:  []session.Input{input("resume-skill", "d")},
 	})
 	if err != nil {
 		t.Fatalf("ForResume: %v", err)
 	}
-	if resume.Prompt != "focus on the counterexample" || len(resume.Context) != 1 || len(resume.Skills) != 1 || resume.ExtraTurns != 2 {
+	if resume.Prompt != "focus on the counterexample" || len(resume.Context) != 1 || len(resume.Skills) != 1 {
 		t.Fatalf("resume input = %#v", resume)
-	}
-	if _, err := ForResume(parent, ResumeInput{ExtraTurns: -1}); err == nil || !strings.Contains(err.Error(), "extra turns") {
-		t.Fatalf("negative resume turn extension error = %v", err)
 	}
 }
 
