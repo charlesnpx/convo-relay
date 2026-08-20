@@ -434,10 +434,7 @@ func runShow(args []string) {
 		fmt.Fprintln(os.Stderr, "error: show accepts only one of --graph, --diff, --proposals, or --trace")
 		os.Exit(2)
 	}
-	if *sessionID == "" && *sessionDir == "" && len(flags.Args()) > 0 {
-		*sessionID = flags.Args()[0]
-	}
-	resolvedSessionDir := resolveSessionDirOrExit(*sessionDir, *sessionID, *relayHome)
+	resolvedSessionDir, _ := resolveSessionDirAndArgs(*sessionDir, *sessionID, *relayHome, flags.Args())
 	if *traceNodeID != "" {
 		trace, err := inspect.BuildTraceReport(resolvedSessionDir, *traceNodeID)
 		if err != nil {
@@ -533,14 +530,11 @@ func runExportCreate(args []string) {
 	if err := parseFlags(flags, args); err != nil {
 		os.Exit(2)
 	}
-	if *sessionID == "" && *sessionDir == "" && len(flags.Args()) > 0 {
-		*sessionID = flags.Args()[0]
-	}
 	if strings.TrimSpace(output) == "" {
 		fmt.Fprintln(os.Stderr, "error: export requires -o/--output")
 		os.Exit(2)
 	}
-	resolvedSessionDir := resolveSessionDirOrExit(*sessionDir, *sessionID, *relayHome)
+	resolvedSessionDir, _ := resolveSessionDirAndArgs(*sessionDir, *sessionID, *relayHome, flags.Args())
 	if *portableOutput {
 		result, err := portable.Export(resolvedSessionDir, output, portable.Options{ConvoRelayVersion: cliVersion})
 		if err != nil {
@@ -931,15 +925,10 @@ func runControlApprove(args []string) {
 	if err := parseFlags(flags, args); err != nil {
 		os.Exit(2)
 	}
-	remaining := flags.Args()
-	if *sessionID == "" && *sessionDir == "" && len(remaining) > 0 {
-		*sessionID = remaining[0]
-		remaining = remaining[1:]
-	}
+	resolvedSessionDir, remaining := resolveSessionDirAndArgs(*sessionDir, *sessionID, *relayHome, flags.Args())
 	if *proposalID == "" && len(remaining) > 0 {
 		*proposalID = remaining[0]
 	}
-	resolvedSessionDir := resolveSessionDirOrExit(*sessionDir, *sessionID, *relayHome)
 	if *proposalID == "" {
 		fmt.Fprintln(os.Stderr, "error: control approve requires a session and proposal id")
 		os.Exit(2)
@@ -978,15 +967,10 @@ func runControlReject(args []string) {
 	if err := parseFlags(flags, args); err != nil {
 		os.Exit(2)
 	}
-	remaining := flags.Args()
-	if *sessionID == "" && *sessionDir == "" && len(remaining) > 0 {
-		*sessionID = remaining[0]
-		remaining = remaining[1:]
-	}
+	resolvedSessionDir, remaining := resolveSessionDirAndArgs(*sessionDir, *sessionID, *relayHome, flags.Args())
 	if *proposalID == "" && len(remaining) > 0 {
 		*proposalID = remaining[0]
 	}
-	resolvedSessionDir := resolveSessionDirOrExit(*sessionDir, *sessionID, *relayHome)
 	if *proposalID == "" {
 		fmt.Fprintln(os.Stderr, "error: control reject requires a session and proposal id")
 		os.Exit(2)
@@ -1045,16 +1029,11 @@ func runResume(args []string) {
 	if len(extracted["skill"]) > 0 {
 		visited["skill"] = true
 	}
-	remaining := flags.Args()
-	if *sessionID == "" && *sessionDir == "" && len(remaining) > 0 {
-		*sessionID = remaining[0]
-		remaining = remaining[1:]
-	}
+	resolvedSessionDir, remaining := resolveSessionDirAndArgs(*sessionDir, *sessionID, *relayHome, flags.Args())
 	if *prompt == "" && len(remaining) > 0 {
 		*prompt = strings.Join(remaining, " ")
 		visited["prompt"] = true
 	}
-	resolvedSessionDir := resolveSessionDirOrExit(*sessionDir, *sessionID, *relayHome)
 	effectiveRounds := *rounds
 	if *quick {
 		effectiveRounds = 3
@@ -1090,10 +1069,7 @@ func runControlCancel(args []string) {
 	if err := parseFlags(flags, args); err != nil {
 		os.Exit(2)
 	}
-	if *sessionID == "" && *sessionDir == "" && len(flags.Args()) > 0 {
-		*sessionID = flags.Args()[0]
-	}
-	resolvedSessionDir := resolveSessionDirOrExit(*sessionDir, *sessionID, *relayHome)
+	resolvedSessionDir, _ := resolveSessionDirAndArgs(*sessionDir, *sessionID, *relayHome, flags.Args())
 	report, err := runner.Stop(resolvedSessionDir, runner.StopOptions{ForceKill: *force})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error: %s\n", err)
@@ -1116,15 +1092,10 @@ func runControlSteer(args []string) {
 	if err := parseFlags(flags, args); err != nil {
 		os.Exit(2)
 	}
-	remaining := flags.Args()
-	if *sessionID == "" && *sessionDir == "" && len(remaining) > 0 {
-		*sessionID = remaining[0]
-		remaining = remaining[1:]
-	}
+	resolvedSessionDir, remaining := resolveSessionDirAndArgs(*sessionDir, *sessionID, *relayHome, flags.Args())
 	if *prompt == "" && len(remaining) > 0 {
 		*prompt = strings.Join(remaining, " ")
 	}
-	resolvedSessionDir := resolveSessionDirOrExit(*sessionDir, *sessionID, *relayHome)
 	item, err := runner.QueueSteeringPrompt(resolvedSessionDir, *prompt)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error: %s\n", err)
@@ -1176,10 +1147,7 @@ func runClean(args []string) {
 		fmt.Printf("\n%d session(s) marked as orphaned.\n", count)
 		return
 	}
-	if *sessionID == "" && *sessionDir == "" && len(flags.Args()) > 0 {
-		*sessionID = flags.Args()[0]
-	}
-	resolvedSessionDir := resolveSessionDirOrExit(*sessionDir, *sessionID, *relayHome)
+	resolvedSessionDir, _ := resolveSessionDirAndArgs(*sessionDir, *sessionID, *relayHome, flags.Args())
 	report, err := runner.CleanSession(resolvedSessionDir)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error: %s\n", err)
@@ -1381,6 +1349,13 @@ type boolFlag interface {
 func isBoolFlag(flagValue *flag.Flag) bool {
 	boolean, ok := flagValue.Value.(boolFlag)
 	return ok && boolean.IsBoolFlag()
+}
+
+func resolveSessionDirAndArgs(sessionDir string, sessionID string, relayHome string, args []string) (string, []string) {
+	if sessionID == "" && sessionDir == "" && len(args) > 0 {
+		sessionID, args = args[0], args[1:]
+	}
+	return resolveSessionDirOrExit(sessionDir, sessionID, relayHome), args
 }
 
 func resolveSessionDirOrExit(sessionDir string, sessionID string, relayHome string) string {

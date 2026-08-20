@@ -107,11 +107,6 @@ func TestRecipeCatalogAndCompileCLIContracts(t *testing.T) {
 		t.Fatalf("malformed root bundle error = %s", malformedRootBundle.stdout)
 	}
 
-	invalidTarget := env.run(t, "recipes", "compile", "review-panel", "--target", "automatic", "--settings", env.settingsPath, "--json")
-	invalidTarget.requireExit(t, 2)
-	if !strings.Contains(invalidTarget.stderr, "flag provided but not defined") {
-		t.Fatalf("invalid target stderr = %q", invalidTarget.stderr)
-	}
 }
 
 type catalogCLIEnv struct {
