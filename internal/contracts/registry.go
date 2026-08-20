@@ -4,7 +4,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"sort"
-	"strings"
 )
 
 const (
@@ -30,7 +29,6 @@ const (
 	DigestProfileV1            = "relay-root-digests-v1"
 	WorkspaceIsolationReportV1 = "relay-workspace-isolation-v1"
 	PortableExportV2           = "relay-root-portable-export-v2"
-	CapabilitiesV1             = "relay-capabilities-v1"
 )
 
 // VersionRegistry is the single implementation-owned inventory used by
@@ -61,7 +59,6 @@ var publicVersionRegistry = VersionRegistry{
 		"digest_profile":            {DigestProfileV1},
 		"isolation_report":          {WorkspaceIsolationReportV1},
 		"workspace_mechanisms":      {"inherited", "detached_writable_git_worktree"},
-		"capability_advertisement":  {CapabilitiesV1},
 	},
 }
 
@@ -86,49 +83,6 @@ func (r VersionRegistry) NumericContracts() []string {
 
 func (r VersionRegistry) StringContracts() []string {
 	return sortedVersionKeys(r.string)
-}
-
-// BuildCapabilityAdvertisement projects the public registry without probing
-// providers, authentication, or the host environment.
-func BuildCapabilityAdvertisement(convoRelayVersion string, goos string, goarch string, schemaVersion string) (map[string]any, error) {
-	if strings.TrimSpace(schemaVersion) == "" {
-		schemaVersion = CapabilitiesV1
-	}
-	if _, err := RequireStringVersion(map[string]any{"schema_version": schemaVersion}, "capability_advertisement"); err != nil {
-		return nil, err
-	}
-	convoRelayVersion = strings.TrimSpace(convoRelayVersion)
-	goos = strings.TrimSpace(goos)
-	goarch = strings.TrimSpace(goarch)
-	if convoRelayVersion == "" || goos == "" || goarch == "" {
-		return nil, NewValidationError("capability advertisement requires CLI version and build platform")
-	}
-
-	registry := PublicVersionRegistry()
-	contractVersions := map[string]any{}
-	for _, contract := range registry.NumericContracts() {
-		contractVersions[contract] = registry.Numeric(contract)
-	}
-	contractVersions[ContractIntegrationBundle] = registry.Strings(ContractIntegrationBundle)
-
-	report := map[string]any{
-		"schema_version":      schemaVersion,
-		"convo_relay_version": convoRelayVersion,
-		"build_platform": map[string]any{
-			"goos":   goos,
-			"goarch": goarch,
-		},
-		"contracts": contractVersions,
-	}
-	for _, contract := range registry.StringContracts() {
-		switch contract {
-		case ContractIntegrationBundle, "capability_advertisement":
-			continue
-		default:
-			report[contract] = registry.Strings(contract)
-		}
-	}
-	return report, nil
 }
 
 func RequireNumericVersion(object map[string]any, contract string) (int, error) {

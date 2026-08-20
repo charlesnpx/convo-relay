@@ -72,7 +72,7 @@ func TestWitnessV2DefaultRecipeCLIContracts(t *testing.T) {
 		}
 	}
 
-	compiled := env.run(t, "compile-recipe", "--recipe", "witness-falsify-v2", "--target", "root", "--settings", env.settingsPath, "--integration-bundle", v2BundlePath, "--json")
+	compiled := env.run(t, "recipes", "compile", "witness-falsify-v2", "--settings", env.settingsPath, "--integration-bundle", v2BundlePath, "--json")
 	compiled.requireExit(t, 0)
 	plan := decodeCLIJSON(t, compiled.stdout)["compiled_plan"].(map[string]any)
 	projection, _ := plan["prompt_context"].(map[string]any)
@@ -84,7 +84,7 @@ func TestWitnessV2DefaultRecipeCLIContracts(t *testing.T) {
 	if err := os.WriteFile(v1OnlyBundlePath, []byte(witnessV1OnlyBundleJSON), 0o644); err != nil {
 		t.Fatalf("write v1-only mismatch bundle: %v", err)
 	}
-	mismatch := env.run(t, "compile-recipe", "--recipe", "witness-falsify-v2", "--target", "root", "--settings", env.settingsPath, "--integration-bundle", v1OnlyBundlePath, "--json")
+	mismatch := env.run(t, "recipes", "compile", "witness-falsify-v2", "--settings", env.settingsPath, "--integration-bundle", v1OnlyBundlePath, "--json")
 	mismatch.requireExit(t, 1)
 	if !cliReportHasDiagnosticCode(decodeCLIJSON(t, mismatch.stdout), integration.DiagnosticCodeContractNotFound) {
 		t.Fatalf("v1-only mismatch omitted contract-not-found diagnostic: %s", mismatch.stdout)

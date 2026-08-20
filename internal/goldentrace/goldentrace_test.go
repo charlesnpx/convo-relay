@@ -778,7 +778,7 @@ func TestSteering(t *testing.T) {
 		"--task", "TRACE_STEERING_TASK", "--agents", "codex", "--rounds", "1",
 	)
 	requireExit(t, seed, 0)
-	queued := env.run(t, "steer", "--home", env.relayHome, "--json", "steering-session", "TRACE_STEERING_PROMPT")
+	queued := env.run(t, "control", "steer", "--home", env.relayHome, "--json", "steering-session", "TRACE_STEERING_PROMPT")
 	requireExit(t, queued, 0)
 	resumed, resumedReport := env.resumeJSON(t, "steering-session",
 		"--rounds", "1",
@@ -851,7 +851,7 @@ func TestBoundedChildRelayWithAdmission(t *testing.T) {
 	proposalID := graphProposalID(t, env, "child-parent")
 	beforeApproval := listSessions(t, env)
 	approval := env.run(t,
-		"approve", "--home", env.relayHome, "--proposal", proposalID, "--rounds", "1",
+		"control", "approve", "--home", env.relayHome, "--proposal", proposalID, "--rounds", "1",
 		"--timeout", "30", "--stall-timeout", "30", "child-parent",
 	)
 	requireExit(t, approval, 0)
@@ -890,7 +890,7 @@ func TestBoundedChildRelayWithAdmission(t *testing.T) {
 	requireExit(t, seedDenied, 0)
 	deniedProposalID := graphProposalID(t, denied, "denied-parent")
 	before := listSessions(t, denied)
-	rejected := denied.run(t, "reject", "--home", denied.relayHome, "--proposal", deniedProposalID, "denied-parent")
+	rejected := denied.run(t, "control", "reject", "--home", denied.relayHome, "--proposal", deniedProposalID, "denied-parent")
 	requireExit(t, rejected, 0)
 	after := listSessions(t, denied)
 	if len(after) != len(before) || !containsSession(after, "denied-parent") {
@@ -966,13 +966,13 @@ func TestPortableExportRoundTripAndTamperDetection(t *testing.T) {
 	requireExit(t, run, 0)
 
 	bundle := filepath.Join(env.root, "portable-bundle")
-	exported := env.run(t, "export", "--home", env.relayHome, "--portable", "-o", bundle, "--json", "portable-export")
+	exported := env.run(t, "export", "create", "--home", env.relayHome, "--portable", "-o", bundle, "--json", "portable-export")
 	requireExit(t, exported, 0)
 	exportedReport := mustJSON(t, exported)
 	if got := requiredJSONField(t, exportedReport, "output", "portable export result"); got != bundle {
 		t.Fatalf("portable export output = %#v, want %q", got, bundle)
 	}
-	verified := env.run(t, "verify-export", "--json", bundle)
+	verified := env.run(t, "export", "verify", "--json", bundle)
 	requireExit(t, verified, 0)
 	verifiedReport := mustJSON(t, verified)
 	if resultStatus(t, verifiedReport) != "valid" {
@@ -997,7 +997,7 @@ func TestPortableExportRoundTripAndTamperDetection(t *testing.T) {
 	if info, statErr := os.Stat(target); statErr != nil || info.Size() != int64(len(data)) {
 		t.Fatalf("tampered payload size changed or cannot be read: info=%#v err=%v", info, statErr)
 	}
-	tampered := env.run(t, "verify-export", "--json", bundle)
+	tampered := env.run(t, "export", "verify", "--json", bundle)
 	if tampered.exitCode == 0 {
 		t.Fatalf("tampered portable export unexpectedly verified: %s", tampered.stdout)
 	}
@@ -1005,7 +1005,7 @@ func TestPortableExportRoundTripAndTamperDetection(t *testing.T) {
 	if resultStatus(t, tamperedReport) != "invalid" {
 		t.Fatalf("tampered verification result = %#v", tamperedReport)
 	}
-	integrityError := jsonString(t, requiredJSONField(t, tamperedReport, "error", "tampered verify-export result"), "tampered verify-export result.error")
+	integrityError := jsonString(t, requiredJSONField(t, tamperedReport, "error", "tampered export verify result"), "tampered export verify result.error")
 	if !strings.Contains(integrityError, "portable export payload") || !strings.Contains(integrityError, "size or digest mismatch") || strings.Contains(strings.ToLower(integrityError), "decode") {
 		t.Fatalf("tampered payload failed for the wrong reason: %q", integrityError)
 	}
@@ -1049,7 +1049,7 @@ func graphProposal(t *testing.T, env *traceEnv, sessionID string, proposalID str
 
 func graphProposals(t *testing.T, env *traceEnv, sessionID string) map[string]any {
 	t.Helper()
-	result := env.run(t, "show-graph", "--home", env.relayHome, "--json", sessionID)
+	result := env.run(t, "show", "--graph", "--home", env.relayHome, "--json", sessionID)
 	requireExit(t, result, 0)
 	graph := jsonMap(t, mustJSON(t, result)["graph"], "graph")
 	proposals := jsonMap(t, graph["proposals"], "graph proposals")

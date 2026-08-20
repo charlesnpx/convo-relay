@@ -27,7 +27,7 @@ const catalogCLIBundleJSON = `{
   }
 }`
 
-func TestRecipeCatalogAndCompileTargetCLIContracts(t *testing.T) {
+func TestRecipeCatalogAndCompileCLIContracts(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("fake readiness executables use POSIX shell")
 	}
@@ -79,62 +79,34 @@ func TestRecipeCatalogAndCompileTargetCLIContracts(t *testing.T) {
 		t.Fatalf("malformed bundle doctor output = %s", malformedDoctor.stdout)
 	}
 
-	omittedChild := env.run(t, "compile-recipe", "--recipe", "review-panel", "--settings", env.settingsPath, "--json")
-	omittedChild.requireExit(t, 0)
-	omittedReport := decodeCLIJSON(t, omittedChild.stdout)
-	explicitChild := env.run(t, "compile-recipe", "--recipe", "review-panel", "--target", "child", "--settings", env.settingsPath, "--json")
-	explicitChild.requireExit(t, 0)
-	explicitReport := decodeCLIJSON(t, explicitChild.stdout)
-	if omittedReport["target"] != "child" || explicitReport["target"] != "child" {
-		t.Fatalf("child targets = omitted %#v explicit %#v", omittedReport["target"], explicitReport["target"])
+	compiled := env.run(t, "recipes", "compile", "review-panel", "--settings", env.settingsPath, "--json")
+	compiled.requireExit(t, 0)
+	compiledReport := decodeCLIJSON(t, compiled.stdout)
+	if compiledReport["target"] != "root" || compiledReport["compiled_plan"].(map[string]any)["kind"] != "root_recipe_plan" {
+		t.Fatalf("compile report = %#v", compiledReport)
 	}
-	if omittedReport["compiled_plan_digest"] != explicitReport["compiled_plan_digest"] || omittedReport["recipe_digest"] != explicitReport["recipe_digest"] {
-		t.Fatalf("omitted child changed compatibility digests: omitted=%#v explicit=%#v", omittedReport, explicitReport)
-	}
-	if omittedReport["compiled_plan"].(map[string]any)["kind"] != "compiled_plan" || omittedReport["launch"] == nil {
-		t.Fatalf("omitted child report = %#v", omittedReport)
+	if _, exists := compiledReport["launch"]; exists {
+		t.Fatalf("compile derived child launch: %#v", compiledReport)
 	}
 
-	root := env.run(t, "compile-recipe", "--recipe", "review-panel", "--target", "root", "--settings", env.settingsPath, "--json")
-	root.requireExit(t, 0)
-	rootReport := decodeCLIJSON(t, root.stdout)
-	if rootReport["target"] != "root" || rootReport["compiled_plan"].(map[string]any)["kind"] != "root_recipe_plan" {
-		t.Fatalf("root compile report = %#v", rootReport)
-	}
-	if _, exists := rootReport["launch"]; exists {
-		t.Fatalf("root compile derived child launch: %#v", rootReport)
-	}
-
-	boundRoot := env.run(t, "compile-recipe", "--recipe", "bound-review", "--target", "root", "--settings", env.settingsPath, "--integration-bundle", env.bundlePath, "--json")
+	boundRoot := env.run(t, "recipes", "compile", "bound-review", "--settings", env.settingsPath, "--integration-bundle", env.bundlePath, "--json")
 	boundRoot.requireExit(t, 0)
 	boundRootPlan := decodeCLIJSON(t, boundRoot.stdout)["compiled_plan"].(map[string]any)
 	if boundRootPlan["kind"] != "root_recipe_plan" || boundRootPlan["integration_contract_id"] != "test/contract-v1" || boundRootPlan["integration_bundle_digest"] == "" {
 		t.Fatalf("bound root plan = %#v", boundRootPlan)
 	}
 
-	boundChild := env.run(t, "compile-recipe", "--recipe", "bound-review", "--target", "child", "--settings", env.settingsPath, "--integration-bundle", env.bundlePath, "--json")
-	boundChild.requireExit(t, 1)
-	boundChildError := decodeCLIJSON(t, boundChild.stdout)
-	if boundChildError["code"] != "root_only_recipe" || boundChildError["integration_contract"] != "test/contract-v1" {
-		t.Fatalf("bound child error = %#v", boundChildError)
-	}
-
-	missingRootBundle := env.run(t, "compile-recipe", "--recipe", "bound-review", "--target", "root", "--settings", env.settingsPath, "--json")
+	missingRootBundle := env.run(t, "recipes", "compile", "bound-review", "--settings", env.settingsPath, "--json")
 	missingRootBundle.requireExit(t, 1)
 	if len(decodeCLIJSON(t, missingRootBundle.stdout)["diagnostics"].([]any)) == 0 {
 		t.Fatalf("missing root bundle error = %s", missingRootBundle.stdout)
 	}
-	malformedRootBundle := env.run(t, "compile-recipe", "--recipe", "bound-review", "--target", "root", "--settings", env.settingsPath, "--integration-bundle", env.malformedBundlePath, "--json")
+	malformedRootBundle := env.run(t, "recipes", "compile", "bound-review", "--settings", env.settingsPath, "--integration-bundle", env.malformedBundlePath, "--json")
 	malformedRootBundle.requireExit(t, 1)
 	if len(decodeCLIJSON(t, malformedRootBundle.stdout)["diagnostics"].([]any)) == 0 {
 		t.Fatalf("malformed root bundle error = %s", malformedRootBundle.stdout)
 	}
 
-	invalidTarget := env.run(t, "compile-recipe", "--recipe", "review-panel", "--target", "automatic", "--settings", env.settingsPath, "--json")
-	invalidTarget.requireExit(t, 2)
-	if !strings.Contains(invalidTarget.stderr, "--target must be one of root or child") {
-		t.Fatalf("invalid target stderr = %q", invalidTarget.stderr)
-	}
 }
 
 type catalogCLIEnv struct {

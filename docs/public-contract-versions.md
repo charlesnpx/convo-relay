@@ -3,7 +3,7 @@
 Convo Relay dispatches every public successor payload from its declared
 `schema_version`. Readers never infer a version from the presence of fields.
 The implementation registry in `internal/contracts` is authoritative and is
-also the source for `convo-relay capabilities --json`.
+reported under the flat `formats` object from `convo-relay version --json`.
 
 | Contract | Supported versions |
 |---|---|
@@ -22,18 +22,15 @@ also the source for `convo-relay capabilities --json`.
 | digest profile | `relay-root-digests-v1` |
 | workspace isolation report | `relay-workspace-isolation-v1` |
 | portable export | `relay-root-portable-export-v2` |
-| capability advertisement | `relay-capabilities-v1` |
 | workspace mechanisms | `inherited`, `detached_writable_git_worktree` |
 
 Existing v1 payloads retain their released field sets and digest meanings.
 Successor-only fields are rejected when placed under a v1 identifier. Unknown
 versions fail with the typed `unsupported_contract_version` diagnostic.
 
-`convo-relay capabilities --json` projects this registry without inspecting
-sessions, provider executables, authentication, or backend readiness. Its
-`build_platform` identifies the exact `GOOS`/`GOARCH` target of the running
-binary; it is build metadata, not a runtime-certification claim. Runtime
-availability remains the separate concern of `backends status`.
+`convo-relay version --json` projects this registry without inspecting
+sessions, provider executables, authentication, or backend readiness. Runtime
+availability remains the separate concern of `doctor`.
 
 ## `relay-root-digests-v1`
 
@@ -108,6 +105,6 @@ fields, unsupported versions or digest profiles, duplicate ids or paths,
 unlisted files, symlinks, missing payload links, source-session artifact refs,
 and byte-count or digest mismatches. Verification uses no source-session path,
 so relocation and source cleanup do not affect the result.
-`verify-export --json` reports verification failures on stdout as
+`export verify --json` reports verification failures on stdout as
 `{"schema_version":"relay-root-portable-export-v2","status":"invalid","error":"..."}`
 and exits with status 1; argument errors retain the ordinary CLI error path.

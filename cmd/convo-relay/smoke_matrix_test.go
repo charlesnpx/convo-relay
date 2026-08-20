@@ -143,30 +143,11 @@ func TestGoOnlySmokeMatrix(t *testing.T) {
 	}
 
 	richSessionID := phase17SessionID("relay-relay")
-	contracts := env.runJSON(t, "contracts", richSessionID, "--home", env.relayHome, "--json")
-	env.requireValidationOK(t, contracts, "contracts")
-	if len(phase17Slice(contracts["relay_backend_child_contract_bundles"])) == 0 {
-		t.Fatalf("contracts report has no relay backend child bundles: %#v", contracts)
-	}
-
 	graphReport := env.runJSON(t, "show", richSessionID, "--home", env.relayHome, "--graph", "--json")
 	env.requireValidationOK(t, graphReport, "show --graph")
 	graphData := phase17Map(graphReport["graph"])
 	if len(phase17Map(graphData["nodes"])) == 0 {
 		t.Fatalf("show --graph report has no graph nodes: %#v", graphReport)
-	}
-
-	displayOutput := env.runText(t, "display", richSessionID, "--home", env.relayHome, "--html-only")
-	if !strings.Contains(displayOutput, "HTML:") {
-		t.Fatalf("display output missing HTML path: %s", displayOutput)
-	}
-	htmlPath := filepath.Join(env.relayHome, "sessions", richSessionID, "transcript.html")
-	html, err := os.ReadFile(htmlPath)
-	if err != nil {
-		t.Fatalf("read display html: %v", err)
-	}
-	if !bytes.Contains(html, []byte("convo-relay transcript")) || !bytes.Contains(html, []byte("PHASE17_SMOKE relay-relay")) {
-		t.Fatalf("display html missing expected session content")
 	}
 
 	for _, provider := range []string{"codex", "claude", "gemini", "relay"} {
@@ -365,7 +346,7 @@ func (env phase17SmokeEnv) verifyResumeCleanupAndClean(t *testing.T, provider st
 	if err := os.WriteFile(filepath.Join(sessionDir, "relay.pid"), []byte("99999999"), 0o644); err != nil {
 		t.Fatalf("write dead relay pid: %v", err)
 	}
-	cleanup := env.runJSON(t, "cleanup", "--home", env.relayHome, "--limit", "1000", "--json")
+	cleanup := env.runJSON(t, "clean", "--all", "--home", env.relayHome, "--limit", "1000", "--json")
 	if phase17Int(cleanup["orphaned_count"]) < 1 {
 		t.Fatalf("cleanup did not mark orphaned session: %#v", cleanup)
 	}

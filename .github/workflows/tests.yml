@@ -54,12 +54,3 @@ jobs:
 
       - name: Smoke package layout
         run: make package
-
-      - name: Smoke skill install plan
-        run: go run ./cmd/convo-relay install-skills --plan --json --install-root /tmp/relay-skill-stage
-
-      - name: Smoke delegated tool install
-        run: ./install-skill.sh --install --target tools --json --install-root /tmp/relay-tool-stage
-
-      - name: Smoke display help
-        run: go run ./cmd/convo-relay display --help

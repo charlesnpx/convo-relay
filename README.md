@@ -40,7 +40,7 @@ make install
 
 Requires Go 1.23+ to build. `make install` writes the binary to `~/.local/bin/convo-relay` and bundled assets to `~/.local/share/convo-relay/`. Override `PREFIX`, `BINDIR`, or `DATADIR` if you use a different install prefix. For a private repo, choose the SSH or HTTPS form that matches how `git clone` already works on your machine. Any backend you use must be on your PATH. Mixed pairs and explicit two-value configurations default to a Codex facilitator using `gpt-5.5` with fallback models. The single-value shorthand `--agents claude`, `--agents codex`, or `--agents gemini` uses that backend for both slots and the facilitator.
 
-The Go binary is the only relay CLI. Python is not used for relay orchestration; it is only needed when using the optional PDF display helper.
+The Go binary is the only relay CLI. Python is not used for relay orchestration.
 
 For a release install with Go:
 
@@ -48,9 +48,8 @@ For a release install with Go:
 go install github.com/charlesnpx/convo-relay/cmd/convo-relay@latest
 ```
 
-`go install` installs only the executable. Use the release archive, `make install`,
-or the delegated installer when you also want the bundled skill and PDF-helper
-assets installed beside the binary.
+`go install` installs only the executable. Use the release archive or
+`make install` when you also want the bundled skill assets beside the binary.
 
 For a source-only development build, use:
 
@@ -58,25 +57,9 @@ For a source-only development build, use:
 go build -o ./bin/convo-relay ./cmd/convo-relay
 ```
 
-Then install the bundled relay skills:
-
-```bash
-convo-relay install-skills
-convo-relay install-skills --install --target all --json --install-root /tmp/relay-skill-stage
-```
-
-That installs `/relay` and `/relay:steer` for Claude Code, plus `$relay` and `$relay:steer` for Codex, when those CLIs are available on your PATH. You can rerun it any time after upgrading.
-`--install-root` is for delegated installers such as `mise-en-place`; it stages
-files under the supplied directory as if it were `$HOME` and reports those
-staged absolute paths in JSON.
-
-For delegated installers such as `mise-en-place`, `./install-skill.sh` is the
-stable contract entrypoint. It injects the exact release tag into the Go binary
-when run from a tagged checkout, builds the `tools` target into
-`~/.local/bin/convo-relay`, stages bundled assets under
-`~/.local/share/convo-relay/`, and installs the Claude/Codex skill payloads.
-The Go port starts at `v1.0.0`; earlier `v0.x` tags belonged to the Python
-package line.
+Skill installation is packaging-managed and is not a `convo-relay` session
+command. The Go port starts at `v1.0.0`; earlier `v0.x` tags belonged to the
+Python package line.
 
 ### Update the CLI
 
@@ -84,7 +67,6 @@ package line.
 cd convo-relay
 git pull
 make install
-convo-relay install-skills
 ```
 
 ### Package a release layout
@@ -98,10 +80,10 @@ This creates `dist/convo-relay/` with a prefix-style layout:
 ```text
 bin/convo-relay
 share/convo-relay/skill/
-share/convo-relay/scripts/render_display_pdf.py
 ```
 
-The installed or packaged binary discovers bundled skills and the optional PDF helper from `../share/convo-relay/` relative to the executable. If a package manager places assets somewhere else, set `CONVO_RELAY_SKILL_DIR` to the skill directory and `CONVO_RELAY_PDF_HELPER` to the helper script path.
+The release layout includes the bundled skill assets for package-managed
+installation.
 
 ### Release confidence checks
 
@@ -114,17 +96,9 @@ make smoke-fake-providers
 make package
 ```
 
-`make smoke-fake-providers` is the Go-only release smoke gate. It builds the CLI, shadows `codex`, `claude`, and `gemini` with deterministic fake provider binaries in `PATH`, writes sessions into a temp relay home, and checks the required provider matrix plus `resume`, `cleanup`, `clean`, `contracts --json`, `show --graph --json`, and `display --html-only`. Live Codex, Claude, and Gemini runs are useful local release evidence, but they are optional and are not required for CI.
+`make smoke-fake-providers` is the Go-only release smoke gate. It builds the CLI, shadows `codex`, `claude`, and `gemini` with deterministic fake provider binaries in `PATH`, writes sessions into a temp relay home, and checks the required provider matrix plus `resume`, `clean --all`, `clean`, and `show --graph --json`. Live Codex, Claude, and Gemini runs are useful local release evidence, but they are optional and are not required for CI.
 
 Cross-compilation is a release gate, not a runtime certification claim. `make cross-compile` builds every production package for `darwin/arm64` and `windows/amd64`, while `make cross-compile-tests` compiles the repository's practical test packages for those targets. These gates do not execute foreign binaries and do not certify runtime support on macOS or Windows.
-
-### Manual skill install from a checkout
-
-If you are running directly from a source checkout and do not want to install the CLI first, the wrapper script runs the Go command:
-
-```bash
-./install-skill.sh
-```
 
 ## Usage
 
@@ -223,7 +197,7 @@ should not require evidence citations. Use `--investigation context_only` with a
 least one `--context` file when agents should cite supplied context labels and
 avoid repository exploration beyond those files.
 
-Attach a launch plan so the display export can show the plan that kicked off the relay:
+Attach a launch plan to persist the plan that kicked off the relay:
 
 ```bash
 convo-relay run "Pressure-test this rollout plan" \
@@ -234,9 +208,9 @@ Enable dynamic expansion proposals without changing the default two-slot relay b
 
 ```bash
 convo-relay run "Pressure-test this rollout plan" --dynamic ask
-convo-relay proposals a1b2c3d4
-convo-relay approve a1b2c3d4 sp_123456789abc
-convo-relay reject a1b2c3d4 sp_123456789abc --reason "too broad"
+convo-relay show a1b2c3d4 --proposals
+convo-relay control approve a1b2c3d4 sp_123456789abc
+convo-relay control reject a1b2c3d4 sp_123456789abc --reason "too broad"
 ```
 
 Dynamic expansion uses predeclared backend profiles and relay recipes. Built-in profiles include `codex-deep`, `codex-fast`, `claude-code`, `gemini-vision`, and `relay-review`; built-in recipes include `review-panel`, `vision-review`, and `one-pass-review`. Override or extend them with a TOML file:
@@ -310,11 +284,10 @@ convo-relay recipes list --status all --json
 convo-relay recipes show review-panel
 convo-relay recipes show review-panel --view resolved
 convo-relay recipes doctor
-convo-relay compile-recipe --recipe review-panel --target child
-convo-relay compile-recipe --recipe review-panel --target root
+convo-relay recipes compile review-panel --json
 ```
 
-`recipes list` shows usable recipes and recipes that require an integration bundle by default in human output. JSON output includes all statuses unless `--status` is supplied, including invalid or skipped parseable records that would otherwise be hidden by runtime normalization. `recipes show` reports declared recipe data, integration binding, and resolved participant/backend readiness. `recipes doctor` validates settings parseability, recipe/profile references, nested relay profile rules, installation-only backend readiness, and grouped root-cause diagnostics. A missing integration bundle reports `requires_integration` without degrading list or doctor; pass `--integration-bundle <file>` to list, show, doctor, or root compilation to bind an exact contract.
+`recipes list` shows usable recipes and recipes that require an integration bundle by default in human output. JSON output includes all statuses unless `--status` is supplied, including invalid or skipped parseable records that would otherwise be hidden by runtime normalization. `recipes show` reports declared recipe data, integration binding, and resolved participant/backend readiness. `recipes doctor` validates settings parseability, recipe/profile references, nested relay profile rules, installation-only backend readiness, and grouped root-cause diagnostics. A missing integration bundle reports `requires_integration` without degrading list or doctor; pass `--integration-bundle <file>` to list, show, doctor, or `recipes compile` to bind an exact contract.
 
 The optional Witness defaults keep all existing v1 recipe names and contract
 bindings available. Parallel `witness-falsify-v2`,
@@ -327,7 +300,10 @@ topology and policy only. Contract prompts, result schemas, assertions, and
 adjudication remain consumer-owned bundle data, and the relay treats each
 contract id as opaque.
 
-`compile-recipe` defaults `--target` to `child` for compatibility. Child compilation emits `compiled_plan/v1` and rejects integration-bound recipes as root-only. Explicit `--target root` emits `root_recipe_plan/v1` and binds a matching integration bundle when the recipe declares a contract.
+`recipes compile <id>` is a side-effect-free root-plan preflight. It emits a
+machine-readable `root_recipe_plan` and binds a matching integration bundle
+when the recipe declares a contract; it does not execute providers or create a
+session.
 
 Run a configured recipe directly as the root session:
 
@@ -382,7 +358,7 @@ Print JSON instead of markdown:
 convo-relay run "Refactor the database connection pool" --json
 ```
 
-`run` writes an export only when `-o` / `--output` is supplied. To export an existing or incomplete session later, use `convo-relay export`.
+`run` writes an export only when `-o` / `--output` is supplied. To export an existing or incomplete session later, use `convo-relay export create`.
 
 ### List sessions
 
@@ -413,13 +389,13 @@ convo-relay show a1b2c3d4 --graph --json
 ### Export a session
 
 ```bash
-convo-relay export a1b2c3d4 -o transcript.md
-convo-relay export a1b2c3d4 --json -o result.json
-convo-relay export a1b2c3d4 --portable -o evidence-bundle --json
-convo-relay verify-export evidence-bundle --json
+convo-relay export create a1b2c3d4 -o transcript.md
+convo-relay export create a1b2c3d4 --json -o result.json
+convo-relay export create a1b2c3d4 --portable -o evidence-bundle --json
+convo-relay export verify evidence-bundle --json
 ```
 
-`export` requires an explicit `-o` / `--output` path. Markdown exports include session status, incomplete state, task, session id, final ledger details, compact per-turn ledger counts, and transcript turns. JSON exports include the same structured session report as `show --json`, including diagnostics, and succeed for incomplete sessions when the partial transcript can be read.
+`export create` requires an explicit `-o` / `--output` path. Markdown exports include session status, incomplete state, task, session id, final ledger details, compact per-turn ledger counts, and transcript turns. JSON exports include the same structured session report as `show --json`, including diagnostics, and succeed for incomplete sessions when the partial transcript can be read.
 
 `--portable` is separate from those display exports. It accepts a terminal
 successor root session, validates its complete artifact-ref closure, and
@@ -431,7 +407,7 @@ and digest. Every payload except the exact root-session, transcript, and
 diagnostics projections requires that source identity; the same source id may
 appear with different immutable digests, but an exact id/digest pair may appear
 only once. Required absolute source, relay-home, session, retained-input, and
-worktree paths are omitted. `verify-export` rechecks the closed file set,
+worktree paths are omitted. `export verify` rechecks the closed file set,
 payload digests, portable source refs, and one-to-one provider
 invocation/result lineage. Durable marker-only crashes can leave attempt gaps,
 so an export may begin with attempt 2 or omit an earlier attempt. With `--json`,
@@ -440,27 +416,18 @@ exits with status 1.
 Running, recovery-pending, v1, tampered, incomplete, or out-of-root sessions
 fail without publishing the final target.
 
-### Check health
+### Diagnose runtime and sessions
 
 ```bash
-convo-relay health
-convo-relay health --json
-convo-relay health a1b2c3d4
-convo-relay health a1b2c3d4 --json
+convo-relay doctor
+convo-relay doctor --json
+convo-relay doctor a1b2c3d4
+convo-relay doctor a1b2c3d4 --probe-auth --json
 ```
 
-Global `health` loads and validates runtime config without repairing files, probing provider auth, or launching provider commands. Session `health` is read-only and surfaces session status, attention-required state, recent sanitized provider failures, and scan metadata.
-
-### Inspect contracts and artifacts
-
-```bash
-convo-relay contracts a1b2c3d4
-convo-relay contracts a1b2c3d4 --json
-convo-relay contracts a1b2c3d4 --raw
-convo-relay contracts a1b2c3d4 --ref recipe:review-panel --digest sha256:...
-```
-
-`contracts` validates the v1 event log, reports event and artifact-index counts, checks the launch runtime config snapshot, lists transient recipe refs, reports slot replacement history, lists relay-backend and dynamic child contract bundles, and verifies that recipe, compiled-plan, child-invocation, and child-result artifact refs load and digest-check. Public artifact references are `artifact_ref` objects with `id` and `digest`, not filesystem path strings.
+`doctor` combines the read-only global or session health report with backend
+readiness. Its JSON report preserves the complete backend readiness body under
+`backends`; add `--probe-auth` for supported authentication probes.
 
 ### Resume a session
 
@@ -478,60 +445,37 @@ The optional resume prompt is injected into the next resumed turn as new directi
 
 `resume` keeps the original pairing and slot order. It uses the runtime config snapshot saved at launch, so later settings file edits do not change backend profiles or relay recipes for the resumed session. New snapshot-backed sessions reject `resume --settings`; use slot and facilitator model/effort overrides for narrow runtime changes. Override events are recorded separately for slots and facilitators.
 
-### Steer or stop a running session
+### Control a running session
 
 Queue a prompt that will be injected before the next relay turn:
 
 ```bash
-convo-relay steer a1b2c3d4 "Focus on failure modes before continuing"
+convo-relay control steer a1b2c3d4 "Focus on failure modes before continuing"
 ```
 
-Ask a running relay to stop cleanly, or force-kill the tracked relay process:
+Cancel a running relay, optionally force-killing the tracked process:
 
 ```bash
-convo-relay stop a1b2c3d4
-convo-relay kill a1b2c3d4
+convo-relay control cancel a1b2c3d4
+convo-relay control cancel a1b2c3d4 --force
 ```
 
-On Unix, `stop` sends `SIGTERM` to the tracked relay process, which lets the relay mark the session interrupted and terminate the active backend subprocess. A live-process graceful stop is unsupported on Windows: it returns an explicit error without changing session state or removing PID and cleanup evidence. Use `kill` or `stop --kill` there. Force-kill marks the session killed immediately after the platform process-termination request succeeds.
+On Unix, `control cancel` sends `SIGTERM` to the tracked relay process, which
+lets the relay mark the session interrupted and terminate the active backend
+subprocess. A live-process graceful cancellation is unsupported on Windows: it
+returns an explicit error without changing session state or removing PID and
+cleanup evidence. `control cancel --force` marks the session killed after the
+platform process-termination request succeeds.
 
-### Display a session
-
-Generate a styled HTML visualization of a session transcript, with optional PDF export:
-
-```bash
-convo-relay display a1b2c3d4              # HTML + PDF
-convo-relay display a1b2c3d4 --html-only  # HTML only (no Playwright needed)
-convo-relay display a1b2c3d4 --open       # open the file after generation
-convo-relay display a1b2c3d4 -o out.pdf   # custom output path
-```
-
-The output renders the launch prompt at the top, then each turn as a terminal-style block with dark themes matching Claude Code, Codex, and Gemini, window chrome, round numbers, and markdown formatting. Go owns HTML generation, and `--html-only` has no Python dependency.
-
-PDF rendering is the one retained Python boundary: `scripts/render_display_pdf.py` accepts an HTML path and PDF path and uses Playwright/Chromium. Set it up with:
-
-```bash
-python3 -m pip install playwright
-python3 -m playwright install chromium
-```
-
-Source checkouts discover the helper from `scripts/`; installed or packaged layouts discover it from `share/convo-relay/scripts/`. Override discovery with `CONVO_RELAY_PDF_HELPER`. If the helper or Playwright runtime is unavailable, use `--html-only`.
-If session metadata includes a launch plan, the display also renders it in a Mac-style terminal block above the transcript.
-
-https://github.com/user-attachments/assets/d81a5277-25e0-4ae8-aec7-e80c6ecc93fe
-
-### Inspect ledger changes
-
-```bash
-convo-relay diff a1b2c3d4
-```
-
-This prints only contested and withdrawn ledger evolution by round.
+Use `show --diff` for contested and withdrawn ledger evolution by round, and
+`show --proposals` to inspect dynamic spawn proposals. Use `control approve`
+or `control reject` to resolve a proposal.
 
 ### Delete a session
 
 ```bash
 convo-relay clean a1b2c3d4
+convo-relay clean --all --home ~/.convo-relay --json
 ```
 
 ### From Claude Code (sub-agent)
@@ -552,24 +496,16 @@ Then read /tmp/auth-review.md and summarize what each agent found.
 
 | Command | Description |
 |---------|-------------|
-| `install-skills` | Install the bundled Claude Code and Codex relay skills |
 | `run` | Start a new relay dialogue |
+| `resume` | Continue a previous session until convergence or a round limit |
 | `list` | List existing sessions |
 | `show` | Display a session's transcript |
-| `export` | Write a Markdown or JSON transcript export |
-| `health` | Run shallow global or session health checks |
+| `control` | Steer, admit/reject proposals, or cancel a running session |
+| `export` | Create or verify transcript and portable exports |
 | `recipes` | List, show, and diagnose relay recipes |
-| `contracts` | Inspect event and artifact contracts |
-| `resume` | Continue a previous session until convergence or a round limit |
-| `steer` | Queue an operator prompt for a running session's next turn |
-| `proposals` | List dynamic spawn proposals for a session |
-| `approve` | Approve a spawn proposal, run its child relay, and collapse the result |
-| `reject` | Reject a spawn proposal with an operator reason |
-| `stop` | Ask a running relay process to stop cleanly (Unix live processes) |
-| `kill` | Force-kill a tracked relay process |
-| `display` | Generate styled HTML/PDF visualization of a session |
-| `diff` | Show contested and withdrawn ledger changes |
 | `clean` | Delete a session and all its artifacts |
+| `doctor` | Diagnose global/session health and backend readiness |
+| `version` | Report the CLI version and public format versions |
 
 ## Flags
 
@@ -590,26 +526,23 @@ Then read /tmp/auth-review.md and summarize what each agent found.
 | `--recipe ID` | run | Execute a configured recipe directly as the root session |
 | `--input NAME=PATH` | run --recipe | Bind one named contract input; repeat for many-valued inputs |
 | `--workspace-isolation {inherited,read_only,ephemeral}` | run --recipe | Request a root workspace lifecycle policy; `read_only` and `ephemeral` both use writable detached worktrees |
-| `--task-plan FILE` | run | Attach the launch task plan from a JSON or markdown/text file so display exports can show it |
+| `--task-plan FILE` | run | Attach the launch task plan from a JSON or markdown/text file |
 | `--investigation {auto,normal,context_only}` | run | Prompt policy for evidence behavior. Default `auto` cites inspected files/context; `normal` is conceptual; `context_only` requires `--context` and avoids repo exploration |
 | `--dynamic {off,ask,auto-safe}` | run | Enable dynamic spawn proposal handling. Default is `off` |
-| `--settings FILE` | run, resume, approve, health, recipes, compile-recipe | Read backend profiles and relay recipes from a TOML settings file |
+| `--settings FILE` | run, resume, doctor, recipes | Read backend profiles and relay recipes from a TOML settings file |
 | `--facilitator-backend BACKEND` | run | Override the facilitator backend |
 | `--facilitator-model MODEL` | run, resume | Override the facilitator model. Default is `gpt-5.5` for Codex facilitator runs |
 | `-v, --verbose` | run, resume | Print progress to stderr |
 | `-s, --stream` | run | Stream live subprocess stdout to stderr |
-| `-o, --output` | run, resume, export | Write an export to a specific file. Required for `export`; optional for `run` and `resume` |
-| `--portable` | export | Write a complete terminal successor root session as a new portable directory |
-| `--json` | run, show, export, health, recipes, compile-recipe, backends, capabilities, resume, contracts | Use JSON instead of markdown |
+| `-o, --output` | run, resume, export create | Write an export to a specific file. Required for `export create`; optional for `run` and `resume` |
+| `--portable` | export create | Write a complete terminal successor root session as a new portable directory |
+| `--json` | run, resume, list, show, control, export, recipes, clean, doctor, version | Use JSON instead of markdown |
 | `--status {usable,requires_integration,unavailable,invalid,skipped,all}` | recipes list | Filter recipes by catalog status |
 | `--view {all,declared,resolved}` | recipes show | Select declared and/or resolved recipe details |
-| `--target {root,child}` | compile-recipe | Select a recipe compile target; defaults to `child` |
-| `--integration-bundle FILE` | run --recipe, recipes list/show/doctor, compile-recipe | Bind a root run, catalog records, or an explicitly root-targeted compile to a strict integration bundle |
-| `--raw` | contracts | Include full loaded artifact payloads |
-| `--ref REF_ID`, `--digest DIGEST` | contracts | Resolve one artifact ref from the index, using digest when ref ids are ambiguous |
-| `--html-only` | display | Generate HTML only, skip PDF rendering |
-| `--open` | display | Open the generated file after creation |
-| `--limit N` | list | Max sessions to show (default: 20) |
+| `--integration-bundle FILE` | run --recipe, recipes list/show/doctor/compile | Bind a root run, catalog records, or preflight compilation to a strict integration bundle |
+| `--all` | clean | Mark orphaned sessions across a relay home |
+| `--probe-auth` | doctor | Run supported non-model authentication probes |
+| `--limit N` | list, clean --all | Max sessions to show or scan |
 
 ## Session isolation
 
