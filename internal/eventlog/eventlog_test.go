@@ -21,9 +21,10 @@ func TestRoundTripEveryTypedEvent(t *testing.T) {
 		t.Fatalf("put payload: %v", err)
 	}
 	planRef := ref
-	want := make([]Event, 0, 16)
+	want := make([]Event, 0, 17)
 	for index, payload := range []Payload{
 		SessionStartedPayload{PlanDigest: RawBytesDigest([]byte("plan")), SessionID: "session-one"},
+		TurnBudgetGrantedPayload{GrantedBy: "operator", Turns: 2},
 		TurnStartedPayload{ActorID: "actor-a", Round: 1, Role: ParticipantRole},
 		TurnFinishedPayload{ActorID: "actor-a", Round: 1, Content: ref},
 		AttemptStartedPayload{ActorID: "actor-a", Attempt: 1},
@@ -63,6 +64,20 @@ func TestRoundTripEveryTypedEvent(t *testing.T) {
 	}
 	if _, ok := got[0].Payload.(SessionStartedPayload); !ok {
 		t.Fatalf("replay left first payload untyped: %T", got[0].Payload)
+	}
+}
+
+func TestTurnBudgetGrantedPayloadRequiresGrantorAndPositiveTurns(t *testing.T) {
+	_, _, writer := newTestWriter(t)
+	defer writer.Close()
+	for index, payload := range []Payload{
+		TurnBudgetGrantedPayload{GrantedBy: "", Turns: 1},
+		TurnBudgetGrantedPayload{GrantedBy: "operator", Turns: 0},
+		TurnBudgetGrantedPayload{GrantedBy: "operator", Turns: -1},
+	} {
+		if _, err := writer.Append(NewEvent(fmt.Sprintf("invalid-turn-budget-%d", index), fixtureTime(index), payload)); err == nil {
+			t.Fatalf("Append(%T) unexpectedly accepted", payload)
+		}
 	}
 }
 

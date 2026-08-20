@@ -111,9 +111,15 @@ func Run(ctx context.Context, sess *session.Session, deps Deps) (Outcome, error)
 	return runner.execute()
 }
 
-// Resume replays a started, nonterminal session and continues only the work
-// left by its immutable plan. The prompt is deliberately the only new input.
-func Resume(ctx context.Context, sess *session.Session, deps Deps, prompt string) (Outcome, error) {
+// Resume replays a started session and continues only work left by its
+// immutable plan plus an optional explicit turn-budget extension. The variadic
+// form keeps existing prompt-only callers source compatible while allowing one
+// extra turn count at the execution boundary.
+func Resume(ctx context.Context, sess *session.Session, deps Deps, prompt string, requestedExtraTurns ...int) (Outcome, error) {
+	extraTurns, err := resumeExtraTurns(requestedExtraTurns)
+	if err != nil {
+		return Outcome{}, err
+	}
 	if err := checkResumeLifecycle(sess, prompt); err != nil {
 		return Outcome{}, err
 	}
@@ -133,8 +139,13 @@ func Resume(ctx context.Context, sess *session.Session, deps Deps, prompt string
 	if err := runner.rebuildExecutionState(events); err != nil {
 		return Outcome{}, err
 	}
-	if runner.state.terminal != nil {
+	if runner.state.terminal != nil && extraTurns == 0 {
 		return runner.outcome(), nil
+	}
+	if extraTurns > 0 {
+		if err := runner.append(eventlog.TurnBudgetGrantedPayload{GrantedBy: "operator", Turns: extraTurns}); err != nil {
+			return Outcome{}, err
+		}
 	}
 	if text := strings.TrimSpace(prompt); text != "" {
 		ref, err := runner.putText(text)
@@ -146,6 +157,19 @@ func Resume(ctx context.Context, sess *session.Session, deps Deps, prompt string
 		}
 	}
 	return runner.execute()
+}
+
+func resumeExtraTurns(requested []int) (int, error) {
+	if len(requested) > 1 {
+		return 0, errors.New("resume accepts at most one extra turn budget")
+	}
+	if len(requested) == 0 {
+		return 0, nil
+	}
+	if requested[0] < 0 {
+		return 0, errors.New("resume extra turns must not be negative")
+	}
+	return requested[0], nil
 }
 
 // PendingChildren returns every durable child request that has not yet been
@@ -269,6 +293,7 @@ type executionState struct {
 	conversation []conversationTurn
 	ledger       model.Ledger
 	lastResult   completedTurn
+	grantedTurns int
 
 	requests     map[string]*childState
 	childResults []string
@@ -725,6 +750,15 @@ func (r *runner) reduceEvent(event eventlog.Event) error {
 			return nil
 		}
 		return errors.New("steering.applied has no queued prompt")
+	case eventlog.TurnBudgetGrantedPayload:
+		if payload.Turns > maximumInt()-r.sess.Plan.Schedule.Turns-state.grantedTurns {
+			return errors.New("turn budget grants exceed integer range")
+		}
+		state.grantedTurns += payload.Turns
+		state.terminal = nil
+		state.resultValidation = ""
+		r.phaseAfterParticipants()
+		return nil
 	case eventlog.ResultProducedPayload:
 		if state.resultValidation != "" {
 			return errors.New("session has more than one result.produced event")
@@ -784,7 +818,7 @@ func (r *runner) advancePhase(turn *turnState) {
 }
 
 func (r *runner) phaseAfterParticipants() {
-	if len(r.state.conversation) < r.sess.Plan.Schedule.Turns {
+	if len(r.state.conversation) < r.effectiveTurnBudget() {
 		r.state.phase = phaseParticipant
 		return
 	}
@@ -794,6 +828,12 @@ func (r *runner) phaseAfterParticipants() {
 	}
 	r.state.phase = phaseDone
 }
+
+func (r *runner) effectiveTurnBudget() int {
+	return r.sess.Plan.Schedule.Turns + r.state.grantedTurns
+}
+
+func maximumInt() int { return int(^uint(0) >> 1) }
 
 func (r *runner) execute() (Outcome, error) {
 	for {
@@ -850,7 +890,7 @@ type turnSpec struct {
 func (r *runner) nextTurn() (turnSpec, error) {
 	switch r.state.phase {
 	case phaseParticipant:
-		if len(r.state.conversation) >= r.sess.Plan.Schedule.Turns {
+		if len(r.state.conversation) >= r.effectiveTurnBudget() {
 			return turnSpec{}, errors.New("participant phase has no remaining turn")
 		}
 		round := len(r.state.conversation) + 1
@@ -864,7 +904,10 @@ func (r *runner) nextTurn() (turnSpec, error) {
 				Role:  eventlog.ParticipantRole,
 			}, nil
 		}
-		actor, err := r.actor(r.sess.Plan.Schedule.Order[len(r.state.conversation)])
+		if len(r.sess.Plan.Schedule.Order) == 0 {
+			return turnSpec{}, errors.New("sequence schedule has no actor order")
+		}
+		actor, err := r.actor(r.sess.Plan.Schedule.Order[len(r.state.conversation)%len(r.sess.Plan.Schedule.Order)])
 		if err != nil {
 			return turnSpec{}, err
 		}
@@ -886,7 +929,7 @@ func (r *runner) nextTurn() (turnSpec, error) {
 		if err != nil {
 			return turnSpec{}, err
 		}
-		return turnSpec{Actor: actor, Round: r.sess.Plan.Schedule.Turns + 1, Role: eventlog.ReducerRole}, nil
+		return turnSpec{Actor: actor, Round: r.effectiveTurnBudget() + 1, Role: eventlog.ReducerRole}, nil
 	default:
 		return turnSpec{}, errors.New("execution has no next turn")
 	}

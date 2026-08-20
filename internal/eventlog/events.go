@@ -20,6 +20,7 @@ type Type string
 const (
 	SessionStarted    Type = "session.started"
 	SessionFinished   Type = "session.finished"
+	TurnBudgetGranted Type = "turn_budget.granted"
 	TurnStarted       Type = "turn.started"
 	TurnFinished      Type = "turn.finished"
 	AttemptStarted    Type = "attempt.started"
@@ -88,6 +89,24 @@ func (p SessionFinishedPayload) validate() error {
 		return err
 	}
 	return validateText("stop_reason", p.StopReason)
+}
+
+// TurnBudgetGrantedPayload records an explicit operator grant that extends
+// the immutable plan's participant-turn budget without changing the plan.
+type TurnBudgetGrantedPayload struct {
+	GrantedBy string `json:"granted_by"`
+	Turns     int    `json:"turns"`
+}
+
+func (TurnBudgetGrantedPayload) eventType() Type { return TurnBudgetGranted }
+func (p TurnBudgetGrantedPayload) validate() error {
+	if err := validateToken("granted_by", p.GrantedBy); err != nil {
+		return err
+	}
+	if p.Turns < 1 {
+		return errors.New("turn_budget.granted turns must be positive")
+	}
+	return nil
 }
 
 type TurnStartedPayload struct {
@@ -527,6 +546,13 @@ func normalizePayload(payload Payload) (Payload, error) {
 			return nil, errors.New("nil session.finished payload")
 		}
 		return *value, nil
+	case TurnBudgetGrantedPayload:
+		return value, nil
+	case *TurnBudgetGrantedPayload:
+		if value == nil {
+			return nil, errors.New("nil turn_budget.granted payload")
+		}
+		return *value, nil
 	case TurnStartedPayload:
 		return value, nil
 	case *TurnStartedPayload:
@@ -633,6 +659,7 @@ func normalizePayload(payload Payload) (Payload, error) {
 var payloadRegistry = map[Type]func() Payload{
 	SessionStarted:    func() Payload { return &SessionStartedPayload{} },
 	SessionFinished:   func() Payload { return &SessionFinishedPayload{} },
+	TurnBudgetGranted: func() Payload { return &TurnBudgetGrantedPayload{} },
 	TurnStarted:       func() Payload { return &TurnStartedPayload{} },
 	TurnFinished:      func() Payload { return &TurnFinishedPayload{} },
 	AttemptStarted:    func() Payload { return &AttemptStartedPayload{} },

@@ -50,6 +50,16 @@ func Status(_ session.Plan, events []eventlog.Event) StatusView {
 				view.Status = payload.Status
 				view.StopReason = payload.StopReason
 			}
+		case eventlog.TurnBudgetGrantedPayload:
+			view.Terminal = false
+			view.Status = "running"
+			view.StopReason = ""
+		case *eventlog.TurnBudgetGrantedPayload:
+			if payload != nil {
+				view.Terminal = false
+				view.Status = "running"
+				view.StopReason = ""
+			}
 		case eventlog.TurnStartedPayload:
 			view.Counts.TurnsStarted++
 			view.CurrentRound = max(view.CurrentRound, payload.Round)
@@ -253,6 +263,16 @@ func Graph(plan session.Plan, events []eventlog.Event) GraphView {
 			if payload != nil {
 				root := nodes[rootID]
 				root.Status = payload.Status
+				nodes[rootID] = root
+			}
+		case eventlog.TurnBudgetGrantedPayload:
+			root := nodes[rootID]
+			root.Status = "running"
+			nodes[rootID] = root
+		case *eventlog.TurnBudgetGrantedPayload:
+			if payload != nil {
+				root := nodes[rootID]
+				root.Status = "running"
 				nodes[rootID] = root
 			}
 		case eventlog.TurnStartedPayload:

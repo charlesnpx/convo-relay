@@ -908,6 +908,205 @@ func TestResumeTerminalFailedSessionReportsStatus(t *testing.T) {
 	}
 }
 
+func TestResumeCompletedSessionWithExtraTurnBudget(t *testing.T) {
+	sess := createSession(t, dialoguePlan(1))
+	alpha := &fakeBackend{name: "codex", slotID: "alpha", responses: []fakeResponse{{content: "first reply"}}}
+	beta := &fakeBackend{name: "codex", slotID: "beta", responses: []fakeResponse{{content: "second reply"}}}
+	deps := testDeps(map[string]*fakeBackend{"alpha": alpha, "beta": beta})
+	if _, err := Run(context.Background(), sess, deps); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	beforePlan, err := os.ReadFile(filepath.Join(sess.Root, session.SessionFilename))
+	if err != nil {
+		t.Fatalf("read session.json before resume: %v", err)
+	}
+	beforeDigest := sess.Digest
+
+	outcome, err := Resume(context.Background(), sess, deps, "take one more pass", 1)
+	if err != nil {
+		t.Fatalf("Resume with one extra turn: %v", err)
+	}
+	if outcome.Status != statusCompleted || outcome.Result != "second reply" {
+		t.Fatalf("resume outcome = %#v", outcome)
+	}
+	if len(alpha.prompts) != 1 || len(beta.prompts) != 1 || !strings.Contains(beta.prompts[0], "Resume direction: take one more pass") {
+		t.Fatalf("provider prompts alpha=%#v beta=%#v", alpha.prompts, beta.prompts)
+	}
+
+	events := sessionEvents(t, sess)
+	if countType(events, eventlog.TurnFinished) != 2 || countType(events, eventlog.TurnBudgetGranted) != 1 ||
+		countType(events, eventlog.ResultProduced) != 2 || countType(events, eventlog.SessionFinished) != 2 {
+		t.Fatalf("resume events = %v", eventTypes(events))
+	}
+	store, err := sess.BlobStore(blobstore.Limits{})
+	if err != nil {
+		t.Fatalf("open blobs: %v", err)
+	}
+	transcript, err := sessionview.Transcript(sess.Plan, events, store)
+	if err != nil {
+		t.Fatalf("derive transcript: %v", err)
+	}
+	if len(transcript.Entries) != 2 || transcript.Entries[0].Text != "first reply" || transcript.Entries[1].Text != "second reply" {
+		t.Fatalf("transcript = %#v", transcript)
+	}
+	afterPlan, err := os.ReadFile(filepath.Join(sess.Root, session.SessionFilename))
+	if err != nil {
+		t.Fatalf("read session.json after resume: %v", err)
+	}
+	if !reflect.DeepEqual(beforePlan, afterPlan) {
+		t.Fatal("session.json changed during turn-budget resume")
+	}
+	reopened, err := session.Open(sess.Root)
+	if err != nil {
+		t.Fatalf("reopen session: %v", err)
+	}
+	if reopened.Digest != beforeDigest || reopened.Plan.Schedule.Turns != 1 {
+		t.Fatalf("reopened immutable plan = digest %q turns %d", reopened.Digest, reopened.Plan.Schedule.Turns)
+	}
+	runner, err := newStateRunner(sess)
+	if err != nil {
+		t.Fatalf("new state runner: %v", err)
+	}
+	if err := runner.rebuildExecutionState(events); err != nil {
+		t.Fatalf("replay turn budget: %v", err)
+	}
+	if runner.state.grantedTurns != 1 || runner.effectiveTurnBudget() != 2 || sess.Plan.Schedule.Turns != 1 {
+		t.Fatalf("derived turn budget = grants %d effective %d plan %d", runner.state.grantedTurns, runner.effectiveTurnBudget(), sess.Plan.Schedule.Turns)
+	}
+}
+
+func TestResumeCompletedSessionWithoutExtraTurnReturnsRecordedOutcome(t *testing.T) {
+	sess := createSession(t, dialoguePlan(1))
+	alpha := &fakeBackend{name: "codex", slotID: "alpha", responses: []fakeResponse{{content: "recorded reply"}}}
+	beta := &fakeBackend{name: "codex", slotID: "beta"}
+	deps := testDeps(map[string]*fakeBackend{"alpha": alpha, "beta": beta})
+	if _, err := Run(context.Background(), sess, deps); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	before, err := os.ReadFile(filepath.Join(sess.Root, eventlog.EventsFilename))
+	if err != nil {
+		t.Fatalf("read events before resume: %v", err)
+	}
+	beforeCount := len(sessionEvents(t, sess))
+
+	outcome, err := Resume(context.Background(), sess, deps, "")
+	if err != nil {
+		t.Fatalf("Resume without extra turns: %v", err)
+	}
+	if outcome.Status != statusCompleted || outcome.Result != "recorded reply" || len(beta.prompts) != 0 {
+		t.Fatalf("resume outcome=%#v beta prompts=%#v", outcome, beta.prompts)
+	}
+	after, err := os.ReadFile(filepath.Join(sess.Root, eventlog.EventsFilename))
+	if err != nil {
+		t.Fatalf("read events after resume: %v", err)
+	}
+	if !reflect.DeepEqual(before, after) || len(sessionEvents(t, sess)) != beforeCount {
+		t.Fatalf("terminal no-extension resume changed event log: before=%q after=%q", before, after)
+	}
+}
+
+func TestResumeAccumulatesSuccessiveTurnBudgetGrants(t *testing.T) {
+	sess := createSession(t, dialoguePlan(1))
+	alpha := &fakeBackend{name: "codex", slotID: "alpha", responses: []fakeResponse{{content: "first reply"}, {content: "third reply"}}}
+	beta := &fakeBackend{name: "codex", slotID: "beta", responses: []fakeResponse{{content: "second reply"}}}
+	deps := testDeps(map[string]*fakeBackend{"alpha": alpha, "beta": beta})
+	if _, err := Run(context.Background(), sess, deps); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	appendTurnBudgetGrant(t, sess, 1)
+	appendTurnBudgetGrant(t, sess, 1)
+	events := sessionEvents(t, sess)
+	runner, err := newStateRunner(sess)
+	if err != nil {
+		t.Fatalf("new state runner: %v", err)
+	}
+	if err := runner.rebuildExecutionState(events); err != nil {
+		t.Fatalf("replay grants: %v", err)
+	}
+	if runner.state.terminal != nil || runner.state.grantedTurns != 2 || runner.effectiveTurnBudget() != 3 {
+		t.Fatalf("replayed grants terminal=%#v granted=%d effective=%d", runner.state.terminal, runner.state.grantedTurns, runner.effectiveTurnBudget())
+	}
+
+	outcome, err := Resume(context.Background(), sess, deps, "")
+	if err != nil {
+		t.Fatalf("Resume after successive grants: %v", err)
+	}
+	if outcome.Status != statusCompleted || outcome.Result != "third reply" || countType(sessionEvents(t, sess), eventlog.TurnFinished) != 3 {
+		t.Fatalf("accumulated grant outcome=%#v events=%v", outcome, eventTypes(sessionEvents(t, sess)))
+	}
+}
+
+func TestResumeReplaysTurnBudgetGrantAfterCrash(t *testing.T) {
+	sess := createSession(t, dialoguePlan(1))
+	alpha := &fakeBackend{name: "codex", slotID: "alpha", responses: []fakeResponse{{content: "first reply"}}}
+	beta := &fakeBackend{name: "codex", slotID: "beta", responses: []fakeResponse{{content: "second reply"}}}
+	deps := testDeps(map[string]*fakeBackend{"alpha": alpha, "beta": beta})
+	if _, err := Run(context.Background(), sess, deps); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	// This durable prefix is the crash point: the grant is present but no extra
+	// turn has started yet.
+	appendTurnBudgetGrant(t, sess, 1)
+	before := sessionEvents(t, sess)
+	if countType(before, eventlog.TurnBudgetGranted) != 1 || before[len(before)-1].Type != eventlog.TurnBudgetGranted {
+		t.Fatalf("crash prefix = %v", eventTypes(before))
+	}
+
+	outcome, err := Resume(context.Background(), sess, deps, "continue after interruption")
+	if err != nil {
+		t.Fatalf("Resume after crash: %v", err)
+	}
+	after := sessionEvents(t, sess)
+	if outcome.Status != statusCompleted || outcome.Result != "second reply" || countType(after, eventlog.TurnBudgetGranted) != 1 || countType(after, eventlog.TurnFinished) != 2 {
+		t.Fatalf("crash recovery outcome=%#v events=%v", outcome, eventTypes(after))
+	}
+}
+
+func TestResumeTurnBudgetGrantRespectsForbiddenLifecycle(t *testing.T) {
+	plan := dialoguePlan(1)
+	plan.Lifecycle = &session.Lifecycle{Resume: "forbid", Steering: "allow", Dynamic: "forbid", WorkspaceIsolation: "inherited"}
+	sess := createSession(t, plan)
+	alpha := &fakeBackend{name: "codex", slotID: "alpha", responses: []fakeResponse{{content: "recorded reply"}}}
+	beta := &fakeBackend{name: "codex", slotID: "beta"}
+	deps := testDeps(map[string]*fakeBackend{"alpha": alpha, "beta": beta})
+	if _, err := Run(context.Background(), sess, deps); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	before, err := os.ReadFile(filepath.Join(sess.Root, eventlog.EventsFilename))
+	if err != nil {
+		t.Fatalf("read events before forbidden grant: %v", err)
+	}
+	if _, err := Resume(context.Background(), sess, deps, "", 1); err == nil || err.Error() != "plan lifecycle forbids resume" {
+		t.Fatalf("forbidden turn-budget grant error = %v", err)
+	}
+	after, err := os.ReadFile(filepath.Join(sess.Root, eventlog.EventsFilename))
+	if err != nil {
+		t.Fatalf("read events after forbidden grant: %v", err)
+	}
+	if !reflect.DeepEqual(before, after) || len(beta.prompts) != 0 {
+		t.Fatalf("forbidden grant mutated log or called provider: before=%q after=%q beta=%#v", before, after, beta.prompts)
+	}
+}
+
+func TestResumeTurnBudgetGrantCyclesSequenceSchedule(t *testing.T) {
+	sess := createSession(t, sequencePlan())
+	callOrder := []string{}
+	alpha := &fakeBackend{name: "codex", slotID: "alpha", calls: &callOrder, responses: []fakeResponse{{content: "first participant"}, {content: "third participant"}}}
+	beta := &fakeBackend{name: "codex", slotID: "beta", calls: &callOrder, responses: []fakeResponse{{content: "second participant"}}}
+	reducer := &fakeBackend{name: "codex", slotID: "reducer", calls: &callOrder, responses: []fakeResponse{{content: "first result"}, {content: "second result"}}}
+	deps := testDeps(map[string]*fakeBackend{"alpha": alpha, "beta": beta, "reducer": reducer})
+	if _, err := Run(context.Background(), sess, deps); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	outcome, err := Resume(context.Background(), sess, deps, "", 1)
+	if err != nil {
+		t.Fatalf("Resume sequence extension: %v", err)
+	}
+	if outcome.Result != "second result" || !reflect.DeepEqual(callOrder, []string{"alpha", "beta", "reducer", "alpha", "reducer"}) {
+		t.Fatalf("sequence extension outcome=%#v calls=%v", outcome, callOrder)
+	}
+}
+
 func TestResumeFailedTerminalChildFailsParent(t *testing.T) {
 	parent := childParentPlan()
 	home := t.TempDir()
@@ -1368,6 +1567,22 @@ func appendEvent(t *testing.T, writer *eventlog.Writer, payload eventlog.Payload
 	t.Helper()
 	if _, err := writer.Append(eventlog.NewEvent(fmt.Sprintf("seed-%d", writer.NextSeq()), time.Unix(1700000000, 0), payload)); err != nil {
 		t.Fatalf("append %T: %v", payload, err)
+	}
+}
+
+func appendTurnBudgetGrant(t *testing.T, sess *session.Session, turns int) {
+	t.Helper()
+	store, err := sess.BlobStore(blobstore.Limits{})
+	if err != nil {
+		t.Fatalf("open blobs for turn grant: %v", err)
+	}
+	writer, err := sess.EventWriter(store)
+	if err != nil {
+		t.Fatalf("open writer for turn grant: %v", err)
+	}
+	appendEvent(t, writer, eventlog.TurnBudgetGrantedPayload{GrantedBy: "operator", Turns: turns})
+	if err := writer.Close(); err != nil {
+		t.Fatalf("close writer for turn grant: %v", err)
 	}
 }
 

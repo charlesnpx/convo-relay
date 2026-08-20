@@ -118,6 +118,21 @@ func TestGraphMarksOnlyMatchingActorRoundFinished(t *testing.T) {
 	}
 }
 
+func TestTurnBudgetGrantReopensDerivedStatusAndGraph(t *testing.T) {
+	plan := viewPlan()
+	events := []eventlog.Event{
+		{Seq: 1, Type: eventlog.SessionFinished, Payload: eventlog.SessionFinishedPayload{Status: "completed", StopReason: "completed"}},
+		{Seq: 2, Type: eventlog.TurnBudgetGranted, Payload: eventlog.TurnBudgetGrantedPayload{GrantedBy: "operator", Turns: 1}},
+	}
+	status := Status(plan, events)
+	if status.Terminal || status.Status != "running" || status.StopReason != "" {
+		t.Fatalf("status after turn grant = %#v", status)
+	}
+	if !hasNode(Graph(plan, events), "session:"+plan.SessionID, "running") {
+		t.Fatalf("graph did not reopen root: %#v", Graph(plan, events))
+	}
+}
+
 func TestProviderSessionsKeepsLatestSuccessfulSessionAfterFailure(t *testing.T) {
 	content := blobstore.BlobRef{SHA256: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", Size: 1, MediaType: "text/plain"}
 	events := []eventlog.Event{

@@ -105,11 +105,15 @@ func minimum(left int, right int) int {
 	return right
 }
 
-// ForResume accepts only prompt material. Structural variation creates a new
-// launch plan instead of being smuggled into a resume.
+// ForResume accepts prompt material plus an optional extra turn budget.
+// Structural variation still creates a new launch plan instead of being
+// smuggled into a resume.
 func ForResume(parent session.Plan, input ResumeInput) (ResumeInput, error) {
 	if err := session.ValidatePlan(parent); err != nil {
 		return ResumeInput{}, fmt.Errorf("validate parent plan: %w", err)
+	}
+	if input.ExtraTurns < 0 {
+		return ResumeInput{}, fmt.Errorf("resume extra turns must not be negative")
 	}
 	candidate := parent
 	candidate.Context = input.Context
@@ -118,8 +122,9 @@ func ForResume(parent session.Plan, input ResumeInput) (ResumeInput, error) {
 		return ResumeInput{}, fmt.Errorf("validate resume prompt inputs: %w", err)
 	}
 	return ResumeInput{
-		Prompt:  input.Prompt,
-		Context: append([]session.Input{}, input.Context...),
-		Skills:  append([]session.Input{}, input.Skills...),
+		Prompt:     input.Prompt,
+		Context:    append([]session.Input{}, input.Context...),
+		Skills:     append([]session.Input{}, input.Skills...),
+		ExtraTurns: input.ExtraTurns,
 	}, nil
 }
