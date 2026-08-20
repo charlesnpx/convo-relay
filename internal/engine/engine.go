@@ -25,8 +25,9 @@ import (
 )
 
 const (
-	statusCompleted = "completed"
-	statusFailed    = "failed"
+	statusCompleted        = "completed"
+	statusFailed           = "failed"
+	statusAwaitingDecision = "awaiting_decision"
 
 	stopCompleted        = "completed"
 	stopConverged        = "converged"
@@ -36,11 +37,13 @@ const (
 	stopAbandonedAttempt = "abandoned_attempt"
 	stopInvalidResult    = "invalid_result"
 
-	mediaTypePlainTextUTF8  = "text/plain; charset=utf-8"
-	mediaTypeChildResult    = "text/plain; charset=utf-8"
-	mediaTypeChildPlan      = "application/vnd.convo-relay.plan+json"
-	maxPromptTranscriptSize = 12
-	resultSchemaURL         = "https://convo-relay.invalid/engine-result-schema.json"
+	mediaTypePlainTextUTF8         = "text/plain; charset=utf-8"
+	mediaTypeChildResult           = "text/plain; charset=utf-8"
+	mediaTypeChildPlan             = "application/vnd.convo-relay.plan+json"
+	childCapacityExhaustedReason   = "child capacity exhausted"
+	childTurnBudgetExhaustedReason = "child turn budget exhausted"
+	maxPromptTranscriptSize        = 12
+	resultSchemaURL                = "https://convo-relay.invalid/engine-result-schema.json"
 )
 
 // BackendFactory creates a backend for one actor in one managed session.
@@ -70,15 +73,26 @@ type Deps struct {
 	ChildRequestExtractor ChildRequestExtractor
 }
 
-// Outcome contains the parent-facing result and durable terminal classification
-// needed by parent-child execution. Diagnostics and transcript details remain
-// derived through sessionview.
+// Outcome contains the parent-facing result and execution classification needed
+// by parent-child execution. Status is terminal when the session is terminal,
+// or awaiting_decision while an ask-mode child request is pending. Diagnostics
+// and transcript details remain derived through sessionview.
 type Outcome struct {
 	Result string
 	Status string
 }
 
-// Run starts an empty session log and executes its compiled plan to completion.
+// PendingChild is the operator-facing view of one durable, undecided child
+// request. Question is loaded from the request's durable blob.
+type PendingChild struct {
+	RequestID        string
+	RequesterActorID string
+	RecipeID         string
+	Question         string
+}
+
+// Run starts an empty session log and executes until the plan is terminal or
+// an ask-mode child request needs an operator decision.
 func Run(ctx context.Context, sess *session.Session, deps Deps) (Outcome, error) {
 	runner, err := newRunner(ctx, sess, deps)
 	if err != nil {
@@ -134,6 +148,79 @@ func Resume(ctx context.Context, sess *session.Session, deps Deps, prompt string
 		}
 	}
 	return runner.execute()
+}
+
+// PendingChildren returns every durable child request that has not yet been
+// resolved by a child.decided event.
+func PendingChildren(sess *session.Session) ([]PendingChild, error) {
+	runner, err := newStateRunner(sess)
+	if err != nil {
+		return nil, err
+	}
+	events, err := readEvents(sess.Root)
+	if err != nil {
+		return nil, err
+	}
+	if err := runner.rebuildExecutionState(events); err != nil {
+		return nil, err
+	}
+	requestIDs := make([]string, 0, len(runner.state.requests))
+	for requestID, child := range runner.state.requests {
+		if !child.decided() {
+			requestIDs = append(requestIDs, requestID)
+		}
+	}
+	sort.Strings(requestIDs)
+	pending := make([]PendingChild, 0, len(requestIDs))
+	for _, requestID := range requestIDs {
+		child := runner.state.requests[requestID]
+		question, err := runner.readBlob(child.Request.Question)
+		if err != nil {
+			return nil, fmt.Errorf("read pending child request %q: %w", requestID, err)
+		}
+		pending = append(pending, PendingChild{
+			RequestID:        child.Request.RequestID,
+			RequesterActorID: child.Request.RequesterActorID,
+			RecipeID:         child.Request.RecipeID,
+			Question:         question,
+		})
+	}
+	return pending, nil
+}
+
+// ApproveChild resolves one pending ask-mode request. It compiles and stores
+// the child plan at approval time, then records the ordinary child.decided
+// event that makes the admission durable.
+func ApproveChild(ctx context.Context, sess *session.Session, requestID string, recipes []plan.Recipe) error {
+	runner, err := newAdmissionRunner(ctx, sess, recipes)
+	if err != nil {
+		return err
+	}
+	defer runner.closeOwnedWriter()
+	child, err := runner.pendingChildForOperatorDecision(requestID)
+	if err != nil {
+		return err
+	}
+	return runner.admitChild(child, "admitted by operator")
+}
+
+// RejectChild resolves one pending ask-mode request without admitting it.
+func RejectChild(ctx context.Context, sess *session.Session, requestID string) error {
+	runner, err := newAdmissionRunner(ctx, sess, nil)
+	if err != nil {
+		return err
+	}
+	defer runner.closeOwnedWriter()
+	child, err := runner.pendingChildForOperatorDecision(requestID)
+	if err != nil {
+		return err
+	}
+	return runner.append(eventlog.ChildDecidedPayload{
+		RequestID:   child.Request.RequestID,
+		Admitted:    false,
+		Reason:      "rejected by operator",
+		BudgetState: "rejected",
+	})
 }
 
 func checkResumeLifecycle(sess *session.Session, prompt string) error {
@@ -262,49 +349,83 @@ type executionFailure struct {
 func (e *executionFailure) Error() string { return e.cause.Error() }
 func (e *executionFailure) Unwrap() error { return e.cause }
 
-func newRunner(ctx context.Context, sess *session.Session, deps Deps) (*runner, error) {
+func newStateRunner(sess *session.Session) (*runner, error) {
 	if sess == nil {
 		return nil, errors.New("session is required")
-	}
-	if deps.BackendFactory == nil {
-		return nil, errors.New("backend factory is required")
 	}
 	blobs, err := sess.BlobStore(blobstore.Limits{})
 	if err != nil {
 		return nil, fmt.Errorf("open blob store: %w", err)
 	}
+	return &runner{
+		sess:       sess,
+		blobs:      blobs,
+		planDigest: sess.Digest,
+		state:      newExecutionState(),
+	}, nil
+}
+
+func newRunner(ctx context.Context, sess *session.Session, deps Deps) (*runner, error) {
+	if deps.BackendFactory == nil {
+		return nil, errors.New("backend factory is required")
+	}
+	runner, err := newStateRunner(sess)
+	if err != nil {
+		return nil, err
+	}
 	writer := deps.Writer
 	closeLog := false
 	if writer == nil {
-		writer, err = sess.EventWriter(blobs)
+		writer, err = sess.EventWriter(runner.blobs)
 		if err != nil {
 			return nil, fmt.Errorf("open event writer: %w", err)
 		}
 		closeLog = true
 	}
-	material, err := loadPromptMaterial(blobs, sess.Plan)
+	runner.writer = writer
+	runner.closeLog = closeLog
+	material, err := loadPromptMaterial(runner.blobs, sess.Plan)
 	if err != nil {
-		if closeLog {
-			_ = writer.Close()
-		}
+		runner.closeOwnedWriter()
 		return nil, err
 	}
-	runner := &runner{
-		ctx:          ctx,
-		sess:         sess,
-		deps:         deps,
-		blobs:        blobs,
-		writer:       writer,
-		closeLog:     closeLog,
-		planDigest:   sess.Digest,
-		backends:     make(map[string]provider.Backend, len(sess.Plan.Actors)),
-		actors:       make(map[string]session.Actor, len(sess.Plan.Actors)),
-		material:     material,
-		state:        newExecutionState(),
-		participants: participantActors(sess.Plan),
-	}
+	runner.ctx = ctx
+	runner.deps = deps
+	runner.backends = make(map[string]provider.Backend, len(sess.Plan.Actors))
+	runner.actors = make(map[string]session.Actor, len(sess.Plan.Actors))
+	runner.material = material
+	runner.participants = participantActors(sess.Plan)
 	for _, actor := range sess.Plan.Actors {
 		runner.actors[actor.ID] = actor
+	}
+	return runner, nil
+}
+
+func newAdmissionRunner(ctx context.Context, sess *session.Session, recipes []plan.Recipe) (*runner, error) {
+	runner, err := newStateRunner(sess)
+	if err != nil {
+		return nil, err
+	}
+	writer, err := sess.EventWriter(runner.blobs)
+	if err != nil {
+		return nil, fmt.Errorf("open event writer: %w", err)
+	}
+	runner.ctx = ctx
+	runner.deps.Recipes = recipes
+	runner.writer = writer
+	runner.closeLog = true
+	events, err := readEvents(sess.Root)
+	if err != nil {
+		runner.closeOwnedWriter()
+		return nil, err
+	}
+	if len(events) == 0 {
+		runner.closeOwnedWriter()
+		return nil, errors.New("cannot decide a child for a session with no session.started event")
+	}
+	if err := runner.rebuildExecutionState(events); err != nil {
+		runner.closeOwnedWriter()
+		return nil, err
 	}
 	return runner, nil
 }
@@ -705,6 +826,9 @@ func (r *runner) execute() (Outcome, error) {
 			}
 			return r.finishFailure(reason, err)
 		}
+		if r.awaitingChildDecision() {
+			return r.outcome(), nil
+		}
 		if reason := r.dialogueStopReason(); reason != "" {
 			return r.finishSuccess(reason)
 		}
@@ -1008,7 +1132,12 @@ func (r *runner) servicePendingChildren() error {
 }
 
 func (r *runner) decideChild(child *childState) error {
-	if r.sess.Plan.ChildPolicy.Mode != "allow" {
+	switch r.sess.Plan.ChildPolicy.Mode {
+	case "ask":
+		return nil
+	case "allow":
+		return r.admitChild(child, "admitted by child policy")
+	default:
 		return r.append(eventlog.ChildDecidedPayload{
 			RequestID:   child.Request.RequestID,
 			Admitted:    false,
@@ -1016,11 +1145,14 @@ func (r *runner) decideChild(child *childState) error {
 			BudgetState: "not_admitted",
 		})
 	}
+}
+
+func (r *runner) admitChild(child *childState, reason string) error {
 	if r.state.childrenUsed >= r.sess.Plan.ChildPolicy.MaxChildren {
 		return r.append(eventlog.ChildDecidedPayload{
 			RequestID:   child.Request.RequestID,
 			Admitted:    false,
-			Reason:      "child capacity exhausted",
+			Reason:      childCapacityExhaustedReason,
 			BudgetState: "children_exhausted",
 		})
 	}
@@ -1037,7 +1169,7 @@ func (r *runner) decideChild(child *childState) error {
 		return r.append(eventlog.ChildDecidedPayload{
 			RequestID:   child.Request.RequestID,
 			Admitted:    false,
-			Reason:      "child turn budget exhausted",
+			Reason:      childTurnBudgetExhaustedReason,
 			BudgetState: "turns_exhausted",
 		})
 	}
@@ -1048,10 +1180,44 @@ func (r *runner) decideChild(child *childState) error {
 	return r.append(eventlog.ChildDecidedPayload{
 		RequestID:   child.Request.RequestID,
 		Admitted:    true,
-		Reason:      "admitted by child policy",
+		Reason:      reason,
 		BudgetState: "available",
 		Plan:        &planRef,
 	})
+}
+
+func (r *runner) awaitingChildDecision() bool {
+	for _, child := range r.state.requests {
+		if !child.decided() {
+			return true
+		}
+	}
+	return false
+}
+
+func (r *runner) pendingChildForOperatorDecision(requestID string) (*childState, error) {
+	if r.state.terminal != nil {
+		return nil, errors.New("cannot decide a child for a terminal session")
+	}
+	if r.sess.Plan.ChildPolicy.Mode != "ask" {
+		return nil, fmt.Errorf("child policy mode %q does not accept operator decisions", r.sess.Plan.ChildPolicy.Mode)
+	}
+	requestID = strings.TrimSpace(requestID)
+	if requestID == "" {
+		return nil, errors.New("child request id is required")
+	}
+	child, exists := r.state.requests[requestID]
+	if !exists {
+		return nil, fmt.Errorf("child request %q was not found", requestID)
+	}
+	if child.decided() {
+		decision := "rejected"
+		if child.admitted() {
+			decision = "admitted"
+		}
+		return nil, fmt.Errorf("child request %q already has an existing %s decision", requestID, decision)
+	}
+	return child, nil
 }
 
 func (r *runner) childPlanFor(child *childState) (session.Plan, error) {
@@ -1286,6 +1452,8 @@ func (r *runner) outcome() Outcome {
 	status := ""
 	if r.state.terminal != nil {
 		status = r.state.terminal.Status
+	} else if r.awaitingChildDecision() {
+		status = statusAwaitingDecision
 	}
 	return Outcome{Result: r.state.lastResult.Text, Status: status}
 }
