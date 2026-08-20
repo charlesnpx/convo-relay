@@ -456,29 +456,140 @@ func TestResumeRebuildsChildBudgets(t *testing.T) {
 	}
 }
 
-func TestExtractedChildRequestSurvivesBeforeParentCompletion(t *testing.T) {
+func TestFinishedAttemptChildRequestRemainsDecidableBeforeParentCompletion(t *testing.T) {
 	parent := dialoguePlan(1)
-	parent.ChildPolicy = session.ChildPolicy{Mode: "allow", MaxDepth: 1, MaxChildren: 1, MaxTurns: 1, AllowedRecipes: []string{"child"}}
+	parent.ProviderRetry = session.ProviderRetry{Mode: "forbid", MaxAttempts: 1}
+	parent.ChildPolicy = session.ChildPolicy{Mode: "ask", MaxDepth: 1, MaxChildren: 1, MaxTurns: 1, AllowedRecipes: []string{"child"}}
 	sess := createSession(t, parent)
 	seedLog(t, sess, func(store *blobstore.Store, writer *eventlog.Writer) {
 		content := putSeedText(t, store, "parent response")
 		question := putSeedText(t, store, "durable child request")
 		appendEvent(t, writer, eventlog.TurnStartedPayload{ActorID: "alpha", Round: 1, Role: eventlog.ParticipantRole})
 		appendEvent(t, writer, eventlog.AttemptStartedPayload{ActorID: "alpha", Attempt: 1})
-		appendEvent(t, writer, eventlog.ChildRequestedPayload{RequestID: "child-one", RequesterActorID: "alpha", RecipeID: "child", Question: question})
 		appendEvent(t, writer, eventlog.AttemptFinishedPayload{ActorID: "alpha", Attempt: 1, Outcome: "success", Content: content})
+		appendEvent(t, writer, eventlog.ChildRequestedPayload{RequestID: "child-one", RequesterActorID: "alpha", RecipeID: "child", Question: question})
 	})
 	alpha := &fakeBackend{name: "codex", slotID: "alpha"}
 	beta := &fakeBackend{name: "codex", slotID: "beta"}
-	child := &fakeBackend{name: "codex", slotID: "child-alpha", responses: []fakeResponse{{content: "recovered child"}}}
-	deps := testDeps(map[string]*fakeBackend{"alpha": alpha, "beta": beta, "child-alpha": child})
+	deps := testDeps(map[string]*fakeBackend{"alpha": alpha, "beta": beta})
 	deps.Recipes = []plan.Recipe{childRecipe()}
-	if _, err := Resume(context.Background(), sess, deps, ""); err != nil {
+	outcome, err := Resume(context.Background(), sess, deps, "")
+	if err != nil {
 		t.Fatalf("Resume: %v", err)
 	}
+	if outcome.Status != statusAwaitingDecision {
+		t.Fatalf("Resume outcome = %#v, want awaiting decision", outcome)
+	}
 	events := sessionEvents(t, sess)
-	if len(alpha.prompts) != 0 || len(child.prompts) != 1 || countType(events, eventlog.TurnFinished) != 1 || countType(events, eventlog.ChildCompleted) != 1 {
-		t.Fatalf("alpha=%d child=%d events=%#v", len(alpha.prompts), len(child.prompts), eventTypes(events))
+	if started, finished, requested, turnFinished := indexOfType(events, eventlog.AttemptStarted), indexOfType(events, eventlog.AttemptFinished), indexOfType(events, eventlog.ChildRequested), indexOfType(events, eventlog.TurnFinished); !(started < finished && finished < requested && requested < turnFinished) {
+		t.Fatalf("child request prefix order = %v", eventTypes(events))
+	}
+	if countType(events, eventlog.SessionFinished) != 0 {
+		t.Fatalf("resumed parent became terminal: %v", eventTypes(events))
+	}
+	pending, err := PendingChildren(sess)
+	if err != nil || len(pending) != 1 || pending[0].RequestID != "child-one" {
+		t.Fatalf("pending children = %#v err=%v", pending, err)
+	}
+	if err := ApproveChild(context.Background(), sess, "child-one", deps.Recipes); err != nil {
+		t.Fatalf("ApproveChild: %v", err)
+	}
+}
+
+func TestResumeMaterializesChildRequestsFromSuccessfulAttempt(t *testing.T) {
+	for _, test := range []struct {
+		name               string
+		requests           []ChildRequest
+		seededRequestCount int
+	}{
+		{
+			name: "no child requested prefix",
+			requests: []ChildRequest{
+				{Request: plan.ChildRequest{RecipeID: "child", Question: "first recovered child question"}},
+			},
+		},
+		{
+			name: "partial child requested prefix",
+			requests: []ChildRequest{
+				{Request: plan.ChildRequest{RecipeID: "child", Question: "first recovered child question"}},
+				{Request: plan.ChildRequest{RecipeID: "child", Question: "second recovered child question"}},
+			},
+			seededRequestCount: 1,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			parent := dialoguePlan(1)
+			parent.ProviderRetry = session.ProviderRetry{Mode: "forbid", MaxAttempts: 1}
+			parent.ChildPolicy = session.ChildPolicy{
+				Mode: "ask", MaxDepth: 1, MaxChildren: len(test.requests), MaxTurns: len(test.requests), AllowedRecipes: []string{"child"},
+			}
+			sess := createSession(t, parent)
+			seedLog(t, sess, func(store *blobstore.Store, writer *eventlog.Writer) {
+				content := putSeedText(t, store, "durable parent response")
+				appendEvent(t, writer, eventlog.TurnStartedPayload{ActorID: "alpha", Round: 1, Role: eventlog.ParticipantRole})
+				appendEvent(t, writer, eventlog.AttemptStartedPayload{ActorID: "alpha", Attempt: 1})
+				appendEvent(t, writer, eventlog.AttemptFinishedPayload{ActorID: "alpha", Attempt: 1, Outcome: "success", Content: content})
+				for index := 0; index < test.seededRequestCount; index++ {
+					question := putSeedText(t, store, test.requests[index].Request.Question)
+					appendEvent(t, writer, eventlog.ChildRequestedPayload{
+						RequestID:        fmt.Sprintf("alpha-child-1-%d", index+1),
+						RequesterActorID: "alpha",
+						RecipeID:         "child",
+						Question:         question,
+					})
+				}
+			})
+			alpha := &fakeBackend{name: "codex", slotID: "alpha"}
+			beta := &fakeBackend{name: "codex", slotID: "beta"}
+			deps := testDeps(map[string]*fakeBackend{"alpha": alpha, "beta": beta})
+			deps.Recipes = []plan.Recipe{childRecipe()}
+			extractorCalls := 0
+			deps.ChildRequestExtractor = func(actor session.Actor, role eventlog.Role, result provider.TurnResult) []ChildRequest {
+				extractorCalls++
+				if actor.ID != "alpha" || role != eventlog.ParticipantRole {
+					t.Errorf("recovered extractor input = actor=%q role=%q", actor.ID, role)
+				}
+				if want := (provider.TurnResult{Content: "durable parent response"}); !reflect.DeepEqual(result, want) {
+					t.Errorf("recovered result = %#v, want content-only %#v", result, want)
+				}
+				return test.requests
+			}
+
+			outcome, err := Resume(context.Background(), sess, deps, "")
+			if err != nil {
+				t.Fatalf("Resume: %v", err)
+			}
+			if outcome.Status != statusAwaitingDecision || extractorCalls != 1 || len(alpha.prompts) != 0 {
+				t.Fatalf("outcome=%#v extractor calls=%d alpha calls=%d", outcome, extractorCalls, len(alpha.prompts))
+			}
+			events := sessionEvents(t, sess)
+			if countType(events, eventlog.ChildRequested) != len(test.requests) || countType(events, eventlog.SessionFinished) != 0 {
+				t.Fatalf("recovered events = %v", eventTypes(events))
+			}
+			attemptFinished, turnFinished := indexOfType(events, eventlog.AttemptFinished), indexOfType(events, eventlog.TurnFinished)
+			for index, event := range events {
+				if event.Type == eventlog.ChildRequested && !(attemptFinished < index && index < turnFinished) {
+					t.Fatalf("child request order = %v", eventTypes(events))
+				}
+			}
+			pending, err := PendingChildren(sess)
+			if err != nil || len(pending) != len(test.requests) {
+				t.Fatalf("pending children = %#v err=%v", pending, err)
+			}
+			seen := make(map[string]bool, len(pending))
+			for index, child := range pending {
+				wantID := fmt.Sprintf("alpha-child-1-%d", index+1)
+				if child.RequestID != wantID || child.Question != test.requests[index].Request.Question || seen[child.RequestID] {
+					t.Fatalf("pending child %d = %#v, want id=%q question=%q", index, child, wantID, test.requests[index].Request.Question)
+				}
+				seen[child.RequestID] = true
+			}
+			if test.seededRequestCount == 0 {
+				if err := ApproveChild(context.Background(), sess, pending[0].RequestID, deps.Recipes); err != nil {
+					t.Fatalf("ApproveChild recovered request: %v", err)
+				}
+			}
+		})
 	}
 }
 

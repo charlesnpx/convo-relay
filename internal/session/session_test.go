@@ -323,6 +323,22 @@ func TestValidatePlanRejectsForbiddenDynamicWithPermissiveChildPolicy(t *testing
 	}
 }
 
+func TestValidatePlanRejectsAskChildPolicyWithForbiddenResume(t *testing.T) {
+	plan := testPlan()
+	plan.SessionID = "forbidden-resume"
+	plan.Lifecycle = &Lifecycle{
+		Resume:             "forbid",
+		Steering:           "allow",
+		Dynamic:            "allow",
+		WorkspaceIsolation: "inherited",
+	}
+	plan.ChildPolicy = ChildPolicy{Mode: "ask", MaxDepth: 1, MaxChildren: 1, MaxTurns: 1, AllowedRecipes: []string{}}
+	const want = "lifecycle.resume forbid is incompatible with child_policy.mode ask"
+	if err := ValidatePlan(plan); err == nil || err.Error() != want {
+		t.Fatalf("ValidatePlan error = %v, want %q", err, want)
+	}
+}
+
 func TestValidatePlanRejectsUnknownChildPolicyMode(t *testing.T) {
 	for _, mode := range []string{"explode", "disabled"} {
 		t.Run(mode, func(t *testing.T) {
