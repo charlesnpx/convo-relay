@@ -112,13 +112,11 @@ func Run(ctx context.Context, sess *session.Session, deps Deps) (Outcome, error)
 }
 
 // Resume replays a started session and continues only work left by its
-// immutable plan plus an optional explicit turn-budget extension. The variadic
-// form keeps existing prompt-only callers source compatible while allowing one
-// extra turn count at the execution boundary.
-func Resume(ctx context.Context, sess *session.Session, deps Deps, prompt string, requestedTurns ...int) (Outcome, error) {
-	additionalTurns, err := resumeTurnBudget(requestedTurns)
-	if err != nil {
-		return Outcome{}, err
+// immutable plan plus an explicit turn-budget extension when requestedTurns is
+// positive.
+func Resume(ctx context.Context, sess *session.Session, deps Deps, prompt string, requestedTurns int) (Outcome, error) {
+	if requestedTurns < 0 {
+		return Outcome{}, errors.New("resume extra turns must not be negative")
 	}
 	if err := checkResumeLifecycle(sess, prompt); err != nil {
 		return Outcome{}, err
@@ -139,11 +137,14 @@ func Resume(ctx context.Context, sess *session.Session, deps Deps, prompt string
 	if err := runner.rebuildExecutionState(events); err != nil {
 		return Outcome{}, err
 	}
-	if runner.state.terminal != nil && additionalTurns == 0 {
+	if runner.state.terminal != nil && requestedTurns == 0 {
 		return runner.outcome(), nil
 	}
-	if additionalTurns > 0 {
-		if err := runner.append(eventlog.TurnBudgetGrantedPayload{GrantedBy: "operator", Turns: additionalTurns}); err != nil {
+	if requestedTurns > 0 {
+		if err := runner.preflightTurnBudgetGrant(requestedTurns); err != nil {
+			return Outcome{}, err
+		}
+		if err := runner.append(eventlog.TurnBudgetGrantedPayload{GrantedBy: "operator", Turns: requestedTurns}); err != nil {
 			return Outcome{}, err
 		}
 	}
@@ -157,19 +158,6 @@ func Resume(ctx context.Context, sess *session.Session, deps Deps, prompt string
 		}
 	}
 	return runner.execute()
-}
-
-func resumeTurnBudget(requested []int) (int, error) {
-	if len(requested) > 1 {
-		return 0, errors.New("resume accepts at most one extra turn budget")
-	}
-	if len(requested) == 0 {
-		return 0, nil
-	}
-	if requested[0] < 0 {
-		return 0, errors.New("resume extra turns must not be negative")
-	}
-	return requested[0], nil
 }
 
 // PendingChildren returns every durable child request that has not yet been
@@ -290,10 +278,11 @@ type executionState struct {
 
 	active *turnState
 
-	conversation []conversationTurn
-	ledger       model.Ledger
-	lastResult   completedTurn
-	grantedTurns int
+	conversation        []conversationTurn
+	ledger              model.Ledger
+	lastResult          completedTurn
+	grantedTurns        int
+	conversationAtGrant int
 
 	requests     map[string]*childState
 	childResults []string
@@ -751,10 +740,11 @@ func (r *runner) reduceEvent(event eventlog.Event) error {
 		}
 		return errors.New("steering.applied has no queued prompt")
 	case eventlog.TurnBudgetGrantedPayload:
-		if payload.Turns > maximumInt()-r.sess.Plan.Schedule.Turns-state.grantedTurns {
+		if r.turnBudgetGrantExceedsIntegerRange(payload.Turns) {
 			return errors.New("turn budget grants exceed integer range")
 		}
 		state.grantedTurns += payload.Turns
+		state.conversationAtGrant = len(state.conversation)
 		state.terminal = nil
 		state.resultValidation = ""
 		r.phaseAfterParticipants()
@@ -833,6 +823,20 @@ func (r *runner) effectiveTurnBudget() int {
 	return r.sess.Plan.Schedule.Turns + r.state.grantedTurns
 }
 
+func (r *runner) preflightTurnBudgetGrant(turns int) error {
+	if r.turnBudgetGrantExceedsIntegerRange(turns) {
+		return errors.New("turn budget grants exceed integer range")
+	}
+	if r.state.terminal != nil && r.state.terminal.Status != statusCompleted {
+		return fmt.Errorf("cannot grant turns to a %s session; retry or fork it", r.state.terminal.Status)
+	}
+	return nil
+}
+
+func (r *runner) turnBudgetGrantExceedsIntegerRange(turns int) bool {
+	return turns > maximumInt()-r.sess.Plan.Schedule.Turns-r.state.grantedTurns
+}
+
 func maximumInt() int { return int(^uint(0) >> 1) }
 
 func (r *runner) execute() (Outcome, error) {
@@ -865,10 +869,7 @@ func (r *runner) execute() (Outcome, error) {
 			outcome.Status = statusAwaitingDecision
 			return outcome, nil
 		}
-		reason, err := r.dialogueStopReason()
-		if err != nil {
-			return r.finishFailure(stopProviderFailed, err)
-		}
+		reason := r.dialogueStopReason()
 		if reason != "" {
 			return r.finishSuccess(reason)
 		}
@@ -908,9 +909,6 @@ func (r *runner) nextTurn() (turnSpec, error) {
 				Role:  eventlog.ParticipantRole,
 			}, nil
 		}
-		if len(r.sess.Plan.Schedule.Order) == 0 {
-			return turnSpec{}, errors.New("sequence schedule has no actor order")
-		}
 		actor, err := r.actor(r.sess.Plan.Schedule.Order[len(r.state.conversation)%len(r.sess.Plan.Schedule.Order)])
 		if err != nil {
 			return turnSpec{}, err
@@ -939,10 +937,10 @@ func (r *runner) nextTurn() (turnSpec, error) {
 	}
 }
 
-func (r *runner) dialogueStopReason() (string, error) {
+func (r *runner) dialogueStopReason() string {
 	if r.sess.Plan.Schedule.Kind != "dialogue" || !r.sess.Plan.Schedule.StopOnConvergence ||
 		r.state.active != nil || r.state.phase == phaseFacilitator {
-		return "", nil
+		return ""
 	}
 	reason := ""
 	if hasConverged(r.state.conversation, r.state.ledger) {
@@ -952,46 +950,12 @@ func (r *runner) dialogueStopReason() (string, error) {
 		reason = stopNoLedgerSignal
 	}
 	if reason == "" || r.state.grantedTurns == 0 {
-		return reason, nil
+		return reason
 	}
-	conversationAtGrant, err := r.conversationAtLatestTurnBudgetGrant()
-	if err != nil {
-		return "", err
+	if len(r.state.conversation) <= r.state.conversationAtGrant {
+		return ""
 	}
-	if len(r.state.conversation) <= conversationAtGrant {
-		return "", nil
-	}
-	return reason, nil
-}
-
-// conversationAtLatestTurnBudgetGrant derives the participant conversation
-// count at the most recent durable grant. It deliberately replays the log
-// instead of storing a checkpoint alongside the conversation history.
-func (r *runner) conversationAtLatestTurnBudgetGrant() (int, error) {
-	events, err := readEvents(r.sess.Root)
-	if err != nil {
-		return 0, err
-	}
-	type turnKey struct {
-		actorID string
-		round   int
-	}
-	roles := make(map[turnKey]eventlog.Role)
-	conversation := 0
-	conversationAtGrant := 0
-	for _, event := range events {
-		switch payload := event.Payload.(type) {
-		case eventlog.TurnStartedPayload:
-			roles[turnKey{actorID: payload.ActorID, round: payload.Round}] = payload.Role
-		case eventlog.TurnFinishedPayload:
-			if roles[turnKey{actorID: payload.ActorID, round: payload.Round}] == eventlog.ParticipantRole {
-				conversation++
-			}
-		case eventlog.TurnBudgetGrantedPayload:
-			conversationAtGrant = conversation
-		}
-	}
-	return conversationAtGrant, nil
+	return reason
 }
 
 func (r *runner) serviceActiveTurn() error {
@@ -1377,7 +1341,7 @@ func (r *runner) runChild(child *childState) (bool, error) {
 		}
 		childOutcome, childErr = Run(r.ctx, childSession, childDeps)
 	} else {
-		childOutcome, childErr = Resume(r.ctx, childSession, childDeps, "")
+		childOutcome, childErr = Resume(r.ctx, childSession, childDeps, "", 0)
 	}
 	childStatus := childOutcome.Status
 	if childErr != nil {

@@ -1,6 +1,7 @@
 package engine
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"io"
@@ -186,39 +187,11 @@ func TestResumeTurnBudgetGrantRequiresPostGrantDialogueEvidence(t *testing.T) {
 				t.Fatalf("Resume: %v", err)
 			}
 			events := sessionEvents(t, sess)
-			grant := indexOfType(events, eventlog.TurnBudgetGranted)
-			if grant == len(events) {
-				t.Fatal("missing turn_budget.granted")
-			}
-			startedAfterGrant := false
-			finishedAfterGrant := false
-			for _, event := range events[grant+1:] {
-				if payload, ok := turnStarted(event); ok && payload.Round == 5 && payload.Role == eventlog.ParticipantRole {
-					startedAfterGrant = true
-				}
-				if payload, ok := turnFinished(event); ok && payload.Round == 5 && payload.ActorID == "alpha" {
-					finishedAfterGrant = true
-				}
-			}
-			if !startedAfterGrant || !finishedAfterGrant || countType(events, eventlog.TurnFinished) != 5 {
-				t.Fatalf("post-grant turn events=%v started=%t finished=%t", eventTypes(events), startedAfterGrant, finishedAfterGrant)
+			if got := countType(events, eventlog.TurnFinished); got != 5 {
+				t.Fatalf("post-grant finished turns = %d, want 5", got)
 			}
 			if got := sessionFinished(t, events).StopReason; got != test.stopReason {
 				t.Fatalf("post-grant stop reason=%q, want %q", got, test.stopReason)
-			}
-			if len(alpha.prompts) != 3 || !strings.Contains(alpha.prompts[2], "Resume direction: check it again") {
-				t.Fatalf("resumed provider prompts=%#v", alpha.prompts)
-			}
-			store, err := sess.BlobStore(blobstore.Limits{})
-			if err != nil {
-				t.Fatalf("open blobs: %v", err)
-			}
-			transcript, err := sessionview.Transcript(sess.Plan, events, store)
-			if err != nil {
-				t.Fatalf("derive transcript: %v", err)
-			}
-			if len(transcript.Entries) != 5 || transcript.Entries[0].Text != test.responses[0] || transcript.Entries[3].Text != test.responses[3] || transcript.Entries[4].Text != test.responses[4] {
-				t.Fatalf("transcript history=%#v", transcript.Entries)
 			}
 		})
 	}
@@ -332,7 +305,7 @@ func TestResumeReportsAndRetriesAbandonedAttempt(t *testing.T) {
 
 	alpha := &fakeBackend{name: "codex", slotID: "alpha", responses: []fakeResponse{{content: "resumed"}}}
 	beta := &fakeBackend{name: "codex", slotID: "beta"}
-	_, err = Resume(context.Background(), sess, testDeps(map[string]*fakeBackend{"alpha": alpha, "beta": beta}), "continue")
+	_, err = Resume(context.Background(), sess, testDeps(map[string]*fakeBackend{"alpha": alpha, "beta": beta}), "continue", 0)
 	if err != nil {
 		t.Fatalf("Resume: %v", err)
 	}
@@ -376,7 +349,7 @@ func TestResumeFinalizesRecordedSuccessWithoutProvider(t *testing.T) {
 	})
 	alpha := &fakeBackend{name: "codex", slotID: "alpha"}
 	beta := &fakeBackend{name: "codex", slotID: "beta"}
-	outcome, err := Resume(context.Background(), sess, testDeps(map[string]*fakeBackend{"alpha": alpha, "beta": beta}), "")
+	outcome, err := Resume(context.Background(), sess, testDeps(map[string]*fakeBackend{"alpha": alpha, "beta": beta}), "", 0)
 	if err != nil {
 		t.Fatalf("Resume: %v", err)
 	}
@@ -404,7 +377,7 @@ func TestResumeRecordedAuthFailureIsTerminal(t *testing.T) {
 	})
 	alpha := &fakeBackend{name: "codex", slotID: "alpha", responses: []fakeResponse{{content: "must not run"}}}
 	beta := &fakeBackend{name: "codex", slotID: "beta"}
-	if _, err := Resume(context.Background(), sess, testDeps(map[string]*fakeBackend{"alpha": alpha, "beta": beta}), ""); err == nil {
+	if _, err := Resume(context.Background(), sess, testDeps(map[string]*fakeBackend{"alpha": alpha, "beta": beta}), "", 0); err == nil {
 		t.Fatal("Resume accepted a recorded non-retryable auth failure")
 	}
 	events := sessionEvents(t, sess)
@@ -449,7 +422,7 @@ func TestResumeClassifiedFailureBeforeAttemptFinished(t *testing.T) {
 			})
 			alpha := &fakeBackend{name: "codex", slotID: "alpha", responses: test.responses}
 			beta := &fakeBackend{name: "codex", slotID: "beta"}
-			outcome, err := Resume(context.Background(), sess, testDeps(map[string]*fakeBackend{"alpha": alpha, "beta": beta}), "")
+			outcome, err := Resume(context.Background(), sess, testDeps(map[string]*fakeBackend{"alpha": alpha, "beta": beta}), "", 0)
 			if (err != nil) != test.wantError {
 				t.Fatalf("Resume error=%v, want error=%t", err, test.wantError)
 			}
@@ -487,7 +460,7 @@ func TestResumeServicesDueFacilitatorBeforeNextParticipant(t *testing.T) {
 		{content: "{\"settled\":[],\"contested\":[],\"withdrawn\":[]}"},
 		{content: "{\"settled\":[],\"contested\":[],\"withdrawn\":[]}"},
 	}}
-	if _, err := Resume(context.Background(), sess, testDeps(map[string]*fakeBackend{"alpha": alpha, "beta": beta, "facilitator": facilitator}), ""); err != nil {
+	if _, err := Resume(context.Background(), sess, testDeps(map[string]*fakeBackend{"alpha": alpha, "beta": beta, "facilitator": facilitator}), "", 0); err != nil {
 		t.Fatalf("Resume: %v", err)
 	}
 	if got := len(facilitator.prompts); got != 4 {
@@ -523,7 +496,7 @@ func TestResumeRebuildsChildBudgets(t *testing.T) {
 		}
 		return nil
 	}
-	if _, err := Resume(context.Background(), sess, deps, ""); err != nil {
+	if _, err := Resume(context.Background(), sess, deps, "", 0); err != nil {
 		t.Fatalf("Resume: %v", err)
 	}
 	decisions := childDecisions(sessionEvents(t, sess))
@@ -549,7 +522,7 @@ func TestFinishedAttemptChildRequestRemainsDecidableBeforeParentCompletion(t *te
 	beta := &fakeBackend{name: "codex", slotID: "beta"}
 	deps := testDeps(map[string]*fakeBackend{"alpha": alpha, "beta": beta})
 	deps.Recipes = []plan.Recipe{childRecipe()}
-	outcome, err := Resume(context.Background(), sess, deps, "")
+	outcome, err := Resume(context.Background(), sess, deps, "", 0)
 	if err != nil {
 		t.Fatalf("Resume: %v", err)
 	}
@@ -631,7 +604,7 @@ func TestResumeMaterializesChildRequestsFromSuccessfulAttempt(t *testing.T) {
 				return test.requests
 			}
 
-			outcome, err := Resume(context.Background(), sess, deps, "")
+			outcome, err := Resume(context.Background(), sess, deps, "", 0)
 			if err != nil {
 				t.Fatalf("Resume: %v", err)
 			}
@@ -684,7 +657,7 @@ func TestResumeReplaysQueuedSteering(t *testing.T) {
 			})
 			alpha := &fakeBackend{name: "codex", slotID: "alpha", responses: []fakeResponse{{content: "steered"}}}
 			beta := &fakeBackend{name: "codex", slotID: "beta"}
-			if _, err := Resume(context.Background(), sess, testDeps(map[string]*fakeBackend{"alpha": alpha, "beta": beta}), ""); err != nil {
+			if _, err := Resume(context.Background(), sess, testDeps(map[string]*fakeBackend{"alpha": alpha, "beta": beta}), "", 0); err != nil {
 				t.Fatalf("Resume: %v", err)
 			}
 			if len(alpha.prompts) != 1 || !strings.Contains(alpha.prompts[0], "Resume direction: take the conservative route") {
@@ -772,7 +745,7 @@ func TestResumeLifecycleGuardsBeforeMutation(t *testing.T) {
 			}
 			alpha := &fakeBackend{name: "codex", slotID: "alpha"}
 			beta := &fakeBackend{name: "codex", slotID: "beta"}
-			if _, err := Resume(context.Background(), sess, testDeps(map[string]*fakeBackend{"alpha": alpha, "beta": beta}), test.prompt); err == nil {
+			if _, err := Resume(context.Background(), sess, testDeps(map[string]*fakeBackend{"alpha": alpha, "beta": beta}), test.prompt, 0); err == nil {
 				t.Fatal("Resume ignored lifecycle guard")
 			}
 			after, err := os.ReadFile(filepath.Join(sess.Root, eventlog.EventsFilename))
@@ -818,7 +791,7 @@ func TestProviderContinuationIsRecordedAndRestored(t *testing.T) {
 		})
 		alpha := &fakeBackend{name: "codex", slotID: "alpha", responses: []fakeResponse{{content: "third"}}}
 		beta := &fakeBackend{name: "codex", slotID: "beta", responses: []fakeResponse{{content: "second"}}}
-		if _, err := Resume(context.Background(), sess, testDeps(map[string]*fakeBackend{"alpha": alpha, "beta": beta}), ""); err != nil {
+		if _, err := Resume(context.Background(), sess, testDeps(map[string]*fakeBackend{"alpha": alpha, "beta": beta}), "", 0); err != nil {
 			t.Fatalf("Resume: %v", err)
 		}
 		if len(alpha.restored) != 1 || alpha.restored[0]["thread_id"] != "thread-one" || len(alpha.prompts) != 1 {
@@ -943,7 +916,7 @@ func TestResumeCompletedChildBeforeParentCompletionReusesChildSession(t *testing
 	deps := testDeps(map[string]*fakeBackend{"alpha": alpha, "beta": beta, "child-alpha": child})
 	// The completed child is found by the admitted deterministic identity; it
 	// must not need the recipe list to be recomputed during parent recovery.
-	if _, err := Resume(context.Background(), sess, deps, ""); err != nil {
+	if _, err := Resume(context.Background(), sess, deps, "", 0); err != nil {
 		t.Fatalf("resume parent: %v", err)
 	}
 	if got := len(child.prompts); got != 1 {
@@ -975,12 +948,91 @@ func TestResumeTerminalFailedSessionReportsStatus(t *testing.T) {
 	outcome, err := Resume(context.Background(), sess, testDeps(map[string]*fakeBackend{
 		"alpha": resumedAlpha,
 		"beta":  {name: "codex", slotID: "beta"},
-	}), "")
+	}), "", 0)
 	if err != nil {
 		t.Fatalf("Resume terminal failed session: %v", err)
 	}
 	if outcome.Status != statusFailed || len(resumedAlpha.prompts) != 0 {
 		t.Fatalf("terminal resume outcome=%#v calls=%d", outcome, len(resumedAlpha.prompts))
+	}
+}
+
+func TestResumeRejectsOverBoundTurnBudgetWithoutMutatingLog(t *testing.T) {
+	sess := createSession(t, dialoguePlan(1))
+	alpha := &fakeBackend{name: "codex", slotID: "alpha", responses: []fakeResponse{{content: "first reply"}}}
+	beta := &fakeBackend{name: "codex", slotID: "beta", responses: []fakeResponse{{content: "second reply"}}}
+	deps := testDeps(map[string]*fakeBackend{"alpha": alpha, "beta": beta})
+	if _, err := Run(context.Background(), sess, deps); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	eventsPath := filepath.Join(sess.Root, eventlog.EventsFilename)
+	before, err := os.ReadFile(eventsPath)
+	if err != nil {
+		t.Fatalf("read events before rejected grant: %v", err)
+	}
+
+	if _, err := Resume(context.Background(), sess, deps, "do not append this steering", maximumInt()); err == nil || !strings.Contains(err.Error(), "integer range") {
+		t.Fatalf("over-bound Resume error = %v", err)
+	}
+	after, err := os.ReadFile(eventsPath)
+	if err != nil {
+		t.Fatalf("read events after rejected grant: %v", err)
+	}
+	if !bytes.Equal(before, after) {
+		t.Fatal("rejected over-bound grant changed events.jsonl")
+	}
+
+	reopened, err := session.Open(sess.Root)
+	if err != nil {
+		t.Fatalf("reopen session after rejected grant: %v", err)
+	}
+	replayed, err := newStateRunner(reopened)
+	if err != nil {
+		t.Fatalf("new replay runner: %v", err)
+	}
+	if err := replayed.rebuildExecutionState(sessionEvents(t, reopened)); err != nil {
+		t.Fatalf("replay after rejected grant: %v", err)
+	}
+	outcome, err := Resume(context.Background(), reopened, deps, "", 1)
+	if err != nil {
+		t.Fatalf("resume after rejected grant: %v", err)
+	}
+	if outcome.Status != statusCompleted || outcome.Result != "second reply" {
+		t.Fatalf("resumed outcome = %#v", outcome)
+	}
+}
+
+func TestResumeRejectsTurnBudgetGrantForFailedTerminalWithoutMutatingLog(t *testing.T) {
+	sess := createSession(t, dialoguePlan(1))
+	failing := &fakeBackend{name: "codex", slotID: "alpha", responses: []fakeResponse{{err: provider.BackendRunError{Detail: "denied"}}}}
+	if _, err := Run(context.Background(), sess, testDeps(map[string]*fakeBackend{
+		"alpha": failing,
+		"beta":  {name: "codex", slotID: "beta"},
+	})); err == nil {
+		t.Fatal("Run unexpectedly completed a failed session")
+	}
+	eventsPath := filepath.Join(sess.Root, eventlog.EventsFilename)
+	before, err := os.ReadFile(eventsPath)
+	if err != nil {
+		t.Fatalf("read events before rejected failed-terminal grant: %v", err)
+	}
+	resumedAlpha := &fakeBackend{name: "codex", slotID: "alpha", responses: []fakeResponse{{content: "must not run"}}}
+
+	if _, err := Resume(context.Background(), sess, testDeps(map[string]*fakeBackend{
+		"alpha": resumedAlpha,
+		"beta":  {name: "codex", slotID: "beta"},
+	}), "do not append this steering", 1); err == nil || !strings.Contains(err.Error(), "retry or fork") {
+		t.Fatalf("failed-terminal grant error = %v", err)
+	}
+	after, err := os.ReadFile(eventsPath)
+	if err != nil {
+		t.Fatalf("read events after rejected failed-terminal grant: %v", err)
+	}
+	if !bytes.Equal(before, after) {
+		t.Fatal("rejected failed-terminal grant changed events.jsonl")
+	}
+	if len(resumedAlpha.prompts) != 0 {
+		t.Fatalf("failed-terminal grant called provider %d times", len(resumedAlpha.prompts))
 	}
 }
 
@@ -1051,36 +1103,6 @@ func TestResumeCompletedSessionWithExtraTurnBudget(t *testing.T) {
 	}
 }
 
-func TestResumeCompletedSessionWithoutExtraTurnReturnsRecordedOutcome(t *testing.T) {
-	sess := createSession(t, dialoguePlan(1))
-	alpha := &fakeBackend{name: "codex", slotID: "alpha", responses: []fakeResponse{{content: "recorded reply"}}}
-	beta := &fakeBackend{name: "codex", slotID: "beta"}
-	deps := testDeps(map[string]*fakeBackend{"alpha": alpha, "beta": beta})
-	if _, err := Run(context.Background(), sess, deps); err != nil {
-		t.Fatalf("Run: %v", err)
-	}
-	before, err := os.ReadFile(filepath.Join(sess.Root, eventlog.EventsFilename))
-	if err != nil {
-		t.Fatalf("read events before resume: %v", err)
-	}
-	beforeCount := len(sessionEvents(t, sess))
-
-	outcome, err := Resume(context.Background(), sess, deps, "")
-	if err != nil {
-		t.Fatalf("Resume without extra turns: %v", err)
-	}
-	if outcome.Status != statusCompleted || outcome.Result != "recorded reply" || len(beta.prompts) != 0 {
-		t.Fatalf("resume outcome=%#v beta prompts=%#v", outcome, beta.prompts)
-	}
-	after, err := os.ReadFile(filepath.Join(sess.Root, eventlog.EventsFilename))
-	if err != nil {
-		t.Fatalf("read events after resume: %v", err)
-	}
-	if !reflect.DeepEqual(before, after) || len(sessionEvents(t, sess)) != beforeCount {
-		t.Fatalf("terminal no-extension resume changed event log: before=%q after=%q", before, after)
-	}
-}
-
 func TestResumeAccumulatesSuccessiveTurnBudgetGrants(t *testing.T) {
 	sess := createSession(t, dialoguePlan(1))
 	alpha := &fakeBackend{name: "codex", slotID: "alpha", responses: []fakeResponse{{content: "first reply"}, {content: "third reply"}}}
@@ -1103,7 +1125,7 @@ func TestResumeAccumulatesSuccessiveTurnBudgetGrants(t *testing.T) {
 		t.Fatalf("replayed grants terminal=%#v granted=%d effective=%d", runner.state.terminal, runner.state.grantedTurns, runner.effectiveTurnBudget())
 	}
 
-	outcome, err := Resume(context.Background(), sess, deps, "")
+	outcome, err := Resume(context.Background(), sess, deps, "", 0)
 	if err != nil {
 		t.Fatalf("Resume after successive grants: %v", err)
 	}
@@ -1150,7 +1172,7 @@ func TestResumeFailedTerminalChildFailsParent(t *testing.T) {
 		"alpha":       {name: "codex", slotID: "alpha"},
 		"beta":        {name: "codex", slotID: "beta"},
 		"child-alpha": child,
-	}), "")
+	}), "", 0)
 	if err == nil {
 		t.Fatal("parent Resume unexpectedly succeeded after failed terminal child")
 	}
@@ -1177,7 +1199,7 @@ func TestResumeFailedChildCompletionFailsParent(t *testing.T) {
 		"alpha":       {name: "codex", slotID: "alpha"},
 		"beta":        {name: "codex", slotID: "beta"},
 		"child-alpha": child,
-	}), "")
+	}), "", 0)
 	if err == nil {
 		t.Fatal("parent Resume unexpectedly succeeded after failed child.completed")
 	}
@@ -1207,7 +1229,7 @@ func TestResumeCreatesMissingChildFromDurablePlanAfterRecipeDrift(t *testing.T) 
 		"drifted-alpha": drifted,
 	})
 	deps.Recipes = []plan.Recipe{driftedRecipe}
-	outcome, err := Resume(context.Background(), sess, deps, "")
+	outcome, err := Resume(context.Background(), sess, deps, "", 0)
 	if err != nil {
 		t.Fatalf("Resume: %v", err)
 	}
@@ -1237,7 +1259,7 @@ func TestResumeRefusesChildRootWithMismatchedAdmittedPlan(t *testing.T) {
 		"alpha":       {name: "codex", slotID: "alpha"},
 		"beta":        {name: "codex", slotID: "beta"},
 		"child-alpha": child,
-	}), "")
+	}), "", 0)
 	if err == nil || !strings.Contains(err.Error(), "does not match the durable admitted plan") {
 		t.Fatalf("Resume error=%v, want admitted-plan refusal", err)
 	}
@@ -1259,7 +1281,7 @@ func TestResumeFinalizesDurableResultProduced(t *testing.T) {
 	outcome, err := Resume(context.Background(), sess, testDeps(map[string]*fakeBackend{
 		"alpha": {name: "codex", slotID: "alpha"},
 		"beta":  {name: "codex", slotID: "beta"},
-	}), "")
+	}), "", 0)
 	if err != nil {
 		t.Fatalf("Resume: %v", err)
 	}

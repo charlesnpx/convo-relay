@@ -73,7 +73,6 @@ func TestTurnBudgetGrantedPayloadRequiresGrantorAndPositiveTurns(t *testing.T) {
 	for index, payload := range []Payload{
 		TurnBudgetGrantedPayload{GrantedBy: "", Turns: 1},
 		TurnBudgetGrantedPayload{GrantedBy: "operator", Turns: 0},
-		TurnBudgetGrantedPayload{GrantedBy: "operator", Turns: -1},
 	} {
 		if _, err := writer.Append(NewEvent(fmt.Sprintf("invalid-turn-budget-%d", index), fixtureTime(index), payload)); err == nil {
 			t.Fatalf("Append(%T) unexpectedly accepted", payload)

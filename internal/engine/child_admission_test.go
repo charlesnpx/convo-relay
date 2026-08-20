@@ -29,7 +29,7 @@ func TestAskChildRequestWaitsForOperatorDecision(t *testing.T) {
 	if outcome.Status != statusAwaitingDecision || len(alpha.prompts) != 1 || len(beta.prompts) != 0 || len(child.prompts) != 0 {
 		t.Fatalf("outcome=%#v alpha=%d beta=%d child=%d", outcome, len(alpha.prompts), len(beta.prompts), len(child.prompts))
 	}
-	resumed, err := Resume(context.Background(), sess, deps, "")
+	resumed, err := Resume(context.Background(), sess, deps, "", 0)
 	if err != nil || resumed.Status != statusAwaitingDecision || len(alpha.prompts) != 1 || len(beta.prompts) != 0 {
 		t.Fatalf("pending Resume outcome=%#v err=%v alpha=%d beta=%d", resumed, err, len(alpha.prompts), len(beta.prompts))
 	}
@@ -70,7 +70,7 @@ func TestApprovePendingChildThenResume(t *testing.T) {
 		t.Fatalf("admission decision = %#v found=%t", decision, found)
 	}
 
-	outcome, err := Resume(context.Background(), sess, deps, "")
+	outcome, err := Resume(context.Background(), sess, deps, "", 0)
 	if err != nil {
 		t.Fatalf("Resume: %v", err)
 	}
@@ -136,7 +136,7 @@ func TestNestedAskWaitsForGrandchildDecision(t *testing.T) {
 	if err := ApproveChild(context.Background(), sess, "child-request", deps.Recipes); err != nil {
 		t.Fatalf("ApproveChild child: %v", err)
 	}
-	waiting, err := Resume(context.Background(), sess, deps, "")
+	waiting, err := Resume(context.Background(), sess, deps, "", 0)
 	if err != nil || waiting.Status != statusAwaitingDecision || waiting.Status == statusFailed {
 		t.Fatalf("waiting outcome=%#v err=%v", waiting, err)
 	}
@@ -149,14 +149,14 @@ func TestNestedAskWaitsForGrandchildDecision(t *testing.T) {
 	if err != nil || len(pending) != 1 || pending[0].RequestID != "grandchild-request" {
 		t.Fatalf("grandchild pending=%#v err=%v", pending, err)
 	}
-	resumed, err := Resume(context.Background(), sess, deps, "")
+	resumed, err := Resume(context.Background(), sess, deps, "", 0)
 	if err != nil || resumed.Status != statusAwaitingDecision || len(child.prompts) != 1 {
 		t.Fatalf("resumed outcome=%#v err=%v child=%d", resumed, err, len(child.prompts))
 	}
 	if err := ApproveChild(context.Background(), childSession, "grandchild-request", deps.Recipes); err != nil {
 		t.Fatalf("ApproveChild grandchild: %v", err)
 	}
-	completed, err := Resume(context.Background(), sess, deps, "")
+	completed, err := Resume(context.Background(), sess, deps, "", 0)
 	if err != nil || completed.Status != statusCompleted || len(beta.prompts) != 1 || strings.Count(beta.prompts[0], "child result after asking grandchild") != 1 {
 		t.Fatalf("completed outcome=%#v err=%v beta=%#v", completed, err, beta.prompts)
 	}
@@ -192,7 +192,7 @@ func TestRejectPendingChild(t *testing.T) {
 		t.Fatalf("rejection decision = %#v found=%t", decision, found)
 	}
 
-	outcome, err := Resume(context.Background(), sess, deps, "")
+	outcome, err := Resume(context.Background(), sess, deps, "", 0)
 	if err != nil {
 		t.Fatalf("Resume: %v", err)
 	}
