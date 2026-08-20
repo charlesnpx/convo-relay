@@ -12,7 +12,6 @@ import (
 	"path/filepath"
 	"regexp"
 	"sort"
-	"strconv"
 	"strings"
 	"time"
 
@@ -232,22 +231,14 @@ type completedTurn struct {
 }
 
 type childState struct {
-	Request   eventlog.ChildRequestedPayload
-	Admission childAdmission
-	Plan      *session.Plan
-	Status    string
+	Request eventlog.ChildRequestedPayload
+	Decided bool
+	Plan    *session.Plan
+	Status  string
 }
 
-type childAdmission string
-
-const (
-	childUndecided childAdmission = ""
-	childAdmitted  childAdmission = "admitted"
-	childRejected  childAdmission = "rejected"
-)
-
-func (child *childState) decided() bool   { return child != nil && child.Admission != childUndecided }
-func (child *childState) admitted() bool  { return child != nil && child.Admission == childAdmitted }
+func (child *childState) decided() bool   { return child != nil && child.Decided }
+func (child *childState) admitted() bool  { return child != nil && child.Plan != nil }
 func (child *childState) completed() bool { return child != nil && child.Status != "" }
 
 type steeringState struct {
@@ -575,17 +566,11 @@ func (r *runner) reduceEvent(event eventlog.Event) error {
 			if childPlan.SessionID != r.childSessionID(payload.RequestID) {
 				return fmt.Errorf("admitted child plan for %q has unexpected session id %q", payload.RequestID, childPlan.SessionID)
 			}
-			turns, err := r.childTurnsFor(payload.BudgetState)
-			if err != nil {
-				return err
-			}
-			child.Admission = childAdmitted
 			child.Plan = &childPlan
 			state.childrenUsed++
-			state.childTurns += turns
-		} else {
-			child.Admission = childRejected
+			state.childTurns += childPlan.Schedule.Turns
 		}
+		child.Decided = true
 		return nil
 	case eventlog.ChildCompletedPayload:
 		child, exists := state.requests[payload.RequestID]
@@ -1064,7 +1049,7 @@ func (r *runner) decideChild(child *childState) error {
 		RequestID:   child.Request.RequestID,
 		Admitted:    true,
 		Reason:      "admitted by child policy",
-		BudgetState: childBudgetState("available", childPlan.Schedule.Turns),
+		BudgetState: "available",
 		Plan:        &planRef,
 	})
 }
@@ -1118,21 +1103,6 @@ func (r *runner) readAdmittedChildPlan(ref blobstore.BlobRef) (session.Plan, err
 
 func (r *runner) childSessionID(requestID string) string {
 	return r.sess.Plan.SessionID + "-child-" + requestID
-}
-
-func childBudgetState(state string, turns int) string {
-	return state + ";child_turns=" + strconv.Itoa(turns)
-}
-
-func (r *runner) childTurnsFor(budgetState string) (int, error) {
-	if _, suffix, found := strings.Cut(budgetState, ";child_turns="); found {
-		turns, err := strconv.Atoi(suffix)
-		if err != nil || turns < 0 {
-			return 0, fmt.Errorf("child.decided has invalid child turn count %q", suffix)
-		}
-		return turns, nil
-	}
-	return 0, errors.New("child.decided has no child turn count")
 }
 
 func (r *runner) runChild(child *childState) error {
@@ -1197,7 +1167,7 @@ func (r *runner) runChild(child *childState) error {
 // to the durable child.decided snapshot. A missing root is created from that
 // snapshot, never by recompiling the current recipe catalog.
 func (r *runner) openOrCreateChildSession(child *childState) (*session.Session, error) {
-	if !child.admitted() || child.Plan == nil {
+	if !child.admitted() {
 		return nil, errors.New("admitted child plan is required")
 	}
 	admittedPlan := *child.Plan

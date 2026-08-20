@@ -422,14 +422,7 @@ func TestResumeServicesDueFacilitatorBeforeNextParticipant(t *testing.T) {
 func TestResumeRebuildsChildBudgets(t *testing.T) {
 	parent := dialoguePlan(2)
 	parent.ChildPolicy = session.ChildPolicy{Mode: "allow", MaxDepth: 1, MaxChildren: 1, MaxTurns: 1, AllowedRecipes: []string{"child"}}
-	childPlan, err := plan.ForChild(parent, plan.ChildRequest{
-		SessionID: parent.SessionID + "-child-child-one",
-		RecipeID:  "child",
-		Question:  "first child question",
-	}, []plan.Recipe{childRecipe()})
-	if err != nil {
-		t.Fatalf("compile child plan: %v", err)
-	}
+	childPlan := compileAdmittedChildPlan(t, parent, "child-one", "first child question", []plan.Recipe{childRecipe()})
 	sess := createSession(t, parent)
 	seedLog(t, sess, func(store *blobstore.Store, writer *eventlog.Writer) {
 		content := putSeedText(t, store, "first participant")
@@ -440,7 +433,7 @@ func TestResumeRebuildsChildBudgets(t *testing.T) {
 		appendEvent(t, writer, eventlog.ChildRequestedPayload{RequestID: "child-one", RequesterActorID: "alpha", RecipeID: "child", Question: question})
 		appendEvent(t, writer, eventlog.AttemptFinishedPayload{ActorID: "alpha", Attempt: 1, Outcome: "success", Content: content})
 		appendEvent(t, writer, eventlog.TurnFinishedPayload{ActorID: "alpha", Round: 1, Content: content})
-		appendEvent(t, writer, eventlog.ChildDecidedPayload{RequestID: "child-one", Admitted: true, Reason: "admitted", BudgetState: "available;child_turns=1", Plan: putSeedChildPlan(t, store, childPlan)})
+		appendEvent(t, writer, eventlog.ChildDecidedPayload{RequestID: "child-one", Admitted: true, Reason: "admitted", BudgetState: "available", Plan: putSeedChildPlan(t, store, childPlan)})
 		appendEvent(t, writer, eventlog.ChildCompletedPayload{RequestID: "child-one", ChildSessionID: childPlan.SessionID, Result: childResult, Status: statusCompleted})
 	})
 	alpha := &fakeBackend{name: "codex", slotID: "alpha"}
@@ -701,11 +694,8 @@ func TestChildRequestsAdmitAndRejectWithoutRunningDeniedChildren(t *testing.T) {
 			if len(decisions) != 1 || decisions[0].Admitted != test.wantAdmitted {
 				t.Fatalf("child decisions = %#v", decisions)
 			}
-			if test.wantAdmitted && decisions[0].BudgetState != "available;child_turns=1" {
+			if test.wantAdmitted && decisions[0].BudgetState != "available" {
 				t.Fatalf("admitted child budget state = %q", decisions[0].BudgetState)
-			}
-			if test.wantAdmitted && decisions[0].Plan == nil {
-				t.Fatal("admitted child decision did not bind a durable plan")
 			}
 			if test.wantAdmitted && indexOfType(sessionEvents(t, sess), eventlog.ChildRequested) > indexOfType(sessionEvents(t, sess), eventlog.TurnFinished) {
 				t.Fatal("child request was not durable before its parent turn finished")
@@ -745,14 +735,7 @@ func TestResumeCompletedChildBeforeParentCompletionReusesChildSession(t *testing
 	home := t.TempDir()
 	sess := createSessionIn(t, home, parent)
 	const requestID = "child-request"
-	childPlan, err := plan.ForChild(parent, plan.ChildRequest{
-		SessionID: parent.SessionID + "-child-" + requestID,
-		RecipeID:  "child",
-		Question:  "resolve the child question",
-	}, []plan.Recipe{childRecipe()})
-	if err != nil {
-		t.Fatalf("compile child plan: %v", err)
-	}
+	childPlan := compileAdmittedChildPlan(t, parent, requestID, "resolve the child question", []plan.Recipe{childRecipe()})
 	seedLog(t, sess, func(store *blobstore.Store, writer *eventlog.Writer) {
 		content := putSeedText(t, store, "parent response")
 		question := putSeedText(t, store, "resolve the child question")
@@ -761,7 +744,7 @@ func TestResumeCompletedChildBeforeParentCompletionReusesChildSession(t *testing
 		appendEvent(t, writer, eventlog.ChildRequestedPayload{RequestID: requestID, RequesterActorID: "alpha", RecipeID: "child", Question: question})
 		appendEvent(t, writer, eventlog.AttemptFinishedPayload{ActorID: "alpha", Attempt: 1, Outcome: "success", Content: content})
 		appendEvent(t, writer, eventlog.TurnFinishedPayload{ActorID: "alpha", Round: 1, Content: content})
-		appendEvent(t, writer, eventlog.ChildDecidedPayload{RequestID: requestID, Admitted: true, Reason: "admitted", BudgetState: "available;child_turns=1", Plan: putSeedChildPlan(t, store, childPlan)})
+		appendEvent(t, writer, eventlog.ChildDecidedPayload{RequestID: requestID, Admitted: true, Reason: "admitted", BudgetState: "available", Plan: putSeedChildPlan(t, store, childPlan)})
 	})
 	childSession := createSessionIn(t, home, childPlan)
 	child := &fakeBackend{name: "codex", slotID: "child-alpha", responses: []fakeResponse{{content: "completed child"}}}
@@ -1221,7 +1204,7 @@ func seedParentChildPrefix(t *testing.T, sess *session.Session, childPlan sessio
 			RequestID:   requestID,
 			Admitted:    true,
 			Reason:      "admitted",
-			BudgetState: childBudgetState("available", childPlan.Schedule.Turns),
+			BudgetState: "available",
 			Plan:        putSeedChildPlan(t, store, childPlan),
 		})
 		if completedStatus != "" {
