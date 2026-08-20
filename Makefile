@@ -8,7 +8,7 @@ LDFLAGS ?= -X main.cliVersion=$(VERSION)
 
 CROSS_TARGETS ?= darwin/arm64 windows/amd64
 
-.PHONY: build install install-assets install-skills fmt-check test test-race cross-compile cross-compile-tests smoke-fake-providers release-gate package clean
+.PHONY: build install install-assets fmt-check test test-race cross-compile cross-compile-tests smoke-fake-providers release-gate package clean
 
 build:
 	mkdir -p "$(dir $(BINARY))"
@@ -22,11 +22,6 @@ install-assets:
 	rm -rf "$(DATADIR)/skill"
 	mkdir -p "$(DATADIR)"
 	cp -R skill "$(DATADIR)/skill"
-	mkdir -p "$(DATADIR)/scripts"
-	install -m 0755 scripts/render_display_pdf.py "$(DATADIR)/scripts/render_display_pdf.py"
-
-install-skills:
-	go run ./cmd/convo-relay install-skills
 
 fmt-check:
 	@unformatted="$$(gofmt -l cmd internal)"; \
@@ -76,10 +71,9 @@ release-gate: cross-compile cross-compile-tests smoke-fake-providers
 package: build
 	rm -rf "$(DIST_DIR)"
 	mkdir -p "$(DIST_DIR)/bin"
-	mkdir -p "$(DIST_DIR)/share/convo-relay/scripts"
+	mkdir -p "$(DIST_DIR)/share/convo-relay"
 	install -m 0755 "$(BINARY)" "$(DIST_DIR)/bin/convo-relay"
 	cp -R skill "$(DIST_DIR)/share/convo-relay/skill"
-	install -m 0755 scripts/render_display_pdf.py "$(DIST_DIR)/share/convo-relay/scripts/render_display_pdf.py"
 
 clean:
 	rm -rf bin dist
