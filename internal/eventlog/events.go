@@ -220,6 +220,11 @@ type ChildDecidedPayload struct {
 	Admitted    bool   `json:"admitted"`
 	Reason      string `json:"reason"`
 	BudgetState string `json:"budget_state"`
+	// Plan is the canonical, immutable admitted child plan stored in the
+	// parent's blob store. It is present exactly when admission succeeds so a
+	// missing child root can be recreated without consulting a changed recipe
+	// catalog.
+	Plan *blobstore.BlobRef `json:"plan,omitempty"`
 }
 
 func (ChildDecidedPayload) eventType() Type { return ChildDecided }
@@ -230,13 +235,26 @@ func (p ChildDecidedPayload) validate() error {
 	if err := validateText("reason", p.Reason); err != nil {
 		return err
 	}
-	return validateText("budget_state", p.BudgetState)
+	if err := validateText("budget_state", p.BudgetState); err != nil {
+		return err
+	}
+	if !p.Admitted {
+		if p.Plan != nil {
+			return errors.New("child.decided plan is only valid for an admitted child")
+		}
+		return nil
+	}
+	if p.Plan == nil {
+		return errors.New("child.decided admitted child requires a plan")
+	}
+	return blobstore.ValidateRef(*p.Plan)
 }
 
 type ChildCompletedPayload struct {
 	RequestID      string            `json:"request_id"`
 	ChildSessionID string            `json:"child_session_id"`
 	Result         blobstore.BlobRef `json:"result"`
+	Status         string            `json:"status"`
 }
 
 func (ChildCompletedPayload) eventType() Type { return ChildCompleted }
@@ -247,7 +265,15 @@ func (p ChildCompletedPayload) validate() error {
 	if err := validateToken("child_session_id", p.ChildSessionID); err != nil {
 		return err
 	}
-	return blobstore.ValidateRef(p.Result)
+	if err := blobstore.ValidateRef(p.Result); err != nil {
+		return err
+	}
+	switch p.Status {
+	case "completed", "failed":
+		return nil
+	default:
+		return errors.New("child.completed status must be completed or failed")
+	}
 }
 
 type SteeringQueuedPayload struct {
@@ -655,6 +681,10 @@ func BlobRefs(events []Event) []blobstore.BlobRef {
 			refs = append(refs, payload.Content)
 		case ChildRequestedPayload:
 			refs = append(refs, payload.Question)
+		case ChildDecidedPayload:
+			if payload.Plan != nil {
+				refs = append(refs, *payload.Plan)
+			}
 		case ChildCompletedPayload:
 			refs = append(refs, payload.Result)
 		case SteeringQueuedPayload:

@@ -12,7 +12,6 @@ import (
 	"path/filepath"
 	"regexp"
 	"sort"
-	"strconv"
 	"strings"
 	"time"
 
@@ -33,11 +32,13 @@ const (
 	stopConverged        = "converged"
 	stopNoLedgerSignal   = "stalled_no_ledger_signal"
 	stopProviderFailed   = "provider_failed"
+	stopChildFailed      = "child_failed"
 	stopAbandonedAttempt = "abandoned_attempt"
 	stopInvalidResult    = "invalid_result"
 
 	mediaTypePlainTextUTF8  = "text/plain; charset=utf-8"
 	mediaTypeChildResult    = "text/plain; charset=utf-8"
+	mediaTypeChildPlan      = "application/vnd.convo-relay.plan+json"
 	maxPromptTranscriptSize = 12
 	resultSchemaURL         = "https://convo-relay.invalid/engine-result-schema.json"
 )
@@ -69,10 +70,12 @@ type Deps struct {
 	ChildRequestExtractor ChildRequestExtractor
 }
 
-// Outcome contains the textual result needed by parent-child execution.
-// Status, diagnostics, and transcript details are derived through sessionview.
+// Outcome contains the parent-facing result and durable terminal classification
+// needed by parent-child execution. Diagnostics and transcript details remain
+// derived through sessionview.
 type Outcome struct {
 	Result string
+	Status string
 }
 
 // Run starts an empty session log and executes its compiled plan to completion.
@@ -194,7 +197,7 @@ type executionState struct {
 
 	steering         []*steeringState
 	providerSessions map[string]string
-	result           *resultState
+	resultValidation string
 }
 
 type turnState struct {
@@ -228,21 +231,21 @@ type completedTurn struct {
 }
 
 type childState struct {
-	Request   eventlog.ChildRequestedPayload
-	Decided   bool
-	Admitted  bool
-	Completed bool
+	Request eventlog.ChildRequestedPayload
+	Decided bool
+	Plan    *session.Plan
+	Status  string
 }
+
+func (child *childState) decided() bool   { return child != nil && child.Decided }
+func (child *childState) admitted() bool  { return child != nil && child.Plan != nil }
+func (child *childState) completed() bool { return child != nil && child.Status != "" }
 
 type steeringState struct {
 	Ref          blobstore.BlobRef
 	Text         string
 	AppliedRound int
 	Consumed     bool
-}
-
-type resultState struct {
-	ValidationOutcome string
 }
 
 type resultSchemaLoader struct{}
@@ -490,9 +493,6 @@ func (r *runner) reduceEvent(event eventlog.Event) error {
 		if payload.Outcome != "success" && payload.Outcome != "failed" {
 			return fmt.Errorf("attempt.finished outcome %q is unsupported", payload.Outcome)
 		}
-		if attempt.Failure != nil && payload.Outcome != "failed" {
-			return fmt.Errorf("attempt.finished for %s attempt %d conflicts with provider.failed", payload.ActorID, payload.Attempt)
-		}
 		attempt.Outcome = payload.Outcome
 		attempt.Content = payload.Content
 		if payload.Outcome == "success" && strings.TrimSpace(payload.ProviderSessionID) != "" {
@@ -510,9 +510,6 @@ func (r *runner) reduceEvent(event eventlog.Event) error {
 		}
 		if attempt.Failure != nil {
 			return fmt.Errorf("duplicate provider.failed for %s attempt %d", payload.ActorID, payload.Attempts)
-		}
-		if attempt.Outcome != "" && attempt.Outcome != "failed" {
-			return fmt.Errorf("provider.failed for %s attempt %d conflicts with attempt.finished", payload.ActorID, payload.Attempts)
 		}
 		// A classified provider failure is itself a durable failed outcome. This
 		// lets replay decide retry policy even if the subsequent attempt.finished
@@ -555,34 +552,48 @@ func (r *runner) reduceEvent(event eventlog.Event) error {
 		if !exists {
 			return fmt.Errorf("child.decided for unknown request %q", payload.RequestID)
 		}
-		if child.Decided {
+		if child.decided() {
 			return fmt.Errorf("duplicate child.decided for request %q", payload.RequestID)
 		}
-		child.Decided = true
-		child.Admitted = payload.Admitted
 		if payload.Admitted {
-			turns, err := r.childTurnsFor(payload.BudgetState)
-			if err != nil {
-				return err
+			if payload.Plan == nil {
+				return errors.New("admitted child.decided has no plan")
 			}
+			childPlan, err := r.readAdmittedChildPlan(*payload.Plan)
+			if err != nil {
+				return fmt.Errorf("read admitted child plan for %q: %w", payload.RequestID, err)
+			}
+			if childPlan.SessionID != r.childSessionID(payload.RequestID) {
+				return fmt.Errorf("admitted child plan for %q has unexpected session id %q", payload.RequestID, childPlan.SessionID)
+			}
+			child.Plan = &childPlan
 			state.childrenUsed++
-			state.childTurns += turns
+			state.childTurns += childPlan.Schedule.Turns
 		}
+		child.Decided = true
 		return nil
 	case eventlog.ChildCompletedPayload:
 		child, exists := state.requests[payload.RequestID]
 		if !exists {
 			return fmt.Errorf("child.completed for unknown request %q", payload.RequestID)
 		}
-		if child.Completed {
+		if !child.admitted() {
+			return fmt.Errorf("child.completed for unadmitted request %q", payload.RequestID)
+		}
+		if child.completed() {
 			return fmt.Errorf("duplicate child.completed for request %q", payload.RequestID)
+		}
+		if child.Plan == nil || payload.ChildSessionID != child.Plan.SessionID {
+			return fmt.Errorf("child.completed for %q does not match the admitted child plan", payload.RequestID)
 		}
 		text, err := r.readBlob(payload.Result)
 		if err != nil {
 			return err
 		}
-		child.Completed = true
-		state.childResults = append(state.childResults, text)
+		child.Status = payload.Status
+		if payload.Status == statusCompleted {
+			state.childResults = append(state.childResults, text)
+		}
 		return nil
 	case eventlog.SteeringQueuedPayload:
 		text, err := r.readBlob(payload.Prompt)
@@ -601,12 +612,10 @@ func (r *runner) reduceEvent(event eventlog.Event) error {
 		}
 		return errors.New("steering.applied has no queued prompt")
 	case eventlog.ResultProducedPayload:
-		if state.result != nil {
+		if state.resultValidation != "" {
 			return errors.New("session has more than one result.produced event")
 		}
-		state.result = &resultState{
-			ValidationOutcome: payload.ValidationOutcome,
-		}
+		state.resultValidation = payload.ValidationOutcome
 		return nil
 	case eventlog.SessionFinishedPayload:
 		if state.terminal != nil {
@@ -689,7 +698,12 @@ func (r *runner) execute() (Outcome, error) {
 			continue
 		}
 		if err := r.servicePendingChildren(); err != nil {
-			return r.finishFailure(stopProviderFailed, err)
+			reason := stopProviderFailed
+			var failure *executionFailure
+			if errors.As(err, &failure) {
+				reason = failure.reason
+			}
+			return r.finishFailure(reason, err)
 		}
 		if reason := r.dialogueStopReason(); reason != "" {
 			return r.finishSuccess(reason)
@@ -973,14 +987,20 @@ func (r *runner) servicePendingChildren() error {
 	sort.Strings(requestIDs)
 	for _, requestID := range requestIDs {
 		child := r.state.requests[requestID]
-		if !child.Decided {
+		if !child.decided() {
 			if err := r.decideChild(child); err != nil {
 				return err
 			}
 		}
-		if child.Admitted && !child.Completed {
+		if child.admitted() && !child.completed() {
 			if err := r.runChild(child); err != nil {
 				return err
+			}
+		}
+		if child.completed() && child.Status == statusFailed {
+			return &executionFailure{
+				reason: stopChildFailed,
+				cause:  fmt.Errorf("child request %q finished failed", child.Request.RequestID),
 			}
 		}
 	}
@@ -1021,11 +1041,16 @@ func (r *runner) decideChild(child *childState) error {
 			BudgetState: "turns_exhausted",
 		})
 	}
+	planRef, err := r.persistAdmittedChildPlan(childPlan)
+	if err != nil {
+		return err
+	}
 	return r.append(eventlog.ChildDecidedPayload{
 		RequestID:   child.Request.RequestID,
 		Admitted:    true,
 		Reason:      "admitted by child policy",
-		BudgetState: childBudgetState("available", childPlan.Schedule.Turns),
+		BudgetState: "available",
+		Plan:        &planRef,
 	})
 }
 
@@ -1041,23 +1066,43 @@ func (r *runner) childPlanFor(child *childState) (session.Plan, error) {
 	}, r.deps.Recipes)
 }
 
+func (r *runner) persistAdmittedChildPlan(childPlan session.Plan) (blobstore.BlobRef, error) {
+	body, err := session.CanonicalBytes(childPlan)
+	if err != nil {
+		return blobstore.BlobRef{}, fmt.Errorf("canonicalize admitted child plan: %w", err)
+	}
+	ref, err := r.blobs.PutBytes(body, mediaTypeChildPlan)
+	if err != nil {
+		return blobstore.BlobRef{}, fmt.Errorf("store admitted child plan: %w", err)
+	}
+	return ref, nil
+}
+
+func (r *runner) readAdmittedChildPlan(ref blobstore.BlobRef) (session.Plan, error) {
+	reader, err := r.blobs.Open(ref)
+	if err != nil {
+		return session.Plan{}, err
+	}
+	body, readErr := io.ReadAll(reader)
+	closeErr := reader.Close()
+	if readErr != nil {
+		return session.Plan{}, readErr
+	}
+	if closeErr != nil {
+		return session.Plan{}, closeErr
+	}
+	var childPlan session.Plan
+	if err := eventlog.DecodeCanonicalJSON(body, &childPlan); err != nil {
+		return session.Plan{}, err
+	}
+	if err := session.ValidatePlan(childPlan); err != nil {
+		return session.Plan{}, err
+	}
+	return childPlan, nil
+}
+
 func (r *runner) childSessionID(requestID string) string {
 	return r.sess.Plan.SessionID + "-child-" + requestID
-}
-
-func childBudgetState(state string, turns int) string {
-	return state + ";child_turns=" + strconv.Itoa(turns)
-}
-
-func (r *runner) childTurnsFor(budgetState string) (int, error) {
-	if _, suffix, found := strings.Cut(budgetState, ";child_turns="); found {
-		turns, err := strconv.Atoi(suffix)
-		if err != nil || turns < 0 {
-			return 0, fmt.Errorf("child.decided has invalid child turn count %q", suffix)
-		}
-		return turns, nil
-	}
-	return 0, errors.New("child.decided has no child turn count")
 }
 
 func (r *runner) runChild(child *childState) error {
@@ -1085,8 +1130,22 @@ func (r *runner) runChild(child *childState) error {
 	} else {
 		childOutcome, childErr = Resume(r.ctx, childSession, childDeps, "")
 	}
-	resultText := childOutcome.Result
+	childStatus := childOutcome.Status
 	if childErr != nil {
+		childStatus = statusFailed
+	}
+	switch childStatus {
+	case statusCompleted:
+	case statusFailed:
+		if childErr == nil {
+			childErr = fmt.Errorf("child session %q finished failed", childSession.Plan.SessionID)
+		}
+	default:
+		childStatus = statusFailed
+		childErr = fmt.Errorf("child session %q did not report a terminal status", childSession.Plan.SessionID)
+	}
+	resultText := childOutcome.Result
+	if childStatus == statusFailed {
 		resultText = "child execution failed: " + provider.SanitizeProviderFailureDetail(childErr.Error())
 	}
 	resultRef, err := r.blobs.PutBytes([]byte(resultText), mediaTypeChildResult)
@@ -1097,16 +1156,25 @@ func (r *runner) runChild(child *childState) error {
 		RequestID:      child.Request.RequestID,
 		ChildSessionID: childSession.Plan.SessionID,
 		Result:         resultRef,
+		Status:         childStatus,
 	}); err != nil {
 		return err
 	}
 	return childErr
 }
 
-// openOrCreateChildSession reuses the child whose deterministic session ID is
-// bound by child.decided and the immutable parent plan. This consumes an
-// already-completed child instead of allocating a new managed session root.
+// openOrCreateChildSession reuses only a child root whose immutable plan binds
+// to the durable child.decided snapshot. A missing root is created from that
+// snapshot, never by recompiling the current recipe catalog.
 func (r *runner) openOrCreateChildSession(child *childState) (*session.Session, error) {
+	if !child.admitted() {
+		return nil, errors.New("admitted child plan is required")
+	}
+	admittedPlan := *child.Plan
+	admittedDigest, err := session.PlanDigest(admittedPlan)
+	if err != nil {
+		return nil, fmt.Errorf("digest admitted child plan: %w", err)
+	}
 	childSessionID := r.childSessionID(child.Request.RequestID)
 	home := filepath.Dir(r.sess.Root)
 	entries, err := os.ReadDir(home)
@@ -1128,6 +1196,9 @@ func (r *runner) openOrCreateChildSession(child *childState) (*session.Session, 
 		if candidate.Plan.SessionID != childSessionID {
 			continue
 		}
+		if candidate.Digest != admittedDigest {
+			return nil, fmt.Errorf("child session %q does not match the durable admitted plan", childSessionID)
+		}
 		if found != nil {
 			return nil, fmt.Errorf("multiple child sessions match admitted plan %q", childSessionID)
 		}
@@ -1136,11 +1207,7 @@ func (r *runner) openOrCreateChildSession(child *childState) (*session.Session, 
 	if found != nil {
 		return found, nil
 	}
-	childPlan, err := r.childPlanFor(child)
-	if err != nil {
-		return nil, err
-	}
-	return session.Create(home, childPlan)
+	return session.Create(home, admittedPlan)
 }
 
 func childDecisionReason(mode string) string {
@@ -1176,7 +1243,7 @@ func copyPlanBlobs(source *blobstore.Store, destination *blobstore.Store, refs [
 }
 
 func (r *runner) finishSuccess(reason string) (Outcome, error) {
-	if r.state.result == nil {
+	if r.state.resultValidation == "" {
 		outcome := "valid"
 		validationErr := r.validateSelectedResult()
 		if validationErr != nil {
@@ -1193,7 +1260,7 @@ func (r *runner) finishSuccess(reason string) (Outcome, error) {
 			return r.finishFailure(stopInvalidResult, validationErr)
 		}
 	}
-	if r.state.result.ValidationOutcome != "valid" {
+	if r.state.resultValidation != "valid" {
 		return r.finishFailure(stopInvalidResult, errors.New("selected result failed declared format or schema validation"))
 	}
 	if err := r.append(eventlog.SessionFinishedPayload{Status: statusCompleted, StopReason: reason}); err != nil {
@@ -1216,7 +1283,11 @@ func (r *runner) finishFailure(reason string, cause error) (Outcome, error) {
 }
 
 func (r *runner) outcome() Outcome {
-	return Outcome{Result: r.state.lastResult.Text}
+	status := ""
+	if r.state.terminal != nil {
+		status = r.state.terminal.Status
+	}
+	return Outcome{Result: r.state.lastResult.Text, Status: status}
 }
 
 func (r *runner) validateSelectedResult() error {
