@@ -1170,9 +1170,21 @@ func TestResumeCompletedSessionWithExtraTurnBudget(t *testing.T) {
 
 	events := sessionEvents(t, sess)
 	if countType(events, eventlog.TurnFinished) != 2 || countType(events, eventlog.TurnBudgetGranted) != 1 ||
+		countType(events, eventlog.SteeringQueued) != 0 || countType(events, eventlog.SteeringApplied) != 1 ||
 		countType(events, eventlog.ResultProduced) != 2 || countType(events, eventlog.SessionFinished) != 2 {
 		t.Fatalf("resume events = %v", eventTypes(events))
 	}
+	grants := turnBudgetGrants(events)
+	if len(grants) != 1 || grants[0].Prompt == nil {
+		t.Fatalf("prompted grant payloads = %#v", grants)
+	}
+	for _, event := range events {
+		applied, ok := event.Payload.(eventlog.SteeringAppliedPayload)
+		if ok && !applied.Prompt.Equal(*grants[0].Prompt) {
+			t.Fatalf("steering.applied prompt = %#v, want grant prompt %#v", applied.Prompt, *grants[0].Prompt)
+		}
+	}
+	t.Logf("resume log=%v grant=%#v", eventTypes(events), grants[0])
 	store, err := sess.BlobStore(blobstore.Limits{})
 	if err != nil {
 		t.Fatalf("open blobs: %v", err)
@@ -1223,6 +1235,150 @@ func TestResumeCompletedSessionWithExtraTurnBudget(t *testing.T) {
 	}
 	if recordedOutcome != outcome || !bytes.Equal(beforeTerminalResume, afterTerminalResume) {
 		t.Fatalf("terminal resume outcome=%#v events changed=%t", recordedOutcome, !bytes.Equal(beforeTerminalResume, afterTerminalResume))
+	}
+}
+
+func TestResumeExactPromptedTurnBudgetRetryAfterDurableGrant(t *testing.T) {
+	sess := createSession(t, dialoguePlan(1))
+	alpha := &fakeBackend{name: "codex", slotID: "alpha", responses: []fakeResponse{{content: "first reply"}}}
+	beta := &fakeBackend{name: "codex", slotID: "beta", responses: []fakeResponse{{content: "second reply"}}}
+	deps := testDeps(map[string]*fakeBackend{"alpha": alpha, "beta": beta})
+	if _, err := Run(context.Background(), sess, deps); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	store, err := sess.BlobStore(blobstore.Limits{})
+	if err != nil {
+		t.Fatalf("open blobs: %v", err)
+	}
+	const requestedPrompt = "address the requested counterexample"
+	promptRef := putSeedText(t, store, requestedPrompt)
+	writer, err := sess.EventWriter(store)
+	if err != nil {
+		t.Fatalf("open writer: %v", err)
+	}
+	appendEvent(t, writer, eventlog.TurnBudgetGrantedPayload{GrantedBy: "operator", Turns: 1, Prompt: &promptRef})
+	if err := writer.Close(); err != nil {
+		t.Fatalf("close crash-prefix writer: %v", err)
+	}
+	crashPrefix := sessionEvents(t, sess)
+	if len(crashPrefix) == 0 || crashPrefix[len(crashPrefix)-1].Type != eventlog.TurnBudgetGranted {
+		t.Fatalf("crash prefix = %v", eventTypes(crashPrefix))
+	}
+	if grants := turnBudgetGrants(crashPrefix); len(grants) != 1 || grants[0].Prompt == nil || !grants[0].Prompt.Equal(promptRef) {
+		t.Fatalf("durable prompted grant = %#v, want prompt %#v", grants, promptRef)
+	}
+	t.Logf("durable crash-prefix log=%v", eventTypes(crashPrefix))
+
+	outcome, err := Resume(context.Background(), sess, deps, requestedPrompt, 1)
+	if err != nil {
+		t.Fatalf("exact retry: %v", err)
+	}
+	events := sessionEvents(t, sess)
+	if outcome.Status != statusCompleted || outcome.Result != "second reply" || countType(events, eventlog.TurnBudgetGranted) != 1 ||
+		countType(events, eventlog.SteeringQueued) != 0 || countType(events, eventlog.SteeringApplied) != 1 {
+		t.Fatalf("exact retry outcome=%#v events=%v", outcome, eventTypes(events))
+	}
+	if len(beta.prompts) != 1 || !strings.Contains(beta.prompts[0], "Resume direction: "+requestedPrompt) {
+		t.Fatalf("exact retry turn input = %#v", beta.prompts)
+	}
+	t.Logf("exact-retry log=%v turn_input=%q", eventTypes(events), beta.prompts[0])
+}
+
+func TestResumeRejectsPromptedRetryForGrantWithoutPrompt(t *testing.T) {
+	sess := createSession(t, dialoguePlan(1))
+	alpha := &fakeBackend{name: "codex", slotID: "alpha", responses: []fakeResponse{{content: "first reply"}}}
+	beta := &fakeBackend{name: "codex", slotID: "beta", responses: []fakeResponse{{content: "must not run"}}}
+	deps := testDeps(map[string]*fakeBackend{"alpha": alpha, "beta": beta})
+	if _, err := Run(context.Background(), sess, deps); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	appendTurnBudgetGrant(t, sess, 1)
+	eventsPath := filepath.Join(sess.Root, eventlog.EventsFilename)
+	before, err := os.ReadFile(eventsPath)
+	if err != nil {
+		t.Fatalf("read unprompted-grant prefix: %v", err)
+	}
+	if _, err := Resume(context.Background(), sess, deps, "do not attach this prompt", 1); err == nil || !strings.Contains(err.Error(), "scheduled work is outstanding") {
+		t.Fatalf("prompted retry for unprompted grant error = %v", err)
+	}
+	after, err := os.ReadFile(eventsPath)
+	if err != nil {
+		t.Fatalf("read after rejected prompted retry: %v", err)
+	}
+	if !bytes.Equal(before, after) || len(beta.prompts) != 0 {
+		t.Fatalf("unprompted grant accepted a prompted retry: log changed=%t beta=%#v", !bytes.Equal(before, after), beta.prompts)
+	}
+}
+
+func TestResumePromptWithoutTurnBudgetUsesSteeringQueued(t *testing.T) {
+	sess := createSession(t, dialoguePlan(1))
+	seedLog(t, sess, func(_ *blobstore.Store, writer *eventlog.Writer) {
+		appendEvent(t, writer, eventlog.TurnStartedPayload{ActorID: "alpha", Round: 1, Role: eventlog.ParticipantRole})
+	})
+	alpha := &fakeBackend{name: "codex", slotID: "alpha", responses: []fakeResponse{{content: "steered reply"}}}
+	beta := &fakeBackend{name: "codex", slotID: "beta"}
+	const requestedPrompt = "continue through the safety case"
+	if _, err := Resume(context.Background(), sess, testDeps(map[string]*fakeBackend{"alpha": alpha, "beta": beta}), requestedPrompt, 0); err != nil {
+		t.Fatalf("prompt-only Resume: %v", err)
+	}
+	events := sessionEvents(t, sess)
+	if countType(events, eventlog.TurnBudgetGranted) != 0 || countType(events, eventlog.SteeringQueued) != 1 || countType(events, eventlog.SteeringApplied) != 1 {
+		t.Fatalf("prompt-only events = %v", eventTypes(events))
+	}
+	if len(alpha.prompts) != 1 || !strings.Contains(alpha.prompts[0], "Resume direction: "+requestedPrompt) {
+		t.Fatalf("prompt-only turn input = %#v", alpha.prompts)
+	}
+}
+
+func TestReplayRejectsTurnBudgetGrantWithUnresolvablePromptReference(t *testing.T) {
+	sess := createSession(t, dialoguePlan(1))
+	alpha := &fakeBackend{name: "codex", slotID: "alpha", responses: []fakeResponse{{content: "first reply"}}}
+	if _, err := Run(context.Background(), sess, testDeps(map[string]*fakeBackend{"alpha": alpha, "beta": {name: "codex", slotID: "beta"}})); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	events := sessionEvents(t, sess)
+	missing := blobstore.BlobRef{SHA256: strings.Repeat("0", 64), Size: 1, MediaType: mediaTypePlainTextUTF8}
+	events = append(events, canonicalReplayEvent(t, uint64(len(events)+1), "unresolvable-grant-prompt", eventlog.TurnBudgetGrantedPayload{
+		GrantedBy: "operator", Turns: 1, Prompt: &missing,
+	}))
+	runner, err := newStateRunner(sess)
+	if err != nil {
+		t.Fatalf("new state runner: %v", err)
+	}
+	err = runner.rebuildExecutionState(events)
+	if err == nil || !strings.Contains(err.Error(), "read turn_budget.granted prompt") {
+		t.Fatalf("replay unresolvable prompted grant error = %v", err)
+	}
+	if runner.state.grantedTurns != 0 || len(runner.state.steering) != 0 {
+		t.Fatalf("unresolvable prompted grant mutated state=%#v", runner.state)
+	}
+}
+
+func TestReplayRejectsSteeringAppliedPromptNotCarriedByGrant(t *testing.T) {
+	sess := createSession(t, dialoguePlan(1))
+	alpha := &fakeBackend{name: "codex", slotID: "alpha", responses: []fakeResponse{{content: "first reply"}}}
+	if _, err := Run(context.Background(), sess, testDeps(map[string]*fakeBackend{"alpha": alpha, "beta": {name: "codex", slotID: "beta"}})); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	store, err := sess.BlobStore(blobstore.Limits{})
+	if err != nil {
+		t.Fatalf("open blobs: %v", err)
+	}
+	carried := putSeedText(t, store, "the prompt carried by the grant")
+	unrelated := putSeedText(t, store, "an unrelated prompt")
+	events := sessionEvents(t, sess)
+	events = append(events,
+		canonicalReplayEvent(t, uint64(len(events)+1), "prompted-grant", eventlog.TurnBudgetGrantedPayload{GrantedBy: "operator", Turns: 1, Prompt: &carried}),
+		canonicalReplayEvent(t, uint64(len(events)+2), "mismatched-steering", eventlog.SteeringAppliedPayload{Prompt: unrelated, Round: 2}),
+	)
+	runner, err := newStateRunner(sess)
+	if err != nil {
+		t.Fatalf("new state runner: %v", err)
+	}
+	err = runner.rebuildExecutionState(events)
+	if err == nil || !strings.Contains(err.Error(), "steering.applied has no queued prompt") {
+		t.Fatalf("replay prompt not carried by grant error = %v", err)
 	}
 }
 
@@ -1460,8 +1616,15 @@ func TestBlobReferencesAreVerifiedBeforeEventAppend(t *testing.T) {
 	if _, err := Run(context.Background(), sess, deps); err != nil {
 		t.Fatalf("Run: %v", err)
 	}
+	if _, err := Resume(context.Background(), sess, deps, "durable prompted grant", 1); err != nil {
+		t.Fatalf("Resume prompted grant: %v", err)
+	}
 	if len(verifier.refs) == 0 {
 		t.Fatal("writer never verified a blob reference")
+	}
+	grants := turnBudgetGrants(sessionEvents(t, sess))
+	if len(grants) != 1 || grants[0].Prompt == nil || !verifier.saw(*grants[0].Prompt) {
+		t.Fatalf("prompted grant reference was not verified: grants=%#v refs=%#v", grants, verifier.refs)
 	}
 	for _, event := range sessionEvents(t, sess) {
 		for _, ref := range eventlog.BlobRefs([]eventlog.Event{event}) {
@@ -1745,6 +1908,16 @@ func appendEvent(t *testing.T, writer *eventlog.Writer, payload eventlog.Payload
 	}
 }
 
+func canonicalReplayEvent(t *testing.T, sequence uint64, identifier string, payload eventlog.Payload) eventlog.Event {
+	t.Helper()
+	event := eventlog.NewEvent(identifier, time.Unix(1700000000, 0), payload)
+	event.Seq = sequence
+	if _, err := eventlog.CanonicalEventBytes(event); err != nil {
+		t.Fatalf("canonical replay event %q: %v", identifier, err)
+	}
+	return event
+}
+
 func appendTurnBudgetGrant(t *testing.T, sess *session.Session, turns int) {
 	t.Helper()
 	store, err := sess.BlobStore(blobstore.Limits{})
@@ -1790,6 +1963,16 @@ func countType(events []eventlog.Event, kind eventlog.Type) int {
 		}
 	}
 	return count
+}
+
+func turnBudgetGrants(events []eventlog.Event) []eventlog.TurnBudgetGrantedPayload {
+	grants := []eventlog.TurnBudgetGrantedPayload{}
+	for _, event := range events {
+		if payload, ok := event.Payload.(eventlog.TurnBudgetGrantedPayload); ok {
+			grants = append(grants, payload)
+		}
+	}
+	return grants
 }
 
 func indexOfType(events []eventlog.Event, kind eventlog.Type) int {

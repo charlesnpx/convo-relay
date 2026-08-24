@@ -140,15 +140,25 @@ func Resume(ctx context.Context, sess *session.Session, deps Deps, prompt string
 	if runner.state.terminal != nil && !runner.hasUnstartedGrantedWork() && requestedTurns == 0 {
 		return runner.outcome(), nil
 	}
+	text := strings.TrimSpace(prompt)
 	if requestedTurns > 0 {
-		if err := runner.turnBudgetGrantApplicable(requestedTurns); err != nil {
-			return Outcome{}, err
+		if !runner.isExactPromptedTurnBudgetRetry(requestedTurns, text) {
+			if err := runner.turnBudgetGrantApplicable(requestedTurns); err != nil {
+				return Outcome{}, err
+			}
+			var promptRef *blobstore.BlobRef
+			if text != "" {
+				ref, err := runner.putText(text)
+				if err != nil {
+					return Outcome{}, err
+				}
+				promptRef = &ref
+			}
+			if err := runner.append(eventlog.TurnBudgetGrantedPayload{GrantedBy: "operator", Turns: requestedTurns, Prompt: promptRef}); err != nil {
+				return Outcome{}, err
+			}
 		}
-		if err := runner.append(eventlog.TurnBudgetGrantedPayload{GrantedBy: "operator", Turns: requestedTurns}); err != nil {
-			return Outcome{}, err
-		}
-	}
-	if text := strings.TrimSpace(prompt); text != "" {
+	} else if text != "" {
 		ref, err := runner.putText(text)
 		if err != nil {
 			return Outcome{}, err
@@ -283,6 +293,7 @@ type executionState struct {
 	lastResult          completedTurn
 	grantedTurns        int
 	conversationAtGrant int
+	lastTurnBudgetGrant *eventlog.TurnBudgetGrantedPayload
 
 	requests     map[string]*childState
 	childResults []string
@@ -747,8 +758,21 @@ func (r *runner) reduceEvent(event eventlog.Event) error {
 		if err := r.turnBudgetGrantApplicable(payload.Turns); err != nil {
 			return fmt.Errorf("turn_budget.granted is inapplicable: %w", err)
 		}
+		var steering *steeringState
+		if payload.Prompt != nil {
+			text, err := r.readBlob(*payload.Prompt)
+			if err != nil {
+				return fmt.Errorf("read turn_budget.granted prompt: %w", err)
+			}
+			steering = &steeringState{Ref: *payload.Prompt, Text: text}
+		}
 		state.grantedTurns += payload.Turns
 		state.conversationAtGrant = len(state.conversation)
+		grant := payload
+		state.lastTurnBudgetGrant = &grant
+		if steering != nil {
+			state.steering = append(state.steering, steering)
+		}
 		return nil
 	case eventlog.ResultProducedPayload:
 		if state.resultValidation != "" {
@@ -822,6 +846,24 @@ func (r *runner) phaseAfterParticipants() {
 
 func (r *runner) effectiveTurnBudget() int {
 	return r.sess.Plan.Schedule.Turns + r.state.grantedTurns
+}
+
+// isExactPromptedTurnBudgetRetry recognizes a retry of the one durable event
+// that already carries both the unused grant and its steering. It does not
+// admit another grant while that work remains unstarted.
+func (r *runner) isExactPromptedTurnBudgetRetry(turns int, prompt string) bool {
+	grant := r.state.lastTurnBudgetGrant
+	if prompt == "" || !r.hasUnstartedGrantedWork() || grant == nil ||
+		grant.GrantedBy != "operator" || grant.Turns != turns || grant.Prompt == nil {
+		return false
+	}
+	for _, steering := range r.state.steering {
+		if steering.Consumed || steering.AppliedRound != 0 || !steering.Ref.Equal(*grant.Prompt) {
+			continue
+		}
+		return steering.Text == prompt
+	}
+	return false
 }
 
 // turnBudgetGrantApplicable reports whether the current replayed execution

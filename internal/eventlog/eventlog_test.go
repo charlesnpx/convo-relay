@@ -21,10 +21,11 @@ func TestRoundTripEveryTypedEvent(t *testing.T) {
 		t.Fatalf("put payload: %v", err)
 	}
 	planRef := ref
+	promptRef := ref
 	want := make([]Event, 0, 17)
 	for index, payload := range []Payload{
 		SessionStartedPayload{PlanDigest: RawBytesDigest([]byte("plan")), SessionID: "session-one"},
-		TurnBudgetGrantedPayload{GrantedBy: "operator", Turns: 2},
+		TurnBudgetGrantedPayload{GrantedBy: "operator", Turns: 2, Prompt: &promptRef},
 		TurnStartedPayload{ActorID: "actor-a", Round: 1, Role: ParticipantRole},
 		TurnFinishedPayload{ActorID: "actor-a", Round: 1, Content: ref},
 		AttemptStartedPayload{ActorID: "actor-a", Attempt: 1},
@@ -70,9 +71,11 @@ func TestRoundTripEveryTypedEvent(t *testing.T) {
 func TestTurnBudgetGrantedPayloadRequiresGrantorAndPositiveTurns(t *testing.T) {
 	_, _, writer := newTestWriter(t)
 	defer writer.Close()
+	invalidPrompt := blobstore.BlobRef{}
 	for index, payload := range []Payload{
 		TurnBudgetGrantedPayload{GrantedBy: "", Turns: 1},
 		TurnBudgetGrantedPayload{GrantedBy: "operator", Turns: 0},
+		TurnBudgetGrantedPayload{GrantedBy: "operator", Turns: 1, Prompt: &invalidPrompt},
 	} {
 		if _, err := writer.Append(NewEvent(fmt.Sprintf("invalid-turn-budget-%d", index), fixtureTime(index), payload)); err == nil {
 			t.Fatalf("Append(%T) unexpectedly accepted", payload)
@@ -282,6 +285,19 @@ func TestAppendRequiresDurableBlobAndLeavesUnreferencedBlobReadable(t *testing.T
 	}
 	if len(report.Unreferenced) != 1 || report.Unreferenced[0].SHA256 != orphan.SHA256 {
 		t.Fatalf("unreferenced report = %#v", report)
+	}
+}
+
+func TestAppendRejectsTurnBudgetGrantWithNonDurablePrompt(t *testing.T) {
+	_, _, writer := newTestWriter(t)
+	defer writer.Close()
+	missing := blobstore.BlobRef{SHA256: "0000000000000000000000000000000000000000000000000000000000000000", Size: 1, MediaType: "text/plain"}
+	_, err := writer.Append(NewEvent("missing-grant-prompt", fixtureTime(0), TurnBudgetGrantedPayload{
+		GrantedBy: "operator", Turns: 1, Prompt: &missing,
+	}))
+	var notDurable *BlobNotDurableError
+	if !errors.As(err, &notDurable) {
+		t.Fatalf("append prompted grant with missing blob error = %v, want BlobNotDurableError", err)
 	}
 }
 

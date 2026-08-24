@@ -92,10 +92,13 @@ func (p SessionFinishedPayload) validate() error {
 }
 
 // TurnBudgetGrantedPayload records an explicit operator grant that extends
-// the immutable plan's participant-turn budget without changing the plan.
+// the immutable plan's participant-turn budget without changing the plan. A
+// prompted resume carries its durable steering reference here so one event
+// records the grant and the prompt together.
 type TurnBudgetGrantedPayload struct {
-	GrantedBy string `json:"granted_by"`
-	Turns     int    `json:"turns"`
+	GrantedBy string             `json:"granted_by"`
+	Turns     int                `json:"turns"`
+	Prompt    *blobstore.BlobRef `json:"prompt,omitempty"`
 }
 
 func (TurnBudgetGrantedPayload) eventType() Type { return TurnBudgetGranted }
@@ -105,6 +108,9 @@ func (p TurnBudgetGrantedPayload) validate() error {
 	}
 	if p.Turns < 1 {
 		return errors.New("turn_budget.granted turns must be positive")
+	}
+	if p.Prompt != nil {
+		return blobstore.ValidateRef(*p.Prompt)
 	}
 	return nil
 }
@@ -702,6 +708,10 @@ func BlobRefs(events []Event) []blobstore.BlobRef {
 	refs := []blobstore.BlobRef{}
 	for _, event := range events {
 		switch payload := event.Payload.(type) {
+		case TurnBudgetGrantedPayload:
+			if payload.Prompt != nil {
+				refs = append(refs, *payload.Prompt)
+			}
 		case TurnFinishedPayload:
 			refs = append(refs, payload.Content)
 		case AttemptFinishedPayload:
