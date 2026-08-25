@@ -104,9 +104,19 @@ func prepareWithHooks(
 
 	materialized := &Materialized{Mode: mode, ExecutionCWD: launchCWD}
 	if mode == ModeHeadCopy {
-		if err := prepareHeadCopy(ctx, sess, launchCWD, materialized); err != nil {
+		if err := describeHeadCopy(ctx, sess, launchCWD, materialized); err != nil {
 			return nil, err
 		}
+		// The event contains every portable fact needed to identify this
+		// head-copy before Git registers its worktree. Make it durable first so
+		// every registered worktree is owned by workspace.prepared.
+		if err := appendState(sess, materialized); err != nil {
+			return nil, err
+		}
+		if err := materializeHeadCopy(ctx, materialized); err != nil {
+			return nil, err
+		}
+		return materialized, nil
 	} else if root, commit, tree, found, gitErr := gitFacts(ctx, launchCWD); gitErr != nil {
 		return nil, gitErr
 	} else if found {
@@ -128,15 +138,12 @@ func prepareWithHooks(
 		}
 	}
 	if err := appendState(sess, materialized); err != nil {
-		if materialized.WorktreePath != "" {
-			_ = removeWorktree(ctx, materialized.SourceRoot, materialized.WorktreePath)
-		}
 		return nil, err
 	}
 	return materialized, nil
 }
 
-func prepareHeadCopy(ctx context.Context, sess *session.Session, launchCWD string, materialized *Materialized) error {
+func describeHeadCopy(ctx context.Context, sess *session.Session, launchCWD string, materialized *Materialized) error {
 	sourceRoot, commit, tree, found, err := gitFacts(ctx, launchCWD)
 	if err != nil {
 		return err
@@ -154,20 +161,24 @@ func prepareHeadCopy(ctx context.Context, sess *session.Session, launchCWD strin
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return err
 	}
-	if _, err := runGit(ctx, sourceRoot, "worktree", "add", "--detach", worktreePath, commit); err != nil {
-		return fmt.Errorf("create detached head-copy worktree: %w", err)
-	}
-	executionCWD := filepath.Join(worktreePath, filepath.FromSlash(relativePath))
-	if _, err := absoluteDirectory(executionCWD); err != nil {
-		_ = removeWorktree(ctx, sourceRoot, worktreePath)
-		return fmt.Errorf("recorded head-copy subdirectory is unavailable: %w", err)
-	}
-	materialized.ExecutionCWD = executionCWD
 	materialized.WorktreePath = worktreePath
 	materialized.SourceRoot = sourceRoot
 	materialized.Commit = commit
 	materialized.TreeHash = tree
 	materialized.RelativePath = relativePath
+	return nil
+}
+
+func materializeHeadCopy(ctx context.Context, materialized *Materialized) error {
+	if _, err := runGit(ctx, materialized.SourceRoot, "worktree", "add", "--detach", materialized.WorktreePath, materialized.Commit); err != nil {
+		return fmt.Errorf("create detached head-copy worktree: %w", err)
+	}
+	executionCWD := filepath.Join(materialized.WorktreePath, filepath.FromSlash(materialized.RelativePath))
+	if _, err := absoluteDirectory(executionCWD); err != nil {
+		_ = removeWorktree(ctx, materialized.SourceRoot, materialized.WorktreePath)
+		return fmt.Errorf("recorded head-copy subdirectory is unavailable: %w", err)
+	}
+	materialized.ExecutionCWD = executionCWD
 	return nil
 }
 
@@ -417,8 +428,14 @@ func save(sess *session.Session, materialized Materialized) error {
 		return err
 	}
 	path := statePath(sess)
-	file, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	file, err := os.CreateTemp(filepath.Dir(path), ".workspace-*")
 	if err != nil {
+		return err
+	}
+	temporaryPath := file.Name()
+	defer os.Remove(temporaryPath)
+	if err := file.Chmod(0o600); err != nil {
+		_ = file.Close()
 		return err
 	}
 	if _, err := file.Write(body); err != nil {
@@ -429,7 +446,10 @@ func save(sess *session.Session, materialized Materialized) error {
 		_ = file.Close()
 		return err
 	}
-	return file.Close()
+	if err := file.Close(); err != nil {
+		return err
+	}
+	return os.Rename(temporaryPath, path)
 }
 
 func load(sess *session.Session) (persistedState, error) {

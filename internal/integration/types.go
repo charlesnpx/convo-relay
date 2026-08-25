@@ -32,13 +32,11 @@ const (
 )
 
 // Bundle is the normalized, immutable representation of one consumer-owned
-// integration bundle. SourcePath is informational and is deliberately absent
-// from ToMap and Digest.
+// integration bundle.
 type Bundle struct {
 	schemaVersion string
 	id            string
 	contracts     map[string]*Contract
-	sourcePath    string
 	digest        string
 }
 
@@ -121,13 +119,6 @@ func (b *Bundle) ID() string {
 		return ""
 	}
 	return b.id
-}
-
-func (b *Bundle) SourcePath() string {
-	if b == nil {
-		return ""
-	}
-	return b.sourcePath
 }
 
 func (b *Bundle) Digest() string {

@@ -135,9 +135,15 @@ func TestPrepareCrashGapRecovery(t *testing.T) {
 		if _, err := Recover(context.Background(), sess); err == nil || !strings.Contains(err.Error(), "runtime/workspace.json is missing for current workspace; it may have been deleted") {
 			t.Fatalf("missing current runtime state error = %v", err)
 		}
+		if err := os.WriteFile(statePath(sess), []byte(`{"mode":"current"`), 0o600); err != nil {
+			t.Fatalf("write torn current runtime state: %v", err)
+		}
+		if _, err := Recover(context.Background(), sess); err == nil || !strings.Contains(err.Error(), "decode workspace state") {
+			t.Fatalf("torn current runtime state error = %v", err)
+		}
 	})
 
-	t.Run("head-copy rebuilds from its durable event", func(t *testing.T) {
+	t.Run("head-copy event precedes its registered worktree", func(t *testing.T) {
 		repository := t.TempDir()
 		runGitTest(t, repository, "init")
 		runGitTest(t, repository, "config", "user.email", "test@example.invalid")
@@ -160,9 +166,51 @@ func TestPrepareCrashGapRecovery(t *testing.T) {
 			t.Fatalf("create session: %v", err)
 		}
 
-		preparedBefore, err := Prepare(context.Background(), sess, Options{LaunchCWD: launchCWD, Mode: ModeHeadCopy})
+		worktreePath := filepath.Join(sess.Root, "runtime", "workspace")
+		eventWriteFailure := errors.New("simulated event write failure")
+		_, err = prepareWithHooks(
+			context.Background(),
+			sess,
+			Options{LaunchCWD: launchCWD, Mode: ModeHeadCopy},
+			save,
+			func(*session.Session, *Materialized) error { return eventWriteFailure },
+		)
+		if !errors.Is(err, eventWriteFailure) {
+			t.Fatalf("head-copy event failure = %v", err)
+		}
+		if _, err := os.Lstat(worktreePath); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("worktree after failed event append = %v, want absent", err)
+		}
+		listing, err := gitOutput(context.Background(), repository, "worktree", "list", "--porcelain")
+		if err != nil {
+			t.Fatalf("list source worktrees: %v", err)
+		}
+		if strings.Contains(listing, worktreePath) {
+			t.Fatalf("source registered worktree after failed event append: %s", listing)
+		}
+
+		eventSawNoWorktree := false
+		preparedBefore, err := prepareWithHooks(
+			context.Background(),
+			sess,
+			Options{LaunchCWD: launchCWD, Mode: ModeHeadCopy},
+			save,
+			func(appended *session.Session, materialized *Materialized) error {
+				if materialized.Commit == "" || materialized.TreeHash == "" || materialized.RelativePath != "nested" {
+					t.Fatalf("head-copy facts before event = %#v", materialized)
+				}
+				if _, err := os.Lstat(worktreePath); !errors.Is(err, os.ErrNotExist) {
+					t.Fatalf("worktree at event append = %v, want absent", err)
+				}
+				eventSawNoWorktree = true
+				return appendPrepared(appended, materialized)
+			},
+		)
 		if err != nil {
 			t.Fatalf("prepare head-copy workspace: %v", err)
+		}
+		if !eventSawNoWorktree {
+			t.Fatal("head-copy event append did not observe the absent worktree")
 		}
 		t.Cleanup(func() { _ = Cleanup(context.Background(), sess) })
 		if _, err := os.Stat(statePath(sess)); !errors.Is(err, os.ErrNotExist) {

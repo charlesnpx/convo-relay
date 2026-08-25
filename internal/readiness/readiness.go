@@ -103,10 +103,6 @@ type limitedBuffer struct {
 	truncated bool
 }
 
-func RegisteredBackends() []string {
-	return append([]string{}, registeredBackends...)
-}
-
 func CheckRegistered(ctx context.Context, options Options) Report {
 	records, _ := Check(ctx, registeredBackends, options)
 	return Report{Scope: "backends", ProbeAuth: options.ProbeAuth, Backends: records}

@@ -40,7 +40,6 @@ func LoadBundleFile(path string, maxBytes int64) (*Bundle, error) {
 	if err != nil {
 		return nil, err
 	}
-	bundle.sourcePath = absolutePath
 	return bundle, nil
 }
 

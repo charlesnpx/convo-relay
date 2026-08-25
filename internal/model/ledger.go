@@ -78,24 +78,6 @@ func (l Ledger) Counts() LedgerCounts {
 	}
 }
 
-func (l Ledger) CountsMap() map[string]any {
-	counts := l.Counts()
-	return map[string]any{
-		"settled":   counts.Settled,
-		"contested": counts.Contested,
-		"withdrawn": counts.Withdrawn,
-	}
-}
-
-func (l Ledger) IsEmpty() bool {
-	counts := l.Counts()
-	return counts.Settled == 0 && counts.Contested == 0 && counts.Withdrawn == 0
-}
-
-func (l Ledger) HasContested() bool {
-	return len(l.contested) > 0
-}
-
 func (l Ledger) ToMap() map[string]any {
 	return map[string]any{
 		"settled":   stringsToAny(l.settled),
@@ -115,12 +97,4 @@ func (l *Ledger) UnmarshalJSON(data []byte) error {
 	}
 	*l = ParseLedger(value)
 	return nil
-}
-
-func LedgerFromJSON(data []byte) (Ledger, error) {
-	var ledger Ledger
-	if err := json.Unmarshal(data, &ledger); err != nil {
-		return EmptyLedger(), err
-	}
-	return ledger, nil
 }
