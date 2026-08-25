@@ -61,6 +61,11 @@ func TestV2CancellationProjectionSeam(t *testing.T) {
 	if cancel.exitCode != 1 || !strings.Contains(cancel.stderr, "interrupt its relay process directly") {
 		t.Fatalf("control cancel = exit %d stdout=%q stderr=%q", cancel.exitCode, cancel.stdout, cancel.stderr)
 	}
+	steer := env.run(t, "control", "steer", "--home", env.relayHome, "--json", "cancelled", "steer after interruption")
+	const wantLiveSteer = "error: session cancelled is running; interrupt its relay process directly, then queue steering before its next resume\n"
+	if steer.exitCode != 1 || steer.stderr != wantLiveSteer {
+		t.Fatalf("control steer = exit %d stdout=%q stderr=%q, want stderr=%q", steer.exitCode, steer.stdout, steer.stderr, wantLiveSteer)
+	}
 	afterCancel, err := os.ReadFile(filepath.Join(sessionDir, "events.jsonl"))
 	if err != nil {
 		t.Fatalf("read events after control cancel: %v", err)

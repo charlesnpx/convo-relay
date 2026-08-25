@@ -401,9 +401,9 @@ func TestResumeReportsAndRetriesAbandonedAttempt(t *testing.T) {
 	}
 }
 
-func TestRunCancellationLeavesAbandonedAttemptResumable(t *testing.T) {
+func TestRunCancellationWithForbiddenProviderRetryLeavesAbandonedAttemptResumable(t *testing.T) {
 	plan := dialoguePlan(1)
-	plan.ProviderRetry = session.ProviderRetry{Mode: "allow", MaxAttempts: 2}
+	plan.ProviderRetry = session.ProviderRetry{Mode: "forbid", MaxAttempts: 1}
 	sess := createSession(t, plan)
 	started := make(chan struct{})
 	alpha := &fakeBackend{name: "codex", slotID: "alpha", responses: []fakeResponse{
