@@ -29,13 +29,12 @@ const (
 	statusInterrupted      = "interrupted"
 	statusAwaitingDecision = "awaiting_decision"
 
-	stopCompleted        = "completed"
-	stopConverged        = "converged"
-	stopNoLedgerSignal   = "stalled_no_ledger_signal"
-	stopProviderFailed   = "provider_failed"
-	stopChildFailed      = "child_failed"
-	stopAbandonedAttempt = "abandoned_attempt"
-	stopInvalidResult    = "invalid_result"
+	stopCompleted      = "completed"
+	stopConverged      = "converged"
+	stopNoLedgerSignal = "stalled_no_ledger_signal"
+	stopProviderFailed = "provider_failed"
+	stopChildFailed    = "child_failed"
+	stopInvalidResult  = "invalid_result"
 
 	mediaTypePlainTextUTF8  = "text/plain; charset=utf-8"
 	mediaTypeChildResult    = "text/plain; charset=utf-8"
@@ -1224,15 +1223,6 @@ func (r *runner) serviceActiveTurn() error {
 			cause:  recordedFailure(turn, failed),
 		}
 	}
-	if abandoned := turn.latest(""); abandoned != nil {
-		if !r.retryAbandoned(abandoned.Attempt) {
-			return &executionFailure{
-				reason: stopAbandonedAttempt,
-				cause:  fmt.Errorf("abandoned provider attempt %d for %s cannot be retried by plan policy", abandoned.Attempt, turn.ActorID),
-			}
-		}
-		return r.callActiveAttempt(turn, len(turn.Attempts)+1)
-	}
 	return r.callActiveAttempt(turn, len(turn.Attempts)+1)
 }
 
@@ -1256,10 +1246,6 @@ func recordedFailure(turn *turnState, attempt *attemptState) error {
 		attempt.Failure.SanitizedDetail,
 		attempt.Failure.Category,
 	)
-}
-
-func (r *runner) retryAbandoned(attempt int) bool {
-	return r.sess.Plan.ProviderRetry.Mode == "allow" && attempt < r.sess.Plan.ProviderRetry.MaxAttempts
 }
 
 func (r *runner) shouldRetry(failure *providerFailureState, attempt int) bool {
@@ -1895,8 +1881,8 @@ func (r *runner) finishFailure(reason string, cause error) (Outcome, error) {
 }
 
 // finishInterrupted intentionally appends no terminal event. The outstanding
-// attempt remains an abandoned durable prefix, which Resume already retries
-// according to the plan's provider retry policy.
+// attempt remains an abandoned durable prefix and is always resumable by
+// explicit operator action.
 func (r *runner) finishInterrupted(cause error) (Outcome, error) {
 	if cause == nil {
 		cause = context.Canceled

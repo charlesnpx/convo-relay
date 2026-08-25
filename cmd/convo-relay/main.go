@@ -13,6 +13,7 @@ import (
 	"strings"
 
 	"github.com/charlesnpx/convo-relay/internal/engine"
+	"github.com/charlesnpx/convo-relay/internal/eventlog"
 	"github.com/charlesnpx/convo-relay/internal/format"
 	"github.com/charlesnpx/convo-relay/internal/readiness"
 	"github.com/charlesnpx/convo-relay/internal/recipes"
@@ -1157,6 +1158,10 @@ func runControlSteer(args []string) {
 		os.Exit(1)
 	}
 	if err := engine.QueueSteering(sess, promptText); err != nil {
+		var locked *eventlog.WriterLockedError
+		if errors.As(err, &locked) {
+			err = fmt.Errorf("another process holds session %s's writer (usually a running relay); interrupt its relay process directly, then queue steering before its next resume", sess.Plan.SessionID)
+		}
 		fmt.Fprintf(os.Stderr, "error: %s\n", err)
 		os.Exit(1)
 	}
