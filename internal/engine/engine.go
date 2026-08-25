@@ -1881,8 +1881,8 @@ func (r *runner) finishFailure(reason string, cause error) (Outcome, error) {
 }
 
 // finishInterrupted intentionally appends no terminal event. The outstanding
-// attempt remains an abandoned durable prefix, which Resume already retries
-// according to the plan's provider retry policy.
+// attempt remains an abandoned durable prefix and is always resumable by
+// explicit operator action.
 func (r *runner) finishInterrupted(cause error) (Outcome, error) {
 	if cause == nil {
 		cause = context.Canceled

@@ -182,7 +182,7 @@ Treat resume exactly like a fresh long-running relay:
 - if the user asks for a summary so far during resume, inspect the live session and summarize whatever has completed
 - avoid inferring failure from stale session files; if the user asks for progress, inspect the live session and summarize whatever has completed
 
-If the user wants to steer a relay that is already running, queue the direction instead of restarting:
+Steering queues on an idle or interrupted session and applies at its next resume. If a relay is running, interrupt its process first, then queue the direction:
 
 ```bash
 convo-relay control steer <session-id> "<new direction>"

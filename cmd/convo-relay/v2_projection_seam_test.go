@@ -62,7 +62,7 @@ func TestV2CancellationProjectionSeam(t *testing.T) {
 		t.Fatalf("control cancel = exit %d stdout=%q stderr=%q", cancel.exitCode, cancel.stdout, cancel.stderr)
 	}
 	steer := env.run(t, "control", "steer", "--home", env.relayHome, "--json", "cancelled", "steer after interruption")
-	const wantLiveSteer = "error: session cancelled is running; interrupt its relay process directly, then queue steering before its next resume\n"
+	const wantLiveSteer = "error: another process holds session cancelled's writer (usually a running relay); interrupt its relay process directly, then queue steering before its next resume\n"
 	if steer.exitCode != 1 || steer.stderr != wantLiveSteer {
 		t.Fatalf("control steer = exit %d stdout=%q stderr=%q, want stderr=%q", steer.exitCode, steer.stdout, steer.stderr, wantLiveSteer)
 	}

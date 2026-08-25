@@ -1160,7 +1160,7 @@ func runControlSteer(args []string) {
 	if err := engine.QueueSteering(sess, promptText); err != nil {
 		var locked *eventlog.WriterLockedError
 		if errors.As(err, &locked) {
-			err = fmt.Errorf("session %s is running; interrupt its relay process directly, then queue steering before its next resume", sess.Plan.SessionID)
+			err = fmt.Errorf("another process holds session %s's writer (usually a running relay); interrupt its relay process directly, then queue steering before its next resume", sess.Plan.SessionID)
 		}
 		fmt.Fprintf(os.Stderr, "error: %s\n", err)
 		os.Exit(1)
