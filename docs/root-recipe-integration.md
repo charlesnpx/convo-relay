@@ -191,8 +191,7 @@ Existing administration commands use the same generic projection:
 
 - `show`, `list`, and `export create` report root execution and validation
   state.
-- `doctor` checks artifacts, input blobs, checkpoints, workspace recovery,
-  cleanup state, and backend readiness.
+- `doctor` derives session health from plan, event, and blob projections and checks backend readiness.
 - `clean` restores provider-owned resources, removes the managed workspace,
   and only then removes session files; retryable failures retain the session.
 

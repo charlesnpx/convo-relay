@@ -165,6 +165,7 @@ type AttemptFinishedPayload struct {
 	ActorID           string            `json:"actor_id"`
 	Attempt           int               `json:"attempt"`
 	Outcome           string            `json:"outcome"`
+	ProviderOutcome   string            `json:"provider_outcome"`
 	ProviderSessionID string            `json:"provider_session_id"`
 	Content           blobstore.BlobRef `json:"content"`
 }
@@ -177,10 +178,24 @@ func (p AttemptFinishedPayload) validate() error {
 	if err := validateToken("outcome", p.Outcome); err != nil {
 		return err
 	}
+	if p.ProviderOutcome != "" && !validAttemptProviderOutcome(p.ProviderOutcome) {
+		return fmt.Errorf("attempt.finished provider_outcome %q is unsupported", p.ProviderOutcome)
+	}
 	if err := validateText("provider_session_id", p.ProviderSessionID); err != nil {
 		return err
 	}
 	return blobstore.ValidateRef(p.Content)
+}
+
+func validAttemptProviderOutcome(value string) bool {
+	switch value {
+	case "completed", "failed", "recovered", "timed_out", "stalled",
+		"timed_out_stalled", "timed_out_recovered", "stalled_recovered",
+		"timed_out_stalled_recovered":
+		return true
+	default:
+		return false
+	}
 }
 
 type ProviderFailedPayload struct {

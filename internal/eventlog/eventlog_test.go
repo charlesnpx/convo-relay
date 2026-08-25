@@ -29,7 +29,7 @@ func TestRoundTripEveryTypedEvent(t *testing.T) {
 		TurnStartedPayload{ActorID: "actor-a", Round: 1, Role: ParticipantRole},
 		TurnFinishedPayload{ActorID: "actor-a", Round: 1, Content: ref},
 		AttemptStartedPayload{ActorID: "actor-a", Attempt: 1},
-		AttemptFinishedPayload{ActorID: "actor-a", Attempt: 1, Outcome: "success", ProviderSessionID: "provider-a", Content: ref},
+		AttemptFinishedPayload{ActorID: "actor-a", Attempt: 1, Outcome: "success", ProviderOutcome: "completed", ProviderSessionID: "provider-a", Content: ref},
 		ProviderFailedPayload{ActorID: "actor-a", Backend: "codex", Category: "transport", Retryable: true, Attempts: 1, RemediationCode: "retry", SanitizedDetail: "temporary network failure"},
 		ChildRequestedPayload{RequestID: "request-one", RequesterActorID: "actor-a", RecipeID: "review", Question: ref},
 		ChildDecidedPayload{RequestID: "request-one", Admitted: true, Reason: "within budget", BudgetState: "remaining", Plan: &planRef},

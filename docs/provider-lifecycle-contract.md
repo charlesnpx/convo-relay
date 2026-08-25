@@ -28,9 +28,9 @@ The runner classifies failures as `auth`, `configuration`, `transient`,
 
 - Authentication-looking failures stop immediately and do not consume the
   transient retry budget.
-- Retryable failures use bounded backoff: 5s, 10s, 20s, 40s, 80s, then 160s.
-  Exhaustion marks the session failed without creating a successful transcript
-  turn for the failed attempt.
+- Retryable failures wait one second after the first failure, double each
+  later wait, and cap each wait at 30 seconds. Exhaustion marks the session
+  failed without creating a successful transcript turn for the failed attempt.
 - A hard timeout is recorded as a timed-out provider outcome.
 - The stream watchdog treats lack of stream activity for the configured stall
   interval as a stalled turn. Any stream event, including an agentbus progress
@@ -39,18 +39,21 @@ The runner classifies failures as `auth`, `configuration`, `transient`,
   interrupted, the turn can complete with `recovered: true`; otherwise the
   failure policy decides whether to retry or terminate.
 
-Failed provider turns append a canonical provider-failure event. Its durable
-payload records the phase, actor, backend, category, retryability, attempt
-count, timeout/stall state, return code, remediation, and sanitized detail.
-Credential-looking values are redacted and raw provider detail is not retained.
-
 ## Durable record
 
-Provider outcomes are represented through `relay.event/v1` records and
-BlobRef-backed payload content. New records include enough outcome information
-to distinguish normal completion, recovery, timeout, and stall without storing
-machine-local provider paths. The immutable `relay.plan/v1` determines the
-provider policy that applies to the session.
+For new records, `attempt.finished` carries the ordinary success-or-failure
+`outcome`, a BlobRef-backed content payload, the provider session id, and a
+compact `provider_outcome`. That classification is `completed`, `failed`, or
+an ordered combination of `timed_out`, `stalled`, and `recovered`; it therefore
+distinguishes normal completion, recovery, timeout, and stall without copying
+the runtime observation object into the event log.
+
+An error-returning attempt also writes `provider.failed` before its
+`attempt.finished` record. It carries the actor, backend, category,
+retryability, attempt count, remediation code, and sanitized detail. Return
+codes, warning lists, recovery sources, and raw provider detail remain runtime
+observations rather than durable event fields. The immutable `relay.plan/v1`
+determines the provider policy that applies to the session.
 
 When an integration input is named, its bytes are read once before execution,
 stored as a session blob, and bound into the plan. Provider prompts load that

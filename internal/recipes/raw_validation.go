@@ -21,8 +21,6 @@ const (
 )
 
 var allowedRecipeFields = map[string]bool{
-	"kind":                 true,
-	"schema_version":       true,
 	"id":                   true,
 	"purpose":              true,
 	"participants":         true,
@@ -103,11 +101,6 @@ func validateRecipeRecord(recipe map[string]any, path string) []format.Diagnosti
 		}
 	}
 
-	if value, exists := recipe["kind"]; exists {
-		if text, ok := value.(string); !ok || text != "recipe" {
-			diagnostics = append(diagnostics, invalidRecipeField(path, "kind", "must equal recipe"))
-		}
-	}
 	if value, exists := recipe["participants"]; exists {
 		participants, ok := strictStringList(value)
 		if !ok || len(participants) != 2 || strings.TrimSpace(participants[0]) == "" || strings.TrimSpace(participants[1]) == "" {
@@ -205,7 +198,7 @@ func validateLifecycleRecord(lifecycle map[string]any, path string) []format.Dia
 		}
 		choices := []string{"allow", "forbid"}
 		if field == "workspace_isolation" {
-			choices = []string{"inherited", "read_only", "ephemeral"}
+			choices = []string{"inherited", "ephemeral"}
 		}
 		value, ok := lifecycle[field].(string)
 		if !ok || !stringInSet(value, choices) {

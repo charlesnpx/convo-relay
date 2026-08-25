@@ -242,14 +242,14 @@ func TestVersionJSONReportsFlatFormatsWithoutProviderProbes(t *testing.T) {
 	}
 }
 
-func TestExportVerifyJSONReportsPortableV2(t *testing.T) {
+func TestExportVerifyJSONReportsPortableBundle(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "portable")
 	payloads := []struct {
 		kind  string
 		id    string
 		value any
 	}{
-		{kind: "root_session", id: "session", value: map[string]any{"kind": "portable_root_session", "terminal_status": "completed"}},
+		{kind: "root_session", id: "session", value: map[string]any{"terminal_status": "completed"}},
 		{kind: "participant_transcript", id: "transcript", value: []any{}},
 		{kind: "diagnostics", id: "diagnostics", value: map[string]any{"execution_kind": "recipe", "status": "completed"}},
 	}
@@ -306,6 +306,47 @@ func TestExportVerifyJSONReportsPortableV2(t *testing.T) {
 	}
 	if report["status"] != "valid" || report["format"] != format.BundleV1 {
 		t.Fatalf("export verify report = %#v", report)
+	}
+
+	legacyRoot := map[string]any{
+		"kind":            strings.Join([]string{"portable", "v2", "root", "session"}, "_"),
+		"terminal_status": "completed",
+	}
+	legacyBody, err := format.CanonicalJSONBytes(legacyRoot)
+	if err != nil {
+		t.Fatalf("encode legacy root payload: %v", err)
+	}
+	rootPath := filepath.Join(dir, "payloads", "root_session", "session.json")
+	if err := os.WriteFile(rootPath, legacyBody, 0o644); err != nil {
+		t.Fatalf("write legacy root payload: %v", err)
+	}
+	for _, raw := range inventory {
+		entry := raw.(map[string]any)
+		if entry["path"] == filepath.ToSlash(filepath.Join("payloads", "root_session", "session.json")) {
+			entry["blob"] = blobstore.RefForBytes(legacyBody, "application/json")
+		}
+	}
+	legacyManifest, err := format.BundleManifest(map[string]any{
+		"convo_relay_version": "test",
+		"terminal_status":     "completed",
+		"stop_reason":         nil,
+		"session_payload":     "payloads/root_session/session.json",
+		"transcript_payload":  "payloads/participant_transcript/transcript.json",
+		"diagnostics_payload": "payloads/diagnostics/diagnostics.json",
+		"payload_inventory":   inventory,
+	})
+	if err != nil {
+		t.Fatalf("legacy portable manifest: %v", err)
+	}
+	legacyManifestBody, err := format.CanonicalJSONBytes(legacyManifest)
+	if err != nil {
+		t.Fatalf("encode legacy manifest: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "manifest.json"), legacyManifestBody, 0o644); err != nil {
+		t.Fatalf("write legacy manifest: %v", err)
+	}
+	if _, err := v2VerifyPortableDirectory(dir); err == nil || !strings.Contains(err.Error(), "must omit kind") {
+		t.Fatalf("legacy root marker verification error = %v", err)
 	}
 }
 

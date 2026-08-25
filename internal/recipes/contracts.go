@@ -79,8 +79,6 @@ func normalizeAllowForbid(value any) string {
 
 func normalizeWorkspaceIsolation(value any) string {
 	switch strings.TrimSpace(stringValue(value)) {
-	case "read_only":
-		return "read_only"
 	case "ephemeral":
 		return "ephemeral"
 	default:

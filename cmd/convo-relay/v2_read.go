@@ -14,7 +14,6 @@ import (
 
 	"github.com/charlesnpx/convo-relay/internal/blobstore"
 	"github.com/charlesnpx/convo-relay/internal/format"
-	"github.com/charlesnpx/convo-relay/internal/model"
 	"github.com/charlesnpx/convo-relay/internal/recipes"
 	"github.com/charlesnpx/convo-relay/internal/relayv2"
 	"github.com/charlesnpx/convo-relay/internal/session"
@@ -68,7 +67,7 @@ func v2ProjectShowTranscriptReport(report map[string]any, fromRound int, roundsS
 	}
 	report["incomplete"] = status == "awaiting_decision" || status == "running"
 	report["export_ready"] = status == "completed" || status == "failed"
-	return model.NewShowReport(report).ToMap(), nil
+	return report, nil
 }
 
 func v2ExportReport(sess *session.Session, jsonMode bool) (map[string]any, error) {
@@ -80,7 +79,7 @@ func v2ExportReport(sess *session.Session, jsonMode bool) (map[string]any, error
 		"format":     map[bool]string{true: "json", false: "markdown"}[jsonMode],
 		"incomplete": report["incomplete"],
 	}
-	return model.NewExportReport(report).ToMap(), nil
+	return report, nil
 }
 
 func v2FormatTranscriptMarkdown(report map[string]any) string {
@@ -307,7 +306,7 @@ func v2SessionHealthReport(sess *session.Session) (map[string]any, error) {
 	if root, ok := report["root"].(map[string]any); ok {
 		result["root"] = root
 	}
-	return model.NewHealthReport(result).ToMap(), nil
+	return result, nil
 }
 
 func v2GlobalHealthReport(settingsPath string) map[string]any {
@@ -613,7 +612,6 @@ func v2ExportPortable(sess *session.Session, targetDir string, version string) (
 	}
 	root, _ := report["root"].(map[string]any)
 	sessionPayload := map[string]any{
-		"kind":                          "portable_v2_root_session",
 		"plan":                          sess.Plan,
 		"terminal_status":               status,
 		"stop_reason":                   report["stop_reason"],
@@ -823,9 +821,14 @@ func v2VerifyPortableDirectory(directory string) (map[string]any, error) {
 		if got := blobstore.RefForBytes(body, "application/json"); !got.Equal(blob) {
 			return nil, format.NewValidationError("portable export payload %s size or digest mismatch", relative)
 		}
-		_, err = format.DecodeStrictJSONBytes(body)
+		value, err := format.DecodeStrictJSONBytes(body)
 		if err != nil {
 			return nil, fmt.Errorf("decode portable export payload %s: %w", relative, err)
+		}
+		if key == "root_session:session" {
+			if err := v2VerifyPortableRootSessionPayload(value); err != nil {
+				return nil, err
+			}
 		}
 		payloadCount++
 	}
@@ -844,6 +847,17 @@ func v2VerifyPortableDirectory(directory string) (map[string]any, error) {
 		"payload_count":   payloadCount,
 		"manifest_digest": manifest["manifest_digest"],
 	}, nil
+}
+
+func v2VerifyPortableRootSessionPayload(value any) error {
+	payload, ok := value.(map[string]any)
+	if !ok {
+		return format.NewValidationError("portable root session payload must be an object")
+	}
+	if _, found := payload["kind"]; found {
+		return format.NewValidationError("portable root session payload must omit kind; relay.bundle/v1 identifies it")
+	}
+	return nil
 }
 
 func v2VerifyClosedPortableFileSet(root string, expected map[string]bool) error {

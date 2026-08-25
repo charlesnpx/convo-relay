@@ -10,7 +10,6 @@ import (
 	"os"
 	"strconv"
 	"strings"
-	"unicode/utf8"
 
 	"github.com/charlesnpx/convo-relay/internal/eventlog"
 )
@@ -21,13 +20,7 @@ func CanonicalJSONBytes(value any) ([]byte, error) {
 	return eventlog.SemanticJSONBytes(value)
 }
 
-func RawBytesDigest(data []byte) string { return eventlog.RawBytesDigest(data) }
-
 func SemanticJSONDigest(value any) (string, error) { return eventlog.SemanticJSONDigest(value) }
-
-func SemanticJSONDigestBytes(data []byte) (string, error) {
-	return eventlog.SemanticJSONDigestBytes(data)
-}
 
 // ReadBytesLimited rejects a source before it can exceed its stated byte
 // ceiling. It is used for configuration inputs, not durable payload storage.
@@ -81,22 +74,13 @@ func ReadFileBytesLimited(filename string, maxBytes int64) ([]byte, error) {
 // DecodeStrictJSONBytes accepts exactly one UTF-8 JSON value, preserves JSON
 // numbers, and rejects duplicate object keys.
 func DecodeStrictJSONBytes(data []byte) (any, error) {
-	if offset := invalidUTF8Offset(data); offset >= 0 {
-		return nil, strictJSONError("invalid UTF-8 at byte %d", offset)
+	if _, err := eventlog.SemanticJSONBytesRaw(data); err != nil {
+		return nil, strictJSONError("invalid JSON: %v", err)
 	}
 	decoder := json.NewDecoder(bytes.NewReader(data))
 	decoder.UseNumber()
-	value, err := decodeStrictJSONValue(decoder)
-	if err != nil {
-		return nil, err
-	}
-	if offset := trailingJSONOffset(data, decoder.InputOffset()); offset >= 0 {
-		return nil, strictJSONError("trailing JSON content at byte %d", offset)
-	}
-	if _, err := decoder.Token(); err != io.EOF {
-		if err == nil {
-			return nil, strictJSONError("JSON input must contain exactly one top-level value")
-		}
+	var value any
+	if err := decoder.Decode(&value); err != nil {
 		return nil, strictJSONError("invalid JSON: %v", err)
 	}
 	return value, nil
@@ -114,93 +98,9 @@ func DecodeStrictJSONObjectBytes(data []byte) (map[string]any, error) {
 	return object, nil
 }
 
-func decodeStrictJSONValue(decoder *json.Decoder) (any, error) {
-	token, err := decoder.Token()
-	if err != nil {
-		return nil, strictJSONError("invalid JSON: %v", err)
-	}
-	delimiter, isDelimiter := token.(json.Delim)
-	if !isDelimiter {
-		return token, nil
-	}
-	switch delimiter {
-	case '{':
-		object := map[string]any{}
-		for decoder.More() {
-			keyToken, err := decoder.Token()
-			if err != nil {
-				return nil, strictJSONError("invalid JSON: %v", err)
-			}
-			key, ok := keyToken.(string)
-			if !ok {
-				return nil, strictJSONError("JSON object keys must be strings")
-			}
-			if _, exists := object[key]; exists {
-				return nil, strictJSONError("JSON objects must not contain duplicate keys")
-			}
-			item, err := decodeStrictJSONValue(decoder)
-			if err != nil {
-				return nil, err
-			}
-			object[key] = item
-		}
-		closing, err := decoder.Token()
-		if err != nil || closing != json.Delim('}') {
-			return nil, strictJSONError("JSON object is not properly closed")
-		}
-		return object, nil
-	case '[':
-		items := []any{}
-		for decoder.More() {
-			item, err := decodeStrictJSONValue(decoder)
-			if err != nil {
-				return nil, err
-			}
-			items = append(items, item)
-		}
-		closing, err := decoder.Token()
-		if err != nil || closing != json.Delim(']') {
-			return nil, strictJSONError("JSON array is not properly closed")
-		}
-		return items, nil
-	default:
-		return nil, strictJSONError("JSON contains an unexpected closing delimiter")
-	}
-}
-
 func strictJSONError(message string, args ...any) error {
 	diagnostic := NewDiagnostic("invalid_json", DiagnosticPhaseDecode, "", fmt.Sprintf(message, args...), nil)
 	return NewDiagnosticError(diagnostic.Message, diagnostic)
-}
-
-func invalidUTF8Offset(data []byte) int {
-	for offset := 0; offset < len(data); {
-		runeValue, size := utf8.DecodeRune(data[offset:])
-		if runeValue == utf8.RuneError && size == 1 {
-			return offset
-		}
-		offset += size
-	}
-	return -1
-}
-
-func trailingJSONOffset(data []byte, inputOffset int64) int {
-	offset := int(inputOffset)
-	if offset < 0 {
-		offset = 0
-	}
-	if offset > len(data) {
-		offset = len(data)
-	}
-	for offset < len(data) {
-		switch data[offset] {
-		case ' ', '\t', '\r', '\n':
-			offset++
-		default:
-			return offset
-		}
-	}
-	return -1
 }
 
 func exactInt(value any) (int64, bool) {

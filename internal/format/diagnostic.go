@@ -6,12 +6,8 @@ import (
 )
 
 const (
-	DiagnosticPhaseDecode           = "decode"
-	DiagnosticPhasePreflight        = "preflight"
-	DiagnosticPhasePolicy           = "policy"
-	DiagnosticPhaseSchema           = "schema"
-	DiagnosticPhaseAssertion        = "assertion"
-	DiagnosticPhaseResultValidation = "result_validation"
+	DiagnosticPhaseDecode    = "decode"
+	DiagnosticPhasePreflight = "preflight"
 )
 
 // Diagnostic is a structured explanation for configuration and input errors.

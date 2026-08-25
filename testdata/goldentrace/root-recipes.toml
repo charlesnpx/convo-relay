@@ -29,7 +29,6 @@ effort = "low"
 capabilities = []
 
 [relay_recipes.trace-facilitated]
-schema_version = 2
 purpose = "Expose a facilitator ledger through the public transcript."
 participants = ["trace-alpha", "trace-beta"]
 facilitator = "trace-facilitator"
@@ -67,7 +66,6 @@ dynamic = "forbid"
 workspace_isolation = "inherited"
 
 [relay_recipes.trace-reducer]
-schema_version = 2
 purpose = "Run the fixed participant schedule and select the fresh reducer result."
 participants = ["trace-alpha", "trace-beta"]
 facilitator = "trace-facilitator"
@@ -88,7 +86,6 @@ dynamic = "forbid"
 workspace_isolation = "inherited"
 
 [relay_recipes.trace-retry]
-schema_version = 2
 purpose = "Expose a retried provider invocation through the root inspection report."
 participants = ["trace-gemini", "trace-gemini"]
 facilitator = "trace-gemini"
