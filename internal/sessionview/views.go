@@ -130,6 +130,15 @@ func Status(_ session.Plan, events []eventlog.Event) StatusView {
 	return view
 }
 
+// PublicStatus converts the durable status fields into the public CLI status
+// vocabulary without introducing another execution state.
+func PublicStatus(status string, stopReason string) string {
+	if status == "failed" && stopReason == "invalid_result" {
+		return "invalid_result"
+	}
+	return status
+}
+
 type TranscriptEntry struct {
 	ActorID string
 	Role    eventlog.Role

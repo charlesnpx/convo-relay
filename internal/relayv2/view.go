@@ -92,13 +92,7 @@ func BuildReport(sess *session.Session, options ProjectionOptions) (map[string]a
 	if stopReason == "" && status == "awaiting_decision" {
 		stopReason = "awaiting_decision"
 	}
-	// Engine records an invalid selected result as a failed terminal with an
-	// explicit stop reason. The public CLI has long exposed this as the
-	// distinct invalid_result status; it is a pure projection of those durable
-	// fields, not a second execution state.
-	if status == "failed" && stopReason == "invalid_result" {
-		status = "invalid_result"
-	}
+	status = sessionview.PublicStatus(status, stopReason)
 	result, validation := resultProjection(events, blobs)
 	if validation == "" {
 		validation = "pending"
@@ -133,6 +127,7 @@ func BuildReport(sess *session.Session, options ProjectionOptions) (map[string]a
 		"execution_kind":                executionKind(sess.Plan),
 		"recipe_id":                     sess.Plan.RecipeID,
 		"task":                          sess.Plan.Task,
+		"title":                         sess.Plan.Task,
 		"mode":                          sess.Plan.Mode,
 		"investigation_mode":            sess.Plan.Investigation,
 		"timeout_seconds":               sess.Plan.Timeouts.TurnSeconds,

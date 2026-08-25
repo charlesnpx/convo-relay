@@ -99,7 +99,7 @@ type appendFile interface {
 type Writer struct {
 	root    string
 	file    appendFile
-	lease   *writerLease
+	lease   *WriterLease
 	blobs   BlobVerifier
 	nextSeq uint64
 	closed  bool

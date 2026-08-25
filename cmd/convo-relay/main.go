@@ -1080,7 +1080,7 @@ func runClean(args []string) {
 	relayHome := flags.String("home", "", "Optional relay home; defaults to CODEX_CLAUDE_HOME or ~/.codex-claude")
 	all := flags.Bool("all", false, "Mark orphaned sessions under --home")
 	limit := flags.Int("limit", 500, "Maximum sessions to scan with --all")
-	force := flags.Bool("force", false, "Also mark sessions without PID files as orphaned with --all")
+	force := flags.Bool("force", false, "Bypass the active-writer check")
 	jsonOutput := flags.Bool("json", false, "Emit machine-readable clean JSON")
 	if err := parseFlags(flags, args); err != nil {
 		os.Exit(2)
@@ -1112,7 +1112,7 @@ func runClean(args []string) {
 		return
 	}
 	resolvedSessionDir, _ := resolveSessionDirAndArgs(*sessionDir, *sessionID, *relayHome, flags.Args())
-	report, err := sessionstore.CleanSession(resolvedSessionDir)
+	report, err := sessionstore.CleanSession(resolvedSessionDir, *force)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error: %s\n", err)
 		os.Exit(1)

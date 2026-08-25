@@ -31,10 +31,6 @@ func ResolveSessionDir(home string, sessionDir string, sessionIDPrefix string) (
 		return "", fmt.Errorf("--session-dir or session id is required")
 	}
 	sessionsDir := filepath.Join(resolveRelayHome(home), "sessions")
-	exact := filepath.Join(sessionsDir, prefix)
-	if sessionIsReadable(exact) {
-		return exact, nil
-	}
 	entries, err := os.ReadDir(sessionsDir)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -50,8 +46,12 @@ func ResolveSessionDir(home string, sessionDir string, sessionIDPrefix string) (
 			continue
 		}
 		candidate := filepath.Join(sessionsDir, entry.Name())
+		nameMatches := strings.HasPrefix(entry.Name(), prefix)
 		sess, err := session.Open(candidate)
 		if err != nil {
+			if nameMatches {
+				return "", fmt.Errorf("candidate %s is not a readable v2 session: %w", candidate, err)
+			}
 			continue
 		}
 		if sess.Plan.SessionID == prefix {
@@ -94,7 +94,13 @@ func ListSessions(home string, limit int) ([]map[string]any, error) {
 		return nil, err
 	}
 
-	items := []map[string]any{}
+	type listedSession struct {
+		item       map[string]any
+		createdAt  time.Time
+		hasCreated bool
+		sessionID  string
+	}
+	items := []listedSession{}
 	for _, entry := range entries {
 		if !entry.IsDir() {
 			continue
@@ -108,47 +114,66 @@ func ListSessions(home string, limit int) ([]map[string]any, error) {
 		if err != nil {
 			continue
 		}
-		status := listStatus(sess, events)
+		statusView := sessionview.Status(sess.Plan, events)
+		status := sessionview.PublicStatus(statusView.Status, statusView.StopReason)
+		createdAt, hasCreated := firstEventTime(events)
+		createdAtValue := any(nil)
+		if hasCreated {
+			createdAtValue = createdAt.Format(time.RFC3339Nano)
+		}
+		turns := participantRoundCount(events)
 		item := map[string]any{
 			"session_id":    sess.Plan.SessionID,
 			"path":          sessionDir,
 			"status":        status,
 			"mode":          sess.Plan.Mode,
 			"task":          sess.Plan.Task,
+			"title":         sess.Plan.Task,
 			"agents":        participantBackends(sess.Plan),
-			"actual_rounds": participantRoundCount(events),
-			"created_at":    firstEventTime(events),
+			"actual_rounds": turns,
+			"created_at":    createdAtValue,
 		}
 		if sess.Plan.Provenance == session.ProvenanceRecipe || sess.Plan.Provenance == session.ProvenanceChild {
-			item["root"] = rootSummary(sess, events, status, participantRoundCount(events))
+			item["root"] = rootSummary(sess, events, status, turns)
 		}
-		items = append(items, item)
+		items = append(items, listedSession{
+			item:       item,
+			createdAt:  createdAt,
+			hasCreated: hasCreated,
+			sessionID:  sess.Plan.SessionID,
+		})
 	}
-	sort.SliceStable(items, func(left, right int) bool {
-		return stringValue(items[left]["created_at"]) > stringValue(items[right]["created_at"])
+	sort.Slice(items, func(left, right int) bool {
+		if items[left].hasCreated != items[right].hasCreated {
+			return items[left].hasCreated
+		}
+		if items[left].hasCreated && !items[left].createdAt.Equal(items[right].createdAt) {
+			return items[left].createdAt.After(items[right].createdAt)
+		}
+		if items[left].sessionID != items[right].sessionID {
+			return items[left].sessionID < items[right].sessionID
+		}
+		return stringValue(items[left].item["path"]) < stringValue(items[right].item["path"])
 	})
-	if len(items) > limit {
-		return items[:limit], nil
+	result := make([]map[string]any, 0, len(items))
+	for _, item := range items {
+		result = append(result, item.item)
 	}
-	return items, nil
+	if len(result) > limit {
+		return result[:limit], nil
+	}
+	return result, nil
 }
 
 // CleanSession removes a single v2 session after proving no event writer owns
-// its runtime lock.
-func CleanSession(sessionDir string) (map[string]any, error) {
-	return cleanSessionWithRemover(sessionDir, os.RemoveAll)
+// its runtime lock, unless force bypasses that check.
+func CleanSession(sessionDir string, force bool) (map[string]any, error) {
+	return cleanSessionWithRemover(sessionDir, os.RemoveAll, force)
 }
 
 // cleanSessionWithRemover is the removal seam for callers that need to verify
 // the exact target without deleting a real directory.
-func cleanSessionWithRemover(sessionDir string, removeSession func(string) error) (map[string]any, error) {
-	return cleanSessionWithRemoverMode(sessionDir, removeSession, false)
-}
-
-func cleanSessionWithRemoverMode(sessionDir string, removeSession func(string) error, force bool) (map[string]any, error) {
-	if removeSession == nil {
-		return nil, errors.New("session remover is required")
-	}
+func cleanSessionWithRemover(sessionDir string, removeSession func(string) error, force bool) (map[string]any, error) {
 	sess, err := session.Open(sessionDir)
 	if err != nil {
 		return nil, err
@@ -186,9 +211,6 @@ func CleanupSessions(home string, limit int, force bool) (map[string]any, error)
 }
 
 func cleanupSessionsWithRemover(home string, limit int, force bool, removeSession func(string) error) (map[string]any, error) {
-	if removeSession == nil {
-		return nil, errors.New("session remover is required")
-	}
 	sessions, err := ListSessions(home, limit)
 	if err != nil {
 		return nil, err
@@ -199,10 +221,7 @@ func cleanupSessionsWithRemover(home string, limit int, force bool, removeSessio
 		if status != "running" && status != "orphaned" {
 			continue
 		}
-		if status == "running" && !force {
-			continue
-		}
-		report, err := cleanSessionWithRemoverMode(stringValue(summary["path"]), removeSession, force)
+		report, err := cleanSessionWithRemover(stringValue(summary["path"]), removeSession, force)
 		if err != nil {
 			if errors.Is(err, errSessionRunning) || errors.Is(err, os.ErrNotExist) {
 				continue
@@ -230,25 +249,6 @@ func readEvents(sess *session.Session) ([]eventlog.Event, error) {
 		return nil, err
 	}
 	return eventlog.Replay(bytes.NewReader(body))
-}
-
-func listStatus(sess *session.Session, events []eventlog.Event) string {
-	view := sessionview.Status(sess.Plan, events)
-	status := view.Status
-	if status == "failed" && view.StopReason == "invalid_result" {
-		status = "invalid_result"
-	}
-	if status != "running" {
-		return status
-	}
-	lease, err := eventlog.AcquireWriterLease(sess.Root)
-	if err != nil {
-		return status
-	}
-	if err := lease.Release(); err != nil {
-		return status
-	}
-	return "orphaned"
 }
 
 func rootSummary(sess *session.Session, events []eventlog.Event, status string, turns int) map[string]any {
@@ -402,16 +402,11 @@ func reducerAttemptCount(value session.Plan, ledger sessionview.LedgerView) int 
 	return count
 }
 
-func firstEventTime(events []eventlog.Event) any {
+func firstEventTime(events []eventlog.Event) (time.Time, bool) {
 	if len(events) == 0 {
-		return nil
+		return time.Time{}, false
 	}
-	return events[0].Time.UTC().Format(time.RFC3339Nano)
-}
-
-func sessionIsReadable(sessionDir string) bool {
-	_, err := session.Open(sessionDir)
-	return err == nil
+	return events[0].Time.UTC(), true
 }
 
 func resolveRelayHome(home string) string {
