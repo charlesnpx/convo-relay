@@ -101,7 +101,7 @@ func BuildReport(sess *session.Session, options ProjectionOptions) (map[string]a
 	}
 	result, validation := resultProjection(events, blobs)
 	if validation == "" {
-		validation = "not_required"
+		validation = "pending"
 	}
 	if validation == "valid" {
 		validation = "validated"

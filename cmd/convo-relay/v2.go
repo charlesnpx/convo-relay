@@ -163,7 +163,8 @@ func v2RunOrdinary(ctx context.Context, options v2OrdinaryRunOptions) (map[strin
 	if err != nil {
 		return nil, err
 	}
-	runtime := relayv2.Runtime{LaunchCWD: v2LaunchCWD(options.LaunchCWD), SettingsPath: config.SettingsPath, Recipes: catalog}
+	launchCWD := v2LaunchCWD(options.LaunchCWD)
+	runtime := relayv2.Runtime{SettingsPath: config.SettingsPath, Recipes: catalog}
 	if err := v2PersistInputs(sess, contexts, skills); err != nil {
 		return nil, err
 	}
@@ -171,7 +172,7 @@ func v2RunOrdinary(ctx context.Context, options v2OrdinaryRunOptions) (map[strin
 		return nil, err
 	}
 	materialized, err := v2PrepareWorkspace(ctx, sess, v2WorkspaceOptions{
-		LaunchCWD:     runtime.LaunchCWD,
+		LaunchCWD:     launchCWD,
 		MinimumPolicy: v2WorkspaceMinimum(planValue),
 		Limits:        config.EffectiveLimits(),
 	})
@@ -226,7 +227,8 @@ func v2RunRecipe(ctx context.Context, options v2RecipeRunOptions) (map[string]an
 	if err != nil {
 		return nil, err
 	}
-	runtime := relayv2.Runtime{LaunchCWD: v2LaunchCWD(options.LaunchCWD), SettingsPath: config.SettingsPath, Recipes: catalog}
+	launchCWD := v2LaunchCWD(options.LaunchCWD)
+	runtime := relayv2.Runtime{SettingsPath: config.SettingsPath, Recipes: catalog}
 	if err := v2PersistInputs(sess, contexts, skills, inputs); err != nil {
 		return nil, err
 	}
@@ -234,7 +236,7 @@ func v2RunRecipe(ctx context.Context, options v2RecipeRunOptions) (map[string]an
 		return nil, err
 	}
 	materialized, err := v2PrepareWorkspace(ctx, sess, v2WorkspaceOptions{
-		LaunchCWD:         runtime.LaunchCWD,
+		LaunchCWD:         launchCWD,
 		MinimumPolicy:     v2WorkspaceMinimum(planValue),
 		RequestedPolicy:   options.WorkspaceIsolation,
 		RequestedExplicit: options.WorkspaceExplicit,
@@ -260,7 +262,7 @@ func v2RunResume(ctx context.Context, sessionDir string, options v2ResumeOptions
 	if err != nil {
 		return nil, err
 	}
-	executionCWD, err := relayv2.ExecutionCWD(ctx, sess, runtime)
+	executionCWD, err := relayv2.ExecutionCWD(ctx, sess)
 	if err != nil {
 		return nil, err
 	}
@@ -530,19 +532,13 @@ func v2PrepareWorkspace(ctx context.Context, sess *session.Session, options v2Wo
 
 func v2Run(ctx context.Context, sess *session.Session, runtime relayv2.Runtime, executionCWD string, resume bool, prompt string, requestedTurns int) (map[string]any, error) {
 	deps := relayv2.NewDeps(runtime, executionCWD)
-	var outcome engine.Outcome
 	var runErr error
 	if resume {
-		outcome, runErr = engine.Resume(ctx, sess, deps, prompt, requestedTurns)
+		_, runErr = engine.Resume(ctx, sess, deps, prompt, requestedTurns)
 	} else {
-		outcome, runErr = engine.Run(ctx, sess, deps)
+		_, runErr = engine.Run(ctx, sess, deps)
 	}
-	projection := relayv2.ProjectionOptions{Status: outcome.Status}
-	if ctx.Err() != nil || errors.Is(runErr, context.Canceled) {
-		projection.Status = "interrupted"
-		projection.StopReason = "interrupted"
-	}
-	report, reportErr := relayv2.BuildReport(sess, projection)
+	report, reportErr := relayv2.BuildReport(sess, relayv2.ProjectionOptions{})
 	if reportErr != nil {
 		return nil, errors.Join(runErr, reportErr)
 	}

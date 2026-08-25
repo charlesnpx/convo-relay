@@ -35,7 +35,6 @@ const runtimeFilename = "v2-runtime.json"
 // the imperative provider boundary for resume and operator child decisions.
 type Runtime struct {
 	SchemaVersion int           `json:"schema_version"`
-	LaunchCWD     string        `json:"launch_cwd"`
 	SettingsPath  string        `json:"settings_path,omitempty"`
 	Recipes       []plan.Recipe `json:"recipes"`
 }
@@ -110,23 +109,15 @@ func NewDeps(value Runtime, executionCWD string) engine.Deps {
 }
 
 // ExecutionCWD recovers the durable workspace boundary for a later operation.
-// The runtime snapshot is only a fallback for sessions created before an
-// execution workspace was materialized.
-func ExecutionCWD(ctx context.Context, sess *session.Session, value Runtime) (string, error) {
+func ExecutionCWD(ctx context.Context, sess *session.Session) (string, error) {
 	if sess == nil {
 		return "", errors.New("session is required")
 	}
 	recovered, err := workspace.Recover(ctx, store.New(sess.Root))
-	if err == nil && recovered != nil && strings.TrimSpace(recovered.ExecutionCWD) != "" {
-		return recovered.ExecutionCWD, nil
-	}
 	if err != nil {
 		return "", err
 	}
-	if cwd := strings.TrimSpace(value.LaunchCWD); cwd != "" {
-		return cwd, nil
-	}
-	return "", errors.New("v2 runtime has no launch cwd")
+	return recovered.ExecutionCWD, nil
 }
 
 // NewBackendFactory is the production engine.BackendFactory. It maps the
@@ -145,9 +136,6 @@ func NewBackendFactory(value Runtime, executionCWD string) engine.BackendFactory
 			return nil, fmt.Errorf("provider backend %q is not allowed for facilitator", backendName)
 		}
 		cwd := strings.TrimSpace(executionCWD)
-		if cwd == "" {
-			cwd = strings.TrimSpace(value.LaunchCWD)
-		}
 		if cwd == "" {
 			return nil, errors.New("provider execution cwd is required")
 		}

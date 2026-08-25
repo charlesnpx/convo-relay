@@ -979,28 +979,28 @@ func runResume(args []string) {
 	sessionID := flags.String("session-id", "", "Session id under --home when --session-dir is omitted")
 	relayHome := flags.String("home", "", "Optional relay home; defaults to CODEX_CLAUDE_HOME or ~/.codex-claude")
 	prompt := flags.String("prompt", "", "Optional new direction for the next turn")
-	mode := flags.String("mode", "", "Typed mode control for resumed rounds: adversarial, cooperative, or steelman")
+	_ = flags.String("mode", "", "Typed mode control for resumed rounds: adversarial, cooperative, or steelman")
 	_ = flags.String("context", "", "Attach resume context text files; may be repeated. Limits: 1 MiB per file, 2 MiB total")
 	_ = flags.String("skill", "", "Attach resume capability text files; may be repeated")
 	rounds := flags.Int("rounds", 0, "Resume for exactly N additional rounds; omit for auto-stop")
-	maxRounds := flags.Int("max-rounds", 50, "Additional-round safety cap when --rounds is omitted")
-	timeout := flags.Int("timeout", 600, "Per-turn timeout in seconds")
-	stallTimeout := flags.Int("stall-timeout", 300, "Claude JSONL stall timeout in seconds")
-	settingsPath := flags.String("settings", "", "Optional settings.toml path")
-	facilitatorModel := flags.String("facilitator-model", "", "Facilitator model override")
-	facilitatorEffort := flags.String("facilitator-effort", "", "Facilitator effort override")
+	_ = flags.Int("max-rounds", 50, "Additional-round safety cap when --rounds is omitted")
+	_ = flags.Int("timeout", 600, "Per-turn timeout in seconds")
+	_ = flags.Int("stall-timeout", 300, "Claude JSONL stall timeout in seconds")
+	_ = flags.String("settings", "", "Optional settings.toml path")
+	_ = flags.String("facilitator-model", "", "Facilitator model override")
+	_ = flags.String("facilitator-effort", "", "Facilitator effort override")
 	quick := flags.Bool("quick", false, "Force exactly 3 additional rounds")
 	output := ""
 	flags.StringVar(&output, "output", "", "Write transcript or JSON export to file")
 	flags.StringVar(&output, "o", "", "Alias for --output")
-	modelA := flags.String("model-a", "", "Model override for slot_0")
-	effortA := flags.String("effort-a", "", "Effort override for slot_0")
-	modelB := flags.String("model-b", "", "Model override for slot_1")
-	effortB := flags.String("effort-b", "", "Effort override for slot_1")
-	replaceA := flags.String("replace-a", "", "Advanced: replace slot_0 backend/profile for resumed turns")
-	replaceB := flags.String("replace-b", "", "Advanced: replace slot_1 backend/profile for resumed turns")
+	_ = flags.String("model-a", "", "Model override for slot_0")
+	_ = flags.String("effort-a", "", "Effort override for slot_0")
+	_ = flags.String("model-b", "", "Model override for slot_1")
+	_ = flags.String("effort-b", "", "Effort override for slot_1")
+	_ = flags.String("replace-a", "", "Advanced: replace slot_0 backend/profile for resumed turns")
+	_ = flags.String("replace-b", "", "Advanced: replace slot_1 backend/profile for resumed turns")
 	jsonOutput := flags.Bool("json", false, "Emit machine-readable run JSON")
-	extracted, cleanedArgs, err := extractMultiValueFlags(args, "context", "skill")
+	_, cleanedArgs, err := extractMultiValueFlags(args, "context", "skill")
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error: %s\n", err)
 		os.Exit(2)
@@ -1008,17 +1008,9 @@ func runResume(args []string) {
 	if err := parseFlags(flags, cleanedArgs); err != nil {
 		os.Exit(2)
 	}
-	visited := visitedFlagNames(flags)
-	if len(extracted["context"]) > 0 {
-		visited["context"] = true
-	}
-	if len(extracted["skill"]) > 0 {
-		visited["skill"] = true
-	}
 	resolvedSessionDir, remaining := resolveSessionDirAndArgs(*sessionDir, *sessionID, *relayHome, flags.Args())
 	if *prompt == "" && len(remaining) > 0 {
 		*prompt = strings.Join(remaining, " ")
-		visited["prompt"] = true
 	}
 	effectiveRounds := *rounds
 	if *quick {
@@ -1026,21 +1018,6 @@ func runResume(args []string) {
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), commandInterruptSignals()...)
 	defer stop()
-	_ = mode
-	_ = extracted
-	_ = maxRounds
-	_ = timeout
-	_ = stallTimeout
-	_ = settingsPath
-	_ = facilitatorModel
-	_ = facilitatorEffort
-	_ = modelA
-	_ = effortA
-	_ = modelB
-	_ = effortB
-	_ = replaceA
-	_ = replaceB
-	_ = visited
 	result, err := v2RunResume(ctx, resolvedSessionDir, v2ResumeOptions{Prompt: *prompt, RequestedTurns: effectiveRounds})
 	writeRunnerResult(result, err, *jsonOutput, output)
 }

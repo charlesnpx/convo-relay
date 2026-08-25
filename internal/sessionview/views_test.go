@@ -138,6 +138,38 @@ func TestTurnBudgetGrantReopensDerivedStatusAndGraph(t *testing.T) {
 	}
 }
 
+func TestStatusDerivesAwaitingDecisionFromUndecidedChildRequest(t *testing.T) {
+	plan := viewPlan()
+	events := []eventlog.Event{
+		{Seq: 1, Type: eventlog.ChildRequested, Payload: eventlog.ChildRequestedPayload{RequestID: "request-one", RequesterActorID: "actor-a", RecipeID: "review"}},
+	}
+	status := Status(plan, events)
+	if status.Terminal || status.Status != "awaiting_decision" || status.StopReason != "awaiting_decision" {
+		t.Fatalf("undecided child status = %#v", status)
+	}
+	events = append(events, eventlog.Event{Seq: 2, Type: eventlog.ChildDecided, Payload: eventlog.ChildDecidedPayload{RequestID: "request-one", Admitted: false, Reason: "rejected", BudgetState: "available"}})
+	status = Status(plan, events)
+	if status.Terminal || status.Status != "running" || status.StopReason != "" {
+		t.Fatalf("decided child status = %#v", status)
+	}
+}
+
+func TestStatusDerivesInterruptedFromAbandonedAttempt(t *testing.T) {
+	plan := viewPlan()
+	events := []eventlog.Event{
+		{Seq: 1, Type: eventlog.AttemptStarted, Payload: eventlog.AttemptStartedPayload{ActorID: "actor-a", Attempt: 1}},
+	}
+	status := Status(plan, events)
+	if status.Terminal || status.Status != "interrupted" || status.StopReason != "interrupted" {
+		t.Fatalf("abandoned attempt status = %#v", status)
+	}
+	events = append(events, eventlog.Event{Seq: 2, Type: eventlog.ProviderFailed, Payload: eventlog.ProviderFailedPayload{ActorID: "actor-a", Attempts: 1}})
+	status = Status(plan, events)
+	if status.Terminal || status.Status != "running" || status.StopReason != "" {
+		t.Fatalf("classified failure status = %#v", status)
+	}
+}
+
 func TestProviderSessionsKeepsLatestSuccessfulSessionAfterFailure(t *testing.T) {
 	content := blobstore.BlobRef{SHA256: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", Size: 1, MediaType: "text/plain"}
 	events := []eventlog.Event{

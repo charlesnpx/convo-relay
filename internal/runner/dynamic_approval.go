@@ -323,7 +323,7 @@ func approveV2Proposal(ctx context.Context, sess *session.Session, opts ApproveO
 	if err := engine.ApproveChild(ctx, sess, opts.ProposalID, runtime.Recipes); err != nil {
 		return nil, err
 	}
-	executionCWD, err := relayv2.ExecutionCWD(ctx, sess, runtime)
+	executionCWD, err := relayv2.ExecutionCWD(ctx, sess)
 	if err != nil {
 		return nil, err
 	}

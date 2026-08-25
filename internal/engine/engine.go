@@ -27,6 +27,7 @@ import (
 const (
 	statusCompleted        = "completed"
 	statusFailed           = "failed"
+	statusInterrupted      = "interrupted"
 	statusAwaitingDecision = "awaiting_decision"
 
 	stopCompleted        = "completed"
@@ -73,8 +74,9 @@ type Deps struct {
 
 // Outcome contains the parent-facing result and execution classification needed
 // by parent-child execution. Status is terminal when the session is terminal,
-// or awaiting_decision while an ask-mode child request is pending. Diagnostics
-// and transcript details remain derived through sessionview.
+// interrupted when a caller cancelled active work, or awaiting_decision while
+// an ask-mode child request is pending. Diagnostics and transcript details
+// remain derived through sessionview.
 type Outcome struct {
 	Result string
 	Status string
@@ -952,11 +954,17 @@ func (r *runner) hasUnstartedGrantedWork() bool {
 
 func (r *runner) execute() (Outcome, error) {
 	for {
+		if err := r.ctx.Err(); err != nil {
+			return r.finishInterrupted(err)
+		}
 		if r.state.terminal != nil && !r.hasUnstartedGrantedWork() {
 			return r.outcome(), nil
 		}
 		if r.state.active != nil {
 			if err := r.serviceActiveTurn(); err != nil {
+				if cancelErr := r.ctx.Err(); cancelErr != nil {
+					return r.finishInterrupted(cancelErr)
+				}
 				reason := stopProviderFailed
 				var failure *executionFailure
 				if errors.As(err, &failure) {
@@ -968,6 +976,9 @@ func (r *runner) execute() (Outcome, error) {
 		}
 		awaitingChild, err := r.servicePendingChildren()
 		if err != nil {
+			if cancelErr := r.ctx.Err(); cancelErr != nil {
+				return r.finishInterrupted(cancelErr)
+			}
 			reason := stopProviderFailed
 			var failure *executionFailure
 			if errors.As(err, &failure) {
@@ -989,7 +1000,13 @@ func (r *runner) execute() (Outcome, error) {
 		}
 		next, err := r.nextTurn()
 		if err != nil {
+			if cancelErr := r.ctx.Err(); cancelErr != nil {
+				return r.finishInterrupted(cancelErr)
+			}
 			return r.finishFailure(stopProviderFailed, err)
+		}
+		if err := r.ctx.Err(); err != nil {
+			return r.finishInterrupted(err)
 		}
 		if err := r.append(eventlog.TurnStartedPayload{ActorID: next.Actor.ID, Round: next.Round, Role: next.Role}); err != nil {
 			return Outcome{}, err
@@ -1167,6 +1184,9 @@ func (r *runner) callActiveAttempt(turn *turnState, attemptNumber int) error {
 		TimeoutSeconds:      r.sess.Plan.Timeouts.TurnSeconds,
 		StallTimeoutSeconds: r.sess.Plan.Timeouts.StallSeconds,
 	})
+	if err := r.ctx.Err(); err != nil {
+		return err
+	}
 	ref, putErr := r.putText(result.Content)
 	if putErr != nil {
 		return putErr
@@ -1458,6 +1478,9 @@ func (r *runner) runChild(child *childState) (bool, error) {
 	} else {
 		childOutcome, childErr = Resume(r.ctx, childSession, childDeps, "", 0)
 	}
+	if err := r.ctx.Err(); err != nil {
+		return false, err
+	}
 	childStatus := childOutcome.Status
 	if childErr != nil {
 		childStatus = statusFailed
@@ -1599,6 +1622,16 @@ func (r *runner) finishFailure(reason string, cause error) (Outcome, error) {
 		cause = errors.New(reason)
 	}
 	return r.outcome(), cause
+}
+
+// finishInterrupted intentionally appends no terminal event. The outstanding
+// attempt remains an abandoned durable prefix, which Resume already retries
+// according to the plan's provider retry policy.
+func (r *runner) finishInterrupted(cause error) (Outcome, error) {
+	if cause == nil {
+		cause = context.Canceled
+	}
+	return Outcome{Result: r.state.lastResult.Text, Status: statusInterrupted}, cause
 }
 
 func (r *runner) outcome() Outcome {
