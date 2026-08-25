@@ -83,11 +83,6 @@ max_depth = 1
 	if first["composition_path"] != "root.slot_1.slot_0" {
 		t.Fatalf("composition path = %v", first["composition_path"])
 	}
-	launch := report["launch"].(map[string]any)
-	agents := launch["agents"].([]any)
-	if agents[0] != "relay" || agents[1] != "codex" {
-		t.Fatalf("agents = %#v", agents)
-	}
 }
 
 func TestLoadRuntimeConfigUsesEnvironmentSettings(t *testing.T) {

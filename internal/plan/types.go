@@ -104,7 +104,5 @@ type ChildRequest struct {
 // ResumeInput is deliberately prompt-only. Structural overrides create a new
 // launch plan instead of changing an existing session's execution shape.
 type ResumeInput struct {
-	Prompt  string
-	Context []session.Input
-	Skills  []session.Input
+	Prompt string
 }

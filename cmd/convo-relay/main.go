@@ -14,12 +14,9 @@ import (
 
 	"github.com/charlesnpx/convo-relay/internal/contracts"
 	"github.com/charlesnpx/convo-relay/internal/engine"
-	"github.com/charlesnpx/convo-relay/internal/inspect"
-	"github.com/charlesnpx/convo-relay/internal/portable"
 	"github.com/charlesnpx/convo-relay/internal/readiness"
 	"github.com/charlesnpx/convo-relay/internal/recipes"
 	"github.com/charlesnpx/convo-relay/internal/relayv2"
-	"github.com/charlesnpx/convo-relay/internal/runner"
 	"github.com/charlesnpx/convo-relay/internal/session"
 	"github.com/charlesnpx/convo-relay/internal/sessionstore"
 )
@@ -406,7 +403,7 @@ func runList(args []string) {
 			title,
 		)
 		if root, ok := session["root"].(map[string]any); ok {
-			for _, line := range strings.Split(inspect.FormatRootSummary(root), "\n") {
+			for _, line := range strings.Split(v2FormatRootSummary(root), "\n") {
 				fmt.Printf("             %s\n", line)
 			}
 		}
@@ -439,8 +436,13 @@ func runShow(args []string) {
 		os.Exit(2)
 	}
 	resolvedSessionDir, _ := resolveSessionDirAndArgs(*sessionDir, *sessionID, *relayHome, flags.Args())
+	sess, err := session.Open(resolvedSessionDir)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: %s\n", err)
+		os.Exit(1)
+	}
 	if *traceNodeID != "" {
-		trace, err := inspect.BuildTraceReport(resolvedSessionDir, *traceNodeID)
+		trace, err := v2BuildTraceReport(sess, *traceNodeID)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "error: %s\n", err)
 			os.Exit(1)
@@ -449,7 +451,7 @@ func runShow(args []string) {
 		return
 	}
 	if *graphOutput {
-		report, err := inspect.BuildShowGraphReport(resolvedSessionDir)
+		report, err := relayv2.BuildGraphReport(sess)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "error: %s\n", err)
 			os.Exit(1)
@@ -458,11 +460,11 @@ func runShow(args []string) {
 			writeJSON(report)
 			return
 		}
-		fmt.Println(inspect.FormatGraphSummary(report))
+		fmt.Println(v2FormatGraphSummary(report))
 		return
 	}
 	if *diffOutput {
-		text, err := inspect.RenderDiff(resolvedSessionDir)
+		text, err := v2RenderDiff(sess)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "error: %s\n", err)
 			os.Exit(1)
@@ -471,11 +473,6 @@ func runShow(args []string) {
 		return
 	}
 	if *proposalsOutput {
-		sess, err := session.Open(resolvedSessionDir)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "error: %s\n", err)
-			os.Exit(1)
-		}
 		report, err := v2ProposalReport(sess)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "error: %s\n", err)
@@ -498,7 +495,7 @@ func runShow(args []string) {
 		}
 		return
 	}
-	report, err := inspect.BuildShowTranscriptReport(resolvedSessionDir, *fromRound, *roundsSpec)
+	report, err := v2ShowTranscriptReport(sess, *fromRound, *roundsSpec)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error: %s\n", err)
 		os.Exit(1)
@@ -507,7 +504,7 @@ func runShow(args []string) {
 		writeJSON(report)
 		return
 	}
-	fmt.Println(inspect.FormatTranscriptMarkdown(report))
+	fmt.Println(v2FormatTranscriptMarkdown(report))
 }
 
 func runExport(args []string) {
@@ -544,8 +541,13 @@ func runExportCreate(args []string) {
 		os.Exit(2)
 	}
 	resolvedSessionDir, _ := resolveSessionDirAndArgs(*sessionDir, *sessionID, *relayHome, flags.Args())
+	sess, err := session.Open(resolvedSessionDir)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: %s\n", err)
+		os.Exit(1)
+	}
 	if *portableOutput {
-		result, err := portable.Export(resolvedSessionDir, output, portable.Options{ConvoRelayVersion: cliVersion})
+		result, err := v2ExportPortable(sess, output, cliVersion)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "error: %s\n", err)
 			os.Exit(1)
@@ -562,7 +564,7 @@ func runExportCreate(args []string) {
 		fmt.Printf("Exported portable root session to %s\n", result.Directory)
 		return
 	}
-	report, err := inspect.BuildExportReport(resolvedSessionDir, *jsonOutput)
+	report, err := v2ExportReport(sess, *jsonOutput)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error: %s\n", err)
 		os.Exit(1)
@@ -589,7 +591,7 @@ func runExportVerify(args []string) {
 		fmt.Fprintln(os.Stderr, "error: export verify requires a portable export directory")
 		os.Exit(2)
 	}
-	report, err := portable.VerifyDirectory(flags.Args()[0])
+	report, err := v2VerifyPortableDirectory(flags.Args()[0])
 	if err != nil {
 		if *jsonOutput {
 			writeJSON(map[string]any{
@@ -626,21 +628,23 @@ func runDoctor(args []string) {
 	var health map[string]any
 	if *sessionDir != "" || *sessionID != "" {
 		resolvedSessionDir := resolveSessionDirOrExit(*sessionDir, *sessionID, *relayHome)
-		var err error
-		health, err = inspect.BuildSessionHealthReport(resolvedSessionDir)
+		sess, err := session.Open(resolvedSessionDir)
+		if err == nil {
+			health, err = v2SessionHealthReport(sess)
+		}
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "error: %s\n", err)
 			os.Exit(1)
 		}
 	} else {
-		health = inspect.BuildGlobalHealthReport(*settingsPath)
+		health = v2GlobalHealthReport(*settingsPath)
 	}
 	backends := readiness.CheckRegistered(context.Background(), readiness.Options{ProbeAuth: *probeAuth})
 	if *jsonOutput {
 		writeJSON(map[string]any{"health": health, "backends": backends})
 		return
 	}
-	fmt.Println(inspect.FormatHealthReport(health))
+	fmt.Println(v2FormatHealthReport(health))
 	fmt.Println()
 	fmt.Println(readiness.FormatReport(backends))
 }
@@ -1035,8 +1039,6 @@ func runResume(args []string) {
 	relayHome := flags.String("home", "", "Optional relay home; defaults to CODEX_CLAUDE_HOME or ~/.codex-claude")
 	prompt := flags.String("prompt", "", "Optional new direction for the next turn")
 	_ = flags.String("mode", "", "Typed mode control for resumed rounds: adversarial, cooperative, or steelman")
-	_ = flags.String("context", "", "Attach resume context text files; may be repeated. Limits: 1 MiB per file, 2 MiB total")
-	_ = flags.String("skill", "", "Attach resume capability text files; may be repeated")
 	rounds := flags.Int("rounds", 0, "Resume for exactly N additional rounds; omit for auto-stop")
 	_ = flags.Int("max-rounds", 50, "Additional-round safety cap when --rounds is omitted")
 	_ = flags.Int("timeout", 600, "Per-turn timeout in seconds")
@@ -1055,12 +1057,7 @@ func runResume(args []string) {
 	_ = flags.String("replace-a", "", "Advanced: replace slot_0 backend/profile for resumed turns")
 	_ = flags.String("replace-b", "", "Advanced: replace slot_1 backend/profile for resumed turns")
 	jsonOutput := flags.Bool("json", false, "Emit machine-readable run JSON")
-	_, cleanedArgs, err := extractMultiValueFlags(args, "context", "skill")
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "error: %s\n", err)
-		os.Exit(2)
-	}
-	if err := parseFlags(flags, cleanedArgs); err != nil {
+	if err := parseFlags(flags, args); err != nil {
 		os.Exit(2)
 	}
 	resolvedSessionDir, remaining := resolveSessionDirAndArgs(*sessionDir, *sessionID, *relayHome, flags.Args())
@@ -1195,43 +1192,6 @@ func runClean(args []string) {
 		return
 	}
 	fmt.Printf("Deleted session %.8s: %s\n", report["session_id"], report["title"])
-}
-
-func buildTaskWithContext(task string, contextFiles []string, skillFiles []string) (string, string, error) {
-	contexts, err := runner.PreflightLaunchContexts(contextFiles)
-	if err != nil {
-		return "", "", err
-	}
-	taskWithContext := runner.BuildTaskWithLaunchContext(task, contexts)
-	skillsText, err := buildSkillsText(skillFiles)
-	if err != nil {
-		return "", "", err
-	}
-	return taskWithContext, skillsText, nil
-}
-
-func buildSkillsText(skillFiles []string) (string, error) {
-	var skillsBuilder strings.Builder
-	for _, rawPath := range skillFiles {
-		block, err := promptFileBlock(rawPath)
-		if err != nil {
-			return "", fmt.Errorf("unable to read skill file %q: %w", rawPath, err)
-		}
-		skillsBuilder.WriteString(block)
-	}
-	return skillsBuilder.String(), nil
-}
-
-func promptFileBlock(rawPath string) (string, error) {
-	absPath, err := filepath.Abs(rawPath)
-	if err != nil {
-		return "", err
-	}
-	data, err := os.ReadFile(absPath)
-	if err != nil {
-		return "", err
-	}
-	return fmt.Sprintf("\n### %s\n````text\n%s\n````\n", filepath.Base(absPath), string(data)), nil
 }
 
 func loadLaunchPlanFile(path string) (any, error) {
@@ -1475,11 +1435,22 @@ func saveRunnerOutput(result map[string]any, outputPath string, jsonOutput bool)
 		if sessionDir == "" {
 			return "", fmt.Errorf("cannot write transcript output without session_dir")
 		}
-		report, err := inspect.BuildShowTranscriptReport(sessionDir, 0, "")
+		reportInput := make(map[string]any, len(result))
+		for key, value := range result {
+			reportInput[key] = value
+		}
+		if summary, ok := result["summary"].(map[string]any); ok {
+			copiedSummary := make(map[string]any, len(summary))
+			for key, value := range summary {
+				copiedSummary[key] = value
+			}
+			reportInput["summary"] = copiedSummary
+		}
+		report, err := v2ProjectShowTranscriptReport(reportInput, 0, "")
 		if err != nil {
 			return "", err
 		}
-		body = []byte(inspect.FormatTranscriptMarkdown(report))
+		body = []byte(v2FormatTranscriptMarkdown(report))
 	}
 	if err := os.WriteFile(outPath, body, 0o644); err != nil {
 		return "", err
@@ -1503,7 +1474,7 @@ func writeExportOutput(report map[string]any, outputPath string, jsonOutput bool
 		}
 		body = append(body, '\n')
 	} else {
-		body = []byte(inspect.FormatExportMarkdown(report))
+		body = []byte(v2FormatExportMarkdown(report))
 	}
 	if err := os.WriteFile(outPath, body, 0o644); err != nil {
 		return "", err

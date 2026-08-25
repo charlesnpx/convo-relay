@@ -384,89 +384,6 @@ auto_approval = "auto-safe"
 	}
 }
 
-func TestRunCompatibilityFlagsBuildContextSkillsPlanAndQuickMode(t *testing.T) {
-	tempDir := t.TempDir()
-	contextPath := filepath.Join(tempDir, "context.md")
-	skillPath := filepath.Join(tempDir, "skill.md")
-	recipePath := filepath.Join(tempDir, "recipes.toml")
-	generatedRecipePath := filepath.Join(tempDir, "generated-recipes.toml")
-	planPath := filepath.Join(tempDir, "plan.json")
-	if err := os.WriteFile(contextPath, []byte("context body"), 0o644); err != nil {
-		t.Fatalf("write context: %v", err)
-	}
-	if err := os.WriteFile(skillPath, []byte("skill body"), 0o644); err != nil {
-		t.Fatalf("write skill: %v", err)
-	}
-	if err := os.WriteFile(recipePath, []byte("[relay_recipes.example]\nparticipants = [\"codex\", \"codex\"]\n"), 0o644); err != nil {
-		t.Fatalf("write recipe: %v", err)
-	}
-	if err := os.WriteFile(generatedRecipePath, []byte("[relay_recipes.generated]\nparticipants = [\"codex\", \"codex\"]\n"), 0o644); err != nil {
-		t.Fatalf("write generated recipe: %v", err)
-	}
-	if err := os.WriteFile(planPath, []byte(`{"explanation":"Prepare","plan":[{"step":"Run quick relay","status":"completed"}]}`), 0o644); err != nil {
-		t.Fatalf("write plan: %v", err)
-	}
-
-	args := []string{
-		"Pressure-test this",
-		"--context", contextPath,
-		"--skill", skillPath,
-		"--recipe-file", recipePath,
-		"--generated-recipe-file", generatedRecipePath,
-		"--task-plan", planPath,
-		"--quick",
-		"--verbose",
-		"--stream",
-		"-o", filepath.Join(tempDir, "transcript.md"),
-	}
-	extracted, cleaned, err := extractMultiValueFlags(args, "context", "skill", "recipe-file", "generated-recipe-file")
-	if err != nil {
-		t.Fatalf("extract flags: %v", err)
-	}
-	flags := flag.NewFlagSet("run", flag.ContinueOnError)
-	flags.SetOutput(io.Discard)
-	taskPlan := flags.String("task-plan", "", "plan")
-	quick := flags.Bool("quick", false, "quick")
-	verbose := false
-	stream := false
-	output := ""
-	flags.BoolVar(&verbose, "verbose", false, "verbose")
-	flags.BoolVar(&stream, "stream", false, "stream")
-	flags.StringVar(&output, "o", "", "output")
-	if err := parseFlags(flags, cleaned); err != nil {
-		t.Fatalf("parse flags: %v", err)
-	}
-	taskWithContext, skillsText, err := buildTaskWithContext(flags.Arg(0), extracted["context"], extracted["skill"])
-	if err != nil {
-		t.Fatalf("build context: %v", err)
-	}
-	launchPlan, err := loadLaunchPlanFile(*taskPlan)
-	if err != nil {
-		t.Fatalf("load plan: %v", err)
-	}
-
-	if !*quick || !verbose || !stream || output == "" {
-		t.Fatalf("compat flags quick=%v verbose=%v stream=%v output=%q", *quick, verbose, stream, output)
-	}
-	if !strings.Contains(taskWithContext, "--- Launch Context ---") || !strings.Contains(taskWithContext, "ctx1") || !strings.Contains(taskWithContext, "context body") {
-		t.Fatalf("task context not injected:\n%s", taskWithContext)
-	}
-	if !strings.Contains(skillsText, "skill body") {
-		t.Fatalf("skills text not injected:\n%s", skillsText)
-	}
-	if len(extracted["recipe-file"]) != 1 || extracted["recipe-file"][0] != recipePath {
-		t.Fatalf("recipe files = %#v", extracted["recipe-file"])
-	}
-	if len(extracted["generated-recipe-file"]) != 1 || extracted["generated-recipe-file"][0] != generatedRecipePath {
-		t.Fatalf("generated recipe files = %#v", extracted["generated-recipe-file"])
-	}
-	plan, _ := launchPlan.(map[string]any)
-	steps, _ := plan["plan"].([]any)
-	if plan["explanation"] != "Prepare" || len(steps) != 1 {
-		t.Fatalf("launch plan = %#v", launchPlan)
-	}
-}
-
 func TestRecipeRunStructuralOverridesUseOnlyVisitedFlags(t *testing.T) {
 	newFlags := func() *flag.FlagSet {
 		flags := flag.NewFlagSet("run", flag.ContinueOnError)
@@ -1036,20 +953,24 @@ workspace_isolation = "inherited"
 
 func TestSaveRunnerOutputWritesMarkdownAndJSON(t *testing.T) {
 	sessionDir := filepath.Join(t.TempDir(), "session")
-	if err := os.MkdirAll(sessionDir, 0o755); err != nil {
-		t.Fatalf("mkdir session: %v", err)
-	}
-	meta := `{"task":"Output task","title":"Output title","status":"completed","mode":"adversarial","actual_rounds":1,"max_rounds":1,"ledger":{"settled":[],"contested":[],"withdrawn":[]},"slots":[{"backend":"codex"}]}`
-	transcript := `[{"round":1,"from":"Codex","content":"Output body","ledger":{"settled":[],"contested":[],"withdrawn":[]}}]`
-	if err := os.WriteFile(filepath.Join(sessionDir, "meta.json"), []byte(meta), 0o644); err != nil {
-		t.Fatalf("write meta: %v", err)
-	}
-	if err := os.WriteFile(filepath.Join(sessionDir, "transcript.json"), []byte(transcript), 0o644); err != nil {
-		t.Fatalf("write transcript: %v", err)
+	report := map[string]any{
+		"session_id":    "abc123",
+		"session_dir":   sessionDir,
+		"task":          "Output task",
+		"title":         "Output title",
+		"status":        "completed",
+		"mode":          "adversarial",
+		"actual_rounds": 1,
+		"max_rounds":    1,
+		"slots":         []any{map[string]any{"backend": "codex"}},
+		"transcript": []any{map[string]any{
+			"round": 1, "from": "Codex", "content": "Output body",
+			"ledger": map[string]any{"settled": []any{}, "contested": []any{}, "withdrawn": []any{}},
+		}},
 	}
 
 	markdownPath := filepath.Join(t.TempDir(), "relay.md")
-	if saved, err := saveRunnerOutput(map[string]any{"session_dir": sessionDir}, markdownPath, false); err != nil || saved != markdownPath {
+	if saved, err := saveRunnerOutput(report, markdownPath, false); err != nil || saved != markdownPath {
 		t.Fatalf("save markdown = %q, %v", saved, err)
 	}
 	markdown, err := os.ReadFile(markdownPath)
@@ -1061,7 +982,7 @@ func TestSaveRunnerOutputWritesMarkdownAndJSON(t *testing.T) {
 	}
 
 	jsonPath := filepath.Join(t.TempDir(), "relay.json")
-	if saved, err := saveRunnerOutput(map[string]any{"session_id": "abc123", "session_dir": sessionDir}, jsonPath, true); err != nil || saved != jsonPath {
+	if saved, err := saveRunnerOutput(report, jsonPath, true); err != nil || saved != jsonPath {
 		t.Fatalf("save json = %q, %v", saved, err)
 	}
 	jsonData, err := os.ReadFile(jsonPath)
@@ -1113,25 +1034,20 @@ func TestEmitRunnerResultStillWritesStdoutWhenOutputSaveFails(t *testing.T) {
 
 func TestEmitRunnerResultWithRunErrorPersistsSelectedOutputRepresentation(t *testing.T) {
 	sessionDir := filepath.Join(t.TempDir(), "root-session")
-	if err := os.MkdirAll(sessionDir, 0o755); err != nil {
-		t.Fatalf("mkdir root session: %v", err)
-	}
-	meta := `{"execution_kind":"recipe","recipe_id":"neutral-root","task":"Output task","title":"Output title","status":"invalid_result","mode":"cooperative","participant_turns":2,"participant_turns_completed":2,"actual_participant_turns":2,"actual_rounds":2,"max_rounds":2,"result_source":"reducer","validation_status":"failed","ledger":{"settled":[],"contested":[],"withdrawn":[]},"slots":[{"backend":"codex"},{"backend":"codex"}]}`
-	transcript := `[{"round":1,"from":"Participant A","content":"First participant body","ledger":{"settled":[],"contested":[],"withdrawn":[]}},{"round":2,"from":"Participant B","content":"Second participant body","ledger":{"settled":[],"contested":[],"withdrawn":[]}}]`
-	if err := os.WriteFile(filepath.Join(sessionDir, "meta.json"), []byte(meta), 0o644); err != nil {
-		t.Fatalf("write root meta: %v", err)
-	}
-	if err := os.WriteFile(filepath.Join(sessionDir, "transcript.json"), []byte(transcript), 0o644); err != nil {
-		t.Fatalf("write root transcript: %v", err)
-	}
 	canonicalRef := map[string]any{
 		"kind": "artifact_ref", "schema_version": 1, "id": "canonical_result:selected",
 		"digest": contracts.DigestPrefix + strings.Repeat("0", 64),
 	}
 	result := map[string]any{
 		"execution_kind": "recipe", "session_id": "invalid123", "session_dir": sessionDir,
-		"status": "invalid_result", "actual_participant_turns": 2, "participant_turns": 2,
-		"canonical_result_ref": canonicalRef, "transcript": []any{map[string]any{"content": "machine envelope body"}},
+		"task": "Output task", "title": "Output title", "mode": "cooperative", "status": "invalid_result",
+		"actual_participant_turns": 2, "participant_turns": 2, "actual_rounds": 2, "max_rounds": 2,
+		"canonical_result_ref": canonicalRef,
+		"slots":                []any{map[string]any{"backend": "codex"}, map[string]any{"backend": "codex"}},
+		"transcript": []any{
+			map[string]any{"round": 1, "from": "Participant A", "content": "First participant body", "ledger": map[string]any{"settled": []any{}, "contested": []any{}, "withdrawn": []any{}}},
+			map[string]any{"round": 2, "from": "Participant B", "content": "Second participant body", "ledger": map[string]any{"settled": []any{}, "contested": []any{}, "withdrawn": []any{}}},
+		},
 	}
 	runErr := errors.New("invalid root result")
 

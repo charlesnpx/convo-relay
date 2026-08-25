@@ -462,38 +462,6 @@ func rootCompileDiagnostic(code string, path string, message string, details map
 	return contracts.NewDiagnosticError(message, diagnostic)
 }
 
-func RecipeToChildLaunch(compiled map[string]any) (map[string]any, error) {
-	participants, ok := compiled["participants"].([]any)
-	if !ok {
-		return nil, contracts.NewValidationError("compiled_plan.participants must be a list")
-	}
-	agents := make([]any, 0, len(participants))
-	slotConfigs := make([]any, 0, len(participants))
-	for _, rawProfile := range participants {
-		profile, ok := rawProfile.(map[string]any)
-		if !ok {
-			return nil, contracts.NewValidationError("compiled_plan.participants items must be objects")
-		}
-		agents = append(agents, stringValue(profile["backend"]))
-		slotConfigs = append(slotConfigs, map[string]any{
-			"model":            profile["model"],
-			"effort":           profile["effort"],
-			"composition_path": profile["composition_path"],
-		})
-	}
-	facilitatorProfile, _ := compiled["facilitator"].(map[string]any)
-	facilitator := map[string]any{
-		"backend": stringValue(facilitatorProfile["backend"]),
-		"model":   facilitatorProfile["model"],
-		"effort":  facilitatorProfile["effort"],
-	}
-	return map[string]any{
-		"agents":       agents,
-		"slot_configs": slotConfigs,
-		"facilitator":  facilitator,
-	}, nil
-}
-
 func BuildCompileReport(
 	recipeID string,
 	config RuntimeConfig,
@@ -551,13 +519,6 @@ func BuildCompileReport(
 		"recipe_digest":        recipeDigest,
 		"compiled_plan":        compiled,
 		"compiled_plan_digest": compiledDigest,
-	}
-	if target == CompileTargetChild {
-		launch, err := RecipeToChildLaunch(compiled)
-		if err != nil {
-			return nil, err
-		}
-		report["launch"] = launch
 	}
 	if trace, ok := transientRecipeDigestTraces(options.TransientSources)[recipeID]; ok {
 		if target == CompileTargetChild && trace.RecipeDigest != "" && trace.RecipeDigest != recipeDigest {

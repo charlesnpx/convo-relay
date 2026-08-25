@@ -4,7 +4,7 @@ Convo Relay can execute a configured recipe as the root session. This mode is
 for bounded procedures that need an exact turn schedule, named input
 snapshots with boundary integrity checks, an optional fresh reducer,
 declarative result validation, and durable inspection. It is separate from
-ordinary `runner.Run` and from using `relay` as one participant backend.
+using `relay` as one participant backend.
 
 ## Trust boundary
 
@@ -300,11 +300,3 @@ Existing administration commands use the same generic projection:
 
 Add `doctor --probe-auth` when an explicit supported authentication probe is
 needed.
-
-## Compatibility
-
-Ordinary `runner.Run`, `--agents codex`, `--agents relay`, contractless
-recipes, existing sessions, `compiled_plan/v1` artifacts, and runtime-config
-v1 snapshots retain their prior behavior. The root compiler and runner add a
-new direct execution boundary without changing child payloads or introducing
-a second exported recipe compiler.

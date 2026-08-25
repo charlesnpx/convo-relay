@@ -10,7 +10,6 @@ import (
 	"testing"
 
 	"github.com/charlesnpx/convo-relay/internal/contracts"
-	"github.com/charlesnpx/convo-relay/internal/graph"
 	"github.com/charlesnpx/convo-relay/internal/store"
 )
 
@@ -81,9 +80,6 @@ func TestFinalizePersistsSourceAfterAndRetainsIsolatedEvidence(t *testing.T) {
 				t.Fatalf("result evidence changed: %#v, %v", result, err)
 			}
 
-			if _, _, err := graph.RepairAndSaveFromEvents(st); err != nil {
-				t.Fatalf("repair graph after finalization: %v", err)
-			}
 			repeated, err := Finalize(context.Background(), st)
 			if err != nil || repeated.SourceAfterDigest != finalized.SourceAfterDigest || repeated.ArtifactRef["digest"] != finalized.ArtifactRef["digest"] {
 				t.Fatalf("idempotent finalization = %#v, %v", repeated, err)

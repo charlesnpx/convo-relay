@@ -1,9 +1,7 @@
 package provider
 
 import (
-	"context"
 	"testing"
-	"time"
 )
 
 func TestClassifyRetryableProviderErrorPolicy(t *testing.T) {
@@ -30,13 +28,4 @@ func TestClassifyRetryableProviderErrorPolicy(t *testing.T) {
 			}
 		})
 	}
-}
-
-func withFakeRetryBackoff(t *testing.T, fake func(context.Context, time.Duration) error) {
-	t.Helper()
-	original := retryBackoff
-	retryBackoff = fake
-	t.Cleanup(func() {
-		retryBackoff = original
-	})
 }

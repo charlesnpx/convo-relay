@@ -32,10 +32,7 @@ test: fmt-check
 	go test ./... -count=1
 
 test-race:
-	# Explicit timeout: the raced runner suite already sits near Go's 10m default
-	# (~9m measured), so a loaded machine tips it over and the gate fails for load
-	# rather than for a race. CI completes it in about 2m.
-	go test -race -timeout 25m ./internal/runner ./internal/store ./cmd/convo-relay -count=1
+	go test -race ./internal/store ./cmd/convo-relay -count=1
 
 cross-compile:
 	@set -eu; \
