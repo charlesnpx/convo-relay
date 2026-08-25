@@ -68,7 +68,6 @@ type Recipe struct {
 	// affect execution; no reader; not carried into session.Plan.
 	RequiredCapabilities []string          `json:"required_capabilities"`
 	AutoApproval         string            `json:"auto_approval"`
-	MatchKeywords        []string          `json:"match_keywords"`
 	Lifecycle            session.Lifecycle `json:"lifecycle"`
 
 	Workspace   session.Workspace   `json:"workspace"`

@@ -3,6 +3,8 @@ package engine
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"os"
@@ -805,6 +807,81 @@ func TestEmptyReducerResultIsInvalid(t *testing.T) {
 	}
 }
 
+func TestRunStartGuardProvisioningAndExecutionPartitions(t *testing.T) {
+	t.Run("provisioning only runs", func(t *testing.T) {
+		sess := createProvisionedSession(t)
+		alpha := &fakeBackend{name: "codex", slotID: "alpha", responses: []fakeResponse{{content: "runs after provisioning"}}}
+		beta := &fakeBackend{name: "codex", slotID: "beta"}
+
+		if _, err := Run(context.Background(), sess, testDeps(map[string]*fakeBackend{"alpha": alpha, "beta": beta})); err != nil {
+			t.Fatalf("Run provisioning prefix: %v", err)
+		}
+		events := sessionEvents(t, sess)
+		if got := eventTypes(events[:3]); !reflect.DeepEqual(got, []eventlog.Type{eventlog.InputIngested, eventlog.WorkspacePrepared, eventlog.SessionStarted}) {
+			t.Fatalf("provisioning start event order = %v", got)
+		}
+		if got := countType(events, eventlog.InputIngested); got != 1 {
+			t.Fatalf("input.ingested count = %d, want 1", got)
+		}
+	})
+
+	t.Run("execution history is refused", func(t *testing.T) {
+		sess := createProvisionedSession(t)
+		store, err := sess.BlobStore(blobstore.Limits{})
+		if err != nil {
+			t.Fatalf("open blobs: %v", err)
+		}
+		writer, err := sess.EventWriter(store)
+		if err != nil {
+			t.Fatalf("open writer: %v", err)
+		}
+		appendEvent(t, writer, eventlog.TurnStartedPayload{ActorID: "alpha", Round: 1, Role: eventlog.ParticipantRole})
+		if err := writer.Close(); err != nil {
+			t.Fatalf("close writer: %v", err)
+		}
+		before, err := os.ReadFile(filepath.Join(sess.Root, eventlog.EventsFilename))
+		if err != nil {
+			t.Fatalf("read before: %v", err)
+		}
+
+		alpha := &fakeBackend{name: "codex", slotID: "alpha"}
+		beta := &fakeBackend{name: "codex", slotID: "beta"}
+		if _, err := Run(context.Background(), sess, testDeps(map[string]*fakeBackend{"alpha": alpha, "beta": beta})); err == nil || !strings.Contains(err.Error(), "execution event") {
+			t.Fatalf("Run execution history error = %v", err)
+		}
+		after, err := os.ReadFile(filepath.Join(sess.Root, eventlog.EventsFilename))
+		if err != nil {
+			t.Fatalf("read after: %v", err)
+		}
+		if !bytes.Equal(before, after) {
+			t.Fatalf("Run guard mutated execution history: before=%q after=%q", before, after)
+		}
+	})
+}
+
+func TestResumeRecoversProvisioningPrefixWithoutReingesting(t *testing.T) {
+	sess := createProvisionedSession(t)
+	alpha := &fakeBackend{name: "codex", slotID: "alpha", responses: []fakeResponse{{content: "resume after provisioning"}}}
+	beta := &fakeBackend{name: "codex", slotID: "beta"}
+
+	if _, err := Resume(context.Background(), sess, testDeps(map[string]*fakeBackend{"alpha": alpha, "beta": beta}), "", 0); err != nil {
+		t.Fatalf("Resume provisioning prefix: %v", err)
+	}
+	events := sessionEvents(t, sess)
+	if got := countType(events, eventlog.InputIngested); got != 1 {
+		t.Fatalf("input.ingested count after Resume = %d, want 1", got)
+	}
+	if got := countType(events, eventlog.WorkspacePrepared); got != 1 {
+		t.Fatalf("workspace.prepared count after Resume = %d, want 1", got)
+	}
+	if got := countType(events, eventlog.SessionStarted); got != 1 {
+		t.Fatalf("session.started count after Resume = %d, want 1", got)
+	}
+	if got := countType(events, eventlog.TurnFinished); got != 1 {
+		t.Fatalf("turn.finished count after Resume = %d, want 1", got)
+	}
+}
+
 func TestResumeLifecycleGuardsBeforeMutation(t *testing.T) {
 	for _, test := range []struct {
 		name     string
@@ -818,7 +895,7 @@ func TestResumeLifecycleGuardsBeforeMutation(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			plan := dialoguePlan(1)
 			plan.Lifecycle = &session.Lifecycle{
-				Resume: test.resume, Steering: test.steering, Dynamic: "forbid", WorkspaceIsolation: "inherited",
+				Resume: test.resume, Steering: test.steering, Dynamic: "forbid",
 			}
 			sess := createSession(t, plan)
 			seedLog(t, sess, func(_ *blobstore.Store, _ *eventlog.Writer) {})
@@ -1770,7 +1847,6 @@ func dialoguePlan(turns int) session.Plan {
 		Inputs:        []session.Input{},
 		Context:       []session.Input{},
 		Skills:        []session.Input{},
-		MatchKeywords: []string{},
 		ChildPolicy:   session.ChildPolicy{Mode: "deny", MaxDepth: 0, MaxChildren: 0, MaxTurns: 0, AllowedRecipes: []string{}},
 		Result:        session.Result{Source: "last_turn", Format: "text"},
 	}
@@ -1798,7 +1874,6 @@ func sequencePlan() session.Plan {
 		Inputs:        []session.Input{},
 		Context:       []session.Input{},
 		Skills:        []session.Input{},
-		MatchKeywords: []string{},
 		ChildPolicy:   session.ChildPolicy{Mode: "deny", MaxDepth: 0, MaxChildren: 0, MaxTurns: 0, AllowedRecipes: []string{}},
 		Result:        session.Result{Source: "reducer", Format: "text"},
 	}
@@ -1829,6 +1904,43 @@ func createSessionIn(t *testing.T, home string, plan session.Plan) *session.Sess
 	sess, err := session.Create(home, plan)
 	if err != nil {
 		t.Fatalf("create session: %v", err)
+	}
+	return sess
+}
+
+func createProvisionedSession(t *testing.T) *session.Session {
+	t.Helper()
+	body := []byte("provisioned input")
+	sum := sha256.Sum256(body)
+	plan := dialoguePlan(1)
+	plan.Inputs = []session.Input{{
+		Name: "brief",
+		Content: blobstore.BlobRef{
+			SHA256:    hex.EncodeToString(sum[:]),
+			Size:      int64(len(body)),
+			MediaType: mediaTypePlainTextUTF8,
+		},
+	}}
+	sess := createSession(t, plan)
+	store, err := sess.BlobStore(blobstore.Limits{})
+	if err != nil {
+		t.Fatalf("open provisioned blobs: %v", err)
+	}
+	stored, err := store.PutBytes(body, mediaTypePlainTextUTF8)
+	if err != nil {
+		t.Fatalf("store provisioned input: %v", err)
+	}
+	if !stored.Equal(plan.Inputs[0].Content) {
+		t.Fatalf("stored provisioned input = %#v, want %#v", stored, plan.Inputs[0].Content)
+	}
+	writer, err := sess.EventWriter(store)
+	if err != nil {
+		t.Fatalf("open provisioning writer: %v", err)
+	}
+	appendEvent(t, writer, eventlog.InputIngestedPayload{LogicalName: "brief", Content: stored})
+	appendEvent(t, writer, eventlog.WorkspacePreparedPayload{Mode: "current", Commit: "abcdef", TreeHash: "123456"})
+	if err := writer.Close(); err != nil {
+		t.Fatalf("close provisioning writer: %v", err)
 	}
 	return sess
 }

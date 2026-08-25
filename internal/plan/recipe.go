@@ -83,9 +83,6 @@ func planFromRecipe(input RecipeInput, recipe Recipe, provenance string) session
 	policy := recipeChildPolicy(recipe)
 	workspace := recipe.Workspace
 	lifecycle := recipeLifecycle(recipe.Lifecycle)
-	if lifecycle != nil {
-		workspace = workspaceForLifecycle(workspace, *lifecycle)
-	}
 
 	return session.Plan{
 		Provenance:          provenance,
@@ -105,7 +102,6 @@ func planFromRecipe(input RecipeInput, recipe Recipe, provenance string) session
 		Context:             input.Context,
 		Skills:              input.Skills,
 		TaskPlan:            input.TaskPlan,
-		MatchKeywords:       recipe.MatchKeywords,
 		ChildPolicy:         policy,
 		Result:              result,
 		Lifecycle:           lifecycle,
@@ -146,20 +142,9 @@ func childPolicyMode(autoApproval string) string {
 }
 
 func recipeLifecycle(value session.Lifecycle) *session.Lifecycle {
-	if value.Resume == "" && value.Steering == "" && value.Dynamic == "" && value.WorkspaceIsolation == "" {
+	if value.Resume == "" && value.Steering == "" && value.Dynamic == "" {
 		return nil
 	}
 	copy := value
 	return &copy
-}
-
-func workspaceForLifecycle(workspace session.Workspace, lifecycle session.Lifecycle) session.Workspace {
-	workspace.Isolation = lifecycle.WorkspaceIsolation
-	switch lifecycle.WorkspaceIsolation {
-	case "inherited", "read_only":
-		workspace.Mode = "current"
-	case "ephemeral":
-		workspace.Mode = "head-copy"
-	}
-	return workspace
 }

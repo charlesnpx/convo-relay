@@ -19,6 +19,80 @@ import (
 	"github.com/charlesnpx/convo-relay/internal/session"
 )
 
+const fakeCodexAppServerScript = `#!/usr/bin/env python3
+import json
+import os
+import sys
+from pathlib import Path
+
+root_recipe_log = os.environ.get("ROOT_RECIPE_CLI_LOG", "")
+if root_recipe_log:
+    with open(root_recipe_log, "a", encoding="utf-8") as log:
+        log.write(" ".join(sys.argv[1:]) + "\n")
+
+def send(value):
+    print(json.dumps(value), flush=True)
+
+def response(request, result):
+    send({"id": request.get("id"), "result": result})
+
+def prompt_from(params):
+    items = params.get("input", [])
+    if items and isinstance(items[0], dict):
+        return str(items[0].get("text", ""))
+    return ""
+
+def main():
+    if "--version" in sys.argv:
+        print("0.143.0")
+        return 0
+    if len(sys.argv) < 2 or sys.argv[1] != "app-server":
+        print("expected codex app-server", file=sys.stderr)
+        return 2
+    thread_id = "root-recipe-codex"
+    turn_number = 0
+    for raw in sys.stdin:
+        try:
+            request = json.loads(raw)
+        except json.JSONDecodeError:
+            continue
+        method = request.get("method", "")
+        params = request.get("params", {}) or {}
+        if method == "initialize":
+            response(request, {"serverInfo": {"name": "root-recipe-codex"}})
+        elif method in ("thread/start", "thread/resume"):
+            thread_id = params.get("threadId") or thread_id
+            response(request, {"thread": {"id": thread_id}})
+        elif method == "model/list":
+            response(request, {"data": [{"id": "root-recipe-codex", "supportedReasoningEfforts": ["low", "high"]}]})
+        elif method == "turn/start":
+            turn_number += 1
+            turn_id = f"turn-{turn_number}"
+            response(request, {"turn": {"id": turn_id}})
+            prompt = prompt_from(params)
+            if "Return the updated ledger as JSON" in prompt:
+                text = '{"settled":["root"],"contested":[],"withdrawn":[]}'
+            elif root_recipe_log and "Invalid structured result" in prompt:
+                text = "not a JSON result"
+            elif root_recipe_log and "Integration Contract Instructions for This Turn" in prompt:
+                text = '{"value":"cli"}'
+            else:
+                text = "Fake Codex root recipe"
+            send({"method": "item/completed", "params": {
+                "item": {"id": f"item-{turn_number}", "type": "agentMessage", "text": text},
+            }})
+            send({"method": "turn/completed", "params": {
+                "threadId": thread_id,
+                "turn": {"id": turn_id, "status": "completed"},
+            }})
+        elif method == "turn/interrupt":
+            response(request, {})
+    return 0
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+`
+
 func TestParseFlagsAllowsFlagsAfterPositionals(t *testing.T) {
 	flags := flag.NewFlagSet("test", flag.ContinueOnError)
 	flags.SetOutput(io.Discard)
@@ -73,6 +147,22 @@ func TestRecipeCLIValidators(t *testing.T) {
 	}
 }
 
+func TestV2WorkspaceModeAcceptsOnlySurvivingModes(t *testing.T) {
+	for _, want := range []string{"current", "head-copy"} {
+		got, err := v2WorkspaceMode(want)
+		if err != nil || got != want {
+			t.Fatalf("workspace mode %q = %q, %v", want, got, err)
+		}
+	}
+	for _, invalid := range []string{"ephemeral", " current "} {
+		if _, err := v2WorkspaceMode(invalid); err == nil ||
+			!strings.Contains(err.Error(), "current") ||
+			!strings.Contains(err.Error(), "head-copy") {
+			t.Fatalf("invalid workspace mode %q error = %v", invalid, err)
+		}
+	}
+}
+
 func TestDoctorJSONRetainsBackendReadinessByDefault(t *testing.T) {
 	dir := t.TempDir()
 	logPath := filepath.Join(dir, "backends.log")
@@ -108,7 +198,7 @@ esac`)
 		t.Fatalf("doctor backend report metadata = %#v", doctor["backends"])
 	}
 	backends, ok := report["backends"].([]any)
-	if !ok || len(backends) != 4 {
+	if !ok || len(backends) != 3 {
 		t.Fatalf("backend records = %#v", report["backends"])
 	}
 	for _, raw := range backends[:3] {
@@ -120,10 +210,6 @@ esac`)
 		if auth["attempted"] != false || auth["status"] != "not_run" {
 			t.Fatalf("default authentication probe = %#v", auth)
 		}
-	}
-	relay := backends[3].(map[string]any)
-	if relay["backend"] != "relay" || relay["status"] != "ready" || relay["executable_path"] != "built-in" {
-		t.Fatalf("relay record = %#v", relay)
 	}
 	assertBackendProbeLog(t, logPath, []string{"claude:--version", "codex:--version", "gemini:--version"})
 }
@@ -284,7 +370,7 @@ esac`)
 	output := captureStdout(t, func() {
 		runDoctor([]string{"--probe-auth"})
 	})
-	for _, expected := range []string{"Health:", "Backend readiness:", "claude  ready", "codex   auth_failed", "gemini  unsupported_probe", "relay   ready", "auth=unauthenticated", "auth=unsupported"} {
+	for _, expected := range []string{"Health:", "Backend readiness:", "claude  ready", "codex   auth_failed", "gemini  unsupported_probe", "auth=unauthenticated", "auth=unsupported"} {
 		if !strings.Contains(output, expected) {
 			t.Fatalf("human backend output missing %q:\n%s", expected, output)
 		}
@@ -430,7 +516,6 @@ func TestRecipeRunStructuralOverridesUseOnlyVisitedFlags(t *testing.T) {
 		{name: "rounds", value: "1"},
 		{name: "max-rounds", value: "1"},
 		{name: "quick"},
-		{name: "dynamic", value: "ask"},
 	}
 	for _, override := range structural {
 		t.Run(override.name, func(t *testing.T) {
@@ -509,7 +594,6 @@ result_source = "last_turn"
 max_depth = 1
 required_capabilities = []
 auto_approval = "never"
-match_keywords = []
 
 [relay_recipes.neutral-root.lifecycle]
 resume = "allow"
@@ -530,7 +614,6 @@ integration_contract = "neutral/contract-v1"
 max_depth = 1
 required_capabilities = []
 auto_approval = "never"
-match_keywords = []
 
 [relay_recipes.bound-root.lifecycle]
 resume = "allow"
@@ -584,7 +667,6 @@ result_source = "last_turn"
 max_depth = 1
 required_capabilities = []
 auto_approval = "never"
-match_keywords = []
 
 [relay_recipes.generated-helper.lifecycle]
 resume = "allow"
@@ -791,8 +873,8 @@ workspace_isolation = "inherited"
 		"--recipe-file", "root-recipes.toml",
 		"--session-dir", dirtySessionDir,
 		"--launch-cwd", launchCWD,
-		"--workspace-isolation", "ephemeral",
-		"--allow-dirty-source",
+		// U3b §2 (mode collapse): exercise the surviving head-copy operator mode.
+		"--workspace", "head-copy",
 		"--json",
 	)
 	dirtyCommand.Env = command.Env
@@ -807,14 +889,8 @@ workspace_isolation = "inherited"
 	if dirtyResult["status"] != "completed" || dirtyResult["session_id"] == nil {
 		t.Fatalf("dirty-source JSON stdout = %#v", dirtyResult)
 	}
-	if strings.Contains(dirtyStdout.String(), "warning:") {
-		t.Fatalf("dirty-source warning contaminated JSON stdout:\n%s", dirtyStdout.String())
-	}
-	if warning := dirtyStderr.String(); !strings.Contains(warning, "warning:") ||
-		!strings.Contains(warning, "staged=0") ||
-		!strings.Contains(warning, "unstaged=1") ||
-		!strings.Contains(warning, "untracked=0") {
-		t.Fatalf("dirty-source stderr warning = %q", warning)
+	if warning := dirtyStderr.String(); warning != "" {
+		t.Fatalf("head-copy run wrote unexpected stderr: %q", warning)
 	}
 
 	for _, mode := range []struct {

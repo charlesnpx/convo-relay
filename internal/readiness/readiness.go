@@ -42,7 +42,7 @@ const (
 	probeWaitDelay      = 250 * time.Millisecond
 )
 
-var registeredBackends = []string{"claude", "codex", "gemini", "relay"}
+var registeredBackends = []string{"claude", "codex", "gemini"}
 
 type Record struct {
 	Backend              string      `json:"backend"`
@@ -154,9 +154,6 @@ func FormatReport(report Report) string {
 }
 
 func checkBackend(ctx context.Context, spec backendSpec, options Options) Record {
-	if spec.name == "relay" {
-		return builtInRelayRecord(options.ProbeAuth)
-	}
 	record := Record{
 		Backend:              spec.name,
 		AuthenticationStatus: AuthenticationUnknown,
@@ -265,34 +262,8 @@ func backendSpecification(name string) backendSpec {
 		return backendSpec{name: name, versionArgs: []string{"--version"}, authArgs: []string{"auth", "status", "--json"}, parseAuth: parseClaudeAuth}
 	case "gemini":
 		return backendSpec{name: name, versionArgs: []string{"--version"}}
-	case "relay":
-		return backendSpec{name: name}
 	default:
 		panic("backendSpecification called with an unregistered backend")
-	}
-}
-
-func builtInRelayRecord(probeAuth bool) Record {
-	authProbe := newProbe(false)
-	authProbe.Status = ProbeStatusBuiltIn
-	if probeAuth {
-		authProbe.Output = "relay is built in and does not require authentication"
-	}
-	installation := newProbe(true)
-	installation.Status = ProbeStatusBuiltIn
-	version := newProbe(true)
-	version.Status = ProbeStatusBuiltIn
-	return Record{
-		Backend:              "relay",
-		ExecutablePath:       "built-in",
-		Version:              "built-in",
-		AuthenticationStatus: AuthenticationNotApplicable,
-		Status:               StatusReady,
-		ProbeDetail: ProbeDetail{
-			Installation:   installation,
-			Version:        version,
-			Authentication: authProbe,
-		},
 	}
 }
 

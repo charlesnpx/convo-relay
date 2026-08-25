@@ -5,6 +5,8 @@ import (
 	"strings"
 )
 
+// DepthPolicy retains the public compile-option shape while child composition
+// is represented directly as child steps rather than a provider backend.
 type DepthPolicy struct {
 	RelayBackendDepth    int
 	MaxRelayBackendDepth int
@@ -19,281 +21,158 @@ type ChildRecipeIssue struct {
 }
 
 type ChildRelayConfigError struct {
-	Message string             `json:"message"`
-	Issues  []ChildRecipeIssue `json:"issues"`
+	Message string
+	Issues  []ChildRecipeIssue
 }
 
-func (e ChildRelayConfigError) Error() string {
-	return e.Message
-}
+func (e ChildRelayConfigError) Error() string { return e.Message }
 
 func (e ChildRelayConfigError) ToMap() map[string]any {
 	issues := make([]any, 0, len(e.Issues))
 	for _, issue := range e.Issues {
-		payload := map[string]any{
+		issues = append(issues, map[string]any{
 			"category": issue.Category,
 			"code":     issue.Code,
 			"message":  issue.Message,
-		}
-		if issue.Path != "" {
-			payload["path"] = issue.Path
-		}
-		if len(issue.Detail) > 0 {
-			payload["detail"] = issue.Detail
-		}
-		issues = append(issues, payload)
+			"path":     issue.Path,
+			"detail":   issue.Detail,
+		})
 	}
-	return map[string]any{
-		"message": e.Message,
-		"issues":  issues,
-	}
+	return map[string]any{"message": e.Message, "issues": issues}
 }
 
 func ExecutableIssues(
 	recipe map[string]any,
 	profiles map[string]map[string]any,
-	relayRecipes map[string]map[string]any,
+	childRecipes map[string]map[string]any,
 	depthPolicy DepthPolicy,
 	compositionPath string,
 ) []ChildRecipeIssue {
-	return executableIssues(recipe, profiles, relayRecipes, depthPolicy, compositionPath, true)
+	return executableIssues(recipe, profiles, childRecipes, depthPolicy, compositionPath, true)
 }
 
 func rootExecutableIssues(
 	recipe map[string]any,
 	profiles map[string]map[string]any,
-	relayRecipes map[string]map[string]any,
+	childRecipes map[string]map[string]any,
 	depthPolicy DepthPolicy,
 	compositionPath string,
 ) []ChildRecipeIssue {
-	includeReducer := normalizeResultSource(recipe["result_source"]) == "reducer"
-	return executableIssues(recipe, profiles, relayRecipes, depthPolicy, compositionPath, includeReducer)
+	return executableIssues(recipe, profiles, childRecipes, depthPolicy, compositionPath, true)
 }
 
 func executableIssues(
 	recipe map[string]any,
 	profiles map[string]map[string]any,
-	relayRecipes map[string]map[string]any,
+	childRecipes map[string]map[string]any,
 	depthPolicy DepthPolicy,
 	compositionPath string,
 	includeReducer bool,
 ) []ChildRecipeIssue {
 	issues := []ChildRecipeIssue{}
-	recipeID := strings.TrimSpace(stringValue(recipe["id"]))
-	if recipeID == "" {
-		issues = append(issues, ChildRecipeIssue{
-			Category: "invalid_config",
-			Code:     "missing_recipe_id",
-			Message:  "Child relay recipe is missing id.",
-			Path:     "recipe.id",
-		})
+	if recipe == nil {
+		return []ChildRecipeIssue{{Category: "invalid_config", Code: "missing_recipe", Message: "Recipe is required.", Path: "recipe"}}
 	}
-
-	participants := stringSlice(recipe["participants"])
-	if len(participants) != 2 {
-		issues = append(issues, ChildRecipeIssue{
-			Category: "invalid_config",
-			Code:     "invalid_participants",
-			Message:  "Child relay recipe must declare exactly two participants.",
-			Path:     "recipe.participants",
-		})
-		participants = []string{}
+	path := defaultCompositionPath(compositionPath)
+	stack := []string{strings.TrimSpace(stringValue(recipe["id"]))}
+	if stack[0] == "" {
+		stack[0] = "<root>"
 	}
-	for index, ref := range participants {
-		appendProfileIssues(&issues, ref, profiles, fmt.Sprintf("recipe.participants[%d]", index), "participant", relayRecipes, true)
-	}
-
-	facilitatorRef := strings.TrimSpace(stringValue(recipe["facilitator"]))
-	if facilitatorRef == "" && len(participants) > 0 {
-		facilitatorRef = participants[0]
-	}
-	appendProfileIssues(&issues, facilitatorRef, profiles, "recipe.facilitator", "facilitator", relayRecipes, false)
-
-	if includeReducer {
-		reducerRef := strings.TrimSpace(stringValue(recipe["reducer"]))
-		if reducerRef == "" {
-			reducerRef = facilitatorRef
-		}
-		appendProfileIssues(&issues, reducerRef, profiles, "recipe.reducer", "reducer", relayRecipes, false)
-	}
-
-	if len(issues) == 0 {
-		maxDepth := depthPolicy.MaxRelayBackendDepth
-		if maxDepth <= 0 {
-			maxDepth = intFromAny(recipe["max_depth"], 1)
-		}
-		appendNestedRelayRecipeIssues(
-			&issues,
-			recipe,
-			profiles,
-			relayRecipes,
-			depthPolicy.RelayBackendDepth,
-			maxDepth,
-			"recipe",
-			defaultCompositionPath(compositionPath),
-			[]string{recipeID},
-		)
-	}
+	validateRecipeComposition(&issues, recipe, profiles, childRecipes, depthPolicy, path, stack, includeReducer)
 	return issues
 }
 
-func appendProfileIssues(
-	issues *[]ChildRecipeIssue,
-	ref string,
-	profiles map[string]map[string]any,
-	path string,
-	role string,
-	relayRecipes map[string]map[string]any,
-	allowRelay bool,
-) {
-	profileRef := strings.TrimSpace(ref)
-	if profileRef == "" {
-		*issues = append(*issues, ChildRecipeIssue{
-			Category: "invalid_config",
-			Code:     "missing_" + role + "_profile",
-			Message:  "Child relay recipe is missing a " + role + " profile reference.",
-			Path:     path,
-		})
-		return
-	}
-	profile, err := ResolveProfileRef(profileRef, profiles)
-	if err != nil {
-		*issues = append(*issues, ChildRecipeIssue{
-			Category: "invalid_config",
-			Code:     "unknown_" + role + "_profile",
-			Message:  err.Error(),
-			Path:     path,
-			Detail:   map[string]any{"profile_ref": profileRef},
-		})
-		return
-	}
-	if stringValue(profile["backend"]) != "relay" {
-		return
-	}
-	if !allowRelay {
-		*issues = append(*issues, ChildRecipeIssue{
-			Category: "unsupported_capability",
-			Code:     "relay_backend_role_unsupported",
-			Message:  "Relay backend profiles are not supported for the " + role + " role.",
-			Path:     path,
-			Detail:   map[string]any{"profile_ref": profileRef, "role": role},
-		})
-		return
-	}
-	appendRelayProfileReferenceIssues(issues, profile, path, profileRef, relayRecipes)
-}
-
-func appendRelayProfileReferenceIssues(
-	issues *[]ChildRecipeIssue,
-	profile map[string]any,
-	path string,
-	profileRef string,
-	relayRecipes map[string]map[string]any,
-) {
-	childRecipeID := strings.TrimSpace(stringValue(profile["model"]))
-	if childRecipeID == "" {
-		*issues = append(*issues, ChildRecipeIssue{
-			Category: "invalid_config",
-			Code:     "missing_relay_profile_recipe",
-			Message:  "Relay participant profiles must set model to a child recipe id.",
-			Path:     path,
-			Detail:   map[string]any{"profile_ref": profileRef},
-		})
-		return
-	}
-	if _, ok := relayRecipes[childRecipeID]; !ok {
-		*issues = append(*issues, ChildRecipeIssue{
-			Category: "invalid_config",
-			Code:     "unknown_relay_profile_recipe",
-			Message:  fmt.Sprintf("Relay participant profile references unknown child recipe '%s'.", childRecipeID),
-			Path:     path,
-			Detail:   map[string]any{"profile_ref": profileRef, "child_recipe_id": childRecipeID},
-		})
-	}
-	if profile["effort"] != nil {
-		parsedEffort, ok := parseInt(profile["effort"])
-		if !ok || parsedEffort < 1 {
-			*issues = append(*issues, ChildRecipeIssue{
-				Category: "invalid_config",
-				Code:     "invalid_relay_profile_effort",
-				Message:  "Relay participant profile effort must be a positive child round count.",
-				Path:     path,
-				Detail:   map[string]any{"profile_ref": profileRef, "effort": profile["effort"]},
-			})
-		}
-	}
-}
-
-func appendNestedRelayRecipeIssues(
+func validateRecipeComposition(
 	issues *[]ChildRecipeIssue,
 	recipe map[string]any,
 	profiles map[string]map[string]any,
-	relayRecipes map[string]map[string]any,
-	currentDepth int,
-	maxDepth int,
+	childRecipes map[string]map[string]any,
+	depthPolicy DepthPolicy,
+	compositionPath string,
+	stack []string,
+	includeReducer bool,
+) {
+	participants := stringSlice(recipe["participants"])
+	if len(participants) != 2 {
+		*issues = append(*issues, ChildRecipeIssue{Category: "invalid_config", Code: "invalid_participants", Message: "Recipe must declare exactly two participants.", Path: "recipe.participants"})
+		return
+	}
+	for index, reference := range participants {
+		validateReference(issues, reference, profiles, childRecipes, depthPolicy, fmt.Sprintf("recipe.participants[%d]", index), "participant", true, compositionPath, stack)
+	}
+	facilitator := strings.TrimSpace(stringValue(recipe["facilitator"]))
+	if facilitator == "" {
+		facilitator = participants[0]
+	}
+	validateReference(issues, facilitator, profiles, childRecipes, depthPolicy, "recipe.facilitator", "facilitator", false, compositionPath, stack)
+	if includeReducer && normalizeResultSource(recipe["result_source"]) == "reducer" {
+		reducer := strings.TrimSpace(stringValue(recipe["reducer"]))
+		if reducer == "" {
+			reducer = facilitator
+		}
+		validateReference(issues, reducer, profiles, childRecipes, depthPolicy, "recipe.reducer", "reducer", false, compositionPath, stack)
+	}
+}
+
+func validateReference(
+	issues *[]ChildRecipeIssue,
+	reference string,
+	profiles map[string]map[string]any,
+	childRecipes map[string]map[string]any,
+	depthPolicy DepthPolicy,
 	path string,
+	role string,
+	allowChild bool,
 	compositionPath string,
 	stack []string,
 ) {
-	for index, ref := range stringSlice(recipe["participants"]) {
-		profile, err := ResolveProfileRef(ref, profiles)
-		if err != nil || stringValue(profile["backend"]) != "relay" {
-			continue
-		}
-		childRecipeID := strings.TrimSpace(stringValue(profile["model"]))
-		childPath := fmt.Sprintf("%s.participants[%d]", path, index)
-		childCompositionPath := fmt.Sprintf("%s.slot_%d", compositionPath, index)
-		if containsString(stack, childRecipeID) {
-			cycle := strings.Join(append(append([]string{}, stack...), childRecipeID), " -> ")
-			*issues = append(*issues, ChildRecipeIssue{
-				Category: "invalid_config",
-				Code:     "relay_recipe_cycle",
-				Message:  fmt.Sprintf("Relay recipe cycle detected: %s.", cycle),
-				Path:     childPath,
-				Detail: map[string]any{
-					"profile_ref":      ref,
-					"child_recipe_id":  childRecipeID,
-					"composition_path": childCompositionPath,
-				},
-			})
-			continue
-		}
-		childRecipe, ok := relayRecipes[childRecipeID]
-		if !ok {
-			continue
-		}
-		nextDepth := currentDepth + 1
-		if nextDepth >= maxDepth {
-			*issues = append(*issues, ChildRecipeIssue{
-				Category: "runtime_guard",
-				Code:     "relay_backend_depth_exceeded",
-				Message: fmt.Sprintf(
-					"Relay participant at %s would run at depth %d, but max relay backend depth is %d.",
-					childCompositionPath,
-					nextDepth,
-					maxDepth,
-				),
-				Path: childPath,
-				Detail: map[string]any{
-					"profile_ref":             ref,
-					"child_recipe_id":         childRecipeID,
-					"composition_path":        childCompositionPath,
-					"relay_backend_depth":     nextDepth,
-					"max_relay_backend_depth": maxDepth,
-				},
-			})
-			continue
-		}
-		appendNestedRelayRecipeIssues(
-			issues,
-			childRecipe,
-			profiles,
-			relayRecipes,
-			nextDepth,
-			maxDepth,
-			fmt.Sprintf("%s<%s>", childPath, childRecipeID),
-			childCompositionPath,
-			append(append([]string{}, stack...), childRecipeID),
-		)
+	reference = strings.TrimSpace(reference)
+	if reference == "" {
+		*issues = append(*issues, ChildRecipeIssue{Category: "invalid_config", Code: "missing_" + role + "_profile", Message: "Recipe is missing a " + role + " profile reference.", Path: path})
+		return
 	}
+	profile, err := ResolveProfileRef(reference, profiles)
+	if err != nil {
+		*issues = append(*issues, ChildRecipeIssue{Category: "invalid_config", Code: "unknown_" + role + "_profile", Message: err.Error(), Path: path, Detail: map[string]any{"profile_ref": reference}})
+		return
+	}
+	backend := strings.TrimSpace(stringValue(profile["backend"]))
+	if backend != "child" {
+		if !backendRegistry[backend] {
+			*issues = append(*issues, ChildRecipeIssue{Category: "invalid_config", Code: "unknown_provider_backend", Message: fmt.Sprintf("Profile %q has unknown provider backend %q.", reference, backend), Path: path})
+		}
+		return
+	}
+	if !allowChild {
+		*issues = append(*issues, ChildRecipeIssue{Category: "invalid_config", Code: "child_step_role_unsupported", Message: "A child step is only valid for a participant role.", Path: path, Detail: map[string]any{"profile_ref": reference, "role": role}})
+		return
+	}
+	childID := strings.TrimSpace(stringValue(profile["model"]))
+	if childID == "" {
+		*issues = append(*issues, ChildRecipeIssue{Category: "invalid_config", Code: "missing_child_recipe", Message: "Child participant profiles must name a child recipe in model.", Path: path})
+		return
+	}
+	for _, ancestor := range stack {
+		if ancestor == childID {
+			*issues = append(*issues, ChildRecipeIssue{Category: "invalid_config", Code: "child_recipe_cycle", Message: fmt.Sprintf("Child recipe cycle detected at %q.", childID), Path: path})
+			return
+		}
+	}
+	child, found := childRecipes[childID]
+	if !found || child == nil {
+		*issues = append(*issues, ChildRecipeIssue{Category: "invalid_config", Code: "unknown_child_recipe", Message: fmt.Sprintf("Child participant references unknown recipe %q.", childID), Path: path})
+		return
+	}
+	nextDepth := depthPolicy.RelayBackendDepth + 1
+	maxDepth := depthPolicy.MaxRelayBackendDepth
+	if maxDepth <= 0 {
+		maxDepth = intFromAny(child["max_depth"], 1)
+	}
+	if nextDepth > maxDepth {
+		*issues = append(*issues, ChildRecipeIssue{Category: "runtime_guard", Code: "child_depth_exceeded", Message: fmt.Sprintf("Child participant at %s exceeds the configured child depth.", compositionPath), Path: path})
+		return
+	}
+	nextPolicy := depthPolicy
+	nextPolicy.RelayBackendDepth = nextDepth
+	validateRecipeComposition(issues, child, profiles, childRecipes, nextPolicy, compositionPath+".child", append(stack, childID), true)
 }

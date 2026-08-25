@@ -32,7 +32,7 @@ test: fmt-check
 	go test ./... -count=1
 
 test-race:
-	go test -race ./internal/store ./cmd/convo-relay -count=1
+	go test -race ./internal/engine ./internal/sessionstore ./cmd/convo-relay -count=1
 
 cross-compile:
 	@set -eu; \

@@ -91,8 +91,9 @@ type PendingChild struct {
 	Question         string
 }
 
-// Run starts an empty session log and executes until the plan is terminal or
-// an ask-mode child request needs an operator decision.
+// Run starts a session with no execution history and executes until the plan is
+// terminal or an ask-mode child request needs an operator decision. Launch
+// provisioning events may already be present; they are not execution history.
 func Run(ctx context.Context, sess *session.Session, deps Deps) (Outcome, error) {
 	runner, err := newRunner(ctx, sess, deps)
 	if err != nil {
@@ -104,8 +105,11 @@ func Run(ctx context.Context, sess *session.Session, deps Deps) (Outcome, error)
 	if err != nil {
 		return Outcome{}, err
 	}
-	if len(events) != 0 {
-		return Outcome{}, errors.New("session already has events; use Resume")
+	if err := runStartGuard(events); err != nil {
+		return Outcome{}, err
+	}
+	if err := runner.rebuildProvisioningState(events); err != nil {
+		return Outcome{}, err
 	}
 	if err := runner.append(eventlog.SessionStartedPayload{PlanDigest: runner.planDigest, SessionID: sess.Plan.SessionID}); err != nil {
 		return Outcome{}, err
@@ -115,7 +119,9 @@ func Run(ctx context.Context, sess *session.Session, deps Deps) (Outcome, error)
 
 // Resume replays a started session and continues only work left by its
 // immutable plan plus an explicit turn-budget extension when requestedTurns is
-// positive.
+// positive. A provisioning-only launch is also resumed by recording its first
+// session.started event, so a crash before the first turn never re-ingests
+// inputs.
 func Resume(ctx context.Context, sess *session.Session, deps Deps, prompt string, requestedTurns int) (Outcome, error) {
 	if requestedTurns < 0 {
 		return Outcome{}, errors.New("resume extra turns must not be negative")
@@ -135,6 +141,15 @@ func Resume(ctx context.Context, sess *session.Session, deps Deps, prompt string
 	}
 	if len(events) == 0 {
 		return Outcome{}, errors.New("cannot resume a session with no session.started event")
+	}
+	if err := runStartGuard(events); err == nil {
+		if err := runner.rebuildProvisioningState(events); err != nil {
+			return Outcome{}, err
+		}
+		if err := runner.append(eventlog.SessionStartedPayload{PlanDigest: runner.planDigest, SessionID: sess.Plan.SessionID}); err != nil {
+			return Outcome{}, err
+		}
+		return runner.execute()
 	}
 	if err := runner.rebuildExecutionState(events); err != nil {
 		return Outcome{}, err
@@ -332,6 +347,9 @@ type executionState struct {
 	terminal       *eventlog.SessionFinishedPayload
 	phase          executionPhase
 
+	provisionedInputs map[string]blobstore.BlobRef
+	workspacePrepared bool
+
 	active *turnState
 
 	conversation        []conversationTurn
@@ -496,10 +514,11 @@ func newAdmissionRunner(ctx context.Context, sess *session.Session, recipes []pl
 
 func newExecutionState() *executionState {
 	return &executionState{
-		phase:            phaseParticipant,
-		ledger:           model.EmptyLedger(),
-		requests:         make(map[string]*childState),
-		providerSessions: make(map[string]string),
+		phase:             phaseParticipant,
+		ledger:            model.EmptyLedger(),
+		provisionedInputs: make(map[string]blobstore.BlobRef),
+		requests:          make(map[string]*childState),
+		providerSessions:  make(map[string]string),
 	}
 }
 
@@ -601,17 +620,51 @@ func stringValue(value any) string {
 	return text
 }
 
-// rebuildExecutionState is the sole replay path. It drives every event through
-// reduceEvent, which is also called by append during a live execution.
+// rebuildProvisioningState replays a launch prefix before its session.started
+// event. This is the crash-recovery state between provisioning and execution.
+func (r *runner) rebuildProvisioningState(events []eventlog.Event) error {
+	if err := r.replayEvents(events); err != nil {
+		return err
+	}
+	if r.state.sessionStarted {
+		return errors.New("provisioning prefix has session.started event")
+	}
+	return nil
+}
+
+// rebuildExecutionState replays an execution history. It drives every event
+// through reduceEvent, which is also called by append during a live execution.
 func (r *runner) rebuildExecutionState(events []eventlog.Event) error {
+	if err := r.replayEvents(events); err != nil {
+		return err
+	}
+	if !r.state.sessionStarted {
+		return errors.New("session has no session.started event")
+	}
+	return nil
+}
+
+func (r *runner) replayEvents(events []eventlog.Event) error {
 	r.state = newExecutionState()
 	for _, event := range events {
 		if err := r.reduceEvent(event); err != nil {
 			return err
 		}
 	}
-	if !r.state.sessionStarted {
-		return errors.New("session has no session.started event")
+	return nil
+}
+
+// runStartGuard is the one classification for the Run boundary. The two
+// provisioning types form the only allowed prefix; every other durable event
+// records execution and makes the session Resume-only.
+func runStartGuard(events []eventlog.Event) error {
+	for _, event := range events {
+		switch event.Type {
+		case eventlog.InputIngested, eventlog.WorkspacePrepared:
+			continue
+		default:
+			return fmt.Errorf("session already has execution event %q; use Resume", event.Type)
+		}
 	}
 	return nil
 }
@@ -624,6 +677,33 @@ func (r *runner) reduceEvent(event eventlog.Event) error {
 		return errors.New("execution state is required")
 	}
 	switch payload := event.Payload.(type) {
+	case eventlog.InputIngestedPayload:
+		if state.sessionStarted {
+			return errors.New("input.ingested follows session.started")
+		}
+		if _, exists := state.provisionedInputs[payload.LogicalName]; exists {
+			return fmt.Errorf("duplicate input.ingested for %q", payload.LogicalName)
+		}
+		for _, input := range r.sess.Plan.Inputs {
+			if input.Name != payload.LogicalName {
+				continue
+			}
+			if !input.Content.Equal(payload.Content) {
+				return fmt.Errorf("input.ingested for %q does not match immutable plan", payload.LogicalName)
+			}
+			state.provisionedInputs[payload.LogicalName] = payload.Content
+			return nil
+		}
+		return fmt.Errorf("input.ingested for undeclared input %q", payload.LogicalName)
+	case eventlog.WorkspacePreparedPayload:
+		if state.sessionStarted {
+			return errors.New("workspace.prepared follows session.started")
+		}
+		if state.workspacePrepared {
+			return errors.New("session has more than one workspace.prepared event")
+		}
+		state.workspacePrepared = true
+		return nil
 	case eventlog.SessionStartedPayload:
 		if state.sessionStarted {
 			return errors.New("session has more than one session.started event")

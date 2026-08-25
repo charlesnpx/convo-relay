@@ -69,7 +69,6 @@ var backendLabels = map[string]string{
 	"claude": "Claude Code",
 	"codex":  "Codex",
 	"gemini": "Gemini",
-	"relay":  "Relay",
 }
 
 func knownBackend(name string) bool {
@@ -102,8 +101,7 @@ func newBackend(backendName string, sessionRoot string, slotID string, label str
 	}
 }
 
-// NewBackend constructs one declared external provider adapter. Relay is a
-// runner pseudo-backend and is supplied only by the runner-side constructor.
+// NewBackend constructs one declared external provider adapter.
 func NewBackend(backendName string, sessionRoot string, slotID string, label string, cwd string, config SlotConfig) (Backend, error) {
 	return newBackend(backendName, sessionRoot, slotID, label, cwd, config)
 }

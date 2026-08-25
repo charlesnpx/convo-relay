@@ -6,25 +6,20 @@ package relayv2
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"os"
 	"path/filepath"
 	"sort"
 	"strings"
 
 	"github.com/charlesnpx/convo-relay/internal/engine"
-	"github.com/charlesnpx/convo-relay/internal/eventlog"
 	"github.com/charlesnpx/convo-relay/internal/integration"
 	"github.com/charlesnpx/convo-relay/internal/plan"
 	"github.com/charlesnpx/convo-relay/internal/provider"
 	"github.com/charlesnpx/convo-relay/internal/recipes"
 	"github.com/charlesnpx/convo-relay/internal/session"
-	"github.com/charlesnpx/convo-relay/internal/store"
 	"github.com/charlesnpx/convo-relay/internal/workspace"
 )
 
@@ -102,9 +97,8 @@ func LoadRuntime(sess *session.Session) (Runtime, error) {
 // its admitting parent, while still receiving its own session root.
 func NewDeps(value Runtime, executionCWD string) engine.Deps {
 	return engine.Deps{
-		BackendFactory:        NewBackendFactory(value, executionCWD),
-		Recipes:               append([]plan.Recipe{}, value.Recipes...),
-		ChildRequestExtractor: NewChildRequestExtractor(value.Recipes),
+		BackendFactory: NewBackendFactory(value, executionCWD),
+		Recipes:        append([]plan.Recipe{}, value.Recipes...),
 	}
 }
 
@@ -113,7 +107,7 @@ func ExecutionCWD(ctx context.Context, sess *session.Session) (string, error) {
 	if sess == nil {
 		return "", errors.New("session is required")
 	}
-	recovered, err := workspace.Recover(ctx, store.New(sess.Root))
+	recovered, err := workspace.Recover(ctx, sess)
 	if err != nil {
 		return "", err
 	}
@@ -157,115 +151,6 @@ func NewBackendFactory(value Runtime, executionCWD string) engine.BackendFactory
 
 func isFacilitator(value session.Plan, actorID string) bool {
 	return value.Facilitator != nil && value.Facilitator.Actor == actorID
-}
-
-// NewChildRequestExtractor turns a facilitator ledger into durable child
-// requests. Its only dependency on provider.TurnResult is Content: recovery
-// reconstructs precisely that field before invoking extraction again.
-func NewChildRequestExtractor(catalog []plan.Recipe) engine.ChildRequestExtractor {
-	recipes := append([]plan.Recipe{}, catalog...)
-	sort.Slice(recipes, func(left, right int) bool { return recipes[left].ID < recipes[right].ID })
-	return func(_ session.Actor, role eventlog.Role, result provider.TurnResult) []engine.ChildRequest {
-		if role != eventlog.FacilitatorRole {
-			return nil
-		}
-		contested, ok := contestedLedgerItems(result.Content)
-		if !ok || len(contested) == 0 {
-			return nil
-		}
-		requests := make([]engine.ChildRequest, 0, len(contested))
-		for _, item := range contested {
-			recipeID := childRecipeForItem(item, recipes)
-			if recipeID == "" {
-				continue
-			}
-			requests = append(requests, engine.ChildRequest{
-				ID: childRequestID(item),
-				Request: plan.ChildRequest{
-					RecipeID: recipeID,
-					Question: "Resolve this contested parent-relay item: " + item,
-				},
-			})
-		}
-		return requests
-	}
-}
-
-func contestedLedgerItems(content string) ([]string, bool) {
-	var document map[string]json.RawMessage
-	decoder := json.NewDecoder(strings.NewReader(strings.TrimSpace(content)))
-	if err := decoder.Decode(&document); err != nil {
-		return nil, false
-	}
-	var trailing any
-	if err := decoder.Decode(&trailing); err != io.EOF {
-		return nil, false
-	}
-	settled, ok := ledgerStrings(document["settled"])
-	if !ok {
-		return nil, false
-	}
-	contested, ok := ledgerStrings(document["contested"])
-	if !ok {
-		return nil, false
-	}
-	withdrawn, ok := ledgerStrings(document["withdrawn"])
-	if !ok {
-		return nil, false
-	}
-	// Parse all three arrays even though only contested drives requests. A
-	// partial JSON object is not a ledger document and must not accidentally
-	// become a child-spawn protocol.
-	_ = settled
-	_ = withdrawn
-	items := make([]string, 0, len(contested))
-	seen := map[string]bool{}
-	for _, raw := range contested {
-		item := strings.TrimSpace(raw)
-		if item == "" || seen[item] {
-			continue
-		}
-		seen[item] = true
-		items = append(items, item)
-	}
-	return items, true
-}
-
-func ledgerStrings(raw json.RawMessage) ([]string, bool) {
-	if len(raw) == 0 || !strings.HasPrefix(strings.TrimSpace(string(raw)), "[") {
-		return nil, false
-	}
-	var values []string
-	if err := json.Unmarshal(raw, &values); err != nil {
-		return nil, false
-	}
-	return values, true
-}
-
-func childRecipeForItem(item string, catalog []plan.Recipe) string {
-	lowered := strings.ToLower(item)
-	for _, recipe := range catalog {
-		for _, keyword := range recipe.MatchKeywords {
-			if keyword != "" && strings.Contains(lowered, strings.ToLower(keyword)) {
-				return recipe.ID
-			}
-		}
-	}
-	for _, recipe := range catalog {
-		if recipe.ID == "review-panel" {
-			return recipe.ID
-		}
-	}
-	if len(catalog) != 0 {
-		return catalog[0].ID
-	}
-	return ""
-}
-
-func childRequestID(item string) string {
-	normalized := strings.Join(strings.Fields(strings.ToLower(item)), " ")
-	sum := sha256.Sum256([]byte(normalized))
-	return "child-" + hex.EncodeToString(sum[:])[:16]
 }
 
 // RecipeFromRuntime converts a normalized legacy configuration record into
@@ -334,14 +219,13 @@ func recipeFromRecord(record map[string]any, profiles map[string]map[string]any)
 	}
 	lifecycleRecord, _ := normalized["lifecycle"].(map[string]any)
 	lifecycle := session.Lifecycle{
-		Resume:             stringValue(lifecycleRecord["resume"]),
-		Steering:           stringValue(lifecycleRecord["steering"]),
-		Dynamic:            stringValue(lifecycleRecord["dynamic"]),
-		WorkspaceIsolation: stringValue(lifecycleRecord["workspace_isolation"]),
+		Resume:   stringValue(lifecycleRecord["resume"]),
+		Steering: stringValue(lifecycleRecord["steering"]),
+		Dynamic:  stringValue(lifecycleRecord["dynamic"]),
 	}
-	workspace := session.Workspace{Mode: "current", Isolation: lifecycle.WorkspaceIsolation}
-	if lifecycle.WorkspaceIsolation == "ephemeral" {
-		workspace.Mode = "head-copy"
+	workspacePlan := session.Workspace{Mode: workspace.ModeCurrent}
+	if stringValue(lifecycleRecord["workspace_isolation"]) == "ephemeral" {
+		workspacePlan.Mode = workspace.ModeHeadCopy
 	}
 	retryMode := recipes.EffectiveProviderRetry(normalized)
 	retry := session.ProviderRetry{Mode: retryMode, MaxAttempts: 7}
@@ -368,9 +252,8 @@ func recipeFromRecord(record map[string]any, profiles map[string]map[string]any)
 		IntegrationContract: stringValue(normalized["integration_contract"]),
 		MaxDepth:            intValue(normalized["max_depth"], 1),
 		AutoApproval:        stringValue(normalized["auto_approval"]),
-		MatchKeywords:       stringValues(normalized["match_keywords"]),
 		Lifecycle:           lifecycle,
-		Workspace:           workspace,
+		Workspace:           workspacePlan,
 		ChildPolicy: session.ChildPolicy{
 			Mode:           childPolicyMode(stringValue(normalized["auto_approval"])),
 			MaxDepth:       intValue(normalized["max_depth"], 1),

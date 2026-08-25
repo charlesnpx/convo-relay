@@ -153,10 +153,6 @@ func copyPlan(plan session.Plan) session.Plan {
 		plan.Skills = []session.Input{}
 	}
 	plan.TaskPlan = append(json.RawMessage{}, plan.TaskPlan...)
-	plan.MatchKeywords = append([]string{}, plan.MatchKeywords...)
-	if plan.MatchKeywords == nil {
-		plan.MatchKeywords = []string{}
-	}
 	plan.ChildPolicy.AllowedRecipes = append([]string{}, plan.ChildPolicy.AllowedRecipes...)
 	if plan.ChildPolicy.AllowedRecipes == nil {
 		plan.ChildPolicy.AllowedRecipes = []string{}

@@ -264,7 +264,6 @@ func normalizeRelayRecipesWithDefaults(rawRecipes map[string]any, defaults map[s
 			"max_depth":             positiveInt(recipe["max_depth"], 1),
 			"required_capabilities": cleanStringList(recipe["required_capabilities"], false),
 			"auto_approval":         normalizeAutoApproval(recipe["auto_approval"]),
-			"match_keywords":        cleanStringList(recipe["match_keywords"], true),
 			"lifecycle":             recipe["lifecycle"],
 			"origin":                recipe["origin"],
 			"generated_from_ref":    recipe["generated_from_ref"],

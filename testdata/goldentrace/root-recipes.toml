@@ -41,7 +41,6 @@ result_source = "last_turn"
 provider_retry = "forbid"
 max_depth = 1
 auto_approval = "never"
-match_keywords = []
 
 [relay_recipes.trace-facilitated.lifecycle]
 resume = "allow"
@@ -60,7 +59,6 @@ max_rounds = 2
 result_source = "last_turn"
 max_depth = 1
 auto_approval = "never"
-match_keywords = []
 
 [relay_recipes.trace-declarative.lifecycle]
 resume = "allow"
@@ -82,7 +80,6 @@ integration_contract = "goldentrace/reducer-v1"
 provider_retry = "forbid"
 max_depth = 1
 auto_approval = "never"
-match_keywords = []
 
 [relay_recipes.trace-reducer.lifecycle]
 resume = "allow"
@@ -103,7 +100,6 @@ result_source = "last_turn"
 provider_retry = "allow"
 max_depth = 1
 auto_approval = "never"
-match_keywords = []
 
 [relay_recipes.trace-retry.lifecycle]
 resume = "allow"
@@ -122,7 +118,6 @@ max_rounds = 1
 result_source = "last_turn"
 max_depth = 1
 auto_approval = "never"
-match_keywords = []
 
 [relay_recipes.trace-isolated.lifecycle]
 resume = "allow"
@@ -139,4 +134,3 @@ mode = "cooperative"
 max_rounds = 1
 max_depth = 1
 auto_approval = "never"
-match_keywords = ["trace_child_contested"]

@@ -327,9 +327,6 @@ func workspaceSummary(value session.Plan, events []eventlog.Event) map[string]an
 	if value.Workspace.Mode != "" {
 		result["mode"] = value.Workspace.Mode
 	}
-	if value.Workspace.Isolation != "" {
-		result["isolation"] = value.Workspace.Isolation
-	}
 	for _, event := range events {
 		switch payload := event.Payload.(type) {
 		case eventlog.WorkspacePreparedPayload:

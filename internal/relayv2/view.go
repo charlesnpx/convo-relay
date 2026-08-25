@@ -15,7 +15,6 @@ import (
 	"github.com/charlesnpx/convo-relay/internal/eventlog"
 	"github.com/charlesnpx/convo-relay/internal/session"
 	"github.com/charlesnpx/convo-relay/internal/sessionview"
-	"github.com/charlesnpx/convo-relay/internal/store"
 	"github.com/charlesnpx/convo-relay/internal/workspace"
 )
 
@@ -366,37 +365,15 @@ func workspaceProjectionForSession(sess *session.Session, visited map[string]boo
 		return nil, errors.New("cycle while resolving v2 workspace provenance")
 	}
 	visited[sess.Root] = true
-	result := map[string]any{}
-	st := store.New(sess.Root)
-	index := st.ArtifactIndex()
-	entries, _ := index["entries"].([]any)
-	for index := len(entries) - 1; index >= 0; index-- {
-		entry, _ := entries[index].(map[string]any)
-		ref, _ := entry["ref"].(map[string]any)
-		if ref == nil || ref["id"] != "execution_workspace:selected" {
-			continue
-		}
-		artifact, err := st.LoadArtifactPayloadRaw(ref)
-		if err != nil {
-			return nil, fmt.Errorf("load execution workspace: %w", err)
-		}
-		projection, err := workspace.ProvenanceProjection(artifact)
-		if err != nil {
-			return nil, fmt.Errorf("derive execution workspace provenance: %w", err)
-		}
-		for key, value := range projection {
-			result[key] = value
-		}
-		if mode, exists := artifact["mode"]; exists {
-			result["mode"] = mode
-		}
-		if policy, ok := artifact["policy"].(map[string]any); ok {
-			result["policy"] = cloneMap(policy)
-		}
-		return result, nil
+	projection, err := workspace.Projection(sess)
+	if err == nil {
+		return projection, nil
+	}
+	if !errors.Is(err, os.ErrNotExist) {
+		return nil, fmt.Errorf("load v2 workspace state: %w", err)
 	}
 	if sess.Plan.Provenance != session.ProvenanceChild {
-		return nil, errors.New("v2 session has no durable execution workspace artifact")
+		return nil, errors.New("v2 session has no durable workspace state")
 	}
 	return inheritedWorkspaceProjection(sess, visited)
 }

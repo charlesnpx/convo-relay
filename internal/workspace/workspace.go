@@ -1,652 +1,352 @@
+// Package workspace prepares the one execution directory used by a v2 session.
 package workspace
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/base64"
-	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
-	"sort"
 	"strings"
-	"unicode/utf8"
+	"time"
 
-	"github.com/charlesnpx/convo-relay/internal/contracts"
-	"github.com/charlesnpx/convo-relay/internal/recipes"
+	"github.com/charlesnpx/convo-relay/internal/blobstore"
+	"github.com/charlesnpx/convo-relay/internal/eventlog"
+	"github.com/charlesnpx/convo-relay/internal/session"
 )
 
 const (
-	PolicyInherited = "inherited"
-	PolicyReadOnly  = "read_only"
-	PolicyEphemeral = "ephemeral"
+	ModeCurrent  = "current"
+	ModeHeadCopy = "head-copy"
 
-	SessionPathExplicit  = "explicit"
-	SessionPathRelayHome = "relay_home"
-	SessionPathResolved  = "resolved"
+	WorkspaceContentSourceWorkingTree   = "working_tree"
+	WorkspaceContentSourceCommittedHead = "committed_head"
 
-	DiagnosticCodeInvalidPolicy      = "invalid_workspace_isolation_policy"
-	DiagnosticCodePolicyWeakened     = "workspace_isolation_policy_weakened"
-	DiagnosticCodeGitRequired        = "workspace_git_repository_required"
-	DiagnosticCodeUnbornRepository   = "workspace_unborn_repository"
-	DiagnosticCodeInventoryFailed    = "workspace_inventory_failed"
-	DiagnosticCodeInventoryLimit     = "workspace_inventory_limit_exceeded"
-	DiagnosticCodeInventoryCycle     = "workspace_inventory_cycle_detected"
-	DiagnosticCodeInventoryDepth     = "workspace_inventory_depth_exceeded"
-	DiagnosticCodeSessionConflict    = "workspace_session_path_conflict"
-	DiagnosticCodeLaunchNotCommitted = "workspace_launch_path_not_committed"
-	DiagnosticCodeCreationFailed     = "workspace_creation_failed"
-	DiagnosticCodeIntegrity          = "workspace_integrity_failed"
-	DiagnosticCodeDirtySource        = "workspace_dirty_source"
-	DiagnosticCodeDirtyInapplicable  = "workspace_allow_dirty_inapplicable"
+	WorkspaceContentSourceKey     = "workspace_content_source"
+	WorkingTreeChangesIncludedKey = "working_tree_changes_included"
 )
 
-// Options describes workspace preflight without creating a session or Git
-// worktree. RequestedExplicit distinguishes a visited CLI override from its
-// ordinary inherited default.
+const stateFilename = "workspace.json"
+
+// Options identifies the supplied directory and the only execution mode.
 type Options struct {
-	LaunchCWD         string
-	SessionDir        string
-	SessionPathSource string
-	MinimumPolicy     string
-	RequestedPolicy   string
-	RequestedExplicit bool
-	AllowDirtySource  bool
-	GitBinary         string
-	InventoryMaxFiles int64
-	InventoryMaxBytes int64
-	ArtifactVersion   int
+	LaunchCWD string
+	Mode      string
 }
 
-// PolicyResolution records the recipe minimum, caller request, effective
-// policy, and actual policy after successful materialization. Achieved remains
-// empty during pure preflight.
-type PolicyResolution struct {
-	Minimum           string
-	Requested         string
-	RequestedExplicit bool
-	Effective         string
-	Achieved          string
+// Materialized is the durable execution boundary reconstructed from runtime
+// state. Commit and TreeHash are empty only when a current workspace is not a
+// Git repository.
+type Materialized struct {
+	Mode         string
+	ExecutionCWD string
+	WorktreePath string
+	SourceRoot   string
+	Commit       string
+	TreeHash     string
 }
 
-// Snapshot is an immutable, pure-preflight inventory. Materialize consumes it
-// after the caller has crossed the session-creation boundary.
-type Snapshot struct {
-	launchCWD         string
-	sessionDir        string
-	sessionPathSource string
-	gitBinary         string
-	policy            PolicyResolution
-	inventoryLimits   repositoryInventoryLimits
-	artifactVersion   int
-	allowDirtySource  bool
-	sourceChanges     SourceChanges
-	repository        *repositorySnapshot
-	sourceReport      map[string]any
-	exclusions        map[string]any
+type persistedState struct {
+	Mode         string `json:"mode"`
+	ExecutionCWD string `json:"execution_cwd"`
+	WorktreePath string `json:"worktree_path,omitempty"`
+	SourceRoot   string `json:"source_root,omitempty"`
+	Commit       string `json:"commit,omitempty"`
+	TreeHash     string `json:"tree_hash,omitempty"`
 }
 
-// SourceChanges contains only counts from the captured stable inventory.
-type SourceChanges struct {
-	Staged    int64
-	Unstaged  int64
-	Untracked int64
-}
-
-func (c SourceChanges) Dirty() bool {
-	return c.Staged > 0 || c.Unstaged > 0 || c.Untracked > 0
-}
-
-func ResolvePolicy(minimum string, requested string, requestedExplicit bool) (PolicyResolution, error) {
-	if requestedExplicit && strings.TrimSpace(requested) == "" {
-		return PolicyResolution{}, workspaceError(
-			nil,
-			DiagnosticCodeInvalidPolicy,
-			contracts.DiagnosticPhasePolicy,
-			"/workspace_isolation",
-			"An explicit workspace isolation override must be inherited, read_only, or ephemeral.",
-			map[string]any{"minimum": normalizePolicyDefault(minimum), "requested": requested},
-		)
+// Prepare records one workspace decision. Current intentionally sees the
+// supplied working tree. Head-copy intentionally sees exactly the HEAD tree.
+func Prepare(ctx context.Context, sess *session.Session, options Options) (*Materialized, error) {
+	if sess == nil || strings.TrimSpace(sess.Root) == "" {
+		return nil, errors.New("session is required")
 	}
-	minimum = normalizePolicyDefault(minimum)
-	requested = normalizePolicyDefault(requested)
-	minimumRank, minimumOK := policyRank(minimum)
-	requestedRank, requestedOK := policyRank(requested)
-	if !minimumOK || !requestedOK {
-		return PolicyResolution{}, workspaceError(
-			nil,
-			DiagnosticCodeInvalidPolicy,
-			contracts.DiagnosticPhasePolicy,
-			"/workspace_isolation",
-			"Workspace isolation must be inherited, read_only, or ephemeral.",
-			map[string]any{"minimum": minimum, "requested": requested},
-		)
+	if _, err := os.Stat(statePath(sess)); err == nil {
+		return nil, errors.New("workspace is already prepared")
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return nil, fmt.Errorf("inspect workspace state: %w", err)
 	}
-	if requestedExplicit && requestedRank < minimumRank {
-		return PolicyResolution{}, workspaceError(
-			nil,
-			DiagnosticCodePolicyWeakened,
-			contracts.DiagnosticPhasePolicy,
-			"/workspace_isolation",
-			"An explicit workspace isolation override cannot weaken the recipe minimum.",
-			map[string]any{"minimum": minimum, "requested": requested},
-		)
+	mode := strings.TrimSpace(options.Mode)
+	if mode == "" {
+		mode = sess.Plan.Workspace.Mode
 	}
-	effective := minimum
-	if requestedRank > minimumRank {
-		effective = requested
+	if mode != ModeCurrent && mode != ModeHeadCopy {
+		return nil, fmt.Errorf("workspace mode must be %s or %s", ModeCurrent, ModeHeadCopy)
 	}
-	return PolicyResolution{
-		Minimum:           minimum,
-		Requested:         requested,
-		RequestedExplicit: requestedExplicit,
-		Effective:         effective,
-	}, nil
-}
-
-// Preflight resolves policy and paths and inventories Git state without
-// creating a session, artifact, directory, or worktree.
-func Preflight(ctx context.Context, options Options) (*Snapshot, error) {
-	policy, err := ResolvePolicy(options.MinimumPolicy, options.RequestedPolicy, options.RequestedExplicit)
+	launchCWD, err := absoluteDirectory(options.LaunchCWD)
 	if err != nil {
+		return nil, fmt.Errorf("resolve workspace directory: %w", err)
+	}
+
+	materialized := &Materialized{Mode: mode, ExecutionCWD: launchCWD}
+	if mode == ModeHeadCopy {
+		if err := prepareHeadCopy(ctx, sess, launchCWD, materialized); err != nil {
+			return nil, err
+		}
+	} else if root, commit, tree, found, gitErr := gitFacts(ctx, launchCWD); gitErr != nil {
+		return nil, gitErr
+	} else if found {
+		materialized.SourceRoot = root
+		materialized.Commit = commit
+		materialized.TreeHash = tree
+	}
+	if err := save(sess, *materialized); err != nil {
+		if materialized.WorktreePath != "" {
+			_ = removeWorktree(ctx, materialized.SourceRoot, materialized.WorktreePath)
+		}
 		return nil, err
 	}
-	launchCWD, err := canonicalExistingDirectory(options.LaunchCWD)
-	if err != nil {
-		return nil, workspaceError(err, DiagnosticCodeInventoryFailed, contracts.DiagnosticPhasePreflight, "/launch_cwd", "Launch CWD must resolve to a readable directory.", nil)
+	if err := appendPrepared(sess, materialized); err != nil {
+		return nil, err
 	}
-	sessionDir, err := canonicalPathAllowMissing(options.SessionDir)
-	if err != nil || strings.TrimSpace(options.SessionDir) == "" {
-		return nil, workspaceError(err, DiagnosticCodeSessionConflict, contracts.DiagnosticPhasePolicy, "/session_dir", "A resolved session directory is required for workspace preflight.", nil)
-	}
-	sessionPathSource := strings.TrimSpace(options.SessionPathSource)
-	if sessionPathSource == "" {
-		sessionPathSource = SessionPathResolved
-	}
-	if sessionPathSource != SessionPathExplicit && sessionPathSource != SessionPathRelayHome && sessionPathSource != SessionPathResolved {
-		return nil, workspaceError(nil, DiagnosticCodeSessionConflict, contracts.DiagnosticPhasePolicy, "/session_path_source", "Session path source must be explicit, relay_home, or resolved.", map[string]any{"source": sessionPathSource})
-	}
-	gitBinary := strings.TrimSpace(options.GitBinary)
-	if gitBinary == "" {
-		gitBinary = "git"
-	}
-	inventoryLimits := repositoryInventoryLimits{
-		maxFiles: options.InventoryMaxFiles,
-		maxBytes: options.InventoryMaxBytes,
-	}
-	artifactVersion := options.ArtifactVersion
-	if artifactVersion == 0 {
-		artifactVersion = contracts.RootArtifactSchemaVersion
-	}
-	if artifactVersion != contracts.RootArtifactSchemaVersion && artifactVersion != contracts.RootArtifactSchemaVersionV2 {
-		return nil, contracts.NewValidationError("execution workspace artifact version must be 1 or 2")
-	}
-	if inventoryLimits.maxFiles == 0 {
-		inventoryLimits.maxFiles = recipes.DefaultRepositoryInventoryMaxFiles
-	}
-	if inventoryLimits.maxBytes == 0 {
-		inventoryLimits.maxBytes = recipes.DefaultRepositoryInventoryMaxBytes
-	}
-	if inventoryLimits.maxFiles < 0 || inventoryLimits.maxBytes < 0 {
-		return nil, workspaceError(
-			nil,
-			DiagnosticCodeInventoryFailed,
-			contracts.DiagnosticPhasePreflight,
-			"/runtime_config/limits",
-			"Repository inventory limits must be positive integers.",
-			map[string]any{
-				"repository_inventory_max_files": inventoryLimits.maxFiles,
-				"repository_inventory_max_bytes": inventoryLimits.maxBytes,
-			},
-		)
-	}
-
-	snapshot := &Snapshot{
-		launchCWD:         launchCWD,
-		sessionDir:        sessionDir,
-		sessionPathSource: sessionPathSource,
-		gitBinary:         gitBinary,
-		policy:            policy,
-		inventoryLimits:   inventoryLimits,
-		artifactVersion:   artifactVersion,
-		allowDirtySource:  options.AllowDirtySource,
-		exclusions:        emptyExclusions(),
-	}
-	repository, err := inspectRepositoryWithLimits(ctx, gitBinary, launchCWD, inventoryLimits)
-	if err != nil {
-		var topologyErr *repositoryTopologyError
-		if errors.As(err, &topologyErr) {
-			details := map[string]any{
-				"repository_depth": topologyErr.repositoryDepth,
-			}
-			message := "The source workspace repository topology contains a cycle."
-			if topologyErr.code == DiagnosticCodeInventoryDepth {
-				message = "The source workspace repository topology exceeds the supported depth."
-				details["max_repository_depth"] = topologyErr.maxRepositoryDepth
-			} else {
-				details["repository_root"] = topologyErr.repositoryRoot
-			}
-			return nil, workspaceError(
-				err,
-				topologyErr.code,
-				contracts.DiagnosticPhasePreflight,
-				"/launch_cwd",
-				message,
-				details,
-			)
-		}
-		var limitErr *contracts.ResourceLimitError
-		if errors.As(err, &limitErr) {
-			return nil, workspaceError(
-				err,
-				DiagnosticCodeInventoryLimit,
-				contracts.DiagnosticPhasePreflight,
-				"/runtime_config/limits",
-				"The source repository exceeds its configured inventory budget.",
-				resourceLimitDetails(limitErr),
-			)
-		}
-		notGit := errors.Is(err, errNotGitRepository)
-		unborn := errors.Is(err, errUnbornRepository)
-		if policy.Effective != PolicyInherited && (notGit || unborn) {
-			code := DiagnosticCodeGitRequired
-			message := "Required workspace isolation needs a Git working tree."
-			if unborn {
-				code = DiagnosticCodeUnbornRepository
-				message = "Required workspace isolation needs a repository with a committed HEAD."
-			}
-			return nil, workspaceError(err, code, contracts.DiagnosticPhasePreflight, "/launch_cwd", message, map[string]any{"launch_cwd": launchCWD})
-		}
-		if !notGit && !unborn {
-			return nil, workspaceError(err, DiagnosticCodeInventoryFailed, contracts.DiagnosticPhasePreflight, "/launch_cwd", "The source workspace could not be inventoried.", map[string]any{"launch_cwd": launchCWD})
-		}
-		snapshot.sourceReport = map[string]any{
-			"repository_state": repositoryStateForError(err),
-			"launch_cwd":       launchCWD,
-		}
-		if options.AllowDirtySource {
-			return nil, workspaceError(
-				nil,
-				DiagnosticCodeDirtyInapplicable,
-				contracts.DiagnosticPhasePolicy,
-				"/allow_dirty_source",
-				"Dirty-source override applies only to isolated Git execution.",
-				map[string]any{"repository_state": repositoryStateForError(err), "effective_policy": policy.Effective},
-			)
-		}
-		return snapshot, nil
-	}
-	snapshot.repository = repository
-	snapshot.sourceReport = cloneMap(repository.sourceReport)
-	snapshot.exclusions = cloneMap(repository.exclusions)
-	snapshot.sourceChanges = sourceChangeCounts(repository.exclusions)
-
-	if policy.Effective == PolicyInherited && options.AllowDirtySource {
-		return nil, workspaceError(
-			nil,
-			DiagnosticCodeDirtyInapplicable,
-			contracts.DiagnosticPhasePolicy,
-			"/allow_dirty_source",
-			"Dirty-source override is inapplicable to inherited execution.",
-			map[string]any{"effective_policy": policy.Effective},
-		)
-	}
-
-	if policy.Effective != PolicyInherited {
-		if pathsOverlap(repository.root, sessionDir) {
-			return nil, workspaceError(
-				nil,
-				DiagnosticCodeSessionConflict,
-				contracts.DiagnosticPhasePolicy,
-				"/session_dir",
-				"Required workspace isolation cannot place the session inside, equal to, or above the source Git worktree.",
-				map[string]any{"git_root": repository.root, "session_dir": sessionDir, "session_path_source": sessionPathSource},
-			)
-		}
-		if err := verifyCommittedLaunchSubpath(ctx, repository); err != nil {
-			return nil, workspaceError(err, DiagnosticCodeLaunchNotCommitted, contracts.DiagnosticPhasePreflight, "/launch_cwd", "The launch directory is not present as a directory in committed HEAD.", map[string]any{"launch_subpath": repository.launchSubpath})
-		}
-		if snapshot.sourceChanges.Dirty() && !options.AllowDirtySource {
-			return nil, workspaceError(
-				nil,
-				DiagnosticCodeDirtySource,
-				contracts.DiagnosticPhasePolicy,
-				"/allow_dirty_source",
-				"Isolated execution requires a clean source or an explicit dirty-source override.",
-				map[string]any{
-					"staged_changes":    snapshot.sourceChanges.Staged,
-					"unstaged_changes":  snapshot.sourceChanges.Unstaged,
-					"untracked_changes": snapshot.sourceChanges.Untracked,
-				},
-			)
-		}
-		worktreePath := filepath.Join(sessionDir, "execution", "worktree")
-		if registered, err := repositoryWorktreeRegistered(ctx, repository, worktreePath); err != nil {
-			return nil, workspaceError(err, DiagnosticCodeInventoryFailed, contracts.DiagnosticPhasePreflight, "/session_dir", "Git worktree registration could not be inspected.", nil)
-		} else if registered {
-			return nil, workspaceError(nil, DiagnosticCodeSessionConflict, contracts.DiagnosticPhasePolicy, "/session_dir", "The target execution worktree is already registered.", map[string]any{"worktree_path": worktreePath})
-		}
-	}
-	return snapshot, nil
+	return materialized, nil
 }
 
-func (s *Snapshot) SourceChanges() SourceChanges {
-	if s == nil {
-		return SourceChanges{}
-	}
-	return s.sourceChanges
-}
-
-func (s *Snapshot) AllowDirtySource() bool {
-	return s != nil && s.allowDirtySource
-}
-
-func sourceChangeCounts(exclusions map[string]any) SourceChanges {
-	return SourceChanges{
-		Staged:    int64(len(anySlice(exclusions["staged"]))),
-		Unstaged:  int64(len(anySlice(exclusions["unstaged"]))),
-		Untracked: int64(len(anySlice(exclusions["untracked"]))),
-	}
-}
-
-func anySlice(value any) []any {
-	items, _ := value.([]any)
-	return items
-}
-
-func (s *Snapshot) Policy() PolicyResolution {
-	if s == nil {
-		return PolicyResolution{}
-	}
-	return s.policy
-}
-
-func (s *Snapshot) LaunchCWD() string {
-	if s == nil {
-		return ""
-	}
-	return s.launchCWD
-}
-
-func (s *Snapshot) SessionDir() string {
-	if s == nil {
-		return ""
-	}
-	return s.sessionDir
-}
-
-func (s *Snapshot) GitRoot() string {
-	if s == nil || s.repository == nil {
-		return ""
-	}
-	return s.repository.root
-}
-
-func (s *Snapshot) HeadCommit() string {
-	if s == nil || s.repository == nil {
-		return ""
-	}
-	return s.repository.headCommit
-}
-
-func (s *Snapshot) HeadTree() string {
-	if s == nil || s.repository == nil {
-		return ""
-	}
-	return s.repository.headTree
-}
-
-func (s *Snapshot) ObjectFormat() string {
-	if s == nil || s.repository == nil {
-		return ""
-	}
-	return s.repository.objectFormat
-}
-
-func (s *Snapshot) SourceDigest() string {
-	if s == nil || s.repository == nil {
-		return ""
-	}
-	return s.repository.sourceDigest
-}
-
-func (s *Snapshot) Report() map[string]any {
-	if s == nil {
-		return nil
-	}
-	report := map[string]any{
-		"minimum_policy":      s.policy.Minimum,
-		"requested_policy":    s.policy.Requested,
-		"requested_explicit":  s.policy.RequestedExplicit,
-		"effective_policy":    s.policy.Effective,
-		"session_dir":         s.sessionDir,
-		"session_path_source": s.sessionPathSource,
-		"source":              cloneMap(s.sourceReport),
-		"exclusions":          cloneMap(s.exclusions),
-	}
-	if s.policy.Achieved != "" {
-		report["achieved_policy"] = s.policy.Achieved
-	}
-	return report
-}
-
-func normalizePolicyDefault(value string) string {
-	value = strings.TrimSpace(value)
-	if value == "" {
-		return PolicyInherited
-	}
-	return value
-}
-
-func policyRank(value string) (int, bool) {
-	switch value {
-	case PolicyInherited:
-		return 0, true
-	case PolicyReadOnly:
-		return 1, true
-	case PolicyEphemeral:
-		return 2, true
-	default:
-		return 0, false
-	}
-}
-
-func emptyExclusions() map[string]any {
-	return map[string]any{"staged": []any{}, "unstaged": []any{}, "untracked": []any{}}
-}
-
-func canonicalExistingDirectory(value string) (string, error) {
-	if strings.TrimSpace(value) == "" {
-		value = "."
-	}
-	absolute, err := filepath.Abs(value)
-	if err != nil {
-		return "", err
-	}
-	resolved, err := filepath.EvalSymlinks(absolute)
-	if err != nil {
-		return "", err
-	}
-	info, err := os.Stat(resolved)
-	if err != nil {
-		return "", err
-	}
-	if !info.IsDir() {
-		return "", fmt.Errorf("%s is not a directory", resolved)
-	}
-	return filepath.Clean(resolved), nil
-}
-
-func canonicalPathAllowMissing(value string) (string, error) {
-	if strings.TrimSpace(value) == "" {
-		return "", fmt.Errorf("path is required")
-	}
-	absolute, err := filepath.Abs(value)
-	if err != nil {
-		return "", err
-	}
-	current := filepath.Clean(absolute)
-	missing := make([]string, 0)
-	for {
-		if _, err := os.Lstat(current); err == nil {
-			break
-		} else if !os.IsNotExist(err) {
-			return "", err
-		}
-		parent := filepath.Dir(current)
-		if parent == current {
-			return "", fmt.Errorf("no existing ancestor for %s", absolute)
-		}
-		missing = append(missing, filepath.Base(current))
-		current = parent
-	}
-	resolved, err := filepath.EvalSymlinks(current)
-	if err != nil {
-		return "", err
-	}
-	info, err := os.Stat(resolved)
-	if err != nil {
-		return "", err
-	}
-	if !info.IsDir() {
-		return "", fmt.Errorf("existing path ancestor %s is not a directory", resolved)
-	}
-	for index := len(missing) - 1; index >= 0; index-- {
-		resolved = filepath.Join(resolved, missing[index])
-	}
-	return filepath.Clean(resolved), nil
-}
-
-func lexicalAbsolutePath(value string) (string, error) {
-	if strings.TrimSpace(value) == "" {
-		return "", fmt.Errorf("path is required")
-	}
-	absolute, err := filepath.Abs(value)
-	if err != nil {
-		return "", err
-	}
-	return filepath.Clean(absolute), nil
-}
-
-// rejectSymlinkPathComponents validates a lexical absolute path without
-// resolving it. Missing suffixes are allowed, but every existing component
-// must be a real directory except for an existing leaf.
-func rejectSymlinkPathComponents(value string) error {
-	target, err := lexicalAbsolutePath(value)
+func prepareHeadCopy(ctx context.Context, sess *session.Session, launchCWD string, materialized *Materialized) error {
+	sourceRoot, commit, tree, found, err := gitFacts(ctx, launchCWD)
 	if err != nil {
 		return err
 	}
-	root := filepath.VolumeName(target) + string(filepath.Separator)
-	if filepath.VolumeName(target) == "" {
-		root = string(filepath.Separator)
+	if !found {
+		return errors.New("head-copy workspace requires a Git repository")
 	}
-	relative := strings.TrimPrefix(target, root)
-	current := filepath.Clean(root)
-	components := strings.Split(relative, string(filepath.Separator))
-	for index, component := range components {
-		if component == "" || component == "." {
-			continue
-		}
-		current = filepath.Join(current, component)
-		info, err := os.Lstat(current)
-		if os.IsNotExist(err) {
-			return nil
-		}
-		if err != nil {
-			return fmt.Errorf("inspect path component %s: %w", current, err)
-		}
-		if info.Mode()&os.ModeSymlink != 0 {
-			return fmt.Errorf("path component %s is a symlink", current)
-		}
-		if index < len(components)-1 && !info.IsDir() {
-			return fmt.Errorf("path ancestor %s is not a directory", current)
-		}
+	relative, err := filepath.Rel(sourceRoot, launchCWD)
+	if err != nil || relative == ".." || strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
+		return errors.New("workspace directory is outside its Git root")
 	}
+	worktreePath := filepath.Join(sess.Root, "runtime", "workspace")
+	if _, err := os.Lstat(worktreePath); err == nil {
+		return fmt.Errorf("head-copy worktree path already exists: %s", worktreePath)
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	if _, err := runGit(ctx, sourceRoot, "worktree", "add", "--detach", worktreePath, commit); err != nil {
+		return fmt.Errorf("create detached head-copy worktree: %w", err)
+	}
+	executionCWD := filepath.Join(worktreePath, relative)
+	if _, err := absoluteDirectory(executionCWD); err != nil {
+		_ = removeWorktree(ctx, sourceRoot, worktreePath)
+		return fmt.Errorf("recorded head-copy subdirectory is unavailable: %w", err)
+	}
+	materialized.ExecutionCWD = executionCWD
+	materialized.WorktreePath = worktreePath
+	materialized.SourceRoot = sourceRoot
+	materialized.Commit = commit
+	materialized.TreeHash = tree
 	return nil
 }
 
-func pathsOverlap(left string, right string) bool {
-	return pathContains(left, right) || pathContains(right, left)
+// Recover returns the recorded execution boundary without source inventories
+// or re-digests. A head-copy is checked only through Git's own commit/tree
+// view, which is the reproducibility boundary this package owns.
+func Recover(ctx context.Context, sess *session.Session) (*Materialized, error) {
+	state, err := load(sess)
+	if err != nil {
+		return nil, err
+	}
+	materialized := state.materialized()
+	if _, err := absoluteDirectory(materialized.ExecutionCWD); err != nil {
+		return nil, fmt.Errorf("recorded workspace directory is unavailable: %w", err)
+	}
+	if materialized.Mode != ModeHeadCopy {
+		return materialized, nil
+	}
+	if strings.TrimSpace(materialized.WorktreePath) == "" || strings.TrimSpace(materialized.Commit) == "" || strings.TrimSpace(materialized.TreeHash) == "" {
+		return nil, errors.New("head-copy workspace state is incomplete")
+	}
+	commit, err := gitOutput(ctx, materialized.WorktreePath, "rev-parse", "HEAD^{commit}")
+	if err != nil || commit != materialized.Commit {
+		return nil, errors.New("head-copy worktree no longer matches its recorded HEAD")
+	}
+	tree, err := gitOutput(ctx, materialized.WorktreePath, "rev-parse", "HEAD^{tree}")
+	if err != nil || tree != materialized.TreeHash {
+		return nil, errors.New("head-copy worktree no longer matches its recorded tree")
+	}
+	return materialized, nil
 }
 
-func pathContains(parent string, candidate string) bool {
-	relative, err := filepath.Rel(parent, candidate)
-	if err == nil && !filepath.IsAbs(relative) && (relative == "." || (relative != ".." && !strings.HasPrefix(relative, ".."+string(filepath.Separator)))) {
-		return true
+// Cleanup removes only the exact detached worktree recorded for this session.
+// It deliberately leaves the session directory to its caller.
+func Cleanup(ctx context.Context, sess *session.Session) error {
+	state, err := load(sess)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
 	}
-	parentInfo, err := os.Stat(parent)
-	if err != nil || !parentInfo.IsDir() {
-		return false
+	if err != nil {
+		return err
 	}
-	current := filepath.Clean(candidate)
-	for {
-		if candidateInfo, statErr := os.Stat(current); statErr == nil && os.SameFile(parentInfo, candidateInfo) {
-			return true
-		}
-		next := filepath.Dir(current)
-		if next == current {
-			return false
-		}
-		current = next
+	if state.Mode != ModeHeadCopy || state.WorktreePath == "" {
+		return nil
 	}
+	return removeWorktree(ctx, state.SourceRoot, state.WorktreePath)
 }
 
-func pathsEquivalent(left string, right string) bool {
-	if filepath.Clean(left) == filepath.Clean(right) {
-		return true
+// Projection provides the observable workspace provenance used by reports.
+func Projection(sess *session.Session) (map[string]any, error) {
+	state, err := load(sess)
+	if err != nil {
+		return nil, err
 	}
-	leftInfo, leftErr := os.Stat(left)
-	rightInfo, rightErr := os.Stat(right)
-	return leftErr == nil && rightErr == nil && os.SameFile(leftInfo, rightInfo)
+	projection := map[string]any{
+		"mode":                        state.Mode,
+		"commit":                      state.Commit,
+		"tree_hash":                   state.TreeHash,
+		WorkspaceContentSourceKey:     WorkspaceContentSourceWorkingTree,
+		WorkingTreeChangesIncludedKey: true,
+	}
+	if state.Mode == ModeHeadCopy {
+		projection[WorkspaceContentSourceKey] = WorkspaceContentSourceCommittedHead
+		projection[WorkingTreeChangesIncludedKey] = false
+	}
+	return projection, nil
 }
 
-func semanticDigest(value any) (string, error) {
-	canonical, err := contracts.CanonicalJSONBytes(value)
+func appendPrepared(sess *session.Session, materialized *Materialized) error {
+	if materialized == nil || materialized.Commit == "" || materialized.TreeHash == "" {
+		return nil
+	}
+	blobs, err := sess.BlobStore(blobstore.Limits{})
+	if err != nil {
+		return err
+	}
+	writer, err := sess.EventWriter(blobs)
+	if err != nil {
+		return err
+	}
+	defer writer.Close()
+	_, err = writer.Append(eventlog.NewEvent(
+		fmt.Sprintf("workspace-prepared-%d", time.Now().UnixNano()),
+		time.Now(),
+		eventlog.WorkspacePreparedPayload{Mode: materialized.Mode, Commit: materialized.Commit, TreeHash: materialized.TreeHash},
+	))
+	return err
+}
+
+func statePath(sess *session.Session) string {
+	return filepath.Join(sess.Root, "runtime", stateFilename)
+}
+
+func save(sess *session.Session, materialized Materialized) error {
+	state := persistedState{
+		Mode: materialized.Mode, ExecutionCWD: materialized.ExecutionCWD, WorktreePath: materialized.WorktreePath,
+		SourceRoot: materialized.SourceRoot, Commit: materialized.Commit, TreeHash: materialized.TreeHash,
+	}
+	body, err := json.Marshal(state)
+	if err != nil {
+		return err
+	}
+	path := statePath(sess)
+	file, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	if err != nil {
+		return err
+	}
+	if _, err := file.Write(body); err != nil {
+		_ = file.Close()
+		return err
+	}
+	if err := file.Sync(); err != nil {
+		_ = file.Close()
+		return err
+	}
+	return file.Close()
+}
+
+func load(sess *session.Session) (persistedState, error) {
+	if sess == nil || strings.TrimSpace(sess.Root) == "" {
+		return persistedState{}, errors.New("session is required")
+	}
+	body, err := os.ReadFile(statePath(sess))
+	if err != nil {
+		return persistedState{}, err
+	}
+	var state persistedState
+	if err := json.Unmarshal(body, &state); err != nil {
+		return persistedState{}, fmt.Errorf("decode workspace state: %w", err)
+	}
+	if state.Mode != ModeCurrent && state.Mode != ModeHeadCopy {
+		return persistedState{}, errors.New("workspace state has an unsupported mode")
+	}
+	if strings.TrimSpace(state.ExecutionCWD) == "" {
+		return persistedState{}, errors.New("workspace state has no execution directory")
+	}
+	return state, nil
+}
+
+func (s persistedState) materialized() *Materialized {
+	return &Materialized{Mode: s.Mode, ExecutionCWD: s.ExecutionCWD, WorktreePath: s.WorktreePath, SourceRoot: s.SourceRoot, Commit: s.Commit, TreeHash: s.TreeHash}
+}
+
+func absoluteDirectory(path string) (string, error) {
+	if strings.TrimSpace(path) == "" {
+		return "", errors.New("directory is required")
+	}
+	abs, err := filepath.Abs(path)
 	if err != nil {
 		return "", err
 	}
-	sum := sha256.Sum256(canonical)
-	return contracts.DigestPrefix + hex.EncodeToString(sum[:]), nil
-}
-
-func pathMap(path string) map[string]any {
-	result := map[string]any{"path_bytes_base64": base64.StdEncoding.EncodeToString([]byte(path))}
-	if utf8.ValidString(path) {
-		result["path"] = path
+	resolved, err := filepath.EvalSymlinks(abs)
+	if err != nil {
+		return "", err
 	}
-	return result
-}
-
-func pathRecords(paths []string) []any {
-	copied := append([]string(nil), paths...)
-	sort.Slice(copied, func(left int, right int) bool { return copied[left] < copied[right] })
-	result := make([]any, 0, len(copied))
-	for _, path := range copied {
-		result = append(result, pathMap(path))
+	info, err := os.Stat(resolved)
+	if err != nil {
+		return "", err
 	}
-	return result
-}
-
-func cloneMap(value map[string]any) map[string]any {
-	cloned, _ := contracts.Materialize(value).(map[string]any)
-	return cloned
-}
-
-func workspaceError(cause error, code string, phase string, path string, message string, details map[string]any) error {
-	diagnostic := contracts.NewDiagnostic(code, phase, path, message, details)
-	return contracts.WrapDiagnosticError(cause, message, diagnostic)
-}
-
-func resourceLimitDetails(limitErr *contracts.ResourceLimitError) map[string]any {
-	if limitErr == nil {
-		return map[string]any{}
+	if !info.IsDir() {
+		return "", errors.New("path is not a directory")
 	}
-	return map[string]any{
-		"resource":  limitErr.Resource,
-		"limit":     limitErr.Limit,
-		"observed":  limitErr.Observed,
-		"current":   limitErr.Current,
-		"increment": limitErr.Increment,
+	return filepath.Clean(resolved), nil
+}
+
+func gitFacts(ctx context.Context, cwd string) (root, commit, tree string, found bool, err error) {
+	root, err = gitOutput(ctx, cwd, "rev-parse", "--show-toplevel")
+	if err != nil {
+		var exitErr *exec.ExitError
+		if errors.As(err, &exitErr) {
+			return "", "", "", false, nil
+		}
+		return "", "", "", false, err
 	}
+	root, err = absoluteDirectory(root)
+	if err != nil {
+		return "", "", "", false, err
+	}
+	commit, err = gitOutput(ctx, cwd, "rev-parse", "HEAD^{commit}")
+	if err != nil {
+		return "", "", "", false, err
+	}
+	tree, err = gitOutput(ctx, cwd, "rev-parse", "HEAD^{tree}")
+	if err != nil {
+		return "", "", "", false, err
+	}
+	return root, commit, tree, true, nil
+}
+
+func removeWorktree(ctx context.Context, sourceRoot string, worktreePath string) error {
+	if strings.TrimSpace(sourceRoot) == "" || strings.TrimSpace(worktreePath) == "" {
+		return errors.New("head-copy cleanup state is incomplete")
+	}
+	if _, err := os.Lstat(worktreePath); errors.Is(err, os.ErrNotExist) {
+		return nil
+	} else if err != nil {
+		return err
+	}
+	_, err := runGit(ctx, sourceRoot, "worktree", "remove", "--force", worktreePath)
+	return err
+}
+
+func gitOutput(ctx context.Context, cwd string, args ...string) (string, error) {
+	output, err := runGit(ctx, cwd, args...)
+	return strings.TrimSpace(string(output)), err
+}
+
+func runGit(ctx context.Context, cwd string, args ...string) ([]byte, error) {
+	command := exec.CommandContext(ctx, "git", append([]string{"-C", cwd}, args...)...)
+	output, err := command.CombinedOutput()
+	if err != nil {
+		return nil, fmt.Errorf("git %s: %w: %s", strings.Join(args, " "), err, strings.TrimSpace(string(output)))
+	}
+	return output, nil
 }
