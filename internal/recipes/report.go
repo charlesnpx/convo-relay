@@ -68,10 +68,6 @@ type RecipeIssueGroup struct {
 	Recipes []string           `json:"recipes,omitempty"`
 }
 
-func BuildRecipeCatalogReport(settingsPath string) (RecipeCatalogReport, error) {
-	return BuildRecipeCatalogReportWithOptions(settingsPath, RecipeCatalogOptions{})
-}
-
 func BuildRecipeCatalogReportWithTransientSources(settingsPath string, sources []TransientRecipeSource) (RecipeCatalogReport, error) {
 	return BuildRecipeCatalogReportWithOptions(settingsPath, RecipeCatalogOptions{TransientSources: sources})
 }

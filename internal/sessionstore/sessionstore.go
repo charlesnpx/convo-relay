@@ -3,6 +3,7 @@ package sessionstore
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -16,6 +17,7 @@ import (
 	"github.com/charlesnpx/convo-relay/internal/eventlog"
 	"github.com/charlesnpx/convo-relay/internal/session"
 	"github.com/charlesnpx/convo-relay/internal/sessionview"
+	"github.com/charlesnpx/convo-relay/internal/workspace"
 )
 
 var errSessionRunning = errors.New("session is running")
@@ -195,6 +197,9 @@ func cleanSessionWithRemover(sessionDir string, removeSession func(string) error
 		"session_id":  sess.Plan.SessionID,
 		"session_dir": sess.Root,
 		"title":       sess.Plan.Task,
+	}
+	if err := workspace.Cleanup(context.Background(), sess); err != nil {
+		return nil, fmt.Errorf("cleanup session workspace: %w", err)
 	}
 	if err := removeSession(sess.Root); err != nil {
 		return nil, err

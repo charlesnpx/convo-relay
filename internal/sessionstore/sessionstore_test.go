@@ -1,8 +1,10 @@
 package sessionstore
 
 import (
+	"context"
 	"errors"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -12,6 +14,7 @@ import (
 	"github.com/charlesnpx/convo-relay/internal/eventlog"
 	"github.com/charlesnpx/convo-relay/internal/plan"
 	"github.com/charlesnpx/convo-relay/internal/session"
+	"github.com/charlesnpx/convo-relay/internal/workspace"
 )
 
 func TestResolveSessionDirUniquePrefixAndExplicitDirectory(t *testing.T) {
@@ -219,6 +222,50 @@ func TestCleanSessionRefusesActiveWriter(t *testing.T) {
 	}
 }
 
+func TestCleanSessionUnregistersHeadCopyWorktree(t *testing.T) {
+	source := t.TempDir()
+	runSessionstoreGit(t, source, "init")
+	runSessionstoreGit(t, source, "config", "user.email", "test@example.invalid")
+	runSessionstoreGit(t, source, "config", "user.name", "sessionstore test")
+	if err := os.WriteFile(filepath.Join(source, "value.txt"), []byte("committed\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runSessionstoreGit(t, source, "add", "value.txt")
+	runSessionstoreGit(t, source, "commit", "-m", "initial")
+
+	value, err := plan.FromFlags(plan.Flags{
+		SessionID: "head-copy-clean", Task: "head-copy cleanup", Agents: "codex,codex", Rounds: 1,
+		Workspace: session.Workspace{Mode: workspace.ModeHeadCopy},
+	})
+	if err != nil {
+		t.Fatalf("compile plan: %v", err)
+	}
+	sess, err := session.CreateWithOptions(session.CreateOptions{
+		RelayHome: filepath.Join(t.TempDir(), "sessions"), Prefix: "head-copy-clean-", Plan: value,
+	})
+	if err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+	prepared, err := workspace.Prepare(context.Background(), sess, workspace.Options{LaunchCWD: source, Mode: workspace.ModeHeadCopy})
+	if err != nil {
+		t.Fatalf("prepare head-copy workspace: %v", err)
+	}
+	if listing := sessionstoreGitOutput(t, source, "worktree", "list", "--porcelain"); !strings.Contains(listing, prepared.WorktreePath) {
+		t.Fatalf("prepared worktree is not registered: %s", listing)
+	}
+
+	report, err := CleanSession(sess.Root, false)
+	if err != nil {
+		t.Fatalf("clean head-copy session: %v", err)
+	}
+	if report["status"] != "deleted" {
+		t.Fatalf("clean report = %#v", report)
+	}
+	if listing := sessionstoreGitOutput(t, source, "worktree", "list", "--porcelain"); strings.Contains(listing, prepared.WorktreePath) {
+		t.Fatalf("stale worktree registration remains after clean: %s", listing)
+	}
+}
+
 func TestListSessionsLeavesWriterOpensUncontended(t *testing.T) {
 	home := t.TempDir()
 	sess := createTestSession(t, home, "contention-session", testTime(1), false)
@@ -326,4 +373,20 @@ func createEmptyTestSession(t *testing.T, home string, id string) *session.Sessi
 
 func testTime(second int) time.Time {
 	return time.Date(2026, time.August, 25, 12, 0, second, 0, time.UTC)
+}
+
+func runSessionstoreGit(t *testing.T, cwd string, args ...string) {
+	t.Helper()
+	if output, err := exec.Command("git", append([]string{"-C", cwd}, args...)...).CombinedOutput(); err != nil {
+		t.Fatalf("git %s: %v: %s", strings.Join(args, " "), err, output)
+	}
+}
+
+func sessionstoreGitOutput(t *testing.T, cwd string, args ...string) string {
+	t.Helper()
+	output, err := exec.Command("git", append([]string{"-C", cwd}, args...)...).CombinedOutput()
+	if err != nil {
+		t.Fatalf("git %s: %v: %s", strings.Join(args, " "), err, output)
+	}
+	return string(output)
 }

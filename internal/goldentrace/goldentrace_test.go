@@ -372,6 +372,47 @@ func slotThreadID(t *testing.T, report map[string]any, slotID string) string {
 	return ""
 }
 
+func listSessions(t *testing.T, env *traceEnv) []map[string]any {
+	t.Helper()
+	result := env.run(t, "list", "--home", env.relayHome, "--json")
+	requireExit(t, result, 0)
+	report := mustJSON(t, result)
+	raw := jsonSlice(t, report["sessions"], "sessions")
+	items := make([]map[string]any, 0, len(raw))
+	for index, item := range raw {
+		items = append(items, jsonMap(t, item, fmt.Sprintf("sessions[%d]", index)))
+	}
+	return items
+}
+
+func containsSession(items []map[string]any, sessionID string) bool {
+	for _, item := range items {
+		if item["session_id"] == sessionID {
+			return true
+		}
+	}
+	return false
+}
+
+func addedSessionID(t *testing.T, before []map[string]any, after []map[string]any) string {
+	t.Helper()
+	existing := make(map[string]bool, len(before))
+	for index, item := range before {
+		existing[jsonString(t, item["session_id"], fmt.Sprintf("before session[%d].session_id", index))] = true
+	}
+	added := []string{}
+	for index, item := range after {
+		sessionID := jsonString(t, item["session_id"], fmt.Sprintf("after session[%d].session_id", index))
+		if !existing[sessionID] {
+			added = append(added, sessionID)
+		}
+	}
+	if len(added) != 1 {
+		t.Fatalf("expected exactly one newly listed child session, before=%#v after=%#v", before, after)
+	}
+	return added[0]
+}
+
 func hasText(entries []map[string]any, token string) bool {
 	for _, entry := range entries {
 		if strings.Contains(fmt.Sprint(entry["content"]), token) {
@@ -794,6 +835,79 @@ func TestCancellation(t *testing.T) {
 	}
 }
 
+func TestBoundedChildRelayWithAdmission(t *testing.T) {
+	env := newTraceEnv(t, scriptedPlan(map[string][]map[string]any{
+		"slot_0":      {reply("TRACE_PARENT_A"), reply("TRACE_CHILD_REPLY")},
+		"slot_1":      {reply("TRACE_PARENT_B")},
+		"facilitator": {contestedLedger("TRACE_CHILD_CONTESTED")},
+	}))
+	settings := fixturePath(t, env, "root-recipes.toml")
+	parent, _ := env.runJSON(t,
+		"--session-id", "child-parent",
+		"--task", "TRACE_CHILD_PARENT_TASK", "--agents", "codex", "--rounds", "2", "--dynamic", "ask",
+		"--settings", settings,
+	)
+	requireExit(t, parent, 0)
+	proposalID := graphProposalID(t, env, "child-parent")
+	if selected := jsonString(t, requiredJSONField(t, graphProposal(t, env, "child-parent", proposalID), "selected_recipe_id", "graph proposal"), "graph proposal.selected_recipe_id"); selected != "review-panel" {
+		t.Fatalf("contested ledger selected recipe %q, want review-panel convention", selected)
+	}
+	beforeApproval := listSessions(t, env)
+	approval := env.run(t,
+		"control", "approve", "--home", env.relayHome, "--proposal", proposalID, "child-parent",
+	)
+	requireExit(t, approval, 0)
+	afterApproval := listSessions(t, env)
+	childSessionID := addedSessionID(t, beforeApproval, afterApproval)
+	if proposal := graphProposal(t, env, "child-parent", proposalID); jsonString(t, requiredJSONField(t, proposal, "status", "graph proposal"), "graph proposal.status") != "collapsed" {
+		t.Fatalf("approved child proposal was not collapsed: %#v", proposal)
+	}
+
+	parentShow, parentShowReport := env.showJSON(t, "child-parent")
+	requireExit(t, parentShow, 0)
+	parentEntries := transcript(t, parentShowReport)
+	if countText(parentEntries, "TRACE_CHILD_REPLY") != 1 {
+		t.Fatalf("child result did not appear exactly once in parent conversation: %#v", parentEntries)
+	}
+	if !containsSession(afterApproval, childSessionID) {
+		t.Fatalf("admitted child %q is not separately listed", childSessionID)
+	}
+	childShow, childReport := env.showJSON(t, childSessionID)
+	requireExit(t, childShow, 0)
+	if resultActualRounds(t, resultSummary(t, childReport)) != 1 || !hasText(transcript(t, childReport), "TRACE_CHILD_REPLY") {
+		t.Fatalf("separately inspected child omitted its response")
+	}
+
+	denied := newTraceEnv(t, scriptedPlan(map[string][]map[string]any{
+		"slot_0":      {reply("TRACE_DENIED_PARENT_A"), reply("TRACE_DENIED_CHILD_MUST_NOT_RUN")},
+		"slot_1":      {reply("TRACE_DENIED_PARENT_B")},
+		"facilitator": {contestedLedger("TRACE_CHILD_CONTESTED")},
+	}))
+	deniedSettings := fixturePath(t, denied, "root-recipes.toml")
+	seedDenied, _ := denied.runJSON(t,
+		"--session-id", "denied-parent",
+		"--task", "TRACE_DENIED_CHILD_TASK", "--agents", "codex", "--rounds", "2", "--dynamic", "ask",
+		"--settings", deniedSettings,
+	)
+	requireExit(t, seedDenied, 0)
+	deniedProposalID := graphProposalID(t, denied, "denied-parent")
+	before := listSessions(t, denied)
+	rejected := denied.run(t, "control", "reject", "--home", denied.relayHome, "--proposal", deniedProposalID, "denied-parent")
+	requireExit(t, rejected, 0)
+	after := listSessions(t, denied)
+	if len(after) != len(before) || !containsSession(after, "denied-parent") {
+		t.Fatalf("denied child changed public session list: before=%#v after=%#v", before, after)
+	}
+	if proposal := graphProposal(t, denied, "denied-parent", deniedProposalID); jsonString(t, requiredJSONField(t, proposal, "status", "graph proposal"), "graph proposal.status") != "rejected" {
+		t.Fatalf("denied child proposal was not rejected: %#v", proposal)
+	}
+	deniedShow, deniedShowReport := denied.showJSON(t, "denied-parent")
+	requireExit(t, deniedShow, 0)
+	if hasText(transcript(t, deniedShowReport), "TRACE_DENIED_CHILD_MUST_NOT_RUN") {
+		t.Fatalf("denied child executed despite rejection")
+	}
+}
+
 func TestCommittedHeadExecution(t *testing.T) {
 	env := newTraceEnv(t, scriptedPlan(map[string][]map[string]any{
 		"slot_0": {{
@@ -912,6 +1026,37 @@ func waitForTraceProvider(path string) bool {
 		time.Sleep(10 * time.Millisecond)
 	}
 	return false
+}
+
+func graphProposalID(t *testing.T, env *traceEnv, sessionID string) string {
+	t.Helper()
+	proposals := graphProposals(t, env, sessionID)
+	if len(proposals) != 1 {
+		t.Fatalf("expected exactly one public child proposal, got %#v", proposals)
+	}
+	for id := range proposals {
+		return id
+	}
+	t.Fatal("missing graph proposal")
+	return ""
+}
+
+func graphProposal(t *testing.T, env *traceEnv, sessionID string, proposalID string) map[string]any {
+	t.Helper()
+	proposal, found := graphProposals(t, env, sessionID)[proposalID]
+	if !found {
+		t.Fatalf("public child proposal %q missing", proposalID)
+	}
+	return jsonMap(t, proposal, "graph proposal")
+}
+
+func graphProposals(t *testing.T, env *traceEnv, sessionID string) map[string]any {
+	t.Helper()
+	result := env.run(t, "show", "--graph", "--home", env.relayHome, "--json", sessionID)
+	requireExit(t, result, 0)
+	graph := jsonMap(t, mustJSON(t, result)["graph"], "graph")
+	proposals := jsonMap(t, graph["proposals"], "graph proposals")
+	return proposals
 }
 
 func traceGit(t *testing.T, dir string, args ...string) {

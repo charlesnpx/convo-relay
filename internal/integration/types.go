@@ -7,7 +7,6 @@ import (
 )
 
 const (
-	BundleSchemaVersion   = contracts.IntegrationBundleV1
 	BundleSchemaVersionV1 = contracts.IntegrationBundleV1
 	BundleSchemaVersionV2 = contracts.IntegrationBundleV2
 	DefaultMediaType      = "application/octet-stream"
@@ -159,17 +158,6 @@ func (b *Bundle) Contract(id string) (*Contract, bool) {
 		return nil, false
 	}
 	return cloneContract(contract), true
-}
-
-func (b *Bundle) Contracts() map[string]*Contract {
-	if b == nil {
-		return nil
-	}
-	result := make(map[string]*Contract, len(b.contracts))
-	for id, contract := range b.contracts {
-		result[id] = cloneContract(contract)
-	}
-	return result
 }
 
 func (c *Contract) ToMap() map[string]any {

@@ -60,13 +60,25 @@ type persistedState struct {
 // Prepare records one workspace decision. Current intentionally sees the
 // supplied working tree. Head-copy intentionally sees exactly the HEAD tree.
 func Prepare(ctx context.Context, sess *session.Session, options Options) (*Materialized, error) {
+	return prepareWithStateSaver(ctx, sess, options, save)
+}
+
+func prepareWithStateSaver(ctx context.Context, sess *session.Session, options Options, saveState func(*session.Session, Materialized) error) (*Materialized, error) {
 	if sess == nil || strings.TrimSpace(sess.Root) == "" {
 		return nil, errors.New("session is required")
+	}
+	if saveState == nil {
+		return nil, errors.New("workspace state saver is required")
 	}
 	if _, err := os.Stat(statePath(sess)); err == nil {
 		return nil, errors.New("workspace is already prepared")
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return nil, fmt.Errorf("inspect workspace state: %w", err)
+	}
+	if _, found, err := preparedEvent(sess); err != nil {
+		return nil, err
+	} else if found {
+		return Recover(ctx, sess)
 	}
 	mode := strings.TrimSpace(options.Mode)
 	if mode == "" {
@@ -92,13 +104,16 @@ func Prepare(ctx context.Context, sess *session.Session, options Options) (*Mate
 		materialized.Commit = commit
 		materialized.TreeHash = tree
 	}
-	if err := save(sess, *materialized); err != nil {
+	if err := appendPrepared(sess, materialized); err != nil {
 		if materialized.WorktreePath != "" {
 			_ = removeWorktree(ctx, materialized.SourceRoot, materialized.WorktreePath)
 		}
 		return nil, err
 	}
-	if err := appendPrepared(sess, materialized); err != nil {
+	// workspace.prepared is the canonical record. The local state only caches
+	// its execution boundary and is deliberately written after that event so a
+	// crash cannot leave a recoverable workspace without provenance.
+	if err := saveState(sess, *materialized); err != nil {
 		return nil, err
 	}
 	return materialized, nil
@@ -139,10 +154,15 @@ func prepareHeadCopy(ctx context.Context, sess *session.Session, launchCWD strin
 }
 
 // Recover returns the recorded execution boundary without source inventories
-// or re-digests. A head-copy is checked only through Git's own commit/tree
-// view, which is the reproducibility boundary this package owns.
+// or re-digests. When a head-copy cache is missing after workspace.prepared is
+// durable, it rebuilds that cache from the event and detached worktree. A
+// head-copy is checked only through Git's own commit/tree view, which is the
+// reproducibility boundary this package owns.
 func Recover(ctx context.Context, sess *session.Session) (*Materialized, error) {
 	state, err := load(sess)
+	if errors.Is(err, os.ErrNotExist) {
+		return rebuildHeadCopyState(ctx, sess)
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -167,12 +187,68 @@ func Recover(ctx context.Context, sess *session.Session) (*Materialized, error) 
 	return materialized, nil
 }
 
+func rebuildHeadCopyState(ctx context.Context, sess *session.Session) (*Materialized, error) {
+	prepared, found, err := preparedEvent(sess)
+	if err != nil {
+		return nil, err
+	}
+	if !found {
+		return nil, errors.New("workspace state is unavailable and no workspace.prepared event exists")
+	}
+	if prepared.Mode != ModeHeadCopy {
+		return nil, errors.New("workspace state is unavailable for a current workspace")
+	}
+	worktreePath := filepath.Join(sess.Root, "runtime", "workspace")
+	if _, err := absoluteDirectory(worktreePath); err != nil {
+		return nil, fmt.Errorf("recorded head-copy worktree is unavailable: %w", err)
+	}
+	commit, err := gitOutput(ctx, worktreePath, "rev-parse", "HEAD^{commit}")
+	if err != nil || commit != prepared.Commit {
+		return nil, errors.New("head-copy worktree no longer matches its recorded HEAD")
+	}
+	tree, err := gitOutput(ctx, worktreePath, "rev-parse", "HEAD^{tree}")
+	if err != nil || tree != prepared.TreeHash {
+		return nil, errors.New("head-copy worktree no longer matches its recorded tree")
+	}
+	sourceRoot, err := sourceRootForWorktree(ctx, worktreePath)
+	if err != nil {
+		return nil, err
+	}
+	materialized := &Materialized{
+		Mode:         prepared.Mode,
+		ExecutionCWD: worktreePath,
+		WorktreePath: worktreePath,
+		SourceRoot:   sourceRoot,
+		Commit:       prepared.Commit,
+		TreeHash:     prepared.TreeHash,
+	}
+	if err := save(sess, *materialized); err != nil {
+		return nil, fmt.Errorf("rebuild workspace state: %w", err)
+	}
+	return materialized, nil
+}
+
 // Cleanup removes only the exact detached worktree recorded for this session.
 // It deliberately leaves the session directory to its caller.
 func Cleanup(ctx context.Context, sess *session.Session) error {
 	state, err := load(sess)
 	if errors.Is(err, os.ErrNotExist) {
-		return nil
+		prepared, found, preparedErr := preparedEvent(sess)
+		if preparedErr != nil {
+			return preparedErr
+		}
+		if !found || prepared.Mode != ModeHeadCopy {
+			return nil
+		}
+		rebuilt, rebuildErr := rebuildHeadCopyState(ctx, sess)
+		if rebuildErr != nil {
+			return rebuildErr
+		}
+		state = persistedState{
+			Mode: rebuilt.Mode, ExecutionCWD: rebuilt.ExecutionCWD, WorktreePath: rebuilt.WorktreePath,
+			SourceRoot: rebuilt.SourceRoot, Commit: rebuilt.Commit, TreeHash: rebuilt.TreeHash,
+		}
+		err = nil
 	}
 	if err != nil {
 		return err
@@ -222,6 +298,43 @@ func appendPrepared(sess *session.Session, materialized *Materialized) error {
 		eventlog.WorkspacePreparedPayload{Mode: materialized.Mode, Commit: materialized.Commit, TreeHash: materialized.TreeHash},
 	))
 	return err
+}
+
+func preparedEvent(sess *session.Session) (eventlog.WorkspacePreparedPayload, bool, error) {
+	if sess == nil || strings.TrimSpace(sess.Root) == "" {
+		return eventlog.WorkspacePreparedPayload{}, false, errors.New("session is required")
+	}
+	body, err := os.ReadFile(filepath.Join(sess.Root, eventlog.EventsFilename))
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return eventlog.WorkspacePreparedPayload{}, false, nil
+		}
+		return eventlog.WorkspacePreparedPayload{}, false, err
+	}
+	events, err := eventlog.Replay(strings.NewReader(string(body)))
+	if err != nil {
+		return eventlog.WorkspacePreparedPayload{}, false, err
+	}
+	var prepared eventlog.WorkspacePreparedPayload
+	found := false
+	for _, event := range events {
+		switch payload := event.Payload.(type) {
+		case eventlog.WorkspacePreparedPayload:
+			if found {
+				return eventlog.WorkspacePreparedPayload{}, false, errors.New("session has more than one workspace.prepared event")
+			}
+			prepared, found = payload, true
+		case *eventlog.WorkspacePreparedPayload:
+			if payload == nil {
+				continue
+			}
+			if found {
+				return eventlog.WorkspacePreparedPayload{}, false, errors.New("session has more than one workspace.prepared event")
+			}
+			prepared, found = *payload, true
+		}
+	}
+	return prepared, found, nil
 }
 
 func statePath(sess *session.Session) string {
@@ -328,13 +441,30 @@ func removeWorktree(ctx context.Context, sourceRoot string, worktreePath string)
 	if strings.TrimSpace(sourceRoot) == "" || strings.TrimSpace(worktreePath) == "" {
 		return errors.New("head-copy cleanup state is incomplete")
 	}
-	if _, err := os.Lstat(worktreePath); errors.Is(err, os.ErrNotExist) {
-		return nil
-	} else if err != nil {
+	if _, err := os.Lstat(worktreePath); err == nil {
+		if _, err := runGit(ctx, sourceRoot, "worktree", "remove", "--force", worktreePath); err != nil {
+			return err
+		}
+	} else if !errors.Is(err, os.ErrNotExist) {
 		return err
 	}
-	_, err := runGit(ctx, sourceRoot, "worktree", "remove", "--force", worktreePath)
+	_, err := runGit(ctx, sourceRoot, "worktree", "prune")
 	return err
+}
+
+func sourceRootForWorktree(ctx context.Context, worktreePath string) (string, error) {
+	commonDir, err := gitOutput(ctx, worktreePath, "rev-parse", "--git-common-dir")
+	if err != nil {
+		return "", fmt.Errorf("find head-copy source root: %w", err)
+	}
+	if !filepath.IsAbs(commonDir) {
+		commonDir = filepath.Join(worktreePath, commonDir)
+	}
+	root, err := absoluteDirectory(filepath.Dir(commonDir))
+	if err != nil {
+		return "", fmt.Errorf("resolve head-copy source root: %w", err)
+	}
+	return root, nil
 }
 
 func gitOutput(ctx context.Context, cwd string, args ...string) (string, error) {

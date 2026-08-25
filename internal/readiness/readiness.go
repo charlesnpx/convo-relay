@@ -26,7 +26,6 @@ const (
 	AuthenticationAuthenticated = "authenticated"
 	AuthenticationFailed        = "unauthenticated"
 	AuthenticationUnsupported   = "unsupported"
-	AuthenticationNotApplicable = "not_applicable"
 	AuthenticationProbeFailed   = "probe_failed"
 
 	ProbeStatusNotRun       = "not_run"
@@ -35,7 +34,6 @@ const (
 	ProbeStatusTimedOut     = "timed_out"
 	ProbeStatusNotInstalled = "not_installed"
 	ProbeStatusUnsupported  = "unsupported"
-	ProbeStatusBuiltIn      = "built_in"
 
 	DefaultProbeTimeout = 5 * time.Second
 	maxProbeOutputBytes = 64 * 1024

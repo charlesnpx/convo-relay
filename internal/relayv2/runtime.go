@@ -6,15 +6,19 @@ package relayv2
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"sort"
 	"strings"
 
 	"github.com/charlesnpx/convo-relay/internal/engine"
+	"github.com/charlesnpx/convo-relay/internal/eventlog"
 	"github.com/charlesnpx/convo-relay/internal/integration"
 	"github.com/charlesnpx/convo-relay/internal/plan"
 	"github.com/charlesnpx/convo-relay/internal/provider"
@@ -97,8 +101,9 @@ func LoadRuntime(sess *session.Session) (Runtime, error) {
 // its admitting parent, while still receiving its own session root.
 func NewDeps(value Runtime, executionCWD string) engine.Deps {
 	return engine.Deps{
-		BackendFactory: NewBackendFactory(value, executionCWD),
-		Recipes:        append([]plan.Recipe{}, value.Recipes...),
+		BackendFactory:        NewBackendFactory(value, executionCWD),
+		Recipes:               append([]plan.Recipe{}, value.Recipes...),
+		ChildRequestExtractor: NewChildRequestExtractor(value.Recipes),
 	}
 }
 
@@ -151,6 +156,120 @@ func NewBackendFactory(value Runtime, executionCWD string) engine.BackendFactory
 
 func isFacilitator(value session.Plan, actorID string) bool {
 	return value.Facilitator != nil && value.Facilitator.Actor == actorID
+}
+
+// NewChildRequestExtractor turns a facilitator ledger into durable child
+// requests. Its only dependency on provider.TurnResult is Content: recovery
+// reconstructs precisely that field before invoking extraction again.
+func NewChildRequestExtractor(catalog []plan.Recipe) engine.ChildRequestExtractor {
+	recipes := append([]plan.Recipe{}, catalog...)
+	sort.Slice(recipes, func(left, right int) bool { return recipes[left].ID < recipes[right].ID })
+	return func(parent session.Plan, _ session.Actor, role eventlog.Role, result provider.TurnResult) []engine.ChildRequest {
+		if role != eventlog.FacilitatorRole {
+			return nil
+		}
+		contested, ok := contestedLedgerItems(result.Content)
+		if !ok || len(contested) == 0 {
+			return nil
+		}
+		requests := make([]engine.ChildRequest, 0, len(contested))
+		for _, item := range contested {
+			recipeID := childRecipeForItem(parent.ChildPolicy, recipes)
+			if recipeID == "" {
+				continue
+			}
+			requests = append(requests, engine.ChildRequest{
+				ID: childRequestID(item),
+				Request: plan.ChildRequest{
+					RecipeID: recipeID,
+					Question: "Resolve this contested parent-relay item: " + item,
+				},
+			})
+		}
+		return requests
+	}
+}
+
+func contestedLedgerItems(content string) ([]string, bool) {
+	var document map[string]json.RawMessage
+	decoder := json.NewDecoder(strings.NewReader(strings.TrimSpace(content)))
+	if err := decoder.Decode(&document); err != nil {
+		return nil, false
+	}
+	var trailing any
+	if err := decoder.Decode(&trailing); err != io.EOF {
+		return nil, false
+	}
+	settled, ok := ledgerStrings(document["settled"])
+	if !ok {
+		return nil, false
+	}
+	contested, ok := ledgerStrings(document["contested"])
+	if !ok {
+		return nil, false
+	}
+	withdrawn, ok := ledgerStrings(document["withdrawn"])
+	if !ok {
+		return nil, false
+	}
+	// Parse all three arrays even though only contested drives requests. A
+	// partial JSON object is not a ledger document and must not accidentally
+	// become a child-spawn protocol.
+	_ = settled
+	_ = withdrawn
+	items := make([]string, 0, len(contested))
+	seen := map[string]bool{}
+	for _, raw := range contested {
+		item := strings.TrimSpace(raw)
+		if item == "" || seen[item] {
+			continue
+		}
+		seen[item] = true
+		items = append(items, item)
+	}
+	return items, true
+}
+
+func ledgerStrings(raw json.RawMessage) ([]string, bool) {
+	if len(raw) == 0 || !strings.HasPrefix(strings.TrimSpace(string(raw)), "[") {
+		return nil, false
+	}
+	var values []string
+	if err := json.Unmarshal(raw, &values); err != nil {
+		return nil, false
+	}
+	return values, true
+}
+
+// childRecipeForItem selects the first allowed recipe declared by the parent
+// child policy that is present in the catalog; otherwise it selects the
+// review-panel convention; otherwise it selects the first catalog recipe by
+// sorted ID.
+func childRecipeForItem(policy session.ChildPolicy, catalog []plan.Recipe) string {
+	byID := make(map[string]bool, len(catalog))
+	for _, recipe := range catalog {
+		byID[recipe.ID] = true
+	}
+	for _, allowed := range policy.AllowedRecipes {
+		if recipeID := strings.TrimSpace(allowed); recipeID != "" && byID[recipeID] {
+			return recipeID
+		}
+	}
+	for _, recipe := range catalog {
+		if recipe.ID == "review-panel" {
+			return recipe.ID
+		}
+	}
+	if len(catalog) != 0 {
+		return catalog[0].ID
+	}
+	return ""
+}
+
+func childRequestID(item string) string {
+	normalized := strings.Join(strings.Fields(strings.ToLower(item)), " ")
+	sum := sha256.Sum256([]byte(normalized))
+	return "child-" + hex.EncodeToString(sum[:])[:16]
 }
 
 // RecipeFromRuntime converts a normalized legacy configuration record into

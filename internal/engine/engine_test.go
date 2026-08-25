@@ -575,7 +575,7 @@ func TestResumeRebuildsChildBudgets(t *testing.T) {
 	child := &fakeBackend{name: "codex", slotID: "child-alpha", responses: []fakeResponse{{content: "must not run"}}}
 	deps := testDeps(map[string]*fakeBackend{"alpha": alpha, "beta": beta, "child-alpha": child})
 	deps.Recipes = []plan.Recipe{childRecipe()}
-	deps.ChildRequestExtractor = func(actor session.Actor, role eventlog.Role, _ provider.TurnResult) []ChildRequest {
+	deps.ChildRequestExtractor = func(_ session.Plan, actor session.Actor, role eventlog.Role, _ provider.TurnResult) []ChildRequest {
 		if actor.ID == "beta" && role == eventlog.ParticipantRole {
 			return []ChildRequest{{ID: "child-two", Request: plan.ChildRequest{RecipeID: "child", Question: "second child question"}}}
 		}
@@ -678,7 +678,7 @@ func TestResumeMaterializesChildRequestsFromSuccessfulAttempt(t *testing.T) {
 			deps := testDeps(map[string]*fakeBackend{"alpha": alpha, "beta": beta})
 			deps.Recipes = []plan.Recipe{childRecipe()}
 			extractorCalls := 0
-			deps.ChildRequestExtractor = func(actor session.Actor, role eventlog.Role, result provider.TurnResult) []ChildRequest {
+			deps.ChildRequestExtractor = func(_ session.Plan, actor session.Actor, role eventlog.Role, result provider.TurnResult) []ChildRequest {
 				extractorCalls++
 				if actor.ID != "alpha" || role != eventlog.ParticipantRole {
 					t.Errorf("recovered extractor input = actor=%q role=%q", actor.ID, role)
@@ -999,7 +999,7 @@ func TestChildRequestsAdmitAndRejectWithoutRunningDeniedChildren(t *testing.T) {
 			child := &fakeBackend{name: "codex", slotID: "child-alpha", responses: []fakeResponse{{content: "child result"}}}
 			deps := testDeps(map[string]*fakeBackend{"alpha": alpha, "beta": beta, "child-alpha": child})
 			deps.Recipes = []plan.Recipe{childRecipe()}
-			deps.ChildRequestExtractor = func(actor session.Actor, role eventlog.Role, _ provider.TurnResult) []ChildRequest {
+			deps.ChildRequestExtractor = func(_ session.Plan, actor session.Actor, role eventlog.Role, _ provider.TurnResult) []ChildRequest {
 				if actor.ID != "alpha" || role != eventlog.ParticipantRole {
 					return nil
 				}

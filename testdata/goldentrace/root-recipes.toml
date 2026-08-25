@@ -125,7 +125,7 @@ steering = "allow"
 dynamic = "forbid"
 workspace_isolation = "ephemeral"
 
-[relay_recipes.trace-child]
+[relay_recipes.review-panel]
 purpose = "Resolve the trace child contested item in one bounded child turn."
 participants = ["trace-alpha", "trace-beta"]
 facilitator = "trace-facilitator"

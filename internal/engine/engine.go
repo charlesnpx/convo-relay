@@ -59,8 +59,9 @@ type ChildRequest struct {
 }
 
 // ChildRequestExtractor returns requests emitted by a participant or
-// facilitator result. A nil extractor means turns cannot request children.
-type ChildRequestExtractor func(session.Actor, eventlog.Role, provider.TurnResult) []ChildRequest
+// facilitator result. The immutable parent plan lets ingress selection respect
+// the parent's keep-list. A nil extractor means turns cannot request children.
+type ChildRequestExtractor func(session.Plan, session.Actor, eventlog.Role, provider.TurnResult) []ChildRequest
 
 // Deps contains the small imperative boundary required by Run. Writer is
 // optional: when absent, Run opens the session's event writer itself. Recipes
@@ -1354,7 +1355,7 @@ func (r *runner) persistChildRequests(turn *turnState, actor session.Actor, resu
 	if r.deps.ChildRequestExtractor == nil || (turn.Role != eventlog.ParticipantRole && turn.Role != eventlog.FacilitatorRole) {
 		return nil
 	}
-	for index, child := range r.deps.ChildRequestExtractor(actor, turn.Role, result) {
+	for index, child := range r.deps.ChildRequestExtractor(r.sess.Plan, actor, turn.Role, result) {
 		requestID := strings.TrimSpace(child.ID)
 		if requestID == "" {
 			requestID = fmt.Sprintf("%s-child-%d-%d", actor.ID, turn.Round, index+1)
