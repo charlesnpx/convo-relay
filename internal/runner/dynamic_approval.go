@@ -9,8 +9,11 @@ import (
 	"strings"
 
 	"github.com/charlesnpx/convo-relay/internal/contracts"
+	"github.com/charlesnpx/convo-relay/internal/engine"
 	"github.com/charlesnpx/convo-relay/internal/graph"
 	"github.com/charlesnpx/convo-relay/internal/recipes"
+	"github.com/charlesnpx/convo-relay/internal/relayv2"
+	"github.com/charlesnpx/convo-relay/internal/session"
 	"github.com/charlesnpx/convo-relay/internal/store"
 )
 
@@ -46,6 +49,21 @@ type dynamicAdmittedChild struct {
 }
 
 func Proposals(sessionDir string) (map[string]any, error) {
+	if sess, found, err := relayv2.Open(sessionDir); err != nil {
+		return nil, err
+	} else if found {
+		graphReport, err := relayv2.BuildGraphReport(sess)
+		if err != nil {
+			return nil, err
+		}
+		graphData, _ := graphReport["graph"].(map[string]any)
+		proposals, _ := graphData["proposals"].(map[string]any)
+		items := make([]any, 0, len(proposals))
+		for _, requestID := range relayv2.SortProposalIDs(proposals) {
+			items = append(items, proposals[requestID])
+		}
+		return map[string]any{"session_id": sess.Plan.SessionID, "proposals": items}, nil
+	}
 	st := store.New(sessionDir)
 	proposals, err := st.ListProposalMaps()
 	if err != nil {
@@ -59,6 +77,14 @@ func Proposals(sessionDir string) (map[string]any, error) {
 }
 
 func RejectProposal(sessionDir string, opts RejectOptions) (map[string]any, error) {
+	if sess, found, err := relayv2.Open(sessionDir); err != nil {
+		return nil, err
+	} else if found {
+		if err := engine.RejectChild(context.Background(), sess, opts.ProposalID); err != nil {
+			return nil, err
+		}
+		return map[string]any{"session_id": sess.Plan.SessionID, "proposal_id": opts.ProposalID, "status": "rejected"}, nil
+	}
 	if err := guardRootLifecycleSession(sessionDir, rootLifecycleActionProposalReject); err != nil {
 		return nil, err
 	}
@@ -104,6 +130,11 @@ func RejectProposal(sessionDir string, opts RejectOptions) (map[string]any, erro
 }
 
 func ApproveProposal(ctx context.Context, sessionDir string, opts ApproveOptions) (map[string]any, error) {
+	if sess, found, err := relayv2.Open(sessionDir); err != nil {
+		return nil, err
+	} else if found {
+		return approveV2Proposal(ctx, sess, opts)
+	}
 	if opts.TimeoutSeconds <= 0 {
 		opts.TimeoutSeconds = defaultTimeoutSeconds
 	}
@@ -279,6 +310,49 @@ func ApproveProposal(ctx context.Context, sessionDir string, opts ApproveOptions
 		"admitted_rounds":     admitted.AdmittedRounds,
 		"result_envelope_ref": envelopeRef,
 	}, nil
+}
+
+// approveV2Proposal keeps admission and execution in the v2 engine. The
+// follow-up Resume has no budget grant: it services exactly the admitted work
+// that is already durable in child.decided.
+func approveV2Proposal(ctx context.Context, sess *session.Session, opts ApproveOptions) (map[string]any, error) {
+	runtime, err := relayv2.LoadRuntime(sess)
+	if err != nil {
+		return nil, err
+	}
+	if err := engine.ApproveChild(ctx, sess, opts.ProposalID, runtime.Recipes); err != nil {
+		return nil, err
+	}
+	executionCWD, err := relayv2.ExecutionCWD(ctx, sess, runtime)
+	if err != nil {
+		return nil, err
+	}
+	outcome, err := engine.Resume(ctx, sess, relayv2.NewDeps(runtime, executionCWD), "", 0)
+	if err != nil {
+		return nil, err
+	}
+	graphReport, err := relayv2.BuildGraphReport(sess)
+	if err != nil {
+		return nil, err
+	}
+	graphData, _ := graphReport["graph"].(map[string]any)
+	proposals, _ := graphData["proposals"].(map[string]any)
+	proposal, _ := proposals[opts.ProposalID].(map[string]any)
+	report := map[string]any{
+		"session_id":  sess.Plan.SessionID,
+		"proposal_id": opts.ProposalID,
+		"status":      outcome.Status,
+	}
+	if proposal != nil {
+		if status, ok := proposal["status"].(string); ok && status != "" {
+			report["status"] = status
+		}
+		if childID, ok := proposal["child_session_id"].(string); ok {
+			report["child_session_id"] = childID
+			report["child_node_id"] = childID
+		}
+	}
+	return report, nil
 }
 
 func admitDynamicChild(st *store.Store, meta map[string]any, proposal map[string]any, recipe map[string]any, profiles map[string]map[string]any, relayRecipes map[string]map[string]any, admittedRounds int, settingsPath string) (dynamicAdmittedChild, map[string]any, error) {

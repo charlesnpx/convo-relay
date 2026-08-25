@@ -14,7 +14,9 @@ import (
 	"testing"
 
 	"github.com/charlesnpx/convo-relay/internal/contracts"
-	"github.com/charlesnpx/convo-relay/internal/store"
+	"github.com/charlesnpx/convo-relay/internal/eventlog"
+	"github.com/charlesnpx/convo-relay/internal/relayv2"
+	"github.com/charlesnpx/convo-relay/internal/session"
 )
 
 func TestParseFlagsAllowsFlagsAfterPositionals(t *testing.T) {
@@ -718,27 +720,33 @@ workspace_isolation = "inherited"
 	if result["execution_kind"] != "recipe" || result["status"] != "completed" || result["recipe_id"] != "neutral-root" || intValue(result["actual_participant_turns"]) != 2 {
 		t.Fatalf("root CLI result = %#v", result)
 	}
-	if result["root_recipe_plan_ref"] == nil || result["latest_root_checkpoint_ref"] == nil {
-		t.Fatalf("root CLI result refs = %#v", result)
+	v2Session, err := session.Open(sessionDir)
+	if err != nil {
+		t.Fatalf("open v2 root session: %v", err)
 	}
-	if len(result["transient_recipe_refs"].([]any)) != 1 || len(result["transient_recipe_contract_refs"].([]any)) != 2 {
-		t.Fatalf("root CLI transient recipe refs = %#v / %#v", result["transient_recipe_refs"], result["transient_recipe_contract_refs"])
+	if v2Session.Plan.RecipeID != "neutral-root" || v2Session.Plan.Provenance != session.ProvenanceRecipe {
+		t.Fatalf("v2 root plan = %#v", v2Session.Plan)
+	}
+	events, err := relayv2.Events(v2Session)
+	if err != nil || len(events) == 0 {
+		t.Fatalf("v2 root events = %#v, %v", events, err)
 	}
 	logData, err := os.ReadFile(providerLog)
 	if err != nil {
 		t.Fatalf("read provider log: %v", err)
 	}
-	if lines := strings.Split(strings.TrimSpace(string(logData)), "\n"); len(lines) != 5 {
+	if lines := strings.Split(strings.TrimSpace(string(logData)), "\n"); len(lines) != 4 {
 		t.Fatalf("unexpected provider invocation log:\n%s", logData)
 	}
-	graphData, err := os.ReadFile(filepath.Join(sessionDir, "graph.json"))
-	if err != nil {
-		t.Fatalf("read graph: %v", err)
+	if _, statErr := os.Stat(filepath.Join(sessionDir, "meta.json")); !errors.Is(statErr, os.ErrNotExist) {
+		t.Fatalf("v2 root unexpectedly wrote legacy metadata: %v", statErr)
 	}
-	graphPayload := decodeJSONObject(t, string(graphData))
-	nodes := graphPayload["nodes"].(map[string]any)
-	if len(nodes) != 1 || nodes["root"] == nil || len(graphPayload["edges"].([]any)) != 0 {
-		t.Fatalf("root CLI graph = %#v", graphPayload)
+	graphPayload, err := relayv2.BuildGraphReport(v2Session)
+	if err != nil {
+		t.Fatalf("build v2 graph: %v", err)
+	}
+	if graphPayload["graph"] == nil {
+		t.Fatalf("v2 root graph = %#v", graphPayload)
 	}
 
 	boundSessionDir := filepath.Join(tempDir, "bound-session")
@@ -759,21 +767,31 @@ workspace_isolation = "inherited"
 		t.Fatalf("run bound recipe CLI: %v\n%s", err, boundOutput)
 	}
 	boundResult := decodeJSONObject(t, string(boundOutput))
-	for _, field := range []string{"integration_bundle_ref", "integration_contract_ref", "named_input_manifest_ref", "execution_workspace_ref"} {
-		if boundResult[field] == nil {
-			t.Fatalf("bound root CLI result missing %s: %#v", field, boundResult)
-		}
+	if boundResult["status"] != "completed" || boundResult["validation_status"] != "validated" {
+		t.Fatalf("bound root result = %#v", boundResult)
 	}
-	boundInputs := boundResult["provider_inputs"].(map[string]any)["inputs"].([]any)
-	if len(boundInputs) != 1 || boundInputs[0].(map[string]any)["name"] != "payload" {
-		t.Fatalf("bound root provider inputs = %#v", boundInputs)
+	boundSession, err := session.Open(boundSessionDir)
+	if err != nil {
+		t.Fatalf("open bound v2 session: %v", err)
+	}
+	if boundSession.Plan.IntegrationContract != "neutral/contract-v1" ||
+		boundSession.Plan.IntegrationInstructions == nil ||
+		len(boundSession.Plan.IntegrationInstructions.Turns) != 2 ||
+		boundSession.Plan.Result.Format != "json" {
+		t.Fatalf("bound v2 plan = %#v", boundSession.Plan)
+	}
+	if len(boundSession.Plan.Inputs) != 1 || boundSession.Plan.Inputs[0].Name != "payload" {
+		t.Fatalf("bound v2 plan inputs = %#v", boundSession.Plan.Inputs)
+	}
+	if _, statErr := os.Stat(filepath.Join(boundSessionDir, "meta.json")); !errors.Is(statErr, os.ErrNotExist) {
+		t.Fatalf("bound v2 session unexpectedly wrote legacy metadata: %v", statErr)
 	}
 
 	logData, err = os.ReadFile(providerLog)
 	if err != nil {
 		t.Fatalf("read provider log after bound run: %v", err)
 	}
-	if lines := strings.Split(strings.TrimSpace(string(logData)), "\n"); len(lines) != 10 {
+	if lines := strings.Split(strings.TrimSpace(string(logData)), "\n"); len(lines) != 8 {
 		t.Fatalf("unexpected provider invocation log after bound run:\n%s", logData)
 	}
 
@@ -810,18 +828,19 @@ workspace_isolation = "inherited"
 	if intValue(compatibilityResult["timeout_seconds"]) != 77 || intValue(compatibilityResult["stall_timeout_seconds"]) != 33 {
 		t.Fatalf("compatible run timeouts = %#v / %#v", compatibilityResult["timeout_seconds"], compatibilityResult["stall_timeout_seconds"])
 	}
-	canonicalLaunchCWD, err := filepath.EvalSymlinks(launchCWD)
+	compatibilitySession, err := session.Open(stringValue(compatibilityResult["session_dir"]))
 	if err != nil {
-		t.Fatalf("canonical launch CWD: %v", err)
+		t.Fatalf("open compatible v2 session: %v", err)
 	}
-	if compatibilityResult["investigation_mode"] != "context_only" || compatibilityResult["source_launch_cwd"] != canonicalLaunchCWD {
-		t.Fatalf("compatible run launch policy = %#v", compatibilityResult)
+	if compatibilitySession.Plan.Investigation != "context_only" ||
+		len(compatibilitySession.Plan.Context) != 1 ||
+		len(compatibilitySession.Plan.Skills) != 1 ||
+		len(compatibilitySession.Plan.TaskPlan) == 0 {
+		t.Fatalf("compatible v2 plan = %#v", compatibilitySession.Plan)
 	}
-	if len(compatibilityResult["launch_context_refs"].([]any)) != 1 || len(compatibilityResult["input_bundle_refs"].([]any)) != 2 {
-		t.Fatalf("compatible context and skill refs = %#v / %#v", compatibilityResult["launch_context_refs"], compatibilityResult["input_bundle_refs"])
-	}
-	if compatibilityResult["launch_plan"] == nil || len(compatibilityResult["transient_recipe_refs"].([]any)) != 2 {
-		t.Fatalf("compatible task plan or recipe sources missing = %#v", compatibilityResult)
+	compatibilityRuntime, err := relayv2.LoadRuntime(compatibilitySession)
+	if err != nil || len(compatibilityRuntime.Recipes) < 3 {
+		t.Fatalf("compatible v2 runtime = %#v, %v", compatibilityRuntime, err)
 	}
 	outputData, err := os.ReadFile(compatibilityOutput)
 	if err != nil {
@@ -835,7 +854,7 @@ workspace_isolation = "inherited"
 	if err != nil {
 		t.Fatalf("read provider log after compatible run: %v", err)
 	}
-	if lines := strings.Split(strings.TrimSpace(string(logData)), "\n"); len(lines) != 15 {
+	if lines := strings.Split(strings.TrimSpace(string(logData)), "\n"); len(lines) != 12 {
 		t.Fatalf("unexpected provider invocation log after compatible run:\n%s", logData)
 	}
 
@@ -926,28 +945,42 @@ workspace_isolation = "inherited"
 			if !errors.As(runErr, &exitErr) || exitErr.ExitCode() != 1 {
 				t.Fatalf("invalid result exit = %v, stdout=%s, stderr=%s", runErr, stdout.String(), stderr.String())
 			}
-			if !strings.Contains(stderr.String(), "JSON input is not syntactically valid") {
+			if !strings.Contains(stderr.String(), "result is not valid JSON") {
 				t.Fatalf("invalid result stderr = %s", stderr.String())
 			}
 			if mode.jsonOutput {
 				stdoutResult := decodeJSONObject(t, stdout.String())
-				if stdoutResult["status"] != "invalid_result" || stdoutResult["result_validation_failed"] != true {
+				if stdoutResult["status"] != "invalid_result" ||
+					stdoutResult["stop_reason"] != "invalid_result" ||
+					stdoutResult["validation_status"] != "invalid" {
 					t.Fatalf("invalid JSON stdout = %#v", stdoutResult)
 				}
 			} else if !strings.Contains(stdout.String(), " invalid_result at ") || !strings.Contains(stdout.String(), "Participant turns: 2/2") {
 				t.Fatalf("invalid plain stdout = %s", stdout.String())
 			}
-			metaData, readErr := os.ReadFile(filepath.Join(sessionDir, "meta.json"))
-			if readErr != nil {
-				t.Fatalf("read invalid result metadata: %v", readErr)
+			invalidSession, openErr := session.Open(sessionDir)
+			if openErr != nil {
+				t.Fatalf("open invalid v2 session: %v", openErr)
 			}
-			meta := decodeJSONObject(t, string(metaData))
-			if meta["status"] != "invalid_result" || meta["raw_result_ref"] == nil || meta["result_validation_ref"] == nil || meta["canonical_result_ref"] != nil {
-				t.Fatalf("persisted invalid result = %#v", meta)
+			invalidEvents, eventsErr := relayv2.Events(invalidSession)
+			if eventsErr != nil {
+				t.Fatalf("read invalid v2 events: %v", eventsErr)
 			}
-			validation, loadErr := store.New(sessionDir).LoadArtifact(meta["result_validation_ref"].(map[string]any))
-			if loadErr != nil || validation["status"] != "failed" || len(validation["diagnostics"].([]any)) == 0 {
-				t.Fatalf("persisted invalid diagnostics = %#v, %v", validation, loadErr)
+			resultInvalid := false
+			terminalInvalid := false
+			for _, event := range invalidEvents {
+				switch payload := event.Payload.(type) {
+				case eventlog.ResultProducedPayload:
+					resultInvalid = payload.ValidationOutcome == "invalid"
+				case eventlog.SessionFinishedPayload:
+					terminalInvalid = payload.Status == "failed" && payload.StopReason == "invalid_result"
+				}
+			}
+			if !resultInvalid || !terminalInvalid {
+				t.Fatalf("persisted invalid v2 events = %#v", invalidEvents)
+			}
+			if _, statErr := os.Stat(filepath.Join(sessionDir, "meta.json")); !errors.Is(statErr, os.ErrNotExist) {
+				t.Fatalf("invalid v2 session unexpectedly wrote legacy metadata: %v", statErr)
 			}
 			if mode.withOutput {
 				outputData, readErr := os.ReadFile(outputPath)
@@ -956,7 +989,7 @@ workspace_isolation = "inherited"
 				}
 				if mode.jsonOutput {
 					fileResult := decodeJSONObject(t, string(outputData))
-					if fileResult["status"] != "invalid_result" || fileResult["session_id"] != meta["session_id"] {
+					if fileResult["status"] != "invalid_result" || fileResult["session_id"] != invalidSession.Plan.SessionID {
 						t.Fatalf("invalid JSON output file = %#v", fileResult)
 					}
 				} else if !strings.Contains(string(outputData), "not a JSON result") {

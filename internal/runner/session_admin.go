@@ -12,8 +12,10 @@ import (
 	"strings"
 
 	"github.com/charlesnpx/convo-relay/internal/contracts"
+	"github.com/charlesnpx/convo-relay/internal/engine"
 	"github.com/charlesnpx/convo-relay/internal/inspect"
 	"github.com/charlesnpx/convo-relay/internal/model"
+	"github.com/charlesnpx/convo-relay/internal/relayv2"
 	"github.com/charlesnpx/convo-relay/internal/store"
 	"github.com/charlesnpx/convo-relay/internal/workspace"
 )
@@ -55,11 +57,34 @@ func ResolveSessionDir(home string, sessionDir string, sessionIDPrefix string) (
 		}
 		return "", err
 	}
+	exactPlanMatches := []string{}
 	matches := []string{}
 	for _, entry := range entries {
-		if entry.IsDir() && strings.HasPrefix(entry.Name(), prefix) {
-			matches = append(matches, filepath.Join(sessionsDir, entry.Name()))
+		if !entry.IsDir() {
+			continue
 		}
+		candidate := filepath.Join(sessionsDir, entry.Name())
+		if sess, found, openErr := relayv2.Open(candidate); openErr != nil {
+			return "", fmt.Errorf("open v2 session candidate %q: %w", entry.Name(), openErr)
+		} else if found {
+			if sess.Plan.SessionID == prefix {
+				exactPlanMatches = append(exactPlanMatches, candidate)
+				continue
+			}
+			if strings.HasPrefix(sess.Plan.SessionID, prefix) {
+				matches = append(matches, candidate)
+				continue
+			}
+		}
+		if strings.HasPrefix(entry.Name(), prefix) {
+			matches = append(matches, candidate)
+		}
+	}
+	if len(exactPlanMatches) == 1 {
+		return exactPlanMatches[0], nil
+	}
+	if len(exactPlanMatches) > 1 {
+		return "", fmt.Errorf("ambiguous session id %q: %d matching v2 sessions", prefix, len(exactPlanMatches))
 	}
 	switch len(matches) {
 	case 0:
@@ -89,6 +114,27 @@ func ListSessions(home string, limit int) ([]map[string]any, error) {
 			continue
 		}
 		sessionDir := filepath.Join(sessionsDir, entry.Name())
+		if sess, found, openErr := relayv2.Open(sessionDir); openErr != nil {
+			return nil, fmt.Errorf("open v2 session %q: %w", entry.Name(), openErr)
+		} else if found {
+			report, reportErr := relayv2.BuildReport(sess, relayv2.ProjectionOptions{})
+			if reportErr != nil {
+				return nil, fmt.Errorf("project v2 session %q: %w", entry.Name(), reportErr)
+			}
+			item := map[string]any{
+				"session_id":    sess.Plan.SessionID,
+				"path":          sessionDir,
+				"status":        report["status"],
+				"mode":          sess.Plan.Mode,
+				"task":          sess.Plan.Task,
+				"actual_rounds": report["actual_rounds"],
+			}
+			if root, ok := report["root"].(map[string]any); ok {
+				item["root"] = root
+			}
+			sessions = append(sessions, item)
+			continue
+		}
 		meta, err := loadMeta(sessionDir)
 		if err != nil {
 			continue
@@ -121,6 +167,19 @@ func QueueSteeringPrompt(sessionDir string, prompt string) (map[string]any, erro
 	text := strings.TrimSpace(prompt)
 	if text == "" {
 		return nil, fmt.Errorf("steering prompt cannot be empty")
+	}
+	if sess, found, err := relayv2.Open(sessionDir); err != nil {
+		return nil, err
+	} else if found {
+		if err := engine.QueueSteering(sess, text); err != nil {
+			return nil, err
+		}
+		return map[string]any{
+			"id":         "steering-queued",
+			"session_id": sess.Plan.SessionID,
+			"prompt":     text,
+			"status":     "queued",
+		}, nil
 	}
 	if err := guardRootLifecycleSession(sessionDir, rootLifecycleActionSteer); err != nil {
 		return nil, err

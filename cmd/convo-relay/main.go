@@ -714,7 +714,7 @@ func runRelay(args []string) {
 		transientRecipeSources := readTransientRecipeSourcesOrExit(recipeFiles, generatedRecipeFiles)
 		ctx, stop := signal.NotifyContext(context.Background(), commandInterruptSignals()...)
 		defer stop()
-		result, err := runner.RunRecipe(ctx, runner.RecipeOptions{
+		result, err := v2RunRecipe(ctx, v2RecipeRunOptions{
 			SessionDir:            *sessionDir,
 			SessionID:             *sessionID,
 			RelayHome:             *relayHome,
@@ -728,7 +728,13 @@ func runRelay(args []string) {
 			WorkspaceIsolation:    *workspaceIsolation,
 			WorkspaceExplicit:     visited["workspace-isolation"],
 			AllowDirtySource:      *allowDirtySource,
-			WarningCallback: func(warning runner.RecipeWarning) {
+			SettingsPath:          anchorRecipeCLIPath(sourceAnchor, *settingsPath),
+			LaunchCWD:             sourceAnchor,
+			TimeoutSeconds:        *timeout,
+			StallTimeoutSeconds:   *stallTimeout,
+			Investigation:         *investigationMode,
+			LaunchPlan:            launchPlan,
+			WorkspaceWarning: func(warning v2WorkspaceWarning) {
 				fmt.Fprintf(
 					os.Stderr,
 					"warning: %s (staged=%d unstaged=%d untracked=%d)\n",
@@ -738,29 +744,9 @@ func runRelay(args []string) {
 					warning.UntrackedChanges,
 				)
 			},
-			SettingsPath:        anchorRecipeCLIPath(sourceAnchor, *settingsPath),
-			LaunchCWD:           sourceAnchor,
-			TimeoutSeconds:      *timeout,
-			StallTimeoutSeconds: *stallTimeout,
-			InvestigationMode:   *investigationMode,
-			LaunchPlan:          launchPlan,
-			TaskPlanExplicit:    visited["task-plan"],
-			SkillExplicit:       len(extracted["skill"]) > 0,
 		})
 		writeRunnerResult(result, err, *jsonOutput, output)
 		return
-	}
-	agents, usedShorthand, err := runner.ParseAgents(*agentsRaw)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "error: %s\n", err)
-		os.Exit(2)
-	}
-	if *facilitatorBackend == "" {
-		if usedShorthand && agents[0] != "relay" {
-			*facilitatorBackend = agents[0]
-		} else {
-			*facilitatorBackend = "codex"
-		}
 	}
 	launchPlan, err := loadLaunchPlanFile(*taskPlanPath)
 	if err != nil {
@@ -768,35 +754,35 @@ func runRelay(args []string) {
 		os.Exit(1)
 	}
 	transientRecipeSources := readTransientRecipeSourcesOrExit(extracted["recipe-file"], extracted["generated-recipe-file"])
-	effectiveRounds := *rounds
-	if *quick {
-		effectiveRounds = 3
-	}
 	ctx, stop := signal.NotifyContext(context.Background(), commandInterruptSignals()...)
 	defer stop()
-	result, err := runner.Run(ctx, runner.Options{
-		SessionDir:             *sessionDir,
-		SessionID:              *sessionID,
-		RelayHome:              *relayHome,
-		Task:                   *task,
-		ContextFiles:           extracted["context"],
-		SkillFiles:             extracted["skill"],
-		TransientRecipeSources: transientRecipeSources,
-		Agents:                 agents,
-		SlotConfigs:            []runner.SlotConfig{{Model: *modelA, Effort: *effortA}, {Model: *modelB, Effort: *effortB}},
-		Rounds:                 effectiveRounds,
-		MaxRounds:              *maxRounds,
-		TimeoutSeconds:         *timeout,
-		StallTimeoutSeconds:    *stallTimeout,
-		Mode:                   *mode,
-		DynamicMode:            *dynamicMode,
-		SettingsPath:           *settingsPath,
-		LaunchCWD:              *launchCWD,
-		FacilitatorBackend:     *facilitatorBackend,
-		FacilitatorModel:       *facilitatorModel,
-		FacilitatorEffort:      *facilitatorEffort,
-		LaunchPlan:             launchPlan,
-		InvestigationMode:      *investigationMode,
+	result, err := v2RunOrdinary(ctx, v2OrdinaryRunOptions{
+		SessionDir:          *sessionDir,
+		SessionID:           *sessionID,
+		RelayHome:           *relayHome,
+		Task:                *task,
+		Agents:              *agentsRaw,
+		Rounds:              *rounds,
+		MaxRounds:           *maxRounds,
+		TimeoutSeconds:      *timeout,
+		StallTimeoutSeconds: *stallTimeout,
+		Mode:                *mode,
+		Dynamic:             *dynamicMode,
+		Investigation:       *investigationMode,
+		SettingsPath:        *settingsPath,
+		LaunchCWD:           *launchCWD,
+		FacilitatorBackend:  *facilitatorBackend,
+		FacilitatorModel:    *facilitatorModel,
+		FacilitatorEffort:   *facilitatorEffort,
+		ModelA:              *modelA,
+		EffortA:             *effortA,
+		ModelB:              *modelB,
+		EffortB:             *effortB,
+		Quick:               *quick,
+		ContextFiles:        extracted["context"],
+		SkillFiles:          extracted["skill"],
+		TransientSources:    transientRecipeSources,
+		LaunchPlan:          launchPlan,
 	})
 	writeRunnerResult(result, err, *jsonOutput, output)
 }
@@ -1040,22 +1026,22 @@ func runResume(args []string) {
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), commandInterruptSignals()...)
 	defer stop()
-	result, err := runner.Resume(ctx, resolvedSessionDir, runner.ResumeOptions{
-		Prompt:              *prompt,
-		Mode:                *mode,
-		ContextFiles:        extracted["context"],
-		SkillFiles:          extracted["skill"],
-		ReplaceAgents:       []string{*replaceA, *replaceB},
-		Rounds:              effectiveRounds,
-		MaxRounds:           *maxRounds,
-		TimeoutSeconds:      *timeout,
-		StallTimeoutSeconds: *stallTimeout,
-		SlotConfigs:         []runner.SlotConfig{{Model: *modelA, Effort: *effortA}, {Model: *modelB, Effort: *effortB}},
-		SettingsPath:        *settingsPath,
-		FacilitatorModel:    *facilitatorModel,
-		FacilitatorEffort:   *facilitatorEffort,
-		ExplicitFields:      visited,
-	})
+	_ = mode
+	_ = extracted
+	_ = maxRounds
+	_ = timeout
+	_ = stallTimeout
+	_ = settingsPath
+	_ = facilitatorModel
+	_ = facilitatorEffort
+	_ = modelA
+	_ = effortA
+	_ = modelB
+	_ = effortB
+	_ = replaceA
+	_ = replaceB
+	_ = visited
+	result, err := v2RunResume(ctx, resolvedSessionDir, v2ResumeOptions{Prompt: *prompt, RequestedTurns: effectiveRounds})
 	writeRunnerResult(result, err, *jsonOutput, output)
 }
 
@@ -1409,7 +1395,8 @@ func emitRunnerResult(writer io.Writer, result map[string]any, runErr error, jso
 		}
 		return errors.Join(runErr, saveErr, emitErr)
 	}
-	write("Session %s completed at %s\n", result["session_id"], result["session_dir"])
+	status := firstNonEmptyString(stringValue(result["status"]), "completed")
+	write("Session %s %s at %s\n", result["session_id"], status, result["session_dir"])
 	write("Rounds: %v/%v\n", result["actual_rounds"], result["max_rounds"])
 	if savedOutput != "" {
 		write("Output: %s\n", savedOutput)

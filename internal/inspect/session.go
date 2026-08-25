@@ -11,6 +11,7 @@ import (
 
 	"github.com/charlesnpx/convo-relay/internal/model"
 	"github.com/charlesnpx/convo-relay/internal/recipes"
+	"github.com/charlesnpx/convo-relay/internal/relayv2"
 	"github.com/charlesnpx/convo-relay/internal/store"
 )
 
@@ -31,6 +32,15 @@ func LoadTranscript(sessionDir string) ([]map[string]any, error) {
 }
 
 func BuildShowTranscriptReport(sessionDir string, fromRound int, roundsSpec string) (map[string]any, error) {
+	if sess, found, err := relayv2.Open(sessionDir); err != nil {
+		return nil, err
+	} else if found {
+		report, err := relayv2.BuildReport(sess, relayv2.ProjectionOptions{})
+		if err != nil {
+			return nil, err
+		}
+		return buildV2ShowTranscriptReport(report, fromRound, roundsSpec)
+	}
 	meta, err := LoadMeta(sessionDir)
 	if err != nil {
 		return nil, err
@@ -87,6 +97,54 @@ func BuildShowTranscriptReport(sessionDir string, fromRound int, roundsSpec stri
 	if root := BuildRootInspectionReport(sessionDir, meta, false); root != nil {
 		report["root"] = root
 	}
+	return model.NewShowReport(report).ToMap(), nil
+}
+
+// buildV2ShowTranscriptReport keeps the public show envelope stable while the
+// contents come from the v2 plan, event log, blobs, and sessionview. It does
+// not reconstruct or write legacy session metadata.
+func buildV2ShowTranscriptReport(report map[string]any, fromRound int, roundsSpec string) (map[string]any, error) {
+	predicate, filterDesc, err := roundPredicate(fromRound, roundsSpec)
+	if err != nil {
+		return nil, err
+	}
+	entries := make([]map[string]any, 0)
+	for _, raw := range asSlice(report["transcript"]) {
+		if entry, ok := raw.(map[string]any); ok {
+			entries = append(entries, entry)
+		}
+	}
+	filtered := filterTranscript(entries, predicate)
+	report["transcript"] = transcriptAny(filtered)
+	report["transcript_payload"] = transcriptAny(filtered)
+	summary, _ := report["summary"].(map[string]any)
+	if summary == nil {
+		summary = map[string]any{}
+		report["summary"] = summary
+	}
+	summary["filtered_rounds"] = len(filtered)
+	if filterDesc != "" {
+		summary["round_filter"] = filterDesc
+	}
+	ledger := emptyLedgerLocal()
+	if len(entries) > 0 {
+		ledger = normalizeLedgerLocal(entries[len(entries)-1]["ledger"])
+	}
+	status := stringFromAny(report["status"])
+	meta := map[string]any{
+		"task":          report["task"],
+		"status":        report["status"],
+		"stop_reason":   report["stop_reason"],
+		"mode":          report["mode"],
+		"rounds":        report["participant_turns"],
+		"max_rounds":    report["max_rounds"],
+		"actual_rounds": report["actual_rounds"],
+		"ledger":        ledger,
+		"slots":         report["slots"],
+	}
+	report["meta"] = meta
+	report["incomplete"] = status == "awaiting_decision" || status == "running"
+	report["export_ready"] = status == "completed" || status == "failed"
 	return model.NewShowReport(report).ToMap(), nil
 }
 

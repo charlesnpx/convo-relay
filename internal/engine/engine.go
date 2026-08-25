@@ -170,6 +170,45 @@ func Resume(ctx context.Context, sess *session.Session, deps Deps, prompt string
 	return runner.execute()
 }
 
+// QueueSteering records a durable operator direction without granting turns.
+// It is intentionally separate from Resume so a completed session can retain
+// a direction for a later explicit turn-budget grant.
+func QueueSteering(sess *session.Session, prompt string) error {
+	text := strings.TrimSpace(prompt)
+	if text == "" {
+		return errors.New("steering prompt is required")
+	}
+	if err := checkResumeLifecycle(sess, text); err != nil {
+		return err
+	}
+	runner, err := newStateRunner(sess)
+	if err != nil {
+		return err
+	}
+	writer, err := sess.EventWriter(runner.blobs)
+	if err != nil {
+		return fmt.Errorf("open event writer: %w", err)
+	}
+	runner.writer = writer
+	runner.closeLog = true
+	defer runner.closeOwnedWriter()
+	events, err := readEvents(sess.Root)
+	if err != nil {
+		return err
+	}
+	if len(events) == 0 {
+		return errors.New("cannot steer a session with no session.started event")
+	}
+	if err := runner.rebuildExecutionState(events); err != nil {
+		return err
+	}
+	ref, err := runner.putText(text)
+	if err != nil {
+		return err
+	}
+	return runner.append(eventlog.SteeringQueuedPayload{Prompt: ref})
+}
+
 // PendingChildren returns every durable child request that has not yet been
 // resolved by a child.decided event.
 func PendingChildren(sess *session.Session) ([]PendingChild, error) {
@@ -1643,6 +1682,11 @@ func (r *runner) promptFor(actor session.Actor, round int, role eventlog.Role, r
 	if prompt := strings.TrimSpace(resumePrompt); prompt != "" {
 		fmt.Fprintf(&builder, "Resume direction: %s\n", prompt)
 	}
+	if role == eventlog.ParticipantRole {
+		if instructions := r.integrationTurnInstructions(actor.ID, round); instructions != "" {
+			fmt.Fprintf(&builder, "\n--- Integration Contract Instructions for This Turn ---\n%s\n", instructions)
+		}
+	}
 	if material := r.promptMaterial(); material != "" {
 		builder.WriteString("\nInputs:\n")
 		builder.WriteString(material)
@@ -1665,9 +1709,27 @@ func (r *runner) promptFor(actor session.Actor, round int, role eventlog.Role, r
 		fmt.Fprintf(&builder, "\nReturn a JSON ledger with settled, contested, and withdrawn arrays. Current counts: settled=%d contested=%d withdrawn=%d.\n", counts.Settled, counts.Contested, counts.Withdrawn)
 	}
 	if role == eventlog.ReducerRole {
+		if r.sess.Plan.IntegrationInstructions != nil {
+			instructions := strings.TrimSpace(r.sess.Plan.IntegrationInstructions.ReducerInstructions)
+			if instructions != "" {
+				fmt.Fprintf(&builder, "\n--- Integration Contract Reducer Instructions ---\n%s\n", instructions)
+			}
+		}
 		builder.WriteString("\nReturn the final reduced result for this task.\n")
 	}
 	return builder.String()
+}
+
+func (r *runner) integrationTurnInstructions(actorID string, round int) string {
+	if r.sess.Plan.IntegrationInstructions == nil {
+		return ""
+	}
+	for _, turn := range r.sess.Plan.IntegrationInstructions.Turns {
+		if turn.ParticipantTurn == round && turn.Actor == actorID {
+			return strings.TrimSpace(turn.Instructions)
+		}
+	}
+	return ""
 }
 
 func (r *runner) promptMaterial() string {
