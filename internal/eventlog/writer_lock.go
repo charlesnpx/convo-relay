@@ -9,6 +9,13 @@ import (
 
 const writerLockFilename = "events.lock"
 
+// WriterLease holds the runtime lock used by event writers. Callers must
+// release it when they are done with a liveness check or an exclusive session
+// operation.
+type WriterLease interface {
+	Release() error
+}
+
 var writerLeaseRegistry = struct {
 	sync.Mutex
 	held map[string]struct{}
@@ -21,6 +28,12 @@ var writerLeaseRegistry = struct {
 type writerLease struct {
 	file *os.File
 	key  string
+}
+
+// AcquireWriterLease acquires the same non-blocking OS lock used by Writer.
+// A WriterLockedError means an event writer currently owns the session.
+func AcquireWriterLease(sessionDir string) (WriterLease, error) {
+	return acquireWriterLease(sessionDir)
 }
 
 func acquireWriterLease(sessionDir string) (*writerLease, error) {
