@@ -13,10 +13,12 @@ import (
 	"strings"
 
 	"github.com/charlesnpx/convo-relay/internal/contracts"
+	"github.com/charlesnpx/convo-relay/internal/engine"
 	"github.com/charlesnpx/convo-relay/internal/inspect"
 	"github.com/charlesnpx/convo-relay/internal/portable"
 	"github.com/charlesnpx/convo-relay/internal/readiness"
 	"github.com/charlesnpx/convo-relay/internal/recipes"
+	"github.com/charlesnpx/convo-relay/internal/relayv2"
 	"github.com/charlesnpx/convo-relay/internal/runner"
 	"github.com/charlesnpx/convo-relay/internal/sessionstore"
 )
@@ -468,7 +470,17 @@ func runShow(args []string) {
 		return
 	}
 	if *proposalsOutput {
-		report, err := runner.Proposals(resolvedSessionDir)
+		sess, err := v2OpenSession(resolvedSessionDir)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "error: %s\n", err)
+			os.Exit(1)
+		}
+		pending, err := engine.PendingChildren(sess)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "error: %s\n", err)
+			os.Exit(1)
+		}
+		report, err := v2ProposalReport(sess, pending)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "error: %s\n", err)
 			os.Exit(1)
@@ -904,10 +916,10 @@ func runControlApprove(args []string) {
 	sessionID := flags.String("session-id", "", "Session id under --home")
 	relayHome := flags.String("home", "", "Optional relay home; defaults to CODEX_CLAUDE_HOME or ~/.codex-claude")
 	proposalID := flags.String("proposal", "", "Proposal id to approve")
-	rounds := flags.Int("rounds", 0, "Override admitted child rounds")
-	timeout := flags.Int("timeout", 600, "Per-turn timeout in seconds")
-	stallTimeout := flags.Int("stall-timeout", 300, "Stall timeout recorded in the child invocation contract")
-	settingsPath := flags.String("settings", "", "Optional settings.toml path")
+	_ = flags.Int("rounds", 0, "Override admitted child rounds")
+	_ = flags.Int("timeout", 600, "Per-turn timeout in seconds")
+	_ = flags.Int("stall-timeout", 300, "Stall timeout recorded in the child invocation contract")
+	_ = flags.String("settings", "", "Optional settings.toml path")
 	jsonOutput := flags.Bool("json", false, "Emit machine-readable approval JSON")
 	if err := parseFlags(flags, args); err != nil {
 		os.Exit(2)
@@ -922,19 +934,59 @@ func runControlApprove(args []string) {
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), commandInterruptSignals()...)
 	defer stop()
-	report, err := runner.ApproveProposal(ctx, resolvedSessionDir, runner.ApproveOptions{
-		ProposalID:          *proposalID,
-		Rounds:              *rounds,
-		TimeoutSeconds:      *timeout,
-		StallTimeoutSeconds: *stallTimeout,
-		SettingsPath:        *settingsPath,
-	})
+	sess, err := v2OpenSession(resolvedSessionDir)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: %s\n", err)
+		os.Exit(1)
+	}
+	runtime, err := relayv2.LoadRuntime(sess)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: %s\n", err)
+		os.Exit(1)
+	}
+	if err := engine.ApproveChild(ctx, sess, *proposalID, runtime.Recipes); err != nil {
+		fmt.Fprintf(os.Stderr, "error: %s\n", err)
+		if errors.Is(err, context.Canceled) {
+			os.Exit(130)
+		}
+		os.Exit(1)
+	}
+	executionCWD, err := relayv2.ExecutionCWD(ctx, sess)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: %s\n", err)
+		os.Exit(1)
+	}
+	outcome, err := engine.Resume(ctx, sess, relayv2.NewDeps(runtime, executionCWD), "", 0)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error: %s\n", err)
 		if errors.Is(err, context.Canceled) {
 			os.Exit(130)
 		}
 		os.Exit(1)
+	}
+	proposals, err := v2ProposalReport(sess, nil)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: %s\n", err)
+		os.Exit(1)
+	}
+	report := map[string]any{
+		"session_id":  sess.Plan.SessionID,
+		"proposal_id": *proposalID,
+		"status":      outcome.Status,
+	}
+	for _, rawProposal := range proposals["proposals"].([]any) {
+		proposal, _ := rawProposal.(map[string]any)
+		if stringValue(proposal["proposal_id"]) != *proposalID {
+			continue
+		}
+		if status := stringValue(proposal["status"]); status != "" {
+			report["status"] = status
+		}
+		if childID := stringValue(proposal["child_session_id"]); childID != "" {
+			report["child_session_id"] = childID
+			report["child_node_id"] = childID
+		}
+		break
 	}
 	if *jsonOutput {
 		writeJSON(report)
@@ -949,7 +1001,7 @@ func runControlReject(args []string) {
 	sessionID := flags.String("session-id", "", "Session id under --home")
 	relayHome := flags.String("home", "", "Optional relay home; defaults to CODEX_CLAUDE_HOME or ~/.codex-claude")
 	proposalID := flags.String("proposal", "", "Proposal id to reject")
-	reason := flags.String("reason", "rejected by operator", "Rejection reason")
+	_ = flags.String("reason", "rejected by operator", "Rejection reason")
 	jsonOutput := flags.Bool("json", false, "Emit machine-readable rejection JSON")
 	if err := parseFlags(flags, args); err != nil {
 		os.Exit(2)
@@ -962,11 +1014,21 @@ func runControlReject(args []string) {
 		fmt.Fprintln(os.Stderr, "error: control reject requires a session and proposal id")
 		os.Exit(2)
 	}
-	report, err := runner.RejectProposal(resolvedSessionDir, runner.RejectOptions{ProposalID: *proposalID, Reason: *reason})
+	ctx, stop := signal.NotifyContext(context.Background(), commandInterruptSignals()...)
+	defer stop()
+	sess, err := v2OpenSession(resolvedSessionDir)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error: %s\n", err)
 		os.Exit(1)
 	}
+	if err := engine.RejectChild(ctx, sess, *proposalID); err != nil {
+		fmt.Fprintf(os.Stderr, "error: %s\n", err)
+		if errors.Is(err, context.Canceled) {
+			os.Exit(130)
+		}
+		os.Exit(1)
+	}
+	report := map[string]any{"session_id": sess.Plan.SessionID, "proposal_id": *proposalID, "status": "rejected"}
 	if *jsonOutput {
 		writeJSON(report)
 		return
@@ -1034,7 +1096,12 @@ func runControlCancel(args []string) {
 		os.Exit(2)
 	}
 	resolvedSessionDir, _ := resolveSessionDirAndArgs(*sessionDir, *sessionID, *relayHome, flags.Args())
-	report, err := runner.Stop(resolvedSessionDir, runner.StopOptions{ForceKill: *force})
+	sess, err := v2OpenSession(resolvedSessionDir)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: %s\n", err)
+		os.Exit(1)
+	}
+	report, err := v2CancelReport(sess, *force)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error: %s\n", err)
 		os.Exit(1)
@@ -1060,10 +1127,25 @@ func runControlSteer(args []string) {
 	if *prompt == "" && len(remaining) > 0 {
 		*prompt = strings.Join(remaining, " ")
 	}
-	item, err := runner.QueueSteeringPrompt(resolvedSessionDir, *prompt)
+	promptText := strings.TrimSpace(*prompt)
+	if promptText == "" {
+		fmt.Fprintln(os.Stderr, "error: steering prompt cannot be empty")
+		os.Exit(1)
+	}
+	sess, err := v2OpenSession(resolvedSessionDir)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error: %s\n", err)
 		os.Exit(1)
+	}
+	if err := engine.QueueSteering(sess, promptText); err != nil {
+		fmt.Fprintf(os.Stderr, "error: %s\n", err)
+		os.Exit(1)
+	}
+	item := map[string]any{
+		"id":         "steering-queued",
+		"session_id": sess.Plan.SessionID,
+		"prompt":     promptText,
+		"status":     "queued",
 	}
 	report := map[string]any{"session_id": filepath.Base(filepath.Clean(resolvedSessionDir)), "steering": item}
 	if *jsonOutput {

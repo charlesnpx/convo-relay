@@ -31,7 +31,6 @@ const (
 	ChildCompleted    Type = "child.completed"
 	SteeringQueued    Type = "steering.queued"
 	SteeringApplied   Type = "steering.applied"
-	CancelRequested   Type = "cancel.requested"
 	InputIngested     Type = "input.ingested"
 	WorkspacePrepared Type = "workspace.prepared"
 	ResultProduced    Type = "result.produced"
@@ -320,14 +319,6 @@ func (p SteeringAppliedPayload) validate() error {
 	}
 	return blobstore.ValidateRef(p.Prompt)
 }
-
-type CancelRequestedPayload struct {
-	Source string `json:"source"`
-	Force  bool   `json:"force"`
-}
-
-func (CancelRequestedPayload) eventType() Type   { return CancelRequested }
-func (p CancelRequestedPayload) validate() error { return validateToken("source", p.Source) }
 
 type InputIngestedPayload struct {
 	LogicalName string            `json:"logical_name"`
@@ -629,13 +620,6 @@ func normalizePayload(payload Payload) (Payload, error) {
 			return nil, errors.New("nil steering.applied payload")
 		}
 		return *value, nil
-	case CancelRequestedPayload:
-		return value, nil
-	case *CancelRequestedPayload:
-		if value == nil {
-			return nil, errors.New("nil cancel.requested payload")
-		}
-		return *value, nil
 	case InputIngestedPayload:
 		return value, nil
 	case *InputIngestedPayload:
@@ -676,7 +660,6 @@ var payloadRegistry = map[Type]func() Payload{
 	ChildCompleted:    func() Payload { return &ChildCompletedPayload{} },
 	SteeringQueued:    func() Payload { return &SteeringQueuedPayload{} },
 	SteeringApplied:   func() Payload { return &SteeringAppliedPayload{} },
-	CancelRequested:   func() Payload { return &CancelRequestedPayload{} },
 	InputIngested:     func() Payload { return &InputIngestedPayload{} },
 	WorkspacePrepared: func() Payload { return &WorkspacePreparedPayload{} },
 	ResultProduced:    func() Payload { return &ResultProducedPayload{} },

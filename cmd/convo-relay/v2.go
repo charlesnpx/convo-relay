@@ -15,6 +15,7 @@ import (
 
 	"github.com/charlesnpx/convo-relay/internal/blobstore"
 	"github.com/charlesnpx/convo-relay/internal/engine"
+	"github.com/charlesnpx/convo-relay/internal/eventlog"
 	"github.com/charlesnpx/convo-relay/internal/integration"
 	"github.com/charlesnpx/convo-relay/internal/plan"
 	"github.com/charlesnpx/convo-relay/internal/recipes"
@@ -107,6 +108,85 @@ type v2RecipeRunOptions struct {
 type v2ResumeOptions struct {
 	Prompt         string
 	RequestedTurns int
+}
+
+func v2OpenSession(root string) (*session.Session, error) {
+	sess, found, err := relayv2.Open(root)
+	if err != nil {
+		return nil, err
+	}
+	if !found {
+		return nil, fmt.Errorf("session %q is not a v2 session", root)
+	}
+	return sess, nil
+}
+
+// v2ProposalReport derives proposal state from child events. pending is read
+// through engine.PendingChildren by the CLI so an undecided request is checked
+// by the same replay path used for admission.
+func v2ProposalReport(sess *session.Session, pending []engine.PendingChild) (map[string]any, error) {
+	if sess == nil {
+		return nil, errors.New("session is required")
+	}
+	graphReport, err := relayv2.BuildGraphReport(sess)
+	if err != nil {
+		return nil, err
+	}
+	graphData, _ := graphReport["graph"].(map[string]any)
+	projections, _ := graphData["proposals"].(map[string]any)
+	if projections == nil {
+		projections = map[string]any{}
+	}
+	for _, child := range pending {
+		proposal, _ := projections[child.RequestID].(map[string]any)
+		copy := make(map[string]any, len(proposal)+5)
+		for key, value := range proposal {
+			copy[key] = value
+		}
+		copy["proposal_id"] = child.RequestID
+		copy["requester_actor_id"] = child.RequesterActorID
+		copy["selected_recipe_id"] = child.RecipeID
+		copy["delegated_question"] = child.Question
+		if status, _ := copy["status"].(string); status == "" || status == "proposed" {
+			copy["status"] = "proposed"
+		}
+		projections[child.RequestID] = copy
+	}
+	items := make([]any, 0, len(projections))
+	for _, requestID := range relayv2.SortProposalIDs(projections) {
+		items = append(items, projections[requestID])
+	}
+	return map[string]any{"session_id": sess.Plan.SessionID, "proposals": items}, nil
+}
+
+// v2CancelReport deliberately does not append an event. A separate control
+// process cannot append while the executing engine owns events.lock, and the
+// v2 format intentionally has no persisted PID to signal. The writer lease is
+// therefore only an authoritative liveness check; an active run must receive
+// its interrupt directly.
+func v2CancelReport(sess *session.Session, force bool) (map[string]any, error) {
+	if sess == nil {
+		return nil, errors.New("session is required")
+	}
+	if force {
+		return nil, errors.New("force cancellation is unavailable for v2 sessions because they do not record process IDs; interrupt the running relay process directly")
+	}
+	lease, err := eventlog.AcquireWriterLease(sess.Root)
+	if err != nil {
+		var locked *eventlog.WriterLockedError
+		if errors.As(err, &locked) {
+			return nil, fmt.Errorf("session %s is running; interrupt its relay process directly", sess.Plan.SessionID)
+		}
+		return nil, err
+	}
+	defer func() {
+		_ = lease.Release()
+	}()
+	report, err := relayv2.BuildReport(sess, relayv2.ProjectionOptions{})
+	if err != nil {
+		return nil, err
+	}
+	return map[string]any{"session_id": sess.Plan.SessionID, "status": report["status"]}, nil
 }
 
 func v2RunOrdinary(ctx context.Context, options v2OrdinaryRunOptions) (map[string]any, error) {

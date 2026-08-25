@@ -4,12 +4,20 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
+	"io"
+	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
+	"sort"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/charlesnpx/convo-relay/internal/blobstore"
+	"github.com/charlesnpx/convo-relay/internal/eventlog"
+	"github.com/charlesnpx/convo-relay/internal/relayv2"
 )
 
 type u2db3CLIResult struct {
@@ -47,6 +55,22 @@ func TestV2CancellationProjectionSeam(t *testing.T) {
 		_ = command.Wait()
 		t.Fatal("provider did not reach the cancellable turn")
 	}
+	sessionDir := u2db3SessionDir(t, env.relayHome, "cancelled")
+	beforeCancel, err := os.ReadFile(filepath.Join(sessionDir, "events.jsonl"))
+	if err != nil {
+		t.Fatalf("read events before control cancel: %v", err)
+	}
+	cancel := env.run(t, "control", "cancel", "--home", env.relayHome, "--json", "cancelled")
+	if cancel.exitCode != 1 || !strings.Contains(cancel.stderr, "interrupt its relay process directly") {
+		t.Fatalf("control cancel = exit %d stdout=%q stderr=%q", cancel.exitCode, cancel.stdout, cancel.stderr)
+	}
+	afterCancel, err := os.ReadFile(filepath.Join(sessionDir, "events.jsonl"))
+	if err != nil {
+		t.Fatalf("read events after control cancel: %v", err)
+	}
+	if !bytes.Equal(afterCancel, beforeCancel) {
+		t.Fatalf("control cancel appended durable state: before=%s after=%s", beforeCancel, afterCancel)
+	}
 	if err := command.Process.Signal(os.Interrupt); err != nil {
 		t.Fatalf("interrupt relay: %v", err)
 	}
@@ -80,6 +104,55 @@ func TestV2CancellationProjectionSeam(t *testing.T) {
 	}
 }
 
+func TestV2ControlSteerQueuesOneBlobBackedEvent(t *testing.T) {
+	env := newU2DB3CLIEnv(t, "steer")
+	seed := env.run(t,
+		"run", "--home", env.relayHome, "--session-id", "steer-queue",
+		"--task", "queue a later direction", "--agents", "gemini", "--rounds", "1",
+		"--settings", env.settingsPath, "--launch-cwd", env.workDir,
+		"--timeout", "30", "--stall-timeout", "30", "--json",
+	)
+	u2db3RequireExit(t, seed, 0)
+	sessionDir := u2db3SessionDir(t, env.relayHome, "steer-queue")
+	sess, found, err := relayv2.Open(sessionDir)
+	if err != nil || !found {
+		t.Fatalf("open seeded v2 session: session=%#v found=%v err=%v", sess, found, err)
+	}
+	before, err := relayv2.Events(sess)
+	if err != nil {
+		t.Fatalf("read events before steering: %v", err)
+	}
+	queued := env.run(t, "control", "steer", "--home", env.relayHome, "--json", "steer-queue", "steer exactly once")
+	u2db3RequireExit(t, queued, 0)
+	after, err := relayv2.Events(sess)
+	if err != nil {
+		t.Fatalf("read events after steering: %v", err)
+	}
+	if len(after) != len(before)+1 {
+		t.Fatalf("steering event count = %d, want %d; events=%#v", len(after), len(before)+1, after)
+	}
+	steering, ok := after[len(after)-1].Payload.(eventlog.SteeringQueuedPayload)
+	if !ok || after[len(after)-1].Type != eventlog.SteeringQueued {
+		t.Fatalf("last event = %#v, want steering.queued", after[len(after)-1])
+	}
+	blobs, err := sess.BlobStore(blobstore.Limits{})
+	if err != nil {
+		t.Fatalf("open blobs: %v", err)
+	}
+	reader, err := blobs.Open(steering.Prompt)
+	if err != nil {
+		t.Fatalf("open steering prompt blob: %v", err)
+	}
+	body, readErr := io.ReadAll(reader)
+	closeErr := reader.Close()
+	if readErr != nil || closeErr != nil {
+		t.Fatalf("read steering prompt blob: read=%v close=%v", readErr, closeErr)
+	}
+	if string(body) != "steer exactly once" {
+		t.Fatalf("steering prompt blob = %q", body)
+	}
+}
+
 func TestV2AskModeProjectionSeam(t *testing.T) {
 	env := newU2DB3CLIEnv(t, "ask")
 	if err := os.WriteFile(env.settingsPath, []byte(u2db3AskSettings), 0o600); err != nil {
@@ -108,6 +181,23 @@ func TestV2AskModeProjectionSeam(t *testing.T) {
 	if got := env.listStatus(t, "ask-mode"); got != "awaiting_decision" {
 		t.Fatalf("list ask-mode status = %q", got)
 	}
+	sessionDir := u2db3SessionDir(t, env.relayHome, "ask-mode")
+	beforeProposals := u2db3SessionTree(t, sessionDir)
+	proposalView := env.run(t, "show", "--proposals", "--home", env.relayHome, "--json", "ask-mode")
+	u2db3RequireExit(t, proposalView, 0)
+	proposalReport := u2db3Report(t, proposalView)
+	proposals, ok := proposalReport["proposals"].([]any)
+	if !ok || len(proposals) != 1 {
+		t.Fatalf("pending proposal view = %#v", proposalReport)
+	}
+	pendingProposal, ok := proposals[0].(map[string]any)
+	if !ok || pendingProposal["status"] != "proposed" {
+		t.Fatalf("pending proposal = %#v", proposals[0])
+	}
+	afterProposals := u2db3SessionTree(t, sessionDir)
+	if !reflect.DeepEqual(afterProposals, beforeProposals) {
+		t.Fatalf("show --proposals created a session artifact: before=%#v after=%#v", beforeProposals, afterProposals)
+	}
 
 	proposalID := env.proposalID(t, "ask-mode")
 	approval := env.run(t,
@@ -128,6 +218,58 @@ func TestV2AskModeProjectionSeam(t *testing.T) {
 	if got := env.listStatus(t, "ask-mode"); got != "completed" {
 		t.Fatalf("list approved ask-mode status = %q", got)
 	}
+	proposalView = env.run(t, "show", "--proposals", "--home", env.relayHome, "--json", "ask-mode")
+	u2db3RequireExit(t, proposalView, 0)
+	proposalReport = u2db3Report(t, proposalView)
+	proposals, ok = proposalReport["proposals"].([]any)
+	if !ok || len(proposals) != 1 {
+		t.Fatalf("decided proposal view = %#v", proposalReport)
+	}
+	decidedProposal, ok := proposals[0].(map[string]any)
+	if !ok || decidedProposal["status"] != "collapsed" {
+		t.Fatalf("decided proposal = %#v", proposals[0])
+	}
+}
+
+func u2db3SessionDir(t *testing.T, relayHome string, sessionID string) string {
+	t.Helper()
+	entries, err := os.ReadDir(filepath.Join(relayHome, "sessions"))
+	if err != nil {
+		t.Fatalf("read session root: %v", err)
+	}
+	matches := []string{}
+	for _, entry := range entries {
+		if entry.IsDir() && strings.HasPrefix(entry.Name(), sessionID+"-") {
+			matches = append(matches, filepath.Join(relayHome, "sessions", entry.Name()))
+		}
+	}
+	if len(matches) != 1 {
+		t.Fatalf("session %q directories = %#v", sessionID, matches)
+	}
+	return matches[0]
+}
+
+func u2db3SessionTree(t *testing.T, root string) []string {
+	t.Helper()
+	paths := []string{}
+	err := filepath.WalkDir(root, func(path string, entry fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		relative, err := filepath.Rel(root, path)
+		if err != nil {
+			return err
+		}
+		if relative != "." {
+			paths = append(paths, relative)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("walk session %s: %v", root, err)
+	}
+	sort.Strings(paths)
+	return paths
 }
 
 func newU2DB3CLIEnv(t *testing.T, mode string) *u2db3CLIEnv {
