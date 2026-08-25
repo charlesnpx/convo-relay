@@ -38,6 +38,8 @@ type StatusView struct {
 // round without consulting any cache or runtime state.
 func Status(_ session.Plan, events []eventlog.Event) StatusView {
 	view := StatusView{Status: "running", Counts: Counts{Events: len(events)}}
+	pendingChildren := make(map[string]bool)
+	abandonedAttempts := make(map[string]bool)
 	for _, event := range events {
 		switch payload := event.Payload.(type) {
 		case eventlog.SessionFinishedPayload:
@@ -72,27 +74,41 @@ func Status(_ session.Plan, events []eventlog.Event) StatusView {
 			}
 		case eventlog.AttemptStartedPayload:
 			view.Counts.AttemptsStarted++
+			abandonedAttempts[attemptKey(payload.ActorID, payload.Attempt)] = true
 		case *eventlog.AttemptStartedPayload:
 			if payload != nil {
 				view.Counts.AttemptsStarted++
+				abandonedAttempts[attemptKey(payload.ActorID, payload.Attempt)] = true
 			}
 		case eventlog.AttemptFinishedPayload:
 			view.Counts.AttemptsFinished++
+			delete(abandonedAttempts, attemptKey(payload.ActorID, payload.Attempt))
 		case *eventlog.AttemptFinishedPayload:
 			if payload != nil {
 				view.Counts.AttemptsFinished++
+				delete(abandonedAttempts, attemptKey(payload.ActorID, payload.Attempt))
 			}
 		case eventlog.ProviderFailedPayload:
 			view.Counts.ProviderFailures++
+			delete(abandonedAttempts, attemptKey(payload.ActorID, payload.Attempts))
 		case *eventlog.ProviderFailedPayload:
 			if payload != nil {
 				view.Counts.ProviderFailures++
+				delete(abandonedAttempts, attemptKey(payload.ActorID, payload.Attempts))
 			}
 		case eventlog.ChildRequestedPayload:
 			view.Counts.ChildrenRequested++
+			pendingChildren[payload.RequestID] = true
 		case *eventlog.ChildRequestedPayload:
 			if payload != nil {
 				view.Counts.ChildrenRequested++
+				pendingChildren[payload.RequestID] = true
+			}
+		case eventlog.ChildDecidedPayload:
+			delete(pendingChildren, payload.RequestID)
+		case *eventlog.ChildDecidedPayload:
+			if payload != nil {
+				delete(pendingChildren, payload.RequestID)
 			}
 		case eventlog.ChildCompletedPayload:
 			view.Counts.ChildrenCompleted++
@@ -100,6 +116,15 @@ func Status(_ session.Plan, events []eventlog.Event) StatusView {
 			if payload != nil {
 				view.Counts.ChildrenCompleted++
 			}
+		}
+	}
+	if !view.Terminal {
+		if len(pendingChildren) != 0 {
+			view.Status = "awaiting_decision"
+			view.StopReason = "awaiting_decision"
+		} else if len(abandonedAttempts) != 0 {
+			view.Status = "interrupted"
+			view.StopReason = "interrupted"
 		}
 	}
 	return view

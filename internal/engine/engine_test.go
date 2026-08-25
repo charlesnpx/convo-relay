@@ -317,6 +317,59 @@ func TestResumeReportsAndRetriesAbandonedAttempt(t *testing.T) {
 	}
 }
 
+func TestRunCancellationLeavesAbandonedAttemptResumable(t *testing.T) {
+	plan := dialoguePlan(1)
+	plan.ProviderRetry = session.ProviderRetry{Mode: "allow", MaxAttempts: 2}
+	sess := createSession(t, plan)
+	started := make(chan struct{})
+	alpha := &fakeBackend{name: "codex", slotID: "alpha", responses: []fakeResponse{
+		{waitForCancel: true, started: started},
+		{content: "resumed after interruption"},
+	}}
+	beta := &fakeBackend{name: "codex", slotID: "beta"}
+	deps := testDeps(map[string]*fakeBackend{"alpha": alpha, "beta": beta})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	type runResult struct {
+		outcome Outcome
+		err     error
+	}
+	results := make(chan runResult, 1)
+	go func() {
+		outcome, err := Run(ctx, sess, deps)
+		results <- runResult{outcome: outcome, err: err}
+	}()
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("provider did not start before cancellation")
+	}
+	cancel()
+	interrupted := <-results
+	if interrupted.err != context.Canceled || interrupted.outcome.Status != statusInterrupted {
+		t.Fatalf("cancellation outcome = %#v, %v", interrupted.outcome, interrupted.err)
+	}
+
+	events := sessionEvents(t, sess)
+	if countType(events, eventlog.ProviderFailed) != 0 || countType(events, eventlog.AttemptFinished) != 0 || countType(events, eventlog.SessionFinished) != 0 {
+		t.Fatalf("cancellation wrote terminal failure events: %v", eventTypes(events))
+	}
+	status := sessionview.Status(plan, events)
+	if status.Terminal || status.Status != statusInterrupted || status.StopReason != statusInterrupted {
+		t.Fatalf("interrupted durable status = %#v", status)
+	}
+
+	resumed, err := Resume(context.Background(), sess, deps, "", 0)
+	if err != nil || resumed.Status != statusCompleted || resumed.Result != "resumed after interruption" {
+		t.Fatalf("resumed interruption = %#v, %v", resumed, err)
+	}
+	events = sessionEvents(t, sess)
+	if countType(events, eventlog.AttemptStarted) != 2 || countType(events, eventlog.SessionFinished) != 1 || sessionFinished(t, events).Status != statusCompleted {
+		t.Fatalf("resumed interruption events = %v", eventTypes(events))
+	}
+}
+
 func TestResumeFinalizesRecordedSuccessWithoutProvider(t *testing.T) {
 	plan := dialoguePlan(1)
 	sess := createSession(t, plan)
@@ -1627,8 +1680,10 @@ func TestBlobReferencesAreVerifiedBeforeEventAppend(t *testing.T) {
 }
 
 type fakeResponse struct {
-	content string
-	err     error
+	content       string
+	err           error
+	waitForCancel bool
+	started       chan struct{}
 }
 
 type fakeBackend struct {
@@ -1646,7 +1701,7 @@ func (b *fakeBackend) Name() string   { return b.name }
 func (b *fakeBackend) SlotID() string { return b.slotID }
 func (b *fakeBackend) Label() string  { return b.slotID }
 
-func (b *fakeBackend) RunTurn(_ context.Context, prompt string, _ provider.TurnOptions) (provider.TurnResult, error) {
+func (b *fakeBackend) RunTurn(ctx context.Context, prompt string, _ provider.TurnOptions) (provider.TurnResult, error) {
 	b.prompts = append(b.prompts, prompt)
 	if b.calls != nil {
 		*b.calls = append(*b.calls, b.slotID)
@@ -1656,6 +1711,13 @@ func (b *fakeBackend) RunTurn(_ context.Context, prompt string, _ provider.TurnO
 		return provider.TurnResult{Content: "default"}, nil
 	}
 	response := b.responses[index]
+	if response.waitForCancel {
+		if response.started != nil {
+			close(response.started)
+		}
+		<-ctx.Done()
+		return provider.TurnResult{}, ctx.Err()
+	}
 	return provider.TurnResult{Content: response.content}, response.err
 }
 

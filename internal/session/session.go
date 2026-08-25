@@ -93,13 +93,18 @@ type Plan struct {
 	// and Workspace by the compiler.
 	Lifecycle           *Lifecycle `json:"lifecycle,omitempty"`
 	IntegrationContract string     `json:"integration_contract,omitempty"`
+	// IntegrationInstructions is the executable prompt projection of a selected
+	// integration contract. It is immutable plan data rather than local runtime
+	// configuration so retries and resume retain the same contract turn text.
+	IntegrationInstructions *IntegrationInstructions `json:"integration_instructions,omitempty"`
 }
 
 type Actor struct {
-	ID      string `json:"id"`
-	Backend string `json:"backend"`
-	Model   string `json:"model"`
-	Effort  string `json:"effort"`
+	ID        string `json:"id"`
+	Backend   string `json:"backend"`
+	Model     string `json:"model"`
+	Effort    string `json:"effort"`
+	ProfileID string `json:"profile_id,omitempty"`
 }
 
 type Schedule struct {
@@ -157,6 +162,23 @@ type Result struct {
 	Source string          `json:"source"`
 	Format string          `json:"format"`
 	Schema json.RawMessage `json:"schema,omitempty"`
+}
+
+// IntegrationInstructions contains only the contract text the engine needs
+// while executing a selected integration-bound recipe. Bundle provenance and
+// local source paths deliberately do not enter the portable plan.
+type IntegrationInstructions struct {
+	Turns               []IntegrationTurn `json:"turns,omitempty"`
+	ReducerInstructions string            `json:"reducer_instructions,omitempty"`
+}
+
+// IntegrationTurn binds one selected contract instruction to the compiled
+// participant turn and actor. ParticipantTurn is one-based, matching the
+// dialogue schedule and integration contract declarations.
+type IntegrationTurn struct {
+	ParticipantTurn int    `json:"participant_turn"`
+	Actor           string `json:"actor"`
+	Instructions    string `json:"instructions"`
 }
 
 // Lifecycle is the canonical normalized recipe lifecycle projection. Runtime
@@ -425,6 +447,9 @@ func ValidatePlan(plan Plan) error {
 		if err := validateOptionalToken("actor.effort", actor.Effort); err != nil {
 			return err
 		}
+		if err := validateOptionalToken("actor.profile_id", actor.ProfileID); err != nil {
+			return err
+		}
 	}
 	if plan.Schedule.Turns < 1 {
 		return errors.New("schedule turns must be positive")
@@ -571,7 +596,52 @@ func ValidatePlan(plan Plan) error {
 			return err
 		}
 	}
+	if err := validateIntegrationInstructions(plan, actorIDs); err != nil {
+		return err
+	}
 	return eventlog.ValidatePortableValue(portableProjection(plan))
+}
+
+func validateIntegrationInstructions(plan Plan, actors map[string]bool) error {
+	instructions := plan.IntegrationInstructions
+	if instructions == nil {
+		return nil
+	}
+	if plan.IntegrationContract == "" {
+		return errors.New("integration instructions require integration_contract")
+	}
+	turns := make(map[int]struct{}, len(instructions.Turns))
+	for _, turn := range instructions.Turns {
+		if turn.ParticipantTurn < 1 {
+			return errors.New("integration instruction participant_turn must be positive")
+		}
+		if _, exists := turns[turn.ParticipantTurn]; exists {
+			return fmt.Errorf("plan contains duplicate integration instruction for participant turn %d", turn.ParticipantTurn)
+		}
+		turns[turn.ParticipantTurn] = struct{}{}
+		if _, exists := actors[turn.Actor]; !exists {
+			return fmt.Errorf("integration instruction names unknown actor %q", turn.Actor)
+		}
+		if (plan.Facilitator != nil && turn.Actor == plan.Facilitator.Actor) ||
+			(plan.Reducer != nil && turn.Actor == plan.Reducer.Actor) {
+			return fmt.Errorf("integration instruction must name a participant actor, got %q", turn.Actor)
+		}
+		if strings.TrimSpace(turn.Instructions) == "" || strings.Contains(turn.Instructions, "\x00") {
+			return fmt.Errorf("integration instruction for participant turn %d is invalid", turn.ParticipantTurn)
+		}
+	}
+	if instructions.ReducerInstructions != "" {
+		if plan.Reducer == nil {
+			return errors.New("integration reducer instructions require a reducer")
+		}
+		if strings.Contains(instructions.ReducerInstructions, "\x00") {
+			return errors.New("integration reducer instructions contain a control character")
+		}
+	}
+	if plan.Result.Source == "reducer" && strings.TrimSpace(instructions.ReducerInstructions) == "" {
+		return errors.New("integration reducer result requires reducer instructions")
+	}
+	return nil
 }
 
 // ActorIDs returns deterministic actor ids without exposing an untyped map.

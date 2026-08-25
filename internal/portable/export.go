@@ -12,6 +12,8 @@ import (
 
 	"github.com/charlesnpx/convo-relay/internal/contracts"
 	"github.com/charlesnpx/convo-relay/internal/inspect"
+	"github.com/charlesnpx/convo-relay/internal/relayv2"
+	"github.com/charlesnpx/convo-relay/internal/session"
 	"github.com/charlesnpx/convo-relay/internal/store"
 )
 
@@ -48,6 +50,11 @@ func Export(sessionDir string, targetDir string, options Options) (*Result, erro
 		return nil, contracts.NewValidationError("portable export target already exists")
 	} else if !os.IsNotExist(err) {
 		return nil, err
+	}
+	if sess, found, openErr := relayv2.Open(sessionRoot); openErr != nil {
+		return nil, openErr
+	} else if found {
+		return exportV2(sess, target, options)
 	}
 
 	st := store.New(sessionRoot)
@@ -88,6 +95,78 @@ func Export(sessionDir string, targetDir string, options Options) (*Result, erro
 		"convo_relay_version": strings.TrimSpace(options.ConvoRelayVersion),
 		"terminal_status":     strings.TrimSpace(stringValue(meta["status"])),
 		"stop_reason":         emptyStringAsNil(stringValue(meta["stop_reason"])),
+		"session_payload":     "payloads/root_session/session.json",
+		"transcript_payload":  "payloads/participant_transcript/transcript.json",
+		"diagnostics_payload": "payloads/diagnostics/diagnostics.json",
+		"payload_inventory":   inventory,
+	})
+	if err != nil {
+		return nil, err
+	}
+	if err := publishDirectory(target, payloads, manifest); err != nil {
+		return nil, err
+	}
+	return &Result{Directory: target, Manifest: manifest}, nil
+}
+
+// exportV2 emits only the three synthetic portable payloads. Their contents
+// are derived from the immutable plan, typed event log, blobs, sessionview,
+// and the workspace provenance projection; no local runtime paths or legacy
+// store artifacts cross this boundary.
+func exportV2(sess *session.Session, target string, options Options) (*Result, error) {
+	if sess.Plan.Provenance != session.ProvenanceRecipe {
+		return nil, contracts.NewValidationError("portable export requires a direct root session")
+	}
+	report, err := relayv2.BuildReport(sess, relayv2.ProjectionOptions{})
+	if err != nil {
+		return nil, err
+	}
+	status := strings.TrimSpace(stringValue(report["status"]))
+	switch status {
+	case "completed", "failed":
+	default:
+		return nil, contracts.NewValidationError("portable export requires a terminal root session, got %q", status)
+	}
+	root, _ := report["root"].(map[string]any)
+	sessionPayload := map[string]any{
+		"kind":                          "portable_v2_root_session",
+		"plan":                          sess.Plan,
+		"terminal_status":               status,
+		"stop_reason":                   report["stop_reason"],
+		"result_source":                 report["result_source"],
+		"validation_status":             report["validation_status"],
+		"workspace_content_source":      report["workspace_content_source"],
+		"working_tree_changes_included": report["working_tree_changes_included"],
+		"root":                          root,
+	}
+	diagnostics, _ := report["diagnostics"].(map[string]any)
+	payloads := make([]exportPayload, 0, 3)
+	for _, item := range []struct {
+		kind string
+		id   string
+		data any
+	}{
+		{kind: "root_session", id: "session", data: sessionPayload},
+		{kind: "participant_transcript", id: "transcript", data: report["transcript_payload"]},
+		{kind: "diagnostics", id: "diagnostics", data: diagnostics},
+	} {
+		payload, err := newExportPayload(item.kind, item.id, item.data, nil)
+		if err != nil {
+			return nil, err
+		}
+		payloads = append(payloads, payload)
+	}
+	sort.Slice(payloads, func(left, right int) bool {
+		return stringValue(payloads[left].entry["path"]) < stringValue(payloads[right].entry["path"])
+	})
+	inventory := make([]any, 0, len(payloads))
+	for _, payload := range payloads {
+		inventory = append(inventory, payload.entry)
+	}
+	manifest, err := contracts.PortableExportManifest(map[string]any{
+		"convo_relay_version": strings.TrimSpace(options.ConvoRelayVersion),
+		"terminal_status":     status,
+		"stop_reason":         emptyStringAsNil(stringValue(report["stop_reason"])),
 		"session_payload":     "payloads/root_session/session.json",
 		"transcript_payload":  "payloads/participant_transcript/transcript.json",
 		"diagnostics_payload": "payloads/diagnostics/diagnostics.json",

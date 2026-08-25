@@ -714,7 +714,7 @@ func runRelay(args []string) {
 		transientRecipeSources := readTransientRecipeSourcesOrExit(recipeFiles, generatedRecipeFiles)
 		ctx, stop := signal.NotifyContext(context.Background(), commandInterruptSignals()...)
 		defer stop()
-		result, err := runner.RunRecipe(ctx, runner.RecipeOptions{
+		result, err := v2RunRecipe(ctx, v2RecipeRunOptions{
 			SessionDir:            *sessionDir,
 			SessionID:             *sessionID,
 			RelayHome:             *relayHome,
@@ -728,7 +728,13 @@ func runRelay(args []string) {
 			WorkspaceIsolation:    *workspaceIsolation,
 			WorkspaceExplicit:     visited["workspace-isolation"],
 			AllowDirtySource:      *allowDirtySource,
-			WarningCallback: func(warning runner.RecipeWarning) {
+			SettingsPath:          anchorRecipeCLIPath(sourceAnchor, *settingsPath),
+			LaunchCWD:             sourceAnchor,
+			TimeoutSeconds:        *timeout,
+			StallTimeoutSeconds:   *stallTimeout,
+			Investigation:         *investigationMode,
+			LaunchPlan:            launchPlan,
+			WorkspaceWarning: func(warning v2WorkspaceWarning) {
 				fmt.Fprintf(
 					os.Stderr,
 					"warning: %s (staged=%d unstaged=%d untracked=%d)\n",
@@ -738,29 +744,9 @@ func runRelay(args []string) {
 					warning.UntrackedChanges,
 				)
 			},
-			SettingsPath:        anchorRecipeCLIPath(sourceAnchor, *settingsPath),
-			LaunchCWD:           sourceAnchor,
-			TimeoutSeconds:      *timeout,
-			StallTimeoutSeconds: *stallTimeout,
-			InvestigationMode:   *investigationMode,
-			LaunchPlan:          launchPlan,
-			TaskPlanExplicit:    visited["task-plan"],
-			SkillExplicit:       len(extracted["skill"]) > 0,
 		})
 		writeRunnerResult(result, err, *jsonOutput, output)
 		return
-	}
-	agents, usedShorthand, err := runner.ParseAgents(*agentsRaw)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "error: %s\n", err)
-		os.Exit(2)
-	}
-	if *facilitatorBackend == "" {
-		if usedShorthand && agents[0] != "relay" {
-			*facilitatorBackend = agents[0]
-		} else {
-			*facilitatorBackend = "codex"
-		}
 	}
 	launchPlan, err := loadLaunchPlanFile(*taskPlanPath)
 	if err != nil {
@@ -768,35 +754,35 @@ func runRelay(args []string) {
 		os.Exit(1)
 	}
 	transientRecipeSources := readTransientRecipeSourcesOrExit(extracted["recipe-file"], extracted["generated-recipe-file"])
-	effectiveRounds := *rounds
-	if *quick {
-		effectiveRounds = 3
-	}
 	ctx, stop := signal.NotifyContext(context.Background(), commandInterruptSignals()...)
 	defer stop()
-	result, err := runner.Run(ctx, runner.Options{
-		SessionDir:             *sessionDir,
-		SessionID:              *sessionID,
-		RelayHome:              *relayHome,
-		Task:                   *task,
-		ContextFiles:           extracted["context"],
-		SkillFiles:             extracted["skill"],
-		TransientRecipeSources: transientRecipeSources,
-		Agents:                 agents,
-		SlotConfigs:            []runner.SlotConfig{{Model: *modelA, Effort: *effortA}, {Model: *modelB, Effort: *effortB}},
-		Rounds:                 effectiveRounds,
-		MaxRounds:              *maxRounds,
-		TimeoutSeconds:         *timeout,
-		StallTimeoutSeconds:    *stallTimeout,
-		Mode:                   *mode,
-		DynamicMode:            *dynamicMode,
-		SettingsPath:           *settingsPath,
-		LaunchCWD:              *launchCWD,
-		FacilitatorBackend:     *facilitatorBackend,
-		FacilitatorModel:       *facilitatorModel,
-		FacilitatorEffort:      *facilitatorEffort,
-		LaunchPlan:             launchPlan,
-		InvestigationMode:      *investigationMode,
+	result, err := v2RunOrdinary(ctx, v2OrdinaryRunOptions{
+		SessionDir:          *sessionDir,
+		SessionID:           *sessionID,
+		RelayHome:           *relayHome,
+		Task:                *task,
+		Agents:              *agentsRaw,
+		Rounds:              *rounds,
+		MaxRounds:           *maxRounds,
+		TimeoutSeconds:      *timeout,
+		StallTimeoutSeconds: *stallTimeout,
+		Mode:                *mode,
+		Dynamic:             *dynamicMode,
+		Investigation:       *investigationMode,
+		SettingsPath:        *settingsPath,
+		LaunchCWD:           *launchCWD,
+		FacilitatorBackend:  *facilitatorBackend,
+		FacilitatorModel:    *facilitatorModel,
+		FacilitatorEffort:   *facilitatorEffort,
+		ModelA:              *modelA,
+		EffortA:             *effortA,
+		ModelB:              *modelB,
+		EffortB:             *effortB,
+		Quick:               *quick,
+		ContextFiles:        extracted["context"],
+		SkillFiles:          extracted["skill"],
+		TransientSources:    transientRecipeSources,
+		LaunchPlan:          launchPlan,
 	})
 	writeRunnerResult(result, err, *jsonOutput, output)
 }
@@ -993,28 +979,28 @@ func runResume(args []string) {
 	sessionID := flags.String("session-id", "", "Session id under --home when --session-dir is omitted")
 	relayHome := flags.String("home", "", "Optional relay home; defaults to CODEX_CLAUDE_HOME or ~/.codex-claude")
 	prompt := flags.String("prompt", "", "Optional new direction for the next turn")
-	mode := flags.String("mode", "", "Typed mode control for resumed rounds: adversarial, cooperative, or steelman")
+	_ = flags.String("mode", "", "Typed mode control for resumed rounds: adversarial, cooperative, or steelman")
 	_ = flags.String("context", "", "Attach resume context text files; may be repeated. Limits: 1 MiB per file, 2 MiB total")
 	_ = flags.String("skill", "", "Attach resume capability text files; may be repeated")
 	rounds := flags.Int("rounds", 0, "Resume for exactly N additional rounds; omit for auto-stop")
-	maxRounds := flags.Int("max-rounds", 50, "Additional-round safety cap when --rounds is omitted")
-	timeout := flags.Int("timeout", 600, "Per-turn timeout in seconds")
-	stallTimeout := flags.Int("stall-timeout", 300, "Claude JSONL stall timeout in seconds")
-	settingsPath := flags.String("settings", "", "Optional settings.toml path")
-	facilitatorModel := flags.String("facilitator-model", "", "Facilitator model override")
-	facilitatorEffort := flags.String("facilitator-effort", "", "Facilitator effort override")
+	_ = flags.Int("max-rounds", 50, "Additional-round safety cap when --rounds is omitted")
+	_ = flags.Int("timeout", 600, "Per-turn timeout in seconds")
+	_ = flags.Int("stall-timeout", 300, "Claude JSONL stall timeout in seconds")
+	_ = flags.String("settings", "", "Optional settings.toml path")
+	_ = flags.String("facilitator-model", "", "Facilitator model override")
+	_ = flags.String("facilitator-effort", "", "Facilitator effort override")
 	quick := flags.Bool("quick", false, "Force exactly 3 additional rounds")
 	output := ""
 	flags.StringVar(&output, "output", "", "Write transcript or JSON export to file")
 	flags.StringVar(&output, "o", "", "Alias for --output")
-	modelA := flags.String("model-a", "", "Model override for slot_0")
-	effortA := flags.String("effort-a", "", "Effort override for slot_0")
-	modelB := flags.String("model-b", "", "Model override for slot_1")
-	effortB := flags.String("effort-b", "", "Effort override for slot_1")
-	replaceA := flags.String("replace-a", "", "Advanced: replace slot_0 backend/profile for resumed turns")
-	replaceB := flags.String("replace-b", "", "Advanced: replace slot_1 backend/profile for resumed turns")
+	_ = flags.String("model-a", "", "Model override for slot_0")
+	_ = flags.String("effort-a", "", "Effort override for slot_0")
+	_ = flags.String("model-b", "", "Model override for slot_1")
+	_ = flags.String("effort-b", "", "Effort override for slot_1")
+	_ = flags.String("replace-a", "", "Advanced: replace slot_0 backend/profile for resumed turns")
+	_ = flags.String("replace-b", "", "Advanced: replace slot_1 backend/profile for resumed turns")
 	jsonOutput := flags.Bool("json", false, "Emit machine-readable run JSON")
-	extracted, cleanedArgs, err := extractMultiValueFlags(args, "context", "skill")
+	_, cleanedArgs, err := extractMultiValueFlags(args, "context", "skill")
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error: %s\n", err)
 		os.Exit(2)
@@ -1022,17 +1008,9 @@ func runResume(args []string) {
 	if err := parseFlags(flags, cleanedArgs); err != nil {
 		os.Exit(2)
 	}
-	visited := visitedFlagNames(flags)
-	if len(extracted["context"]) > 0 {
-		visited["context"] = true
-	}
-	if len(extracted["skill"]) > 0 {
-		visited["skill"] = true
-	}
 	resolvedSessionDir, remaining := resolveSessionDirAndArgs(*sessionDir, *sessionID, *relayHome, flags.Args())
 	if *prompt == "" && len(remaining) > 0 {
 		*prompt = strings.Join(remaining, " ")
-		visited["prompt"] = true
 	}
 	effectiveRounds := *rounds
 	if *quick {
@@ -1040,22 +1018,7 @@ func runResume(args []string) {
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), commandInterruptSignals()...)
 	defer stop()
-	result, err := runner.Resume(ctx, resolvedSessionDir, runner.ResumeOptions{
-		Prompt:              *prompt,
-		Mode:                *mode,
-		ContextFiles:        extracted["context"],
-		SkillFiles:          extracted["skill"],
-		ReplaceAgents:       []string{*replaceA, *replaceB},
-		Rounds:              effectiveRounds,
-		MaxRounds:           *maxRounds,
-		TimeoutSeconds:      *timeout,
-		StallTimeoutSeconds: *stallTimeout,
-		SlotConfigs:         []runner.SlotConfig{{Model: *modelA, Effort: *effortA}, {Model: *modelB, Effort: *effortB}},
-		SettingsPath:        *settingsPath,
-		FacilitatorModel:    *facilitatorModel,
-		FacilitatorEffort:   *facilitatorEffort,
-		ExplicitFields:      visited,
-	})
+	result, err := v2RunResume(ctx, resolvedSessionDir, v2ResumeOptions{Prompt: *prompt, RequestedTurns: effectiveRounds})
 	writeRunnerResult(result, err, *jsonOutput, output)
 }
 
@@ -1409,7 +1372,8 @@ func emitRunnerResult(writer io.Writer, result map[string]any, runErr error, jso
 		}
 		return errors.Join(runErr, saveErr, emitErr)
 	}
-	write("Session %s completed at %s\n", result["session_id"], result["session_dir"])
+	status := firstNonEmptyString(stringValue(result["status"]), "completed")
+	write("Session %s %s at %s\n", result["session_id"], status, result["session_dir"])
 	write("Rounds: %v/%v\n", result["actual_rounds"], result["max_rounds"])
 	if savedOutput != "" {
 		write("Output: %s\n", savedOutput)

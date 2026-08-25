@@ -27,6 +27,7 @@ import (
 const (
 	statusCompleted        = "completed"
 	statusFailed           = "failed"
+	statusInterrupted      = "interrupted"
 	statusAwaitingDecision = "awaiting_decision"
 
 	stopCompleted        = "completed"
@@ -73,8 +74,9 @@ type Deps struct {
 
 // Outcome contains the parent-facing result and execution classification needed
 // by parent-child execution. Status is terminal when the session is terminal,
-// or awaiting_decision while an ask-mode child request is pending. Diagnostics
-// and transcript details remain derived through sessionview.
+// interrupted when a caller cancelled active work, or awaiting_decision while
+// an ask-mode child request is pending. Diagnostics and transcript details
+// remain derived through sessionview.
 type Outcome struct {
 	Result string
 	Status string
@@ -168,6 +170,45 @@ func Resume(ctx context.Context, sess *session.Session, deps Deps, prompt string
 		}
 	}
 	return runner.execute()
+}
+
+// QueueSteering records a durable operator direction without granting turns.
+// It is intentionally separate from Resume so a completed session can retain
+// a direction for a later explicit turn-budget grant.
+func QueueSteering(sess *session.Session, prompt string) error {
+	text := strings.TrimSpace(prompt)
+	if text == "" {
+		return errors.New("steering prompt is required")
+	}
+	if err := checkResumeLifecycle(sess, text); err != nil {
+		return err
+	}
+	runner, err := newStateRunner(sess)
+	if err != nil {
+		return err
+	}
+	writer, err := sess.EventWriter(runner.blobs)
+	if err != nil {
+		return fmt.Errorf("open event writer: %w", err)
+	}
+	runner.writer = writer
+	runner.closeLog = true
+	defer runner.closeOwnedWriter()
+	events, err := readEvents(sess.Root)
+	if err != nil {
+		return err
+	}
+	if len(events) == 0 {
+		return errors.New("cannot steer a session with no session.started event")
+	}
+	if err := runner.rebuildExecutionState(events); err != nil {
+		return err
+	}
+	ref, err := runner.putText(text)
+	if err != nil {
+		return err
+	}
+	return runner.append(eventlog.SteeringQueuedPayload{Prompt: ref})
 }
 
 // PendingChildren returns every durable child request that has not yet been
@@ -913,11 +954,17 @@ func (r *runner) hasUnstartedGrantedWork() bool {
 
 func (r *runner) execute() (Outcome, error) {
 	for {
+		if err := r.ctx.Err(); err != nil {
+			return r.finishInterrupted(err)
+		}
 		if r.state.terminal != nil && !r.hasUnstartedGrantedWork() {
 			return r.outcome(), nil
 		}
 		if r.state.active != nil {
 			if err := r.serviceActiveTurn(); err != nil {
+				if cancelErr := r.ctx.Err(); cancelErr != nil {
+					return r.finishInterrupted(cancelErr)
+				}
 				reason := stopProviderFailed
 				var failure *executionFailure
 				if errors.As(err, &failure) {
@@ -929,6 +976,9 @@ func (r *runner) execute() (Outcome, error) {
 		}
 		awaitingChild, err := r.servicePendingChildren()
 		if err != nil {
+			if cancelErr := r.ctx.Err(); cancelErr != nil {
+				return r.finishInterrupted(cancelErr)
+			}
 			reason := stopProviderFailed
 			var failure *executionFailure
 			if errors.As(err, &failure) {
@@ -950,7 +1000,13 @@ func (r *runner) execute() (Outcome, error) {
 		}
 		next, err := r.nextTurn()
 		if err != nil {
+			if cancelErr := r.ctx.Err(); cancelErr != nil {
+				return r.finishInterrupted(cancelErr)
+			}
 			return r.finishFailure(stopProviderFailed, err)
+		}
+		if err := r.ctx.Err(); err != nil {
+			return r.finishInterrupted(err)
 		}
 		if err := r.append(eventlog.TurnStartedPayload{ActorID: next.Actor.ID, Round: next.Round, Role: next.Role}); err != nil {
 			return Outcome{}, err
@@ -1128,6 +1184,9 @@ func (r *runner) callActiveAttempt(turn *turnState, attemptNumber int) error {
 		TimeoutSeconds:      r.sess.Plan.Timeouts.TurnSeconds,
 		StallTimeoutSeconds: r.sess.Plan.Timeouts.StallSeconds,
 	})
+	if err := r.ctx.Err(); err != nil {
+		return err
+	}
 	ref, putErr := r.putText(result.Content)
 	if putErr != nil {
 		return putErr
@@ -1419,6 +1478,9 @@ func (r *runner) runChild(child *childState) (bool, error) {
 	} else {
 		childOutcome, childErr = Resume(r.ctx, childSession, childDeps, "", 0)
 	}
+	if err := r.ctx.Err(); err != nil {
+		return false, err
+	}
 	childStatus := childOutcome.Status
 	if childErr != nil {
 		childStatus = statusFailed
@@ -1562,6 +1624,16 @@ func (r *runner) finishFailure(reason string, cause error) (Outcome, error) {
 	return r.outcome(), cause
 }
 
+// finishInterrupted intentionally appends no terminal event. The outstanding
+// attempt remains an abandoned durable prefix, which Resume already retries
+// according to the plan's provider retry policy.
+func (r *runner) finishInterrupted(cause error) (Outcome, error) {
+	if cause == nil {
+		cause = context.Canceled
+	}
+	return Outcome{Result: r.state.lastResult.Text, Status: statusInterrupted}, cause
+}
+
 func (r *runner) outcome() Outcome {
 	status := ""
 	if r.state.terminal != nil {
@@ -1643,6 +1715,11 @@ func (r *runner) promptFor(actor session.Actor, round int, role eventlog.Role, r
 	if prompt := strings.TrimSpace(resumePrompt); prompt != "" {
 		fmt.Fprintf(&builder, "Resume direction: %s\n", prompt)
 	}
+	if role == eventlog.ParticipantRole {
+		if instructions := r.integrationTurnInstructions(actor.ID, round); instructions != "" {
+			fmt.Fprintf(&builder, "\n--- Integration Contract Instructions for This Turn ---\n%s\n", instructions)
+		}
+	}
 	if material := r.promptMaterial(); material != "" {
 		builder.WriteString("\nInputs:\n")
 		builder.WriteString(material)
@@ -1665,9 +1742,27 @@ func (r *runner) promptFor(actor session.Actor, round int, role eventlog.Role, r
 		fmt.Fprintf(&builder, "\nReturn a JSON ledger with settled, contested, and withdrawn arrays. Current counts: settled=%d contested=%d withdrawn=%d.\n", counts.Settled, counts.Contested, counts.Withdrawn)
 	}
 	if role == eventlog.ReducerRole {
+		if r.sess.Plan.IntegrationInstructions != nil {
+			instructions := strings.TrimSpace(r.sess.Plan.IntegrationInstructions.ReducerInstructions)
+			if instructions != "" {
+				fmt.Fprintf(&builder, "\n--- Integration Contract Reducer Instructions ---\n%s\n", instructions)
+			}
+		}
 		builder.WriteString("\nReturn the final reduced result for this task.\n")
 	}
 	return builder.String()
+}
+
+func (r *runner) integrationTurnInstructions(actorID string, round int) string {
+	if r.sess.Plan.IntegrationInstructions == nil {
+		return ""
+	}
+	for _, turn := range r.sess.Plan.IntegrationInstructions.Turns {
+		if turn.ParticipantTurn == round && turn.Actor == actorID {
+			return strings.TrimSpace(turn.Instructions)
+		}
+	}
+	return ""
 }
 
 func (r *runner) promptMaterial() string {
