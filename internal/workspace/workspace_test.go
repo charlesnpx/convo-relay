@@ -61,10 +61,14 @@ func TestPrepareCrashGapRebuildsHeadCopyStateFromPreparedEvent(t *testing.T) {
 	runGitTest(t, repository, "init")
 	runGitTest(t, repository, "config", "user.email", "test@example.invalid")
 	runGitTest(t, repository, "config", "user.name", "workspace test")
-	if err := os.WriteFile(filepath.Join(repository, "value.txt"), []byte("committed\n"), 0o600); err != nil {
+	launchCWD := filepath.Join(repository, "nested")
+	if err := os.Mkdir(launchCWD, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	runGitTest(t, repository, "add", "value.txt")
+	if err := os.WriteFile(filepath.Join(launchCWD, "value.txt"), []byte("committed\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runGitTest(t, repository, "add", "nested/value.txt")
 	runGitTest(t, repository, "commit", "-m", "initial")
 	compiled, err := plan.FromFlags(plan.Flags{SessionID: "workspace-crash-gap", Task: "test", Agents: "codex,codex", Rounds: 1, Workspace: session.Workspace{Mode: ModeHeadCopy}})
 	if err != nil {
@@ -76,7 +80,7 @@ func TestPrepareCrashGapRebuildsHeadCopyStateFromPreparedEvent(t *testing.T) {
 	}
 
 	stateWriteFailure := errors.New("simulated state write failure")
-	_, err = prepareWithStateSaver(context.Background(), sess, Options{LaunchCWD: repository, Mode: ModeHeadCopy}, func(*session.Session, Materialized) error {
+	_, err = prepareWithStateSaver(context.Background(), sess, Options{LaunchCWD: launchCWD, Mode: ModeHeadCopy}, func(*session.Session, Materialized) error {
 		return stateWriteFailure
 	})
 	if !errors.Is(err, stateWriteFailure) {
@@ -86,7 +90,7 @@ func TestPrepareCrashGapRebuildsHeadCopyStateFromPreparedEvent(t *testing.T) {
 		t.Fatalf("workspace state after simulated crash = %v, want absent", err)
 	}
 	prepared, found, err := preparedEvent(sess)
-	if err != nil || !found || prepared.Mode != ModeHeadCopy || prepared.Commit == "" || prepared.TreeHash == "" {
+	if err != nil || !found || prepared.Mode != ModeHeadCopy || prepared.Commit == "" || prepared.TreeHash == "" || prepared.RelativePath != "nested" {
 		t.Fatalf("durable workspace event = %#v found=%t err=%v", prepared, found, err)
 	}
 
@@ -95,7 +99,7 @@ func TestPrepareCrashGapRebuildsHeadCopyStateFromPreparedEvent(t *testing.T) {
 		t.Fatalf("recover from workspace.prepared: %v", err)
 	}
 	t.Cleanup(func() { _ = Cleanup(context.Background(), sess) })
-	if recovered.Mode != ModeHeadCopy || recovered.ExecutionCWD != filepath.Join(sess.Root, "runtime", "workspace") || recovered.Commit != prepared.Commit || recovered.TreeHash != prepared.TreeHash {
+	if recovered.Mode != ModeHeadCopy || recovered.ExecutionCWD != filepath.Join(sess.Root, "runtime", "workspace", "nested") || recovered.Commit != prepared.Commit || recovered.TreeHash != prepared.TreeHash {
 		t.Fatalf("rebuilt workspace = %#v, event = %#v", recovered, prepared)
 	}
 	if _, err := os.Stat(statePath(sess)); err != nil {

@@ -46,6 +46,7 @@ type Materialized struct {
 	SourceRoot   string
 	Commit       string
 	TreeHash     string
+	RelativePath string
 }
 
 type persistedState struct {
@@ -100,9 +101,14 @@ func prepareWithStateSaver(ctx context.Context, sess *session.Session, options O
 	} else if root, commit, tree, found, gitErr := gitFacts(ctx, launchCWD); gitErr != nil {
 		return nil, gitErr
 	} else if found {
+		relativePath, err := repositoryRelativePath(root, launchCWD)
+		if err != nil {
+			return nil, err
+		}
 		materialized.SourceRoot = root
 		materialized.Commit = commit
 		materialized.TreeHash = tree
+		materialized.RelativePath = relativePath
 	}
 	if err := appendPrepared(sess, materialized); err != nil {
 		if materialized.WorktreePath != "" {
@@ -127,9 +133,9 @@ func prepareHeadCopy(ctx context.Context, sess *session.Session, launchCWD strin
 	if !found {
 		return errors.New("head-copy workspace requires a Git repository")
 	}
-	relative, err := filepath.Rel(sourceRoot, launchCWD)
-	if err != nil || relative == ".." || strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
-		return errors.New("workspace directory is outside its Git root")
+	relativePath, err := repositoryRelativePath(sourceRoot, launchCWD)
+	if err != nil {
+		return err
 	}
 	worktreePath := filepath.Join(sess.Root, "runtime", "workspace")
 	if _, err := os.Lstat(worktreePath); err == nil {
@@ -140,7 +146,7 @@ func prepareHeadCopy(ctx context.Context, sess *session.Session, launchCWD strin
 	if _, err := runGit(ctx, sourceRoot, "worktree", "add", "--detach", worktreePath, commit); err != nil {
 		return fmt.Errorf("create detached head-copy worktree: %w", err)
 	}
-	executionCWD := filepath.Join(worktreePath, relative)
+	executionCWD := filepath.Join(worktreePath, filepath.FromSlash(relativePath))
 	if _, err := absoluteDirectory(executionCWD); err != nil {
 		_ = removeWorktree(ctx, sourceRoot, worktreePath)
 		return fmt.Errorf("recorded head-copy subdirectory is unavailable: %w", err)
@@ -150,7 +156,16 @@ func prepareHeadCopy(ctx context.Context, sess *session.Session, launchCWD strin
 	materialized.SourceRoot = sourceRoot
 	materialized.Commit = commit
 	materialized.TreeHash = tree
+	materialized.RelativePath = relativePath
 	return nil
+}
+
+func repositoryRelativePath(root, launchCWD string) (string, error) {
+	relative, err := filepath.Rel(root, launchCWD)
+	if err != nil || relative == ".." || strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
+		return "", errors.New("workspace directory is outside its Git root")
+	}
+	return filepath.ToSlash(relative), nil
 }
 
 // Recover returns the recorded execution boundary without source inventories
@@ -214,13 +229,18 @@ func rebuildHeadCopyState(ctx context.Context, sess *session.Session) (*Material
 	if err != nil {
 		return nil, err
 	}
+	executionCWD := filepath.Join(worktreePath, filepath.FromSlash(prepared.RelativePath))
+	if _, err := absoluteDirectory(executionCWD); err != nil {
+		return nil, fmt.Errorf("recorded head-copy subdirectory is unavailable: %w", err)
+	}
 	materialized := &Materialized{
 		Mode:         prepared.Mode,
-		ExecutionCWD: worktreePath,
+		ExecutionCWD: executionCWD,
 		WorktreePath: worktreePath,
 		SourceRoot:   sourceRoot,
 		Commit:       prepared.Commit,
 		TreeHash:     prepared.TreeHash,
+		RelativePath: prepared.RelativePath,
 	}
 	if err := save(sess, *materialized); err != nil {
 		return nil, fmt.Errorf("rebuild workspace state: %w", err)
@@ -280,8 +300,8 @@ func Projection(sess *session.Session) (map[string]any, error) {
 }
 
 func appendPrepared(sess *session.Session, materialized *Materialized) error {
-	if materialized == nil || materialized.Commit == "" || materialized.TreeHash == "" {
-		return nil
+	if materialized == nil {
+		return errors.New("workspace materialization is required")
 	}
 	blobs, err := sess.BlobStore(blobstore.Limits{})
 	if err != nil {
@@ -295,7 +315,12 @@ func appendPrepared(sess *session.Session, materialized *Materialized) error {
 	_, err = writer.Append(eventlog.NewEvent(
 		fmt.Sprintf("workspace-prepared-%d", time.Now().UnixNano()),
 		time.Now(),
-		eventlog.WorkspacePreparedPayload{Mode: materialized.Mode, Commit: materialized.Commit, TreeHash: materialized.TreeHash},
+		eventlog.WorkspacePreparedPayload{
+			Mode:         materialized.Mode,
+			Commit:       materialized.Commit,
+			TreeHash:     materialized.TreeHash,
+			RelativePath: materialized.RelativePath,
+		},
 	))
 	return err
 }

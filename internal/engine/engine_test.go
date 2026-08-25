@@ -21,6 +21,7 @@ import (
 	"github.com/charlesnpx/convo-relay/internal/provider"
 	"github.com/charlesnpx/convo-relay/internal/session"
 	"github.com/charlesnpx/convo-relay/internal/sessionview"
+	"github.com/charlesnpx/convo-relay/internal/workspace"
 )
 
 func TestRunDialogueEventOrderAndBlobs(t *testing.T) {
@@ -859,17 +860,25 @@ func TestRunStartGuardProvisioningAndExecutionPartitions(t *testing.T) {
 	})
 }
 
-func TestResumeRecoversProvisioningPrefixWithoutReingesting(t *testing.T) {
-	sess := createProvisionedSession(t)
+func TestResumeRecoversNonGitCurrentProvisioningPrefix(t *testing.T) {
+	sess := createNonGitCurrentPreparedSession(t)
 	alpha := &fakeBackend{name: "codex", slotID: "alpha", responses: []fakeResponse{{content: "resume after provisioning"}}}
 	beta := &fakeBackend{name: "codex", slotID: "beta"}
+	beforeResume := sessionEvents(t, sess)
+	if got := eventTypes(beforeResume); !reflect.DeepEqual(got, []eventlog.Type{eventlog.WorkspacePrepared}) {
+		t.Fatalf("events before Resume = %v, want only workspace.prepared", got)
+	}
+	prepared, ok := beforeResume[0].Payload.(eventlog.WorkspacePreparedPayload)
+	if !ok || prepared.Mode != workspace.ModeCurrent || prepared.Commit != "" || prepared.TreeHash != "" || prepared.RelativePath != "" {
+		t.Fatalf("non-Git workspace.prepared = %#v", beforeResume[0].Payload)
+	}
 
 	if _, err := Resume(context.Background(), sess, testDeps(map[string]*fakeBackend{"alpha": alpha, "beta": beta}), "", 0); err != nil {
 		t.Fatalf("Resume provisioning prefix: %v", err)
 	}
 	events := sessionEvents(t, sess)
-	if got := countType(events, eventlog.InputIngested); got != 1 {
-		t.Fatalf("input.ingested count after Resume = %d, want 1", got)
+	if got := countType(events, eventlog.InputIngested); got != 0 {
+		t.Fatalf("input.ingested count after Resume = %d, want 0", got)
 	}
 	if got := countType(events, eventlog.WorkspacePrepared); got != 1 {
 		t.Fatalf("workspace.prepared count after Resume = %d, want 1", got)
@@ -1941,6 +1950,15 @@ func createProvisionedSession(t *testing.T) *session.Session {
 	appendEvent(t, writer, eventlog.WorkspacePreparedPayload{Mode: "current", Commit: "abcdef", TreeHash: "123456"})
 	if err := writer.Close(); err != nil {
 		t.Fatalf("close provisioning writer: %v", err)
+	}
+	return sess
+}
+
+func createNonGitCurrentPreparedSession(t *testing.T) *session.Session {
+	t.Helper()
+	sess := createSession(t, dialoguePlan(1))
+	if _, err := workspace.Prepare(context.Background(), sess, workspace.Options{LaunchCWD: t.TempDir(), Mode: workspace.ModeCurrent}); err != nil {
+		t.Fatalf("prepare non-Git current workspace: %v", err)
 	}
 	return sess
 }
