@@ -50,6 +50,10 @@ func Status(_ session.Plan, events []eventlog.Event) StatusView {
 				view.Status = payload.Status
 				view.StopReason = payload.StopReason
 			}
+		case eventlog.TurnBudgetGrantedPayload:
+			view.Terminal = false
+			view.Status = "running"
+			view.StopReason = ""
 		case eventlog.TurnStartedPayload:
 			view.Counts.TurnsStarted++
 			view.CurrentRound = max(view.CurrentRound, payload.Round)
@@ -239,22 +243,12 @@ func Graph(plan session.Plan, events []eventlog.Event) GraphView {
 	edges := make(map[string]GraphEdge)
 	turnNodes := make(map[string]string)
 	rootID := "session:" + plan.SessionID
-	nodes[rootID] = GraphNode{ID: rootID, Kind: "session", Status: "running"}
+	nodes[rootID] = GraphNode{ID: rootID, Kind: "session", Status: Status(plan, events).Status}
 	for _, actor := range plan.Actors {
 		ensureActor(nodes, edges, rootID, actor.ID)
 	}
 	for _, event := range events {
 		switch payload := event.Payload.(type) {
-		case eventlog.SessionFinishedPayload:
-			root := nodes[rootID]
-			root.Status = payload.Status
-			nodes[rootID] = root
-		case *eventlog.SessionFinishedPayload:
-			if payload != nil {
-				root := nodes[rootID]
-				root.Status = payload.Status
-				nodes[rootID] = root
-			}
 		case eventlog.TurnStartedPayload:
 			turnNodes[turnKey(payload.ActorID, payload.Round)] = addTurnNode(nodes, edges, rootID, event.Seq, payload)
 		case *eventlog.TurnStartedPayload:

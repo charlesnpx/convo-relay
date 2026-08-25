@@ -1,6 +1,7 @@
 package engine
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"io"
@@ -148,6 +149,34 @@ func TestDialogueStopsConvergedAndNoLedgerSignal(t *testing.T) {
 	})
 }
 
+func TestResumeTurnBudgetGrantRequiresPostGrantDialogueEvidence(t *testing.T) {
+	plan := dialoguePlan(6)
+	plan.Schedule.StopOnConvergence = true
+	alpha := &fakeBackend{name: "codex", slotID: "alpha", responses: []fakeResponse{{content: "opening"}, {content: "task is complete"}, {content: "work remains complete"}}}
+	beta := &fakeBackend{name: "codex", slotID: "beta", responses: []fakeResponse{{content: "response"}, {content: "work is complete"}}}
+	sess := createSession(t, plan)
+	deps := testDeps(map[string]*fakeBackend{"alpha": alpha, "beta": beta})
+
+	if _, err := Run(context.Background(), sess, deps); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	before := sessionEvents(t, sess)
+	if got := countType(before, eventlog.TurnFinished); got != 4 || sessionFinished(t, before).StopReason != stopConverged {
+		t.Fatalf("early terminal events=%v stop=%#v", eventTypes(before), sessionFinished(t, before))
+	}
+
+	if _, err := Resume(context.Background(), sess, deps, "check it again", 1); err != nil {
+		t.Fatalf("Resume: %v", err)
+	}
+	events := sessionEvents(t, sess)
+	if got := countType(events, eventlog.TurnFinished); got != 5 {
+		t.Fatalf("post-grant finished turns = %d, want 5", got)
+	}
+	if got := sessionFinished(t, events).StopReason; got != stopConverged {
+		t.Fatalf("post-grant stop reason=%q, want %q", got, stopConverged)
+	}
+}
+
 func TestSequenceRunsOrderAndReducer(t *testing.T) {
 	plan := sequencePlan()
 	callOrder := []string{}
@@ -256,7 +285,7 @@ func TestResumeReportsAndRetriesAbandonedAttempt(t *testing.T) {
 
 	alpha := &fakeBackend{name: "codex", slotID: "alpha", responses: []fakeResponse{{content: "resumed"}}}
 	beta := &fakeBackend{name: "codex", slotID: "beta"}
-	_, err = Resume(context.Background(), sess, testDeps(map[string]*fakeBackend{"alpha": alpha, "beta": beta}), "continue")
+	_, err = Resume(context.Background(), sess, testDeps(map[string]*fakeBackend{"alpha": alpha, "beta": beta}), "continue", 0)
 	if err != nil {
 		t.Fatalf("Resume: %v", err)
 	}
@@ -300,7 +329,7 @@ func TestResumeFinalizesRecordedSuccessWithoutProvider(t *testing.T) {
 	})
 	alpha := &fakeBackend{name: "codex", slotID: "alpha"}
 	beta := &fakeBackend{name: "codex", slotID: "beta"}
-	outcome, err := Resume(context.Background(), sess, testDeps(map[string]*fakeBackend{"alpha": alpha, "beta": beta}), "")
+	outcome, err := Resume(context.Background(), sess, testDeps(map[string]*fakeBackend{"alpha": alpha, "beta": beta}), "", 0)
 	if err != nil {
 		t.Fatalf("Resume: %v", err)
 	}
@@ -328,7 +357,7 @@ func TestResumeRecordedAuthFailureIsTerminal(t *testing.T) {
 	})
 	alpha := &fakeBackend{name: "codex", slotID: "alpha", responses: []fakeResponse{{content: "must not run"}}}
 	beta := &fakeBackend{name: "codex", slotID: "beta"}
-	if _, err := Resume(context.Background(), sess, testDeps(map[string]*fakeBackend{"alpha": alpha, "beta": beta}), ""); err == nil {
+	if _, err := Resume(context.Background(), sess, testDeps(map[string]*fakeBackend{"alpha": alpha, "beta": beta}), "", 0); err == nil {
 		t.Fatal("Resume accepted a recorded non-retryable auth failure")
 	}
 	events := sessionEvents(t, sess)
@@ -373,7 +402,7 @@ func TestResumeClassifiedFailureBeforeAttemptFinished(t *testing.T) {
 			})
 			alpha := &fakeBackend{name: "codex", slotID: "alpha", responses: test.responses}
 			beta := &fakeBackend{name: "codex", slotID: "beta"}
-			outcome, err := Resume(context.Background(), sess, testDeps(map[string]*fakeBackend{"alpha": alpha, "beta": beta}), "")
+			outcome, err := Resume(context.Background(), sess, testDeps(map[string]*fakeBackend{"alpha": alpha, "beta": beta}), "", 0)
 			if (err != nil) != test.wantError {
 				t.Fatalf("Resume error=%v, want error=%t", err, test.wantError)
 			}
@@ -411,11 +440,61 @@ func TestResumeServicesDueFacilitatorBeforeNextParticipant(t *testing.T) {
 		{content: "{\"settled\":[],\"contested\":[],\"withdrawn\":[]}"},
 		{content: "{\"settled\":[],\"contested\":[],\"withdrawn\":[]}"},
 	}}
-	if _, err := Resume(context.Background(), sess, testDeps(map[string]*fakeBackend{"alpha": alpha, "beta": beta, "facilitator": facilitator}), ""); err != nil {
+	if _, err := Resume(context.Background(), sess, testDeps(map[string]*fakeBackend{"alpha": alpha, "beta": beta, "facilitator": facilitator}), "", 0); err != nil {
 		t.Fatalf("Resume: %v", err)
 	}
 	if got := len(facilitator.prompts); got != 4 {
 		t.Fatalf("facilitator calls = %d, want 4", got)
+	}
+}
+
+func TestResumeRejectsTurnBudgetGrantWithDueFacilitatorWithoutMutatingLog(t *testing.T) {
+	plan := dialoguePlan(2)
+	plan.Actors = append(plan.Actors, session.Actor{ID: "facilitator", Backend: "codex"})
+	plan.Facilitator = &session.Facilitator{Actor: "facilitator", Cadence: 1}
+	sess := createSession(t, plan)
+	seedLog(t, sess, func(store *blobstore.Store, writer *eventlog.Writer) {
+		content := putSeedText(t, store, "first participant")
+		appendEvent(t, writer, eventlog.TurnStartedPayload{ActorID: "alpha", Round: 1, Role: eventlog.ParticipantRole})
+		appendEvent(t, writer, eventlog.AttemptStartedPayload{ActorID: "alpha", Attempt: 1})
+		appendEvent(t, writer, eventlog.AttemptFinishedPayload{ActorID: "alpha", Attempt: 1, Outcome: "success", Content: content})
+		appendEvent(t, writer, eventlog.TurnFinishedPayload{ActorID: "alpha", Round: 1, Content: content})
+	})
+	callOrder := []string{}
+	beta := &fakeBackend{name: "codex", slotID: "beta", calls: &callOrder, responses: []fakeResponse{{content: "second participant"}}}
+	facilitator := &fakeBackend{name: "codex", slotID: "facilitator", calls: &callOrder, responses: []fakeResponse{
+		{content: `{"settled":[],"contested":[],"withdrawn":[]}`},
+		{content: `{"settled":[],"contested":[],"withdrawn":[]}`},
+	}}
+	deps := testDeps(map[string]*fakeBackend{
+		"alpha":       {name: "codex", slotID: "alpha"},
+		"beta":        beta,
+		"facilitator": facilitator,
+	})
+	eventsPath := filepath.Join(sess.Root, eventlog.EventsFilename)
+	before, err := os.ReadFile(eventsPath)
+	if err != nil {
+		t.Fatalf("read events before rejected due-facilitator grant: %v", err)
+	}
+	if _, err := Resume(context.Background(), sess, deps, "do not append this steering", 1); err == nil || !strings.Contains(err.Error(), "scheduled work is outstanding") {
+		t.Fatalf("due-facilitator grant error = %v", err)
+	}
+	after, err := os.ReadFile(eventsPath)
+	if err != nil {
+		t.Fatalf("read events after rejected due-facilitator grant: %v", err)
+	}
+	if !bytes.Equal(before, after) {
+		t.Fatal("rejected due-facilitator grant changed events.jsonl")
+	}
+	if len(callOrder) != 0 {
+		t.Fatalf("rejected due-facilitator grant called providers %v", callOrder)
+	}
+
+	if _, err := Resume(context.Background(), sess, deps, "", 0); err != nil {
+		t.Fatalf("Resume after rejected due-facilitator grant: %v", err)
+	}
+	if want := []string{"facilitator", "beta", "facilitator"}; !reflect.DeepEqual(callOrder, want) {
+		t.Fatalf("call order = %v, want %v", callOrder, want)
 	}
 }
 
@@ -447,7 +526,7 @@ func TestResumeRebuildsChildBudgets(t *testing.T) {
 		}
 		return nil
 	}
-	if _, err := Resume(context.Background(), sess, deps, ""); err != nil {
+	if _, err := Resume(context.Background(), sess, deps, "", 0); err != nil {
 		t.Fatalf("Resume: %v", err)
 	}
 	decisions := childDecisions(sessionEvents(t, sess))
@@ -473,7 +552,7 @@ func TestFinishedAttemptChildRequestRemainsDecidableBeforeParentCompletion(t *te
 	beta := &fakeBackend{name: "codex", slotID: "beta"}
 	deps := testDeps(map[string]*fakeBackend{"alpha": alpha, "beta": beta})
 	deps.Recipes = []plan.Recipe{childRecipe()}
-	outcome, err := Resume(context.Background(), sess, deps, "")
+	outcome, err := Resume(context.Background(), sess, deps, "", 0)
 	if err != nil {
 		t.Fatalf("Resume: %v", err)
 	}
@@ -555,7 +634,7 @@ func TestResumeMaterializesChildRequestsFromSuccessfulAttempt(t *testing.T) {
 				return test.requests
 			}
 
-			outcome, err := Resume(context.Background(), sess, deps, "")
+			outcome, err := Resume(context.Background(), sess, deps, "", 0)
 			if err != nil {
 				t.Fatalf("Resume: %v", err)
 			}
@@ -608,7 +687,7 @@ func TestResumeReplaysQueuedSteering(t *testing.T) {
 			})
 			alpha := &fakeBackend{name: "codex", slotID: "alpha", responses: []fakeResponse{{content: "steered"}}}
 			beta := &fakeBackend{name: "codex", slotID: "beta"}
-			if _, err := Resume(context.Background(), sess, testDeps(map[string]*fakeBackend{"alpha": alpha, "beta": beta}), ""); err != nil {
+			if _, err := Resume(context.Background(), sess, testDeps(map[string]*fakeBackend{"alpha": alpha, "beta": beta}), "", 0); err != nil {
 				t.Fatalf("Resume: %v", err)
 			}
 			if len(alpha.prompts) != 1 || !strings.Contains(alpha.prompts[0], "Resume direction: take the conservative route") {
@@ -696,7 +775,7 @@ func TestResumeLifecycleGuardsBeforeMutation(t *testing.T) {
 			}
 			alpha := &fakeBackend{name: "codex", slotID: "alpha"}
 			beta := &fakeBackend{name: "codex", slotID: "beta"}
-			if _, err := Resume(context.Background(), sess, testDeps(map[string]*fakeBackend{"alpha": alpha, "beta": beta}), test.prompt); err == nil {
+			if _, err := Resume(context.Background(), sess, testDeps(map[string]*fakeBackend{"alpha": alpha, "beta": beta}), test.prompt, 0); err == nil {
 				t.Fatal("Resume ignored lifecycle guard")
 			}
 			after, err := os.ReadFile(filepath.Join(sess.Root, eventlog.EventsFilename))
@@ -742,7 +821,7 @@ func TestProviderContinuationIsRecordedAndRestored(t *testing.T) {
 		})
 		alpha := &fakeBackend{name: "codex", slotID: "alpha", responses: []fakeResponse{{content: "third"}}}
 		beta := &fakeBackend{name: "codex", slotID: "beta", responses: []fakeResponse{{content: "second"}}}
-		if _, err := Resume(context.Background(), sess, testDeps(map[string]*fakeBackend{"alpha": alpha, "beta": beta}), ""); err != nil {
+		if _, err := Resume(context.Background(), sess, testDeps(map[string]*fakeBackend{"alpha": alpha, "beta": beta}), "", 0); err != nil {
 			t.Fatalf("Resume: %v", err)
 		}
 		if len(alpha.restored) != 1 || alpha.restored[0]["thread_id"] != "thread-one" || len(alpha.prompts) != 1 {
@@ -867,7 +946,7 @@ func TestResumeCompletedChildBeforeParentCompletionReusesChildSession(t *testing
 	deps := testDeps(map[string]*fakeBackend{"alpha": alpha, "beta": beta, "child-alpha": child})
 	// The completed child is found by the admitted deterministic identity; it
 	// must not need the recipe list to be recomputed during parent recovery.
-	if _, err := Resume(context.Background(), sess, deps, ""); err != nil {
+	if _, err := Resume(context.Background(), sess, deps, "", 0); err != nil {
 		t.Fatalf("resume parent: %v", err)
 	}
 	if got := len(child.prompts); got != 1 {
@@ -899,12 +978,454 @@ func TestResumeTerminalFailedSessionReportsStatus(t *testing.T) {
 	outcome, err := Resume(context.Background(), sess, testDeps(map[string]*fakeBackend{
 		"alpha": resumedAlpha,
 		"beta":  {name: "codex", slotID: "beta"},
-	}), "")
+	}), "", 0)
 	if err != nil {
 		t.Fatalf("Resume terminal failed session: %v", err)
 	}
 	if outcome.Status != statusFailed || len(resumedAlpha.prompts) != 0 {
 		t.Fatalf("terminal resume outcome=%#v calls=%d", outcome, len(resumedAlpha.prompts))
+	}
+}
+
+func TestResumeRejectsTurnBudgetGrantForActiveParticipantWithoutMutatingLog(t *testing.T) {
+	sess := createSession(t, dialoguePlan(2))
+	seedLog(t, sess, func(store *blobstore.Store, writer *eventlog.Writer) {
+		content := putSeedText(t, store, "successful active participant")
+		appendEvent(t, writer, eventlog.TurnStartedPayload{ActorID: "alpha", Round: 1, Role: eventlog.ParticipantRole})
+		appendEvent(t, writer, eventlog.AttemptStartedPayload{ActorID: "alpha", Attempt: 1})
+		appendEvent(t, writer, eventlog.AttemptFinishedPayload{ActorID: "alpha", Attempt: 1, Outcome: "success", Content: content})
+	})
+	eventsPath := filepath.Join(sess.Root, eventlog.EventsFilename)
+	before, err := os.ReadFile(eventsPath)
+	if err != nil {
+		t.Fatalf("read events before rejected active participant grant: %v", err)
+	}
+	alpha := &fakeBackend{name: "codex", slotID: "alpha", responses: []fakeResponse{{content: "must not run"}}}
+	beta := &fakeBackend{name: "codex", slotID: "beta", responses: []fakeResponse{{content: "must not run"}}}
+
+	if _, err := Resume(context.Background(), sess, testDeps(map[string]*fakeBackend{"alpha": alpha, "beta": beta}), "do not append this steering", 1); err == nil || !strings.Contains(err.Error(), "scheduled work is outstanding") {
+		t.Fatalf("active participant grant error = %v", err)
+	}
+	after, err := os.ReadFile(eventsPath)
+	if err != nil {
+		t.Fatalf("read events after rejected active participant grant: %v", err)
+	}
+	if !bytes.Equal(before, after) {
+		t.Fatal("rejected active participant grant changed events.jsonl")
+	}
+	if len(alpha.prompts) != 0 || len(beta.prompts) != 0 {
+		t.Fatalf("active participant grant called providers alpha=%d beta=%d", len(alpha.prompts), len(beta.prompts))
+	}
+}
+
+func TestResumeRejectsOverBoundTurnBudgetWithoutMutatingLog(t *testing.T) {
+	sess := createSession(t, dialoguePlan(1))
+	alpha := &fakeBackend{name: "codex", slotID: "alpha", responses: []fakeResponse{{content: "first reply"}}}
+	beta := &fakeBackend{name: "codex", slotID: "beta", responses: []fakeResponse{{content: "second reply"}}}
+	deps := testDeps(map[string]*fakeBackend{"alpha": alpha, "beta": beta})
+	if _, err := Run(context.Background(), sess, deps); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	eventsPath := filepath.Join(sess.Root, eventlog.EventsFilename)
+	before, err := os.ReadFile(eventsPath)
+	if err != nil {
+		t.Fatalf("read events before rejected grant: %v", err)
+	}
+
+	if _, err := Resume(context.Background(), sess, deps, "do not append this steering", maximumInt()); err == nil || !strings.Contains(err.Error(), "integer range") {
+		t.Fatalf("over-bound Resume error = %v", err)
+	}
+	after, err := os.ReadFile(eventsPath)
+	if err != nil {
+		t.Fatalf("read events after rejected grant: %v", err)
+	}
+	if !bytes.Equal(before, after) {
+		t.Fatal("rejected over-bound grant changed events.jsonl")
+	}
+
+	reopened, err := session.Open(sess.Root)
+	if err != nil {
+		t.Fatalf("reopen session after rejected grant: %v", err)
+	}
+	replayed, err := newStateRunner(reopened)
+	if err != nil {
+		t.Fatalf("new replay runner: %v", err)
+	}
+	if err := replayed.rebuildExecutionState(sessionEvents(t, reopened)); err != nil {
+		t.Fatalf("replay after rejected grant: %v", err)
+	}
+	outcome, err := Resume(context.Background(), reopened, deps, "", 1)
+	if err != nil {
+		t.Fatalf("resume after rejected grant: %v", err)
+	}
+	if outcome.Status != statusCompleted || outcome.Result != "second reply" {
+		t.Fatalf("resumed outcome = %#v", outcome)
+	}
+}
+
+func TestResumeRejectsTurnBudgetGrantForFailedTerminalWithoutMutatingLog(t *testing.T) {
+	sess := createSession(t, dialoguePlan(1))
+	failing := &fakeBackend{name: "codex", slotID: "alpha", responses: []fakeResponse{{err: provider.BackendRunError{Detail: "denied"}}}}
+	if _, err := Run(context.Background(), sess, testDeps(map[string]*fakeBackend{
+		"alpha": failing,
+		"beta":  {name: "codex", slotID: "beta"},
+	})); err == nil {
+		t.Fatal("Run unexpectedly completed a failed session")
+	}
+	eventsPath := filepath.Join(sess.Root, eventlog.EventsFilename)
+	before, err := os.ReadFile(eventsPath)
+	if err != nil {
+		t.Fatalf("read events before rejected failed-terminal grant: %v", err)
+	}
+	resumedAlpha := &fakeBackend{name: "codex", slotID: "alpha", responses: []fakeResponse{{content: "must not run"}}}
+
+	if _, err := Resume(context.Background(), sess, testDeps(map[string]*fakeBackend{
+		"alpha": resumedAlpha,
+		"beta":  {name: "codex", slotID: "beta"},
+	}), "do not append this steering", 1); err == nil || !strings.Contains(err.Error(), "retry or fork") {
+		t.Fatalf("failed-terminal grant error = %v", err)
+	}
+	after, err := os.ReadFile(eventsPath)
+	if err != nil {
+		t.Fatalf("read events after rejected failed-terminal grant: %v", err)
+	}
+	if !bytes.Equal(before, after) {
+		t.Fatal("rejected failed-terminal grant changed events.jsonl")
+	}
+	if len(resumedAlpha.prompts) != 0 {
+		t.Fatalf("failed-terminal grant called provider %d times", len(resumedAlpha.prompts))
+	}
+}
+
+func TestReducerRejectsFailedTerminalTurnBudgetGrantFromEventWriter(t *testing.T) {
+	sess := createSession(t, dialoguePlan(1))
+	failing := &fakeBackend{name: "codex", slotID: "alpha", responses: []fakeResponse{{err: provider.BackendRunError{Detail: "denied"}}}}
+	if _, err := Run(context.Background(), sess, testDeps(map[string]*fakeBackend{
+		"alpha": failing,
+		"beta":  {name: "codex", slotID: "beta"},
+	})); err == nil {
+		t.Fatal("Run unexpectedly completed a failed session")
+	}
+	appendTurnBudgetGrant(t, sess, 1)
+
+	runner, err := newStateRunner(sess)
+	if err != nil {
+		t.Fatalf("new state runner: %v", err)
+	}
+	err = runner.rebuildExecutionState(sessionEvents(t, sess))
+	if err == nil || !strings.Contains(err.Error(), "failed session") {
+		t.Fatalf("replay failed-terminal grant error = %v", err)
+	}
+	if runner.state.terminal == nil || runner.state.terminal.Status != statusFailed || runner.state.grantedTurns != 0 {
+		t.Fatalf("inapplicable failed-terminal grant reopened state=%#v", runner.state)
+	}
+}
+
+func TestReducerRejectsOverBoundTurnBudgetGrantFromEventWriter(t *testing.T) {
+	sess := createSession(t, dialoguePlan(1))
+	alpha := &fakeBackend{name: "codex", slotID: "alpha", responses: []fakeResponse{{content: "first reply"}}}
+	beta := &fakeBackend{name: "codex", slotID: "beta"}
+	if _, err := Run(context.Background(), sess, testDeps(map[string]*fakeBackend{"alpha": alpha, "beta": beta})); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	appendTurnBudgetGrant(t, sess, maximumInt())
+
+	runner, err := newStateRunner(sess)
+	if err != nil {
+		t.Fatalf("new state runner: %v", err)
+	}
+	err = runner.rebuildExecutionState(sessionEvents(t, sess))
+	if err == nil || !strings.Contains(err.Error(), "integer range") {
+		t.Fatalf("replay over-bound grant error = %v", err)
+	}
+	if runner.state.terminal == nil || runner.state.terminal.Status != statusCompleted || runner.state.grantedTurns != 0 {
+		t.Fatalf("inapplicable over-bound grant reopened state=%#v", runner.state)
+	}
+}
+
+func TestResumeCompletedSessionWithExtraTurnBudget(t *testing.T) {
+	sess := createSession(t, dialoguePlan(1))
+	alpha := &fakeBackend{name: "codex", slotID: "alpha", responses: []fakeResponse{{content: "first reply"}}}
+	beta := &fakeBackend{name: "codex", slotID: "beta", responses: []fakeResponse{{content: "second reply"}}}
+	deps := testDeps(map[string]*fakeBackend{"alpha": alpha, "beta": beta})
+	if _, err := Run(context.Background(), sess, deps); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	beforePlan, err := os.ReadFile(filepath.Join(sess.Root, session.SessionFilename))
+	if err != nil {
+		t.Fatalf("read session.json before resume: %v", err)
+	}
+	beforeDigest := sess.Digest
+
+	outcome, err := Resume(context.Background(), sess, deps, "take one more pass", 1)
+	if err != nil {
+		t.Fatalf("Resume with one extra turn: %v", err)
+	}
+	if outcome.Status != statusCompleted || outcome.Result != "second reply" {
+		t.Fatalf("resume outcome = %#v", outcome)
+	}
+	if len(alpha.prompts) != 1 || len(beta.prompts) != 1 || !strings.Contains(beta.prompts[0], "Resume direction: take one more pass") {
+		t.Fatalf("provider prompts alpha=%#v beta=%#v", alpha.prompts, beta.prompts)
+	}
+
+	events := sessionEvents(t, sess)
+	if countType(events, eventlog.TurnFinished) != 2 || countType(events, eventlog.TurnBudgetGranted) != 1 ||
+		countType(events, eventlog.SteeringQueued) != 0 || countType(events, eventlog.SteeringApplied) != 1 ||
+		countType(events, eventlog.ResultProduced) != 2 || countType(events, eventlog.SessionFinished) != 2 {
+		t.Fatalf("resume events = %v", eventTypes(events))
+	}
+	grants := turnBudgetGrants(events)
+	if len(grants) != 1 || grants[0].Prompt == nil {
+		t.Fatalf("prompted grant payloads = %#v", grants)
+	}
+	for _, event := range events {
+		applied, ok := event.Payload.(eventlog.SteeringAppliedPayload)
+		if ok && !applied.Prompt.Equal(*grants[0].Prompt) {
+			t.Fatalf("steering.applied prompt = %#v, want grant prompt %#v", applied.Prompt, *grants[0].Prompt)
+		}
+	}
+	t.Logf("resume log=%v grant=%#v", eventTypes(events), grants[0])
+	store, err := sess.BlobStore(blobstore.Limits{})
+	if err != nil {
+		t.Fatalf("open blobs: %v", err)
+	}
+	transcript, err := sessionview.Transcript(sess.Plan, events, store)
+	if err != nil {
+		t.Fatalf("derive transcript: %v", err)
+	}
+	if len(transcript.Entries) != 2 || transcript.Entries[0].Text != "first reply" || transcript.Entries[1].Text != "second reply" {
+		t.Fatalf("transcript = %#v", transcript)
+	}
+	afterPlan, err := os.ReadFile(filepath.Join(sess.Root, session.SessionFilename))
+	if err != nil {
+		t.Fatalf("read session.json after resume: %v", err)
+	}
+	if !reflect.DeepEqual(beforePlan, afterPlan) {
+		t.Fatal("session.json changed during turn-budget resume")
+	}
+	reopened, err := session.Open(sess.Root)
+	if err != nil {
+		t.Fatalf("reopen session: %v", err)
+	}
+	if reopened.Digest != beforeDigest || reopened.Plan.Schedule.Turns != 1 {
+		t.Fatalf("reopened immutable plan = digest %q turns %d", reopened.Digest, reopened.Plan.Schedule.Turns)
+	}
+	runner, err := newStateRunner(sess)
+	if err != nil {
+		t.Fatalf("new state runner: %v", err)
+	}
+	if err := runner.rebuildExecutionState(events); err != nil {
+		t.Fatalf("replay turn budget: %v", err)
+	}
+	if runner.state.grantedTurns != 1 || runner.effectiveTurnBudget() != 2 || sess.Plan.Schedule.Turns != 1 {
+		t.Fatalf("derived turn budget = grants %d effective %d plan %d", runner.state.grantedTurns, runner.effectiveTurnBudget(), sess.Plan.Schedule.Turns)
+	}
+	wrongRoundEvents := append([]eventlog.Event(nil), events...)
+	for index, event := range wrongRoundEvents {
+		if applied, ok := event.Payload.(eventlog.SteeringAppliedPayload); ok {
+			applied.Round = 999
+			wrongRoundEvents[index].Payload = applied
+		}
+	}
+	if err := runner.rebuildExecutionState(wrongRoundEvents); err == nil || !strings.Contains(err.Error(), "steering.applied round 999 does not match active turn round 2") {
+		t.Fatalf("wrong-round steering replay error = %v", err)
+	}
+	eventsPath := filepath.Join(sess.Root, eventlog.EventsFilename)
+	beforeTerminalResume, err := os.ReadFile(eventsPath)
+	if err != nil {
+		t.Fatalf("read events before terminal resume: %v", err)
+	}
+	recordedOutcome, err := Resume(context.Background(), sess, deps, "", 0)
+	if err != nil {
+		t.Fatalf("Resume recorded terminal: %v", err)
+	}
+	afterTerminalResume, err := os.ReadFile(eventsPath)
+	if err != nil {
+		t.Fatalf("read events after terminal resume: %v", err)
+	}
+	if recordedOutcome != outcome || !bytes.Equal(beforeTerminalResume, afterTerminalResume) {
+		t.Fatalf("terminal resume outcome=%#v events changed=%t", recordedOutcome, !bytes.Equal(beforeTerminalResume, afterTerminalResume))
+	}
+}
+
+func TestResumeExactPromptedTurnBudgetRetryAfterDurableGrant(t *testing.T) {
+	sess := createSession(t, dialoguePlan(1))
+	alpha := &fakeBackend{name: "codex", slotID: "alpha", responses: []fakeResponse{{content: "first reply"}}}
+	beta := &fakeBackend{name: "codex", slotID: "beta", responses: []fakeResponse{{content: "second reply"}}}
+	deps := testDeps(map[string]*fakeBackend{"alpha": alpha, "beta": beta})
+	if _, err := Run(context.Background(), sess, deps); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	store, err := sess.BlobStore(blobstore.Limits{})
+	if err != nil {
+		t.Fatalf("open blobs: %v", err)
+	}
+	const requestedPrompt = "address the requested counterexample"
+	promptRef := putSeedText(t, store, requestedPrompt)
+	writer, err := sess.EventWriter(store)
+	if err != nil {
+		t.Fatalf("open writer: %v", err)
+	}
+	appendEvent(t, writer, eventlog.TurnBudgetGrantedPayload{GrantedBy: "operator", Turns: 1, Prompt: &promptRef})
+	if err := writer.Close(); err != nil {
+		t.Fatalf("close crash-prefix writer: %v", err)
+	}
+	crashPrefix := sessionEvents(t, sess)
+	if len(crashPrefix) == 0 || crashPrefix[len(crashPrefix)-1].Type != eventlog.TurnBudgetGranted {
+		t.Fatalf("crash prefix = %v", eventTypes(crashPrefix))
+	}
+	if grants := turnBudgetGrants(crashPrefix); len(grants) != 1 || grants[0].Prompt == nil || !grants[0].Prompt.Equal(promptRef) {
+		t.Fatalf("durable prompted grant = %#v, want prompt %#v", grants, promptRef)
+	}
+	t.Logf("durable crash-prefix log=%v", eventTypes(crashPrefix))
+
+	outcome, err := Resume(context.Background(), sess, deps, requestedPrompt, 1)
+	if err != nil {
+		t.Fatalf("exact retry: %v", err)
+	}
+	events := sessionEvents(t, sess)
+	if outcome.Status != statusCompleted || outcome.Result != "second reply" || countType(events, eventlog.TurnBudgetGranted) != 1 ||
+		countType(events, eventlog.SteeringQueued) != 0 || countType(events, eventlog.SteeringApplied) != 1 {
+		t.Fatalf("exact retry outcome=%#v events=%v", outcome, eventTypes(events))
+	}
+	if len(beta.prompts) != 1 || !strings.Contains(beta.prompts[0], "Resume direction: "+requestedPrompt) {
+		t.Fatalf("exact retry turn input = %#v", beta.prompts)
+	}
+	t.Logf("exact-retry log=%v turn_input=%q", eventTypes(events), beta.prompts[0])
+}
+
+func TestResumeRejectsPromptedRetryForGrantWithoutPrompt(t *testing.T) {
+	sess := createSession(t, dialoguePlan(1))
+	alpha := &fakeBackend{name: "codex", slotID: "alpha", responses: []fakeResponse{{content: "first reply"}}}
+	beta := &fakeBackend{name: "codex", slotID: "beta", responses: []fakeResponse{{content: "must not run"}}}
+	deps := testDeps(map[string]*fakeBackend{"alpha": alpha, "beta": beta})
+	if _, err := Run(context.Background(), sess, deps); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	appendTurnBudgetGrant(t, sess, 1)
+	eventsPath := filepath.Join(sess.Root, eventlog.EventsFilename)
+	before, err := os.ReadFile(eventsPath)
+	if err != nil {
+		t.Fatalf("read unprompted-grant prefix: %v", err)
+	}
+	if _, err := Resume(context.Background(), sess, deps, "do not attach this prompt", 1); err == nil || !strings.Contains(err.Error(), "scheduled work is outstanding") {
+		t.Fatalf("prompted retry for unprompted grant error = %v", err)
+	}
+	after, err := os.ReadFile(eventsPath)
+	if err != nil {
+		t.Fatalf("read after rejected prompted retry: %v", err)
+	}
+	if !bytes.Equal(before, after) || len(beta.prompts) != 0 {
+		t.Fatalf("unprompted grant accepted a prompted retry: log changed=%t beta=%#v", !bytes.Equal(before, after), beta.prompts)
+	}
+}
+
+func TestReplayRejectsTurnBudgetGrantWithUnresolvablePromptReference(t *testing.T) {
+	sess := createSession(t, dialoguePlan(1))
+	alpha := &fakeBackend{name: "codex", slotID: "alpha", responses: []fakeResponse{{content: "first reply"}}}
+	if _, err := Run(context.Background(), sess, testDeps(map[string]*fakeBackend{"alpha": alpha, "beta": {name: "codex", slotID: "beta"}})); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	events := sessionEvents(t, sess)
+	missing := blobstore.BlobRef{SHA256: strings.Repeat("0", 64), Size: 1, MediaType: mediaTypePlainTextUTF8}
+	events = append(events, canonicalReplayEvent(t, uint64(len(events)+1), "unresolvable-grant-prompt", eventlog.TurnBudgetGrantedPayload{
+		GrantedBy: "operator", Turns: 1, Prompt: &missing,
+	}))
+	runner, err := newStateRunner(sess)
+	if err != nil {
+		t.Fatalf("new state runner: %v", err)
+	}
+	err = runner.rebuildExecutionState(events)
+	if err == nil || !strings.Contains(err.Error(), "read turn_budget.granted prompt") {
+		t.Fatalf("replay unresolvable prompted grant error = %v", err)
+	}
+	if runner.state.grantedTurns != 0 || len(runner.state.steering) != 0 {
+		t.Fatalf("unresolvable prompted grant mutated state=%#v", runner.state)
+	}
+}
+
+func TestReplayRejectsSteeringAppliedPromptNotCarriedByGrant(t *testing.T) {
+	sess := createSession(t, dialoguePlan(1))
+	alpha := &fakeBackend{name: "codex", slotID: "alpha", responses: []fakeResponse{{content: "first reply"}}}
+	if _, err := Run(context.Background(), sess, testDeps(map[string]*fakeBackend{"alpha": alpha, "beta": {name: "codex", slotID: "beta"}})); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	store, err := sess.BlobStore(blobstore.Limits{})
+	if err != nil {
+		t.Fatalf("open blobs: %v", err)
+	}
+	carried := putSeedText(t, store, "the prompt carried by the grant")
+	unrelated := putSeedText(t, store, "an unrelated prompt")
+	events := sessionEvents(t, sess)
+	events = append(events,
+		canonicalReplayEvent(t, uint64(len(events)+1), "prompted-grant", eventlog.TurnBudgetGrantedPayload{GrantedBy: "operator", Turns: 1, Prompt: &carried}),
+		canonicalReplayEvent(t, uint64(len(events)+2), "resumed-turn", eventlog.TurnStartedPayload{ActorID: "beta", Round: 2, Role: eventlog.ParticipantRole}),
+		canonicalReplayEvent(t, uint64(len(events)+3), "mismatched-steering", eventlog.SteeringAppliedPayload{Prompt: unrelated, Round: 2}),
+	)
+	runner, err := newStateRunner(sess)
+	if err != nil {
+		t.Fatalf("new state runner: %v", err)
+	}
+	err = runner.rebuildExecutionState(events)
+	if err == nil || !strings.Contains(err.Error(), "steering.applied has no queued prompt") {
+		t.Fatalf("replay prompt not carried by grant error = %v", err)
+	}
+}
+
+func TestResumeAccumulatesSuccessiveTurnBudgetGrants(t *testing.T) {
+	sess := createSession(t, dialoguePlan(1))
+	alpha := &fakeBackend{name: "codex", slotID: "alpha", responses: []fakeResponse{{content: "first reply"}, {content: "third reply"}}}
+	beta := &fakeBackend{name: "codex", slotID: "beta", responses: []fakeResponse{{content: "second reply"}}}
+	deps := testDeps(map[string]*fakeBackend{"alpha": alpha, "beta": beta})
+	if _, err := Run(context.Background(), sess, deps); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	appendTurnBudgetGrant(t, sess, 1)
+	outcome, err := Resume(context.Background(), sess, deps, "", 0)
+	if err != nil {
+		t.Fatalf("Resume after first grant: %v", err)
+	}
+	if outcome.Status != statusCompleted || outcome.Result != "second reply" {
+		t.Fatalf("first grant outcome=%#v", outcome)
+	}
+	appendTurnBudgetGrant(t, sess, 1)
+	outcome, err = Resume(context.Background(), sess, deps, "", 0)
+	if err != nil {
+		t.Fatalf("Resume after second grant: %v", err)
+	}
+	if outcome.Status != statusCompleted || outcome.Result != "third reply" || countType(sessionEvents(t, sess), eventlog.TurnFinished) != 3 {
+		t.Fatalf("accumulated grant outcome=%#v events=%v", outcome, eventTypes(sessionEvents(t, sess)))
+	}
+	events := sessionEvents(t, sess)
+	runner, err := newStateRunner(sess)
+	if err != nil {
+		t.Fatalf("new state runner: %v", err)
+	}
+	if err := runner.rebuildExecutionState(events); err != nil {
+		t.Fatalf("replay grants: %v", err)
+	}
+	if runner.state.terminal == nil || runner.state.terminal.Status != statusCompleted || runner.state.grantedTurns != 2 || runner.effectiveTurnBudget() != 3 {
+		t.Fatalf("replayed grants terminal=%#v granted=%d effective=%d", runner.state.terminal, runner.state.grantedTurns, runner.effectiveTurnBudget())
+	}
+}
+
+func TestResumeTurnBudgetGrantCyclesSequenceSchedule(t *testing.T) {
+	sess := createSession(t, sequencePlan())
+	callOrder := []string{}
+	alpha := &fakeBackend{name: "codex", slotID: "alpha", calls: &callOrder, responses: []fakeResponse{{content: "first participant"}, {content: "third participant"}}}
+	beta := &fakeBackend{name: "codex", slotID: "beta", calls: &callOrder, responses: []fakeResponse{{content: "second participant"}}}
+	reducer := &fakeBackend{name: "codex", slotID: "reducer", calls: &callOrder, responses: []fakeResponse{{content: "first result"}, {content: "second result"}}}
+	deps := testDeps(map[string]*fakeBackend{"alpha": alpha, "beta": beta, "reducer": reducer})
+	if _, err := Run(context.Background(), sess, deps); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	outcome, err := Resume(context.Background(), sess, deps, "", 1)
+	if err != nil {
+		t.Fatalf("Resume sequence extension: %v", err)
+	}
+	if outcome.Result != "second result" || !reflect.DeepEqual(callOrder, []string{"alpha", "beta", "reducer", "alpha", "reducer"}) {
+		t.Fatalf("sequence extension outcome=%#v calls=%v", outcome, callOrder)
 	}
 }
 
@@ -927,7 +1448,7 @@ func TestResumeFailedTerminalChildFailsParent(t *testing.T) {
 		"alpha":       {name: "codex", slotID: "alpha"},
 		"beta":        {name: "codex", slotID: "beta"},
 		"child-alpha": child,
-	}), "")
+	}), "", 0)
 	if err == nil {
 		t.Fatal("parent Resume unexpectedly succeeded after failed terminal child")
 	}
@@ -954,7 +1475,7 @@ func TestResumeFailedChildCompletionFailsParent(t *testing.T) {
 		"alpha":       {name: "codex", slotID: "alpha"},
 		"beta":        {name: "codex", slotID: "beta"},
 		"child-alpha": child,
-	}), "")
+	}), "", 0)
 	if err == nil {
 		t.Fatal("parent Resume unexpectedly succeeded after failed child.completed")
 	}
@@ -984,7 +1505,7 @@ func TestResumeCreatesMissingChildFromDurablePlanAfterRecipeDrift(t *testing.T) 
 		"drifted-alpha": drifted,
 	})
 	deps.Recipes = []plan.Recipe{driftedRecipe}
-	outcome, err := Resume(context.Background(), sess, deps, "")
+	outcome, err := Resume(context.Background(), sess, deps, "", 0)
 	if err != nil {
 		t.Fatalf("Resume: %v", err)
 	}
@@ -1014,7 +1535,7 @@ func TestResumeRefusesChildRootWithMismatchedAdmittedPlan(t *testing.T) {
 		"alpha":       {name: "codex", slotID: "alpha"},
 		"beta":        {name: "codex", slotID: "beta"},
 		"child-alpha": child,
-	}), "")
+	}), "", 0)
 	if err == nil || !strings.Contains(err.Error(), "does not match the durable admitted plan") {
 		t.Fatalf("Resume error=%v, want admitted-plan refusal", err)
 	}
@@ -1036,7 +1557,7 @@ func TestResumeFinalizesDurableResultProduced(t *testing.T) {
 	outcome, err := Resume(context.Background(), sess, testDeps(map[string]*fakeBackend{
 		"alpha": {name: "codex", slotID: "alpha"},
 		"beta":  {name: "codex", slotID: "beta"},
-	}), "")
+	}), "", 0)
 	if err != nil {
 		t.Fatalf("Resume: %v", err)
 	}
@@ -1086,8 +1607,15 @@ func TestBlobReferencesAreVerifiedBeforeEventAppend(t *testing.T) {
 	if _, err := Run(context.Background(), sess, deps); err != nil {
 		t.Fatalf("Run: %v", err)
 	}
+	if _, err := Resume(context.Background(), sess, deps, "durable prompted grant", 1); err != nil {
+		t.Fatalf("Resume prompted grant: %v", err)
+	}
 	if len(verifier.refs) == 0 {
 		t.Fatal("writer never verified a blob reference")
+	}
+	grants := turnBudgetGrants(sessionEvents(t, sess))
+	if len(grants) != 1 || grants[0].Prompt == nil || !verifier.saw(*grants[0].Prompt) {
+		t.Fatalf("prompted grant reference was not verified: grants=%#v refs=%#v", grants, verifier.refs)
 	}
 	for _, event := range sessionEvents(t, sess) {
 		for _, ref := range eventlog.BlobRefs([]eventlog.Event{event}) {
@@ -1371,6 +1899,32 @@ func appendEvent(t *testing.T, writer *eventlog.Writer, payload eventlog.Payload
 	}
 }
 
+func canonicalReplayEvent(t *testing.T, sequence uint64, identifier string, payload eventlog.Payload) eventlog.Event {
+	t.Helper()
+	event := eventlog.NewEvent(identifier, time.Unix(1700000000, 0), payload)
+	event.Seq = sequence
+	if _, err := eventlog.CanonicalEventBytes(event); err != nil {
+		t.Fatalf("canonical replay event %q: %v", identifier, err)
+	}
+	return event
+}
+
+func appendTurnBudgetGrant(t *testing.T, sess *session.Session, turns int) {
+	t.Helper()
+	store, err := sess.BlobStore(blobstore.Limits{})
+	if err != nil {
+		t.Fatalf("open blobs for turn grant: %v", err)
+	}
+	writer, err := sess.EventWriter(store)
+	if err != nil {
+		t.Fatalf("open writer for turn grant: %v", err)
+	}
+	appendEvent(t, writer, eventlog.TurnBudgetGrantedPayload{GrantedBy: "operator", Turns: turns})
+	if err := writer.Close(); err != nil {
+		t.Fatalf("close writer for turn grant: %v", err)
+	}
+}
+
 func sessionEvents(t *testing.T, sess *session.Session) []eventlog.Event {
 	t.Helper()
 	body, err := os.ReadFile(filepath.Join(sess.Root, eventlog.EventsFilename))
@@ -1400,6 +1954,16 @@ func countType(events []eventlog.Event, kind eventlog.Type) int {
 		}
 	}
 	return count
+}
+
+func turnBudgetGrants(events []eventlog.Event) []eventlog.TurnBudgetGrantedPayload {
+	grants := []eventlog.TurnBudgetGrantedPayload{}
+	for _, event := range events {
+		if payload, ok := event.Payload.(eventlog.TurnBudgetGrantedPayload); ok {
+			grants = append(grants, payload)
+		}
+	}
+	return grants
 }
 
 func indexOfType(events []eventlog.Event, kind eventlog.Type) int {

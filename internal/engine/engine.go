@@ -111,9 +111,13 @@ func Run(ctx context.Context, sess *session.Session, deps Deps) (Outcome, error)
 	return runner.execute()
 }
 
-// Resume replays a started, nonterminal session and continues only the work
-// left by its immutable plan. The prompt is deliberately the only new input.
-func Resume(ctx context.Context, sess *session.Session, deps Deps, prompt string) (Outcome, error) {
+// Resume replays a started session and continues only work left by its
+// immutable plan plus an explicit turn-budget extension when requestedTurns is
+// positive.
+func Resume(ctx context.Context, sess *session.Session, deps Deps, prompt string, requestedTurns int) (Outcome, error) {
+	if requestedTurns < 0 {
+		return Outcome{}, errors.New("resume extra turns must not be negative")
+	}
 	if err := checkResumeLifecycle(sess, prompt); err != nil {
 		return Outcome{}, err
 	}
@@ -133,10 +137,28 @@ func Resume(ctx context.Context, sess *session.Session, deps Deps, prompt string
 	if err := runner.rebuildExecutionState(events); err != nil {
 		return Outcome{}, err
 	}
-	if runner.state.terminal != nil {
+	if runner.state.terminal != nil && !runner.hasUnstartedGrantedWork() && requestedTurns == 0 {
 		return runner.outcome(), nil
 	}
-	if text := strings.TrimSpace(prompt); text != "" {
+	text := strings.TrimSpace(prompt)
+	if requestedTurns > 0 {
+		if !runner.isExactPromptedTurnBudgetRetry(requestedTurns, text) {
+			if err := runner.turnBudgetGrantApplicable(requestedTurns); err != nil {
+				return Outcome{}, err
+			}
+			var promptRef *blobstore.BlobRef
+			if text != "" {
+				ref, err := runner.putText(text)
+				if err != nil {
+					return Outcome{}, err
+				}
+				promptRef = &ref
+			}
+			if err := runner.append(eventlog.TurnBudgetGrantedPayload{GrantedBy: "operator", Turns: requestedTurns, Prompt: promptRef}); err != nil {
+				return Outcome{}, err
+			}
+		}
+	} else if text != "" {
 		ref, err := runner.putText(text)
 		if err != nil {
 			return Outcome{}, err
@@ -266,9 +288,12 @@ type executionState struct {
 
 	active *turnState
 
-	conversation []conversationTurn
-	ledger       model.Ledger
-	lastResult   completedTurn
+	conversation        []conversationTurn
+	ledger              model.Ledger
+	lastResult          completedTurn
+	grantedTurns        int
+	conversationAtGrant int
+	lastTurnBudgetGrant *eventlog.TurnBudgetGrantedPayload
 
 	requests     map[string]*childState
 	childResults []string
@@ -568,11 +593,15 @@ func (r *runner) reduceEvent(event eventlog.Event) error {
 	}
 	switch payload := event.Payload.(type) {
 	case eventlog.TurnStartedPayload:
-		if state.terminal != nil {
+		if state.terminal != nil && !r.hasUnstartedGrantedWork() {
 			return errors.New("turn.started follows session.finished")
 		}
 		if state.active != nil {
 			return errors.New("session has more than one unfinished turn")
+		}
+		if state.terminal != nil {
+			state.terminal = nil
+			state.resultValidation = ""
 		}
 		turn := &turnState{
 			ActorID:  payload.ActorID,
@@ -717,6 +746,12 @@ func (r *runner) reduceEvent(event eventlog.Event) error {
 		state.steering = append(state.steering, &steeringState{Ref: payload.Prompt, Text: text})
 		return nil
 	case eventlog.SteeringAppliedPayload:
+		if state.active == nil {
+			return errors.New("steering.applied has no active turn")
+		}
+		if payload.Round != state.active.Round {
+			return fmt.Errorf("steering.applied round %d does not match active turn round %d", payload.Round, state.active.Round)
+		}
 		for _, steering := range state.steering {
 			if steering.Consumed || steering.AppliedRound != 0 || !steering.Ref.Equal(payload.Prompt) {
 				continue
@@ -725,6 +760,26 @@ func (r *runner) reduceEvent(event eventlog.Event) error {
 			return nil
 		}
 		return errors.New("steering.applied has no queued prompt")
+	case eventlog.TurnBudgetGrantedPayload:
+		if err := r.turnBudgetGrantApplicable(payload.Turns); err != nil {
+			return fmt.Errorf("turn_budget.granted is inapplicable: %w", err)
+		}
+		var steering *steeringState
+		if payload.Prompt != nil {
+			text, err := r.readBlob(*payload.Prompt)
+			if err != nil {
+				return fmt.Errorf("read turn_budget.granted prompt: %w", err)
+			}
+			steering = &steeringState{Ref: *payload.Prompt, Text: text}
+		}
+		state.grantedTurns += payload.Turns
+		state.conversationAtGrant = len(state.conversation)
+		grant := payload
+		state.lastTurnBudgetGrant = &grant
+		if steering != nil {
+			state.steering = append(state.steering, steering)
+		}
+		return nil
 	case eventlog.ResultProducedPayload:
 		if state.resultValidation != "" {
 			return errors.New("session has more than one result.produced event")
@@ -784,7 +839,7 @@ func (r *runner) advancePhase(turn *turnState) {
 }
 
 func (r *runner) phaseAfterParticipants() {
-	if len(r.state.conversation) < r.sess.Plan.Schedule.Turns {
+	if len(r.state.conversation) < r.effectiveTurnBudget() {
 		r.state.phase = phaseParticipant
 		return
 	}
@@ -795,9 +850,70 @@ func (r *runner) phaseAfterParticipants() {
 	r.state.phase = phaseDone
 }
 
+func (r *runner) effectiveTurnBudget() int {
+	return r.sess.Plan.Schedule.Turns + r.state.grantedTurns
+}
+
+// isExactPromptedTurnBudgetRetry recognizes a retry of the one durable event
+// that already carries both the unused grant and its steering. It does not
+// admit another grant while that work remains unstarted.
+func (r *runner) isExactPromptedTurnBudgetRetry(turns int, prompt string) bool {
+	grant := r.state.lastTurnBudgetGrant
+	if prompt == "" || !r.hasUnstartedGrantedWork() || grant == nil ||
+		grant.GrantedBy != "operator" || grant.Turns != turns || grant.Prompt == nil {
+		return false
+	}
+	for _, steering := range r.state.steering {
+		if steering.Consumed || steering.AppliedRound != 0 || !steering.Ref.Equal(*grant.Prompt) {
+			continue
+		}
+		return steering.Text == prompt
+	}
+	return false
+}
+
+// turnBudgetGrantApplicable reports whether the current replayed execution
+// state can consume a turn-budget grant without reopening incompatible work.
+func (r *runner) turnBudgetGrantApplicable(turns int) error {
+	if r.turnBudgetGrantExceedsIntegerRange(turns) {
+		return errors.New("turn budget grants exceed integer range")
+	}
+	if r.state.terminal != nil && r.state.terminal.Status != statusCompleted {
+		return fmt.Errorf("cannot grant turns to a %s session; retry or fork it", r.state.terminal.Status)
+	}
+	if r.hasScheduledWorkOutstanding() {
+		return errors.New("cannot grant turns while scheduled work is outstanding")
+	}
+	if r.state.terminal == nil {
+		return errors.New("turn budget grants require a completed terminal session")
+	}
+	return nil
+}
+
+func (r *runner) turnBudgetGrantExceedsIntegerRange(turns int) bool {
+	return turns > maximumInt()-r.sess.Plan.Schedule.Turns-r.state.grantedTurns
+}
+
+func maximumInt() int { return int(^uint(0) >> 1) }
+
+// hasScheduledWorkOutstanding answers whether replay already left work due.
+// A terminal makes future participant turns non-due, but it cannot suppress a
+// facilitator or reducer phase that was already selected. Once a grant makes
+// a completed terminal historical, the effective budget determines whether a
+// participant turn is newly due.
+func (r *runner) hasScheduledWorkOutstanding() bool {
+	return r.state.active != nil || r.hasUnstartedGrantedWork() ||
+		r.state.phase == phaseFacilitator || r.state.phase == phaseReducer
+}
+
+func (r *runner) hasUnstartedGrantedWork() bool {
+	return r.state.terminal != nil && r.state.terminal.Status == statusCompleted &&
+		r.state.grantedTurns > 0 && len(r.state.conversation) == r.state.conversationAtGrant
+}
+
 func (r *runner) execute() (Outcome, error) {
 	for {
-		if r.state.terminal != nil {
+		if r.state.terminal != nil && !r.hasUnstartedGrantedWork() {
 			return r.outcome(), nil
 		}
 		if r.state.active != nil {
@@ -825,10 +941,11 @@ func (r *runner) execute() (Outcome, error) {
 			outcome.Status = statusAwaitingDecision
 			return outcome, nil
 		}
-		if reason := r.dialogueStopReason(); reason != "" {
+		reason := r.dialogueStopReason()
+		if reason != "" {
 			return r.finishSuccess(reason)
 		}
-		if r.state.phase == phaseDone {
+		if r.state.phase == phaseDone && !r.hasUnstartedGrantedWork() {
 			return r.finishSuccess(stopCompleted)
 		}
 		next, err := r.nextTurn()
@@ -848,9 +965,13 @@ type turnSpec struct {
 }
 
 func (r *runner) nextTurn() (turnSpec, error) {
-	switch r.state.phase {
+	phase := r.state.phase
+	if phase == phaseDone && r.hasUnstartedGrantedWork() {
+		phase = phaseParticipant
+	}
+	switch phase {
 	case phaseParticipant:
-		if len(r.state.conversation) >= r.sess.Plan.Schedule.Turns {
+		if len(r.state.conversation) >= r.effectiveTurnBudget() {
 			return turnSpec{}, errors.New("participant phase has no remaining turn")
 		}
 		round := len(r.state.conversation) + 1
@@ -864,7 +985,7 @@ func (r *runner) nextTurn() (turnSpec, error) {
 				Role:  eventlog.ParticipantRole,
 			}, nil
 		}
-		actor, err := r.actor(r.sess.Plan.Schedule.Order[len(r.state.conversation)])
+		actor, err := r.actor(r.sess.Plan.Schedule.Order[len(r.state.conversation)%len(r.sess.Plan.Schedule.Order)])
 		if err != nil {
 			return turnSpec{}, err
 		}
@@ -886,7 +1007,7 @@ func (r *runner) nextTurn() (turnSpec, error) {
 		if err != nil {
 			return turnSpec{}, err
 		}
-		return turnSpec{Actor: actor, Round: r.sess.Plan.Schedule.Turns + 1, Role: eventlog.ReducerRole}, nil
+		return turnSpec{Actor: actor, Round: r.effectiveTurnBudget() + 1, Role: eventlog.ReducerRole}, nil
 	default:
 		return turnSpec{}, errors.New("execution has no next turn")
 	}
@@ -897,13 +1018,20 @@ func (r *runner) dialogueStopReason() string {
 		r.state.active != nil || r.state.phase == phaseFacilitator {
 		return ""
 	}
+	reason := ""
 	if hasConverged(r.state.conversation, r.state.ledger) {
-		return stopConverged
+		reason = stopConverged
 	}
-	if hasNoLedgerSignal(r.state.conversation, r.state.ledger) {
-		return stopNoLedgerSignal
+	if reason == "" && hasNoLedgerSignal(r.state.conversation, r.state.ledger) {
+		reason = stopNoLedgerSignal
 	}
-	return ""
+	if reason == "" || r.state.grantedTurns == 0 {
+		return reason
+	}
+	if len(r.state.conversation) <= r.state.conversationAtGrant {
+		return ""
+	}
+	return reason
 }
 
 func (r *runner) serviceActiveTurn() error {
@@ -1289,7 +1417,7 @@ func (r *runner) runChild(child *childState) (bool, error) {
 		}
 		childOutcome, childErr = Run(r.ctx, childSession, childDeps)
 	} else {
-		childOutcome, childErr = Resume(r.ctx, childSession, childDeps, "")
+		childOutcome, childErr = Resume(r.ctx, childSession, childDeps, "", 0)
 	}
 	childStatus := childOutcome.Status
 	if childErr != nil {
