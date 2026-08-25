@@ -300,11 +300,3 @@ Existing administration commands use the same generic projection:
 
 Add `doctor --probe-auth` when an explicit supported authentication probe is
 needed.
-
-## Compatibility
-
-`--agents codex`, `--agents relay`, contractless
-recipes, existing sessions, `compiled_plan/v1` artifacts, and runtime-config
-v1 snapshots retain their prior behavior. The root compiler and runner add a
-new direct execution boundary without changing child payloads or introducing
-a second exported recipe compiler.

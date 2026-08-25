@@ -111,15 +111,5 @@ func ForResume(parent session.Plan, input ResumeInput) (ResumeInput, error) {
 	if err := session.ValidatePlan(parent); err != nil {
 		return ResumeInput{}, fmt.Errorf("validate parent plan: %w", err)
 	}
-	candidate := parent
-	candidate.Context = input.Context
-	candidate.Skills = input.Skills
-	if err := session.ValidatePlan(candidate); err != nil {
-		return ResumeInput{}, fmt.Errorf("validate resume prompt inputs: %w", err)
-	}
-	return ResumeInput{
-		Prompt:  input.Prompt,
-		Context: append([]session.Input{}, input.Context...),
-		Skills:  append([]session.Input{}, input.Skills...),
-	}, nil
+	return ResumeInput{Prompt: input.Prompt}, nil
 }

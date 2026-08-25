@@ -176,24 +176,6 @@ func TestForChildPreservesRecipeInputsAndInvestigation(t *testing.T) {
 	}
 }
 
-func TestForResumeAcceptsOnlyPromptInputs(t *testing.T) {
-	parent, err := FromFlags(Flags{Task: "resume parent"})
-	if err != nil {
-		t.Fatalf("FromFlags: %v", err)
-	}
-	resume, err := ForResume(parent, ResumeInput{
-		Prompt:  "focus on the counterexample",
-		Context: []session.Input{input("resume-context", "c")},
-		Skills:  []session.Input{input("resume-skill", "d")},
-	})
-	if err != nil {
-		t.Fatalf("ForResume: %v", err)
-	}
-	if resume.Prompt != "focus on the counterexample" || len(resume.Context) != 1 || len(resume.Skills) != 1 {
-		t.Fatalf("resume input = %#v", resume)
-	}
-}
-
 func TestExplicitRetryAttemptBudgetIsPreserved(t *testing.T) {
 	recipe := canonicalRecipe("explicit-retry")
 	recipe.ProviderRetry = session.ProviderRetry{Mode: "allow", MaxAttempts: 2}

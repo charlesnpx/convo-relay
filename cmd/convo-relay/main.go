@@ -1039,8 +1039,6 @@ func runResume(args []string) {
 	relayHome := flags.String("home", "", "Optional relay home; defaults to CODEX_CLAUDE_HOME or ~/.codex-claude")
 	prompt := flags.String("prompt", "", "Optional new direction for the next turn")
 	_ = flags.String("mode", "", "Typed mode control for resumed rounds: adversarial, cooperative, or steelman")
-	_ = flags.String("context", "", "Attach resume context text files; may be repeated. Limits: 1 MiB per file, 2 MiB total")
-	_ = flags.String("skill", "", "Attach resume capability text files; may be repeated")
 	rounds := flags.Int("rounds", 0, "Resume for exactly N additional rounds; omit for auto-stop")
 	_ = flags.Int("max-rounds", 50, "Additional-round safety cap when --rounds is omitted")
 	_ = flags.Int("timeout", 600, "Per-turn timeout in seconds")
@@ -1059,12 +1057,7 @@ func runResume(args []string) {
 	_ = flags.String("replace-a", "", "Advanced: replace slot_0 backend/profile for resumed turns")
 	_ = flags.String("replace-b", "", "Advanced: replace slot_1 backend/profile for resumed turns")
 	jsonOutput := flags.Bool("json", false, "Emit machine-readable run JSON")
-	_, cleanedArgs, err := extractMultiValueFlags(args, "context", "skill")
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "error: %s\n", err)
-		os.Exit(2)
-	}
-	if err := parseFlags(flags, cleanedArgs); err != nil {
+	if err := parseFlags(flags, args); err != nil {
 		os.Exit(2)
 	}
 	resolvedSessionDir, remaining := resolveSessionDirAndArgs(*sessionDir, *sessionID, *relayHome, flags.Args())
@@ -1199,43 +1192,6 @@ func runClean(args []string) {
 		return
 	}
 	fmt.Printf("Deleted session %.8s: %s\n", report["session_id"], report["title"])
-}
-
-func buildTaskWithContext(task string, contextFiles []string, skillFiles []string) (string, string, error) {
-	contexts, err := preflightLaunchContexts(contextFiles)
-	if err != nil {
-		return "", "", err
-	}
-	taskWithContext := buildTaskWithLaunchContext(task, contexts)
-	skillsText, err := buildSkillsText(skillFiles)
-	if err != nil {
-		return "", "", err
-	}
-	return taskWithContext, skillsText, nil
-}
-
-func buildSkillsText(skillFiles []string) (string, error) {
-	var skillsBuilder strings.Builder
-	for _, rawPath := range skillFiles {
-		block, err := promptFileBlock(rawPath)
-		if err != nil {
-			return "", fmt.Errorf("unable to read skill file %q: %w", rawPath, err)
-		}
-		skillsBuilder.WriteString(block)
-	}
-	return skillsBuilder.String(), nil
-}
-
-func promptFileBlock(rawPath string) (string, error) {
-	absPath, err := filepath.Abs(rawPath)
-	if err != nil {
-		return "", err
-	}
-	data, err := os.ReadFile(absPath)
-	if err != nil {
-		return "", err
-	}
-	return fmt.Sprintf("\n### %s\n````text\n%s\n````\n", filepath.Base(absPath), string(data)), nil
 }
 
 func loadLaunchPlanFile(path string) (any, error) {

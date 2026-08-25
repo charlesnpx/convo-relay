@@ -455,14 +455,11 @@ func TestBuildCompileReportUsesExplicitTargetSpecificPayloads(t *testing.T) {
 	if err != nil {
 		t.Fatalf("root report: %v", err)
 	}
-	if child["target"] != "child" || child["compiled_plan"].(map[string]any)["kind"] != "compiled_plan" || child["launch"] == nil {
+	if child["target"] != "child" || child["compiled_plan"].(map[string]any)["kind"] != "compiled_plan" {
 		t.Fatalf("child report = %#v", child)
 	}
 	if root["target"] != "root" || root["compiled_plan"].(map[string]any)["kind"] != contracts.RootArtifactKindRootRecipePlan {
 		t.Fatalf("root report = %#v", root)
-	}
-	if _, exists := root["launch"]; exists {
-		t.Fatalf("root report derived a child launch: %#v", root)
 	}
 	rootRecipeRef := root["compiled_plan"].(map[string]any)["recipe_ref"].(map[string]any)
 	if rootRecipeRef["digest"] != root["recipe_digest"] {

@@ -1,36 +1,13 @@
 package provider
 
 import (
-	"context"
 	"errors"
 	"fmt"
 	"regexp"
 	"strings"
-	"time"
 
 	"github.com/charlesnpx/convo-relay/internal/model"
-	"github.com/charlesnpx/convo-relay/internal/recipes"
 )
-
-const (
-	retryInitialBackoffSeconds = 5
-	retryMaxBackoffSeconds     = 160
-)
-
-// RetryBackoff controls one retry delay. Runner supplies its existing test
-// seam; ordinary provider callers use the default below.
-type RetryBackoff func(context.Context, time.Duration) error
-
-var retryBackoff RetryBackoff = func(ctx context.Context, delay time.Duration) error {
-	timer := time.NewTimer(delay)
-	defer timer.Stop()
-	select {
-	case <-ctx.Done():
-		return ctx.Err()
-	case <-timer.C:
-		return nil
-	}
-}
 
 type BackendRunError struct {
 	Label  string
@@ -53,10 +30,6 @@ type RetryableProviderError struct {
 	Detail string
 }
 
-type providerRetrySuppressed interface {
-	SuppressProviderRetry()
-}
-
 func (e RetryableProviderError) Error() string {
 	detail := strings.TrimSpace(e.Detail)
 	if detail == "" {
@@ -66,33 +39,6 @@ func (e RetryableProviderError) Error() string {
 		return detail
 	}
 	return fmt.Sprintf("%s failed: %s", e.Label, detail)
-}
-
-type ProviderFailureError struct {
-	Label     string
-	Detail    string
-	Category  string
-	Retryable bool
-	Attempts  int
-	Cause     error
-}
-
-func (e ProviderFailureError) Error() string {
-	detail := strings.TrimSpace(e.Detail)
-	if detail == "" && e.Cause != nil {
-		detail = e.Cause.Error()
-	}
-	if detail == "" {
-		detail = "provider failure"
-	}
-	if strings.TrimSpace(e.Label) == "" {
-		return detail
-	}
-	return fmt.Sprintf("%s failed: %s", e.Label, detail)
-}
-
-func (e ProviderFailureError) Unwrap() error {
-	return e.Cause
 }
 
 // ProviderFailure is the typed failure record that runner serializes into its
@@ -206,56 +152,6 @@ func classifyRetryableProviderError(text string) string {
 	return ""
 }
 
-// RunWithProviderRetryPolicyWithBackoff retains runner's existing deterministic
-// retry-test seam without moving untyped session logic into this package.
-func RunWithProviderRetryPolicyWithBackoff[T any](ctx context.Context, label string, policy string, backoff RetryBackoff, operation func() (T, error)) (T, error) {
-	return runWithProviderRetryPolicyWithBackoff(ctx, label, policy, backoff, operation)
-}
-
-func runWithProviderRetryPolicyWithBackoff[T any](ctx context.Context, label string, policy string, backoff RetryBackoff, operation func() (T, error)) (T, error) {
-	if strings.TrimSpace(policy) == recipes.ProviderRetryForbid {
-		return operation()
-	}
-	if backoff == nil {
-		backoff = retryBackoff
-	}
-	delay := retryInitialBackoffSeconds
-	attempts := 0
-	for {
-		attempts++
-		result, err := operation()
-		if err == nil {
-			return result, nil
-		}
-		var suppressed providerRetrySuppressed
-		if errors.As(err, &suppressed) {
-			return result, err
-		}
-		var retryable RetryableProviderError
-		if !errors.As(err, &retryable) {
-			return result, err
-		}
-		if delay > retryMaxBackoffSeconds {
-			detail := fmt.Sprintf("failed after retryable provider errors: %s", firstNonEmpty(retryable.Detail, err.Error()))
-			return result, ProviderFailureError{
-				Label:     label,
-				Detail:    detail,
-				Category:  "transient",
-				Retryable: true,
-				Attempts:  attempts,
-				Cause: BackendRunError{
-					Label:  label,
-					Detail: detail,
-				},
-			}
-		}
-		if backoffErr := backoff(ctx, time.Duration(delay)*time.Second); backoffErr != nil {
-			return result, backoffErr
-		}
-		delay *= 2
-	}
-}
-
 func providerFailureCategory(text string) string {
 	cleaned := collapseWhitespace(text)
 	if cleaned == "" {
@@ -280,10 +176,6 @@ func providerFailureCategory(text string) string {
 	return "provider_error"
 }
 
-func ProviderFailureCategory(text string) string {
-	return providerFailureCategory(text)
-}
-
 // NewProviderFailure classifies and sanitizes a provider failure without
 // depending on runner's event-map representation.
 func NewProviderFailure(phase string, actor string, backend string, err error, result ProviderResult) ProviderFailure {
@@ -294,16 +186,6 @@ func NewProviderFailure(phase string, actor string, backend string, err error, r
 	var retryableErr RetryableProviderError
 	if errors.As(err, &retryableErr) {
 		retryable = true
-	}
-	var failureErr ProviderFailureError
-	if errors.As(err, &failureErr) {
-		if failureErr.Category != "" {
-			category = failureErr.Category
-		}
-		retryable = failureErr.Retryable
-		if failureErr.Attempts > 0 {
-			attempts = failureErr.Attempts
-		}
 	}
 	return ProviderFailure{
 		Phase:           phase,
@@ -330,10 +212,6 @@ func providerFailureDetail(err error, result ProviderResult) string {
 	if errors.As(err, &retryableErr) && strings.TrimSpace(retryableErr.Detail) != "" {
 		return retryableErr.Detail
 	}
-	var failureErr ProviderFailureError
-	if errors.As(err, &failureErr) && strings.TrimSpace(failureErr.Detail) != "" {
-		return failureErr.Detail
-	}
 	var backendErr BackendRunError
 	if errors.As(err, &backendErr) && strings.TrimSpace(backendErr.Detail) != "" {
 		return backendErr.Detail
@@ -342,10 +220,6 @@ func providerFailureDetail(err error, result ProviderResult) string {
 		return err.Error()
 	}
 	return ""
-}
-
-func ProviderFailureDetail(err error, result ProviderResult) string {
-	return providerFailureDetail(err, result)
 }
 
 func providerReturnCodeForFailure(result ProviderResult) any {
