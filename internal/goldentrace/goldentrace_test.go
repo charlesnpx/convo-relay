@@ -851,8 +851,7 @@ func TestBoundedChildRelayWithAdmission(t *testing.T) {
 	proposalID := graphProposalID(t, env, "child-parent")
 	beforeApproval := listSessions(t, env)
 	approval := env.run(t,
-		"control", "approve", "--home", env.relayHome, "--proposal", proposalID, "--rounds", "1",
-		"--timeout", "30", "--stall-timeout", "30", "child-parent",
+		"control", "approve", "--home", env.relayHome, "--proposal", proposalID, "child-parent",
 	)
 	requireExit(t, approval, 0)
 	afterApproval := listSessions(t, env)

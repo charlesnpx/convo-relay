@@ -15,11 +15,13 @@ import (
 
 	"github.com/charlesnpx/convo-relay/internal/blobstore"
 	"github.com/charlesnpx/convo-relay/internal/engine"
+	"github.com/charlesnpx/convo-relay/internal/eventlog"
 	"github.com/charlesnpx/convo-relay/internal/integration"
 	"github.com/charlesnpx/convo-relay/internal/plan"
 	"github.com/charlesnpx/convo-relay/internal/recipes"
 	"github.com/charlesnpx/convo-relay/internal/relayv2"
 	"github.com/charlesnpx/convo-relay/internal/session"
+	"github.com/charlesnpx/convo-relay/internal/sessionview"
 	"github.com/charlesnpx/convo-relay/internal/store"
 	"github.com/charlesnpx/convo-relay/internal/workspace"
 )
@@ -107,6 +109,49 @@ type v2RecipeRunOptions struct {
 type v2ResumeOptions struct {
 	Prompt         string
 	RequestedTurns int
+}
+
+// v2ProposalReport derives proposal state from the graph's one event projection.
+func v2ProposalReport(sess *session.Session) (map[string]any, error) {
+	graphReport, err := relayv2.BuildGraphReport(sess)
+	if err != nil {
+		return nil, err
+	}
+	graphData, _ := graphReport["graph"].(map[string]any)
+	projections, _ := graphData["proposals"].(map[string]any)
+	items := make([]any, 0, len(projections))
+	for _, requestID := range relayv2.SortProposalIDs(projections) {
+		items = append(items, projections[requestID])
+	}
+	return map[string]any{"session_id": sess.Plan.SessionID, "proposals": items}, nil
+}
+
+// v2CancelReport deliberately does not append an event. A separate control
+// process cannot append while the executing engine owns events.lock, and the
+// v2 format intentionally has no persisted PID to signal. The writer lease is
+// therefore only an authoritative liveness check; an active run must receive
+// its interrupt directly.
+func v2CancelReport(sess *session.Session) (map[string]any, error) {
+	lease, err := eventlog.AcquireWriterLease(sess.Root)
+	if err != nil {
+		var locked *eventlog.WriterLockedError
+		if errors.As(err, &locked) {
+			return nil, fmt.Errorf("session %s is running; interrupt its relay process directly", sess.Plan.SessionID)
+		}
+		return nil, err
+	}
+	defer func() {
+		_ = lease.Release()
+	}()
+	events, err := relayv2.Events(sess)
+	if err != nil {
+		return nil, err
+	}
+	status := sessionview.Status(sess.Plan, events)
+	if !status.Terminal {
+		return nil, errors.New("no owning process is active; the session is not running")
+	}
+	return map[string]any{"session_id": sess.Plan.SessionID, "status": sessionview.PublicStatus(status.Status, status.StopReason)}, nil
 }
 
 func v2RunOrdinary(ctx context.Context, options v2OrdinaryRunOptions) (map[string]any, error) {

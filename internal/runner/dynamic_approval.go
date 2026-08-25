@@ -80,7 +80,7 @@ func RejectProposal(sessionDir string, opts RejectOptions) (map[string]any, erro
 	if sess, found, err := relayv2.Open(sessionDir); err != nil {
 		return nil, err
 	} else if found {
-		if err := engine.RejectChild(context.Background(), sess, opts.ProposalID); err != nil {
+		if err := engine.RejectChild(context.Background(), sess, opts.ProposalID, opts.Reason); err != nil {
 			return nil, err
 		}
 		return map[string]any{"session_id": sess.Plan.SessionID, "proposal_id": opts.ProposalID, "status": "rejected"}, nil

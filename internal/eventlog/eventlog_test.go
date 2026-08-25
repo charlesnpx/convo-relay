@@ -22,7 +22,7 @@ func TestRoundTripEveryTypedEvent(t *testing.T) {
 	}
 	planRef := ref
 	promptRef := ref
-	want := make([]Event, 0, 17)
+	want := make([]Event, 0, 16)
 	for index, payload := range []Payload{
 		SessionStartedPayload{PlanDigest: RawBytesDigest([]byte("plan")), SessionID: "session-one"},
 		TurnBudgetGrantedPayload{GrantedBy: "operator", Turns: 2, Prompt: &promptRef},
@@ -36,7 +36,6 @@ func TestRoundTripEveryTypedEvent(t *testing.T) {
 		ChildCompletedPayload{RequestID: "request-one", ChildSessionID: "child-one", Result: ref, Status: "completed"},
 		SteeringQueuedPayload{Prompt: ref},
 		SteeringAppliedPayload{Prompt: ref, Round: 1},
-		CancelRequestedPayload{Source: "user", Force: false},
 		InputIngestedPayload{LogicalName: "brief", Content: ref},
 		WorkspacePreparedPayload{Mode: "head-copy", Commit: "abcdef", TreeHash: "123456"},
 		ResultProducedPayload{Result: ref, Format: "text", ValidationOutcome: "valid"},
@@ -119,7 +118,7 @@ func TestReplayRecoversOnlyMalformedTail(t *testing.T) {
 
 	root, _, writer := newTestWriter(t)
 	for index := 0; index < 3; index++ {
-		if _, err := writer.Append(NewEvent(fmt.Sprintf("tail-%d", index), fixtureTime(index), CancelRequestedPayload{Source: "test", Force: false})); err != nil {
+		if _, err := writer.Append(NewEvent(fmt.Sprintf("tail-%d", index), fixtureTime(index), SessionFinishedPayload{Status: "completed", StopReason: "test"})); err != nil {
 			t.Fatalf("append %d: %v", index, err)
 		}
 	}
@@ -145,7 +144,7 @@ func TestReplayRecoversOnlyMalformedTail(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open recovered writer: %v", err)
 	}
-	appended, err := recovered.Append(NewEvent("replacement-tail", fixtureTime(4), CancelRequestedPayload{Source: "test", Force: false}))
+	appended, err := recovered.Append(NewEvent("replacement-tail", fixtureTime(4), SessionFinishedPayload{Status: "completed", StopReason: "test"}))
 	if err != nil {
 		_ = recovered.Close()
 		t.Fatalf("append replacement tail: %v", err)
@@ -312,8 +311,8 @@ func TestAppendDoesNotReplayExistingEvents(t *testing.T) {
 			Seq:     uint64(sequence),
 			EventID: fmt.Sprintf("history-%05d", sequence),
 			Time:    fixtureTime(sequence),
-			Type:    CancelRequested,
-			Payload: CancelRequestedPayload{Source: "history", Force: false},
+			Type:    SessionFinished,
+			Payload: SessionFinishedPayload{Status: "completed", StopReason: "history"},
 		})
 		body.Write(line)
 		body.WriteByte('\n')
@@ -337,7 +336,7 @@ func TestAppendDoesNotReplayExistingEvents(t *testing.T) {
 		t.Fatalf("startup log reads = %d, want 1", readCalls)
 	}
 	readsBeforeAppend := readCalls
-	appended, err := writer.Append(NewEvent("after-history", fixtureTime(10001), CancelRequestedPayload{Source: "history", Force: false}))
+	appended, err := writer.Append(NewEvent("after-history", fixtureTime(10001), SessionFinishedPayload{Status: "completed", StopReason: "history"}))
 	if err != nil {
 		t.Fatalf("append after history: %v", err)
 	}
@@ -371,7 +370,7 @@ func TestOpenWriterExcludesConcurrentHandles(t *testing.T) {
 			t.Fatalf("second writer error = %v, want WriterLockedError", err)
 		}
 	}
-	firstEvent, err := first.Append(NewEvent("first", fixtureTime(0), CancelRequestedPayload{Source: "test", Force: false}))
+	firstEvent, err := first.Append(NewEvent("first", fixtureTime(0), SessionFinishedPayload{Status: "completed", StopReason: "test"}))
 	if err != nil {
 		t.Fatalf("append first event: %v", err)
 	}
@@ -385,7 +384,7 @@ func TestOpenWriterExcludesConcurrentHandles(t *testing.T) {
 	if err != nil {
 		t.Fatalf("reopen writer after close: %v", err)
 	}
-	secondEvent, err := second.Append(NewEvent("second", fixtureTime(1), CancelRequestedPayload{Source: "test", Force: false}))
+	secondEvent, err := second.Append(NewEvent("second", fixtureTime(1), SessionFinishedPayload{Status: "completed", StopReason: "test"}))
 	if err != nil {
 		_ = second.Close()
 		t.Fatalf("append second event: %v", err)
@@ -447,7 +446,7 @@ func TestAppendPoisonsWriterAfterAmbiguousFailure(t *testing.T) {
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			writer := &Writer{root: t.TempDir(), file: test.file, nextSeq: 1}
-			_, err := writer.Append(NewEvent("ambiguous", fixtureTime(0), CancelRequestedPayload{Source: "test", Force: false}))
+			_, err := writer.Append(NewEvent("ambiguous", fixtureTime(0), SessionFinishedPayload{Status: "completed", StopReason: "test"}))
 			var poisoned *WriterPoisonedError
 			if !errors.As(err, &poisoned) {
 				t.Fatalf("first append error = %v, want WriterPoisonedError", err)
@@ -456,7 +455,7 @@ func TestAppendPoisonsWriterAfterAmbiguousFailure(t *testing.T) {
 				t.Fatalf("next sequence after ambiguous append = %d, want 1", writer.NextSeq())
 			}
 			writesBeforeRetry := test.file.writes
-			_, err = writer.Append(NewEvent("retry", fixtureTime(1), CancelRequestedPayload{Source: "test", Force: false}))
+			_, err = writer.Append(NewEvent("retry", fixtureTime(1), SessionFinishedPayload{Status: "completed", StopReason: "test"}))
 			if !errors.As(err, &poisoned) {
 				t.Fatalf("retry error = %v, want WriterPoisonedError", err)
 			}

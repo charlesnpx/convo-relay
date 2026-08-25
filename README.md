@@ -453,19 +453,17 @@ Queue a prompt that will be injected before the next relay turn:
 convo-relay control steer a1b2c3d4 "Focus on failure modes before continuing"
 ```
 
-Cancel a running relay, optionally force-killing the tracked process:
+To interrupt a running relay, send `SIGINT` to its owning process. `control
+cancel` checks whether that process is still active and tells you when direct
+interruption is required:
 
 ```bash
 convo-relay control cancel a1b2c3d4
-convo-relay control cancel a1b2c3d4 --force
 ```
 
-On Unix, `control cancel` sends `SIGTERM` to the tracked relay process, which
-lets the relay mark the session interrupted and terminate the active backend
-subprocess. A live-process graceful cancellation is unsupported on Windows: it
-returns an explicit error without changing session state or removing PID and
-cleanup evidence. `control cancel --force` marks the session killed after the
-platform process-termination request succeeds.
+After the owner receives `SIGINT`, the session derives as `interrupted`; use
+`resume` to continue its remaining work. `control cancel` does not send a
+signal itself.
 
 Use `show --diff` for contested and withdrawn ledger evolution by round, and
 `show --proposals` to inspect dynamic spawn proposals. Use `control approve`
