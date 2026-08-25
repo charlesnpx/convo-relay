@@ -188,7 +188,7 @@ If the user wants to steer a relay that is already running, queue the direction 
 convo-relay control steer <session-id> "<new direction>"
 ```
 
-If the user asks to stop a running relay, use `convo-relay control cancel <session-id>`. Add `--force` only when they explicitly want a force cancellation.
+If the user asks to stop a running relay, tell them to send `SIGINT` to its owning process. `convo-relay control cancel <session-id>` checks whether that process is still active and tells them when direct interruption is required; it does not send a signal itself. After it is interrupted, use `resume` to continue its remaining work.
 
 ## Error handling
 
