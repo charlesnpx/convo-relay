@@ -36,9 +36,9 @@ type Options struct {
 	Mode      string
 }
 
-// Materialized is the durable execution boundary reconstructed from runtime
-// state. Commit and TreeHash are empty only when a current workspace is not a
-// Git repository.
+// Materialized is the durable execution boundary. Current-mode execution
+// needs its local directory from runtime state; head-copy execution is
+// reconstructed from workspace.prepared.
 type Materialized struct {
 	Mode         string
 	ExecutionCWD string
@@ -52,10 +52,6 @@ type Materialized struct {
 type persistedState struct {
 	Mode         string `json:"mode"`
 	ExecutionCWD string `json:"execution_cwd"`
-	WorktreePath string `json:"worktree_path,omitempty"`
-	SourceRoot   string `json:"source_root,omitempty"`
-	Commit       string `json:"commit,omitempty"`
-	TreeHash     string `json:"tree_hash,omitempty"`
 }
 
 // Prepare records one workspace decision. Current intentionally sees the
@@ -65,14 +61,27 @@ func Prepare(ctx context.Context, sess *session.Session, options Options) (*Mate
 }
 
 func prepareWithStateSaver(ctx context.Context, sess *session.Session, options Options, saveState func(*session.Session, Materialized) error) (*Materialized, error) {
+	return prepareWithHooks(ctx, sess, options, saveState, appendPrepared)
+}
+
+func prepareWithHooks(
+	ctx context.Context,
+	sess *session.Session,
+	options Options,
+	saveState func(*session.Session, Materialized) error,
+	appendState func(*session.Session, *Materialized) error,
+) (*Materialized, error) {
 	if sess == nil || strings.TrimSpace(sess.Root) == "" {
 		return nil, errors.New("session is required")
 	}
 	if saveState == nil {
 		return nil, errors.New("workspace state saver is required")
 	}
+	if appendState == nil {
+		return nil, errors.New("workspace event appender is required")
+	}
 	if _, err := os.Stat(statePath(sess)); err == nil {
-		return nil, errors.New("workspace is already prepared")
+		return Recover(ctx, sess)
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return nil, fmt.Errorf("inspect workspace state: %w", err)
 	}
@@ -110,16 +119,18 @@ func prepareWithStateSaver(ctx context.Context, sess *session.Session, options O
 		materialized.TreeHash = tree
 		materialized.RelativePath = relativePath
 	}
-	if err := appendPrepared(sess, materialized); err != nil {
+	// Only current mode needs local runtime state after preparation. Save it
+	// before the canonical event: an interruption can then leave only the
+	// repairable state-without-event prefix, never event-without-state.
+	if mode == ModeCurrent {
+		if err := saveState(sess, *materialized); err != nil {
+			return nil, err
+		}
+	}
+	if err := appendState(sess, materialized); err != nil {
 		if materialized.WorktreePath != "" {
 			_ = removeWorktree(ctx, materialized.SourceRoot, materialized.WorktreePath)
 		}
-		return nil, err
-	}
-	// workspace.prepared is the canonical record. The local state only caches
-	// its execution boundary and is deliberately written after that event so a
-	// crash cannot leave a recoverable workspace without provenance.
-	if err := saveState(sess, *materialized); err != nil {
 		return nil, err
 	}
 	return materialized, nil
@@ -169,49 +180,52 @@ func repositoryRelativePath(root, launchCWD string) (string, error) {
 }
 
 // Recover returns the recorded execution boundary without source inventories
-// or re-digests. When a head-copy cache is missing after workspace.prepared is
-// durable, it rebuilds that cache from the event and detached worktree. A
-// head-copy is checked only through Git's own commit/tree view, which is the
-// reproducibility boundary this package owns.
+// or re-digests. Current-mode state repairs a missing workspace.prepared event
+// before callers can execute; a head-copy is rebuilt solely from the durable
+// event and detached worktree.
 func Recover(ctx context.Context, sess *session.Session) (*Materialized, error) {
-	state, err := load(sess)
-	if errors.Is(err, os.ErrNotExist) {
-		return rebuildHeadCopyState(ctx, sess)
-	}
+	prepared, eventPresent, err := preparedEvent(sess)
 	if err != nil {
 		return nil, err
 	}
-	materialized := state.materialized()
-	if _, err := absoluteDirectory(materialized.ExecutionCWD); err != nil {
-		return nil, fmt.Errorf("recorded workspace directory is unavailable: %w", err)
-	}
-	if materialized.Mode != ModeHeadCopy {
+	state, stateErr := load(sess)
+	if stateErr == nil {
+		if state.Mode != ModeCurrent {
+			if !eventPresent {
+				return nil, errors.New("head-copy workspace state has no workspace.prepared event")
+			}
+			return rebuildHeadCopy(ctx, sess, prepared)
+		}
+		materialized, err := materializeCurrent(ctx, state)
+		if err != nil {
+			return nil, err
+		}
+		if !eventPresent {
+			if err := appendPrepared(sess, materialized); err != nil {
+				return nil, fmt.Errorf("repair workspace.prepared from runtime/workspace.json: %w", err)
+			}
+			return materialized, nil
+		}
+		if prepared.Mode != ModeCurrent {
+			return nil, errors.New("runtime/workspace.json does not match workspace.prepared")
+		}
 		return materialized, nil
 	}
-	if strings.TrimSpace(materialized.WorktreePath) == "" || strings.TrimSpace(materialized.Commit) == "" || strings.TrimSpace(materialized.TreeHash) == "" {
-		return nil, errors.New("head-copy workspace state is incomplete")
+	if !errors.Is(stateErr, os.ErrNotExist) {
+		return nil, stateErr
 	}
-	commit, err := gitOutput(ctx, materialized.WorktreePath, "rev-parse", "HEAD^{commit}")
-	if err != nil || commit != materialized.Commit {
-		return nil, errors.New("head-copy worktree no longer matches its recorded HEAD")
+	if !eventPresent {
+		return nil, errors.New("workspace runtime state is unavailable and no workspace.prepared event exists")
 	}
-	tree, err := gitOutput(ctx, materialized.WorktreePath, "rev-parse", "HEAD^{tree}")
-	if err != nil || tree != materialized.TreeHash {
-		return nil, errors.New("head-copy worktree no longer matches its recorded tree")
+	if prepared.Mode == ModeCurrent {
+		return nil, errors.New("runtime/workspace.json is missing for current workspace; it may have been deleted")
 	}
-	return materialized, nil
+	return rebuildHeadCopy(ctx, sess, prepared)
 }
 
-func rebuildHeadCopyState(ctx context.Context, sess *session.Session) (*Materialized, error) {
-	prepared, found, err := preparedEvent(sess)
-	if err != nil {
-		return nil, err
-	}
-	if !found {
-		return nil, errors.New("workspace state is unavailable and no workspace.prepared event exists")
-	}
+func rebuildHeadCopy(ctx context.Context, sess *session.Session, prepared eventlog.WorkspacePreparedPayload) (*Materialized, error) {
 	if prepared.Mode != ModeHeadCopy {
-		return nil, errors.New("workspace state is unavailable for a current workspace")
+		return nil, errors.New("workspace.prepared is not a head-copy workspace")
 	}
 	worktreePath := filepath.Join(sess.Root, "runtime", "workspace")
 	if _, err := absoluteDirectory(worktreePath); err != nil {
@@ -242,57 +256,82 @@ func rebuildHeadCopyState(ctx context.Context, sess *session.Session) (*Material
 		TreeHash:     prepared.TreeHash,
 		RelativePath: prepared.RelativePath,
 	}
-	if err := save(sess, *materialized); err != nil {
-		return nil, fmt.Errorf("rebuild workspace state: %w", err)
+	return materialized, nil
+}
+
+// materializeCurrent derives portable Git provenance from the runtime-only
+// execution directory when a current-mode repair must append the canonical
+// event. The directory is the only persisted local fact; Git facts remain in
+// workspace.prepared once that record exists.
+func materializeCurrent(ctx context.Context, state persistedState) (*Materialized, error) {
+	materialized := state.materialized()
+	executionCWD, err := absoluteDirectory(materialized.ExecutionCWD)
+	if err != nil {
+		return nil, fmt.Errorf("recorded workspace directory is unavailable: %w", err)
 	}
+	materialized.ExecutionCWD = executionCWD
+	root, commit, tree, found, err := gitFacts(ctx, executionCWD)
+	if err != nil {
+		return nil, err
+	}
+	if !found {
+		return materialized, nil
+	}
+	relativePath, err := repositoryRelativePath(root, executionCWD)
+	if err != nil {
+		return nil, err
+	}
+	materialized.SourceRoot = root
+	materialized.Commit = commit
+	materialized.TreeHash = tree
+	materialized.RelativePath = relativePath
 	return materialized, nil
 }
 
 // Cleanup removes only the exact detached worktree recorded for this session.
 // It deliberately leaves the session directory to its caller.
 func Cleanup(ctx context.Context, sess *session.Session) error {
-	state, err := load(sess)
-	if errors.Is(err, os.ErrNotExist) {
-		prepared, found, preparedErr := preparedEvent(sess)
-		if preparedErr != nil {
-			return preparedErr
-		}
-		if !found || prepared.Mode != ModeHeadCopy {
-			return nil
-		}
-		rebuilt, rebuildErr := rebuildHeadCopyState(ctx, sess)
-		if rebuildErr != nil {
-			return rebuildErr
-		}
-		state = persistedState{
-			Mode: rebuilt.Mode, ExecutionCWD: rebuilt.ExecutionCWD, WorktreePath: rebuilt.WorktreePath,
-			SourceRoot: rebuilt.SourceRoot, Commit: rebuilt.Commit, TreeHash: rebuilt.TreeHash,
-		}
-		err = nil
-	}
+	prepared, found, err := preparedEvent(sess)
 	if err != nil {
 		return err
 	}
-	if state.Mode != ModeHeadCopy || state.WorktreePath == "" {
+	if !found || prepared.Mode != ModeHeadCopy {
 		return nil
 	}
-	return removeWorktree(ctx, state.SourceRoot, state.WorktreePath)
+	materialized, err := rebuildHeadCopy(ctx, sess, prepared)
+	if err != nil {
+		return err
+	}
+	return removeWorktree(ctx, materialized.SourceRoot, materialized.WorktreePath)
 }
 
 // Projection provides the observable workspace provenance used by reports.
 func Projection(sess *session.Session) (map[string]any, error) {
-	state, err := load(sess)
+	prepared, found, err := preparedEvent(sess)
 	if err != nil {
 		return nil, err
 	}
+	mode := prepared.Mode
+	commit := prepared.Commit
+	treeHash := prepared.TreeHash
+	if !found {
+		state, stateErr := load(sess)
+		if stateErr != nil {
+			return nil, stateErr
+		}
+		if state.Mode != ModeCurrent {
+			return nil, errors.New("head-copy workspace state has no workspace.prepared event")
+		}
+		mode = state.Mode
+	}
 	projection := map[string]any{
-		"mode":                        state.Mode,
-		"commit":                      state.Commit,
-		"tree_hash":                   state.TreeHash,
+		"mode":                        mode,
+		"commit":                      commit,
+		"tree_hash":                   treeHash,
 		WorkspaceContentSourceKey:     WorkspaceContentSourceWorkingTree,
 		WorkingTreeChangesIncludedKey: true,
 	}
-	if state.Mode == ModeHeadCopy {
+	if mode == ModeHeadCopy {
 		projection[WorkspaceContentSourceKey] = WorkspaceContentSourceCommittedHead
 		projection[WorkingTreeChangesIncludedKey] = false
 	}
@@ -367,9 +406,11 @@ func statePath(sess *session.Session) string {
 }
 
 func save(sess *session.Session, materialized Materialized) error {
+	if materialized.Mode != ModeCurrent {
+		return errors.New("runtime/workspace.json is only used for current workspaces")
+	}
 	state := persistedState{
-		Mode: materialized.Mode, ExecutionCWD: materialized.ExecutionCWD, WorktreePath: materialized.WorktreePath,
-		SourceRoot: materialized.SourceRoot, Commit: materialized.Commit, TreeHash: materialized.TreeHash,
+		Mode: materialized.Mode, ExecutionCWD: materialized.ExecutionCWD,
 	}
 	body, err := json.Marshal(state)
 	if err != nil {
@@ -413,7 +454,7 @@ func load(sess *session.Session) (persistedState, error) {
 }
 
 func (s persistedState) materialized() *Materialized {
-	return &Materialized{Mode: s.Mode, ExecutionCWD: s.ExecutionCWD, WorktreePath: s.WorktreePath, SourceRoot: s.SourceRoot, Commit: s.Commit, TreeHash: s.TreeHash}
+	return &Materialized{Mode: s.Mode, ExecutionCWD: s.ExecutionCWD}
 }
 
 func absoluteDirectory(path string) (string, error) {

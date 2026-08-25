@@ -15,6 +15,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 
 	"github.com/charlesnpx/convo-relay/internal/engine"
@@ -280,12 +281,12 @@ func RecipeFromRuntime(config recipes.RuntimeConfig, recipeID string) (plan.Reci
 	if !found || record == nil {
 		return plan.Recipe{}, fmt.Errorf("recipe %q was not found", recipeID)
 	}
-	return recipeFromRecord(record, config.BackendProfiles)
+	return recipeFromRecord(record, config.BackendProfiles, config.RelayRecipes)
 }
 
-// RecipesFromRuntime returns the executable provider-backed subset of a
-// catalog. Unsupported relay pseudo-backends are deliberately omitted: they
-// are not constructible by provider.NewBackend and cannot silently enter v2.
+// RecipesFromRuntime returns the executable catalog, including declared static
+// child steps. The engine resolves those child steps rather than asking a
+// provider factory to construct a pseudo-backend.
 func RecipesFromRuntime(config recipes.RuntimeConfig) ([]plan.Recipe, error) {
 	ids := make([]string, 0, len(config.RelayRecipes))
 	for recipeID := range config.RelayRecipes {
@@ -303,7 +304,11 @@ func RecipesFromRuntime(config recipes.RuntimeConfig) ([]plan.Recipe, error) {
 	return items, nil
 }
 
-func recipeFromRecord(record map[string]any, profiles map[string]map[string]any) (plan.Recipe, error) {
+func recipeFromRecord(
+	record map[string]any,
+	profiles map[string]map[string]any,
+	relayRecipes map[string]map[string]any,
+) (plan.Recipe, error) {
 	normalized := recipes.RecipeContractPayload(record)
 	id := strings.TrimSpace(stringValue(normalized["id"]))
 	if id == "" {
@@ -315,13 +320,13 @@ func recipeFromRecord(record map[string]any, profiles map[string]map[string]any)
 	}
 	actors := make([]session.Actor, 0, 4)
 	for index, reference := range participantRefs {
-		actor, err := actorFromProfile(fmt.Sprintf("slot_%d", index), reference, profiles)
+		actor, err := actorFromProfile(fmt.Sprintf("slot_%d", index), reference, profiles, relayRecipes)
 		if err != nil {
 			return plan.Recipe{}, fmt.Errorf("recipe %q participant %d: %w", id, index, err)
 		}
 		actors = append(actors, actor)
 	}
-	facilitator, err := actorFromProfile("facilitator", stringValue(normalized["facilitator"]), profiles)
+	facilitator, err := actorFromProfile("facilitator", stringValue(normalized["facilitator"]), profiles, relayRecipes)
 	if err != nil {
 		return plan.Recipe{}, fmt.Errorf("recipe %q facilitator: %w", id, err)
 	}
@@ -329,7 +334,7 @@ func recipeFromRecord(record map[string]any, profiles map[string]map[string]any)
 	resultSource := stringValue(normalized["result_source"])
 	var reducer *session.Reducer
 	if resultSource == integration.ResultSourceReducer {
-		reducerActor, err := actorFromProfile("reducer", stringValue(normalized["reducer"]), profiles)
+		reducerActor, err := actorFromProfile("reducer", stringValue(normalized["reducer"]), profiles, relayRecipes)
 		if err != nil {
 			return plan.Recipe{}, fmt.Errorf("recipe %q reducer: %w", id, err)
 		}
@@ -384,12 +389,40 @@ func recipeFromRecord(record map[string]any, profiles map[string]map[string]any)
 	}, nil
 }
 
-func actorFromProfile(id, reference string, profiles map[string]map[string]any) (session.Actor, error) {
+func actorFromProfile(
+	id, reference string,
+	profiles map[string]map[string]any,
+	relayRecipes map[string]map[string]any,
+) (session.Actor, error) {
 	profile, err := recipes.ResolveProfileRef(reference, profiles)
 	if err != nil {
 		return session.Actor{}, err
 	}
 	backend := strings.TrimSpace(stringValue(profile["backend"]))
+	if backend == "child" {
+		recipeID := strings.TrimSpace(stringValue(profile["model"]))
+		if recipeID == "" {
+			return session.Actor{}, fmt.Errorf("profile %q child step has no recipe id", reference)
+		}
+		childRecipe, found := relayRecipes[recipeID]
+		if !found || childRecipe == nil {
+			return session.Actor{}, fmt.Errorf("profile %q child step references unknown recipe %q", reference, recipeID)
+		}
+		turns := intValue(profile["effort"], 0)
+		if turns == 0 {
+			turns = intValue(childRecipe["max_rounds"], 1)
+		}
+		if turns < 1 {
+			return session.Actor{}, fmt.Errorf("profile %q child step turns must be positive", reference)
+		}
+		return session.Actor{
+			ID:            id,
+			Backend:       "child",
+			ProfileID:     firstNonEmpty(stringValue(profile["id"]), reference),
+			ChildRecipeID: recipeID,
+			ChildTurns:    turns,
+		}, nil
+	}
 	if !provider.KnownBackend(backend) {
 		return session.Actor{}, fmt.Errorf("profile %q resolves to unsupported v2 backend %q", reference, backend)
 	}
@@ -448,6 +481,10 @@ func intValue(value any, fallback int) int {
 	case json.Number:
 		if parsed, err := typed.Int64(); err == nil {
 			return int(parsed)
+		}
+	case string:
+		if parsed, err := strconv.Atoi(strings.TrimSpace(typed)); err == nil {
+			return parsed
 		}
 	}
 	return fallback

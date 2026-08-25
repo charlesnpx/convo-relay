@@ -405,6 +405,7 @@ type childState struct {
 	Decided bool
 	Plan    *session.Plan
 	Status  string
+	Result  blobstore.BlobRef
 }
 
 func (child *childState) decided() bool   { return child != nil && child.Decided }
@@ -431,6 +432,10 @@ type executionFailure struct {
 
 func (e *executionFailure) Error() string { return e.cause.Error() }
 func (e *executionFailure) Unwrap() error { return e.cause }
+
+type staticChildAwaitingError struct{}
+
+func (*staticChildAwaitingError) Error() string { return "static child is awaiting a decision" }
 
 func newStateRunner(sess *session.Session) (*runner, error) {
 	if sess == nil {
@@ -861,6 +866,7 @@ func (r *runner) reduceEvent(event eventlog.Event) error {
 			return err
 		}
 		child.Status = payload.Status
+		child.Result = payload.Result
 		if payload.Status == statusCompleted {
 			state.childResults = append(state.childResults, text)
 		}
@@ -1051,6 +1057,12 @@ func (r *runner) execute() (Outcome, error) {
 				if cancelErr := r.ctx.Err(); cancelErr != nil {
 					return r.finishInterrupted(cancelErr)
 				}
+				var awaiting *staticChildAwaitingError
+				if errors.As(err, &awaiting) {
+					outcome := r.outcome()
+					outcome.Status = statusAwaitingDecision
+					return outcome, nil
+				}
 				reason := stopProviderFailed
 				var failure *executionFailure
 				if errors.As(err, &failure) {
@@ -1181,11 +1193,14 @@ func (r *runner) serviceActiveTurn() error {
 	if turn == nil {
 		return nil
 	}
+	actor, err := r.actor(turn.ActorID)
+	if err != nil {
+		return err
+	}
+	if actor.Backend == "child" {
+		return r.serviceStaticChildTurn(turn, actor)
+	}
 	if success := turn.latest("success"); success != nil {
-		actor, err := r.actor(turn.ActorID)
-		if err != nil {
-			return err
-		}
 		content, err := r.readBlob(success.Content)
 		if err != nil {
 			return err
@@ -1381,6 +1396,113 @@ func (r *runner) persistChildRequests(turn *turnState, actor session.Actor, resu
 		}
 	}
 	return nil
+}
+
+func staticChildRequestID(actorID string, round int) string {
+	return fmt.Sprintf("static-%s-%d", actorID, round)
+}
+
+func (r *runner) staticChildForTurn(turn *turnState, actor session.Actor) (*childState, error) {
+	if turn == nil || turn.Role != eventlog.ParticipantRole {
+		return nil, errors.New("static child step must run as a participant turn")
+	}
+	requestID := staticChildRequestID(actor.ID, turn.Round)
+	if child, found := r.state.requests[requestID]; found {
+		if child.Request.RequesterActorID != actor.ID || child.Request.RecipeID != actor.ChildRecipeID {
+			return nil, fmt.Errorf("static child request %q does not match actor %q", requestID, actor.ID)
+		}
+		return child, nil
+	}
+	resumePrompt, err := r.applySteering(turn.Round)
+	if err != nil {
+		return nil, err
+	}
+	question, err := r.putText(r.promptFor(actor, turn.Round, turn.Role, resumePrompt))
+	if err != nil {
+		return nil, err
+	}
+	if err := r.append(eventlog.ChildRequestedPayload{
+		RequestID:        requestID,
+		RequesterActorID: actor.ID,
+		RecipeID:         actor.ChildRecipeID,
+		Question:         question,
+	}); err != nil {
+		return nil, err
+	}
+	child, found := r.state.requests[requestID]
+	if !found {
+		return nil, errors.New("static child request was not reduced")
+	}
+	return child, nil
+}
+
+func (r *runner) serviceStaticChildTurn(turn *turnState, actor session.Actor) error {
+	child, err := r.staticChildForTurn(turn, actor)
+	if err != nil {
+		return err
+	}
+	if !child.decided() {
+		if err := r.admitStaticChild(actor, child); err != nil {
+			return err
+		}
+	}
+	if !child.admitted() {
+		return errors.New("static child step was not admitted")
+	}
+	if !child.completed() {
+		awaiting, err := r.runChild(child)
+		if err != nil {
+			return err
+		}
+		if awaiting {
+			return &staticChildAwaitingError{}
+		}
+	}
+	if child.Status == statusFailed {
+		return &executionFailure{
+			reason: stopChildFailed,
+			cause:  fmt.Errorf("static child step %q finished failed", child.Request.RequestID),
+		}
+	}
+	if child.Status != statusCompleted || child.Result == (blobstore.BlobRef{}) {
+		return errors.New("static child step did not produce a completed result")
+	}
+	return r.append(eventlog.TurnFinishedPayload{
+		ActorID: turn.ActorID,
+		Round:   turn.Round,
+		Content: child.Result,
+	})
+}
+
+func (r *runner) admitStaticChild(actor session.Actor, child *childState) error {
+	childPlan, err := r.staticChildPlanFor(actor, child)
+	if err != nil {
+		return fmt.Errorf("compile static child step %q: %w", actor.ID, err)
+	}
+	planRef, err := r.persistAdmittedChildPlan(childPlan)
+	if err != nil {
+		return err
+	}
+	return r.append(eventlog.ChildDecidedPayload{
+		RequestID:   child.Request.RequestID,
+		Admitted:    true,
+		Reason:      "admitted by static child step",
+		BudgetState: "available",
+		Plan:        &planRef,
+	})
+}
+
+func (r *runner) staticChildPlanFor(actor session.Actor, child *childState) (session.Plan, error) {
+	question, err := r.readBlob(child.Request.Question)
+	if err != nil {
+		return session.Plan{}, err
+	}
+	return plan.ForStaticChild(r.sess.Plan, plan.ChildRequest{
+		SessionID: r.childSessionID(child.Request.RequestID),
+		RecipeID:  actor.ChildRecipeID,
+		Question:  question,
+		Turns:     actor.ChildTurns,
+	}, r.deps.Recipes)
 }
 
 func (r *runner) servicePendingChildren() (bool, error) {

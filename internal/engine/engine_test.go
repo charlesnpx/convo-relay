@@ -864,17 +864,29 @@ func TestResumeRecoversNonGitCurrentProvisioningPrefix(t *testing.T) {
 	sess := createNonGitCurrentPreparedSession(t)
 	alpha := &fakeBackend{name: "codex", slotID: "alpha", responses: []fakeResponse{{content: "resume after provisioning"}}}
 	beta := &fakeBackend{name: "codex", slotID: "beta"}
+	if err := os.Truncate(filepath.Join(sess.Root, eventlog.EventsFilename), 0); err != nil {
+		t.Fatalf("remove prepared event to simulate crash gap: %v", err)
+	}
+	if beforeRepair := sessionEvents(t, sess); len(beforeRepair) != 0 {
+		t.Fatalf("events before workspace repair = %v, want none", eventTypes(beforeRepair))
+	}
+	if _, err := workspace.Recover(context.Background(), sess); err != nil {
+		t.Fatalf("repair current workspace before Resume: %v", err)
+	}
 	beforeResume := sessionEvents(t, sess)
 	if got := eventTypes(beforeResume); !reflect.DeepEqual(got, []eventlog.Type{eventlog.WorkspacePrepared}) {
-		t.Fatalf("events before Resume = %v, want only workspace.prepared", got)
+		t.Fatalf("events after workspace repair = %v, want only workspace.prepared", got)
 	}
 	prepared, ok := beforeResume[0].Payload.(eventlog.WorkspacePreparedPayload)
 	if !ok || prepared.Mode != workspace.ModeCurrent || prepared.Commit != "" || prepared.TreeHash != "" || prepared.RelativePath != "" {
-		t.Fatalf("non-Git workspace.prepared = %#v", beforeResume[0].Payload)
+		t.Fatalf("repaired non-Git workspace.prepared = %#v", beforeResume[0].Payload)
 	}
 
 	if _, err := Resume(context.Background(), sess, testDeps(map[string]*fakeBackend{"alpha": alpha, "beta": beta}), "", 0); err != nil {
 		t.Fatalf("Resume provisioning prefix: %v", err)
+	}
+	if _, err := workspace.Recover(context.Background(), sess); err != nil {
+		t.Fatalf("repeat workspace recovery after Resume: %v", err)
 	}
 	events := sessionEvents(t, sess)
 	if got := countType(events, eventlog.InputIngested); got != 0 {
@@ -1055,6 +1067,53 @@ func TestChildRequestsAdmitAndRejectWithoutRunningDeniedChildren(t *testing.T) {
 				t.Fatalf("denied child completed = %#v", completed)
 			}
 		})
+	}
+}
+
+func TestStaticChildParticipantExecutesThroughChildPath(t *testing.T) {
+	parent := dialoguePlan(2)
+	parent.Actors = []session.Actor{
+		{ID: "alpha", Backend: "codex"},
+		{ID: "beta", Backend: "child", ChildRecipeID: "child", ChildTurns: 1},
+	}
+	parent.ChildPolicy = session.ChildPolicy{
+		Mode: "deny", MaxDepth: 1, MaxChildren: 0, MaxTurns: 0, AllowedRecipes: []string{},
+	}
+	home := t.TempDir()
+	sess := createSessionIn(t, home, parent)
+	alpha := &fakeBackend{name: "codex", slotID: "alpha", responses: []fakeResponse{{content: "provider participant"}}}
+	child := &fakeBackend{name: "codex", slotID: "child-alpha", responses: []fakeResponse{{content: "static child result"}}}
+	deps := testDeps(map[string]*fakeBackend{"alpha": alpha, "child-alpha": child})
+	deps.Recipes = []plan.Recipe{childRecipe()}
+
+	outcome, err := Run(context.Background(), sess, deps)
+	if err != nil {
+		t.Fatalf("Run static child participant: %v", err)
+	}
+	if outcome.Status != statusCompleted || outcome.Result != "static child result" {
+		t.Fatalf("static child outcome = %#v", outcome)
+	}
+	if len(alpha.prompts) != 1 || len(child.prompts) != 1 {
+		t.Fatalf("provider prompts = %d, child prompts = %d", len(alpha.prompts), len(child.prompts))
+	}
+	events := sessionEvents(t, sess)
+	if got := countType(events, eventlog.ChildRequested); got != 1 {
+		t.Fatalf("child.requested count = %d, want 1", got)
+	}
+	decisions := childDecisions(events)
+	if len(decisions) != 1 || !decisions[0].Admitted || decisions[0].Reason != "admitted by static child step" {
+		t.Fatalf("static child decision = %#v", decisions)
+	}
+	completed := childCompletions(events)
+	if len(completed) != 1 || completed[0].Status != statusCompleted {
+		t.Fatalf("static child completion = %#v", completed)
+	}
+	store, err := sess.BlobStore(blobstore.Limits{})
+	if err != nil {
+		t.Fatalf("open parent blobs: %v", err)
+	}
+	if got := readBlob(t, store, completed[0].Result); got != "static child result" {
+		t.Fatalf("static child result blob = %q", got)
 	}
 }
 

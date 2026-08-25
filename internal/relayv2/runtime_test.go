@@ -54,3 +54,33 @@ func TestChildRequestExtractorSelectionOrder(t *testing.T) {
 		})
 	}
 }
+
+func TestActorFromProfileMapsStaticChildEffort(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		effort any
+		want   int
+	}{
+		{name: "numeric string", effort: "2", want: 2},
+		{name: "TOML integer", effort: int64(3), want: 3},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			actor, err := actorFromProfile(
+				"slot_1",
+				"nested",
+				map[string]map[string]any{
+					"nested": {
+						"id": "nested", "backend": "child", "model": "child-recipe", "effort": test.effort,
+					},
+				},
+				map[string]map[string]any{"child-recipe": {"max_rounds": int64(5)}},
+			)
+			if err != nil {
+				t.Fatalf("map child profile: %v", err)
+			}
+			if actor.Backend != "child" || actor.ChildRecipeID != "child-recipe" || actor.ChildTurns != test.want || actor.Model != "" || actor.Effort != "" {
+				t.Fatalf("static child actor = %#v", actor)
+			}
+		})
+	}
+}

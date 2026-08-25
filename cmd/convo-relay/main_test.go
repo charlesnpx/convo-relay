@@ -1027,6 +1027,163 @@ workspace_isolation = "inherited"
 	}
 }
 
+func TestRunRecipeCLIExecutesStaticChildParticipant(t *testing.T) {
+	tempDir := t.TempDir()
+	binary := filepath.Join(tempDir, "convo-relay")
+	build := exec.Command("go", "build", "-o", binary, ".")
+	if output, err := build.CombinedOutput(); err != nil {
+		t.Fatalf("build CLI: %v\n%s", err, output)
+	}
+
+	launchCWD := filepath.Join(tempDir, "launch")
+	if err := os.MkdirAll(launchCWD, 0o755); err != nil {
+		t.Fatalf("mkdir launch CWD: %v", err)
+	}
+	settingsPath := filepath.Join(launchCWD, "settings.toml")
+	settings := `
+[backend_profiles.parent]
+backend = "codex"
+model = "fake-parent"
+effort = "medium"
+capabilities = []
+
+[backend_profiles.facilitator]
+backend = "codex"
+model = "fake-facilitator"
+effort = "medium"
+capabilities = []
+
+[backend_profiles.static-child]
+backend = "child"
+model = "child-review"
+effort = 1
+capabilities = ["composite"]
+`
+	if err := os.WriteFile(settingsPath, []byte(settings), 0o644); err != nil {
+		t.Fatalf("write settings: %v", err)
+	}
+	recipePath := filepath.Join(launchCWD, "static-recipes.toml")
+	recipes := `
+[relay_recipes.static-parent]
+purpose = "Root recipe with a declared static child participant."
+participants = ["parent", "static-child"]
+facilitator = "facilitator"
+mode = "cooperative"
+max_rounds = 2
+participant_turns = 2
+result_source = "last_turn"
+max_depth = 1
+required_capabilities = []
+auto_approval = "never"
+
+[relay_recipes.static-parent.lifecycle]
+resume = "allow"
+steering = "allow"
+dynamic = "forbid"
+workspace_isolation = "inherited"
+
+[relay_recipes.child-review]
+purpose = "Child review used by the static participant."
+participants = ["parent", "parent"]
+facilitator = "facilitator"
+mode = "cooperative"
+max_rounds = 1
+participant_turns = 1
+result_source = "last_turn"
+max_depth = 1
+required_capabilities = []
+auto_approval = "never"
+
+[relay_recipes.child-review.lifecycle]
+resume = "allow"
+steering = "allow"
+dynamic = "forbid"
+workspace_isolation = "inherited"
+`
+	if err := os.WriteFile(recipePath, []byte(recipes), 0o644); err != nil {
+		t.Fatalf("write recipes: %v", err)
+	}
+
+	compile := exec.Command(binary,
+		"recipes", "compile", "static-parent",
+		"--settings", settingsPath,
+		"--recipe-file", recipePath,
+		"--json",
+	)
+	compiledOutput, err := compile.CombinedOutput()
+	if err != nil {
+		t.Fatalf("compile static child recipe: %v\n%s", err, compiledOutput)
+	}
+	compiled := decodeJSONObject(t, string(compiledOutput))
+	compiledPlan, _ := compiled["compiled_plan"].(map[string]any)
+	participants, _ := compiledPlan["participants"].([]any)
+	if len(participants) != 2 {
+		t.Fatalf("compiled static child participants = %#v", compiledPlan["participants"])
+	}
+	childStep, _ := participants[1].(map[string]any)
+	if childStep["kind"] != "child_step" || childStep["recipe_id"] != "child-review" || intValue(childStep["turns"]) != 1 {
+		t.Fatalf("compiled child step = %#v", childStep)
+	}
+
+	fakeBin := filepath.Join(tempDir, "bin")
+	if err := os.MkdirAll(fakeBin, 0o755); err != nil {
+		t.Fatalf("mkdir fake bin: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(fakeBin, "codex"), []byte(fakeCodexAppServerScript), 0o755); err != nil {
+		t.Fatalf("write fake codex: %v", err)
+	}
+	sessionDir := filepath.Join(tempDir, "session")
+	command := exec.Command(binary,
+		"run", "Execute the declared static child.",
+		"--recipe", "static-parent",
+		"--settings", settingsPath,
+		"--recipe-file", recipePath,
+		"--session-dir", sessionDir,
+		"--launch-cwd", launchCWD,
+		"--json",
+	)
+	command.Env = append(os.Environ(), "PATH="+fakeBin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	rawResult, err := command.CombinedOutput()
+	if err != nil {
+		t.Fatalf("run static child recipe: %v\n%s", err, rawResult)
+	}
+	result := decodeJSONObject(t, string(rawResult))
+	if result["status"] != "completed" || result["execution_kind"] != "recipe" || result["recipe_id"] != "static-parent" {
+		t.Fatalf("static child recipe result = %#v", result)
+	}
+
+	sess, err := session.Open(sessionDir)
+	if err != nil {
+		t.Fatalf("open static child parent session: %v", err)
+	}
+	events, err := relayv2.Events(sess)
+	if err != nil {
+		t.Fatalf("read static child events: %v", err)
+	}
+	var requested eventlog.ChildRequestedPayload
+	var decided eventlog.ChildDecidedPayload
+	var completed eventlog.ChildCompletedPayload
+	for _, event := range events {
+		switch payload := event.Payload.(type) {
+		case eventlog.ChildRequestedPayload:
+			requested = payload
+		case eventlog.ChildDecidedPayload:
+			decided = payload
+		case eventlog.ChildCompletedPayload:
+			completed = payload
+		}
+	}
+	if requested.RequesterActorID != "slot_1" || requested.RecipeID != "child-review" {
+		t.Fatalf("static child request = %#v", requested)
+	}
+	if !decided.Admitted || decided.Reason != "admitted by static child step" || decided.Plan == nil {
+		t.Fatalf("static child decision = %#v", decided)
+	}
+	if completed.RequestID != requested.RequestID || completed.Status != "completed" || completed.ChildSessionID == "" {
+		t.Fatalf("static child completion = %#v", completed)
+	}
+}
+
 func TestSaveRunnerOutputWritesMarkdownAndJSON(t *testing.T) {
 	sessionDir := filepath.Join(t.TempDir(), "session")
 	report := map[string]any{

@@ -201,7 +201,7 @@ convo-relay control approve a1b2c3d4 sp_123456789abc
 convo-relay control reject a1b2c3d4 sp_123456789abc --reason "too broad"
 ```
 
-Dynamic expansion uses predeclared backend profiles and relay recipes. Built-in profiles include `codex-deep`, `codex-fast`, `claude-code`, `gemini-vision`, and `relay-review`; built-in recipes include `review-panel`, `vision-review`, and `one-pass-review`. Override or extend them with a TOML file:
+Dynamic expansion uses predeclared backend profiles and relay recipes. Built-in profiles include `codex-deep`, `codex-fast`, `claude-code`, `gemini-vision`, and `review-panel-child`; built-in recipes include `review-panel`, `vision-review`, and `one-pass-review`. Override or extend them with a TOML file:
 
 ```toml
 [backend_profiles.codex-reviewer]
@@ -222,12 +222,13 @@ max_depth = 1
 auto_approval = "ask"
 ```
 
-Relay profiles can also be participants inside recipes. In a relay profile, `model` is the child recipe id and `effort` is the admitted child round count. If `effort` is omitted, the child recipe's `max_rounds` is used. Facilitator and reducer profiles must still point at normal backends.
+Static child profiles can also be participants inside recipes. In a child profile, `model` is the child recipe id and `effort` is the admitted child round count. If `effort` is omitted, the child recipe's `max_rounds` is used. Facilitator and reducer profiles must still point at normal backends.
 
 ```toml
 [backend_profiles.impl-panel]
-backend = "relay"
+backend = "child"
 model = "implementation-review"
+effort = 2
 description = "Nested implementation review panel."
 capabilities = ["composite", "code", "review"]
 

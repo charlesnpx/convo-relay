@@ -99,11 +99,13 @@ type Plan struct {
 }
 
 type Actor struct {
-	ID        string `json:"id"`
-	Backend   string `json:"backend"`
-	Model     string `json:"model"`
-	Effort    string `json:"effort"`
-	ProfileID string `json:"profile_id,omitempty"`
+	ID            string `json:"id"`
+	Backend       string `json:"backend"`
+	Model         string `json:"model"`
+	Effort        string `json:"effort"`
+	ProfileID     string `json:"profile_id,omitempty"`
+	ChildRecipeID string `json:"child_recipe_id,omitempty"`
+	ChildTurns    int    `json:"child_turns,omitempty"`
 }
 
 type Schedule struct {
@@ -425,6 +427,7 @@ func ValidatePlan(plan Plan) error {
 		return errors.New("plan must contain at least one actor")
 	}
 	actorIDs := make(map[string]bool, len(plan.Actors))
+	childActors := make(map[string]bool, len(plan.Actors))
 	for _, actor := range plan.Actors {
 		if err := validateToken("actor.id", actor.ID); err != nil {
 			return err
@@ -435,6 +438,17 @@ func ValidatePlan(plan Plan) error {
 		actorIDs[actor.ID] = false
 		switch actor.Backend {
 		case "claude", "codex", "gemini":
+			if actor.ChildRecipeID != "" || actor.ChildTurns != 0 {
+				return fmt.Errorf("provider actor %q must not declare a child step", actor.ID)
+			}
+		case "child":
+			if err := validateToken("actor.child_recipe_id", actor.ChildRecipeID); err != nil {
+				return err
+			}
+			if actor.ChildTurns < 0 {
+				return errors.New("actor.child_turns must not be negative")
+			}
+			childActors[actor.ID] = true
 		default:
 			return fmt.Errorf("actor backend %q is not supported", actor.Backend)
 		}
@@ -455,6 +469,9 @@ func ValidatePlan(plan Plan) error {
 		if _, exists := actorIDs[plan.Facilitator.Actor]; !exists {
 			return errors.New("facilitator actor is not in actors")
 		}
+		if childActors[plan.Facilitator.Actor] {
+			return errors.New("facilitator actor must not be a child step")
+		}
 		if plan.Facilitator.Cadence < 1 {
 			return errors.New("facilitator cadence must be positive")
 		}
@@ -462,6 +479,9 @@ func ValidatePlan(plan Plan) error {
 	if plan.Reducer != nil {
 		if _, exists := actorIDs[plan.Reducer.Actor]; !exists {
 			return errors.New("reducer actor is not in actors")
+		}
+		if childActors[plan.Reducer.Actor] {
+			return errors.New("reducer actor must not be a child step")
 		}
 	}
 	controlActorCount := 0

@@ -19,28 +19,10 @@
       }
     },
     {
-      "path": "artifacts/child_invocations/relay-backend-child.json",
-      "ref": {
-        "digest": "sha256:43ccdd3824971ebade51dc8149d78f9eea3ea60be74dac85c7a665e90b9c13d0",
-        "id": "child_invocation:43ccdd3824971eba",
-        "kind": "artifact_ref",
-        "schema_version": 1
-      }
-    },
-    {
       "path": "artifacts/child_invocations/dynamic-child.json",
       "ref": {
         "digest": "sha256:3630788824cafd0341e028467f19b520032097f80ffe8b03603e123817750af3",
         "id": "child_invocation:3630788824cafd03",
-        "kind": "artifact_ref",
-        "schema_version": 1
-      }
-    },
-    {
-      "path": "artifacts/child_results/relay-backend-child.json",
-      "ref": {
-        "digest": "sha256:d4b1ac204c6560890ab7b969b8c2ba1db57988551a24c6664ccb692f98b4f2c9",
-        "id": "child_result:d4b1ac204c656089",
         "kind": "artifact_ref",
         "schema_version": 1
       }

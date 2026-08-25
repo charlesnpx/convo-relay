@@ -48,6 +48,49 @@ func ForChild(parent session.Plan, request ChildRequest, recipes []Recipe) (sess
 	return compile(child)
 }
 
+// ForStaticChild compiles a child step declared by the parent recipe. Static
+// composition is already admitted by that immutable plan, so it does not use
+// the parent's dynamic-child approval mode or budget. Its depth bound still
+// applies to any children the static child might itself request.
+func ForStaticChild(parent session.Plan, request ChildRequest, recipes []Recipe) (session.Plan, error) {
+	if err := session.ValidatePlan(parent); err != nil {
+		return session.Plan{}, fmt.Errorf("validate parent plan: %w", err)
+	}
+	recipeID := strings.TrimSpace(request.RecipeID)
+	if recipeID == "" {
+		return session.Plan{}, fmt.Errorf("child recipe id is required")
+	}
+	if request.Turns < 0 {
+		return session.Plan{}, fmt.Errorf("child turns must not be negative")
+	}
+	if parent.ChildPolicy.MaxDepth <= 0 {
+		return session.Plan{}, fmt.Errorf("static child step has no remaining depth")
+	}
+	recipe, err := selectNamedRecipe(recipeID, recipes)
+	if err != nil {
+		return session.Plan{}, err
+	}
+	if err := validateRecipeProjection(recipe); err != nil {
+		return session.Plan{}, err
+	}
+
+	childSessionID := strings.TrimSpace(request.SessionID)
+	if childSessionID == "" {
+		childSessionID = parent.SessionID + "-child"
+	}
+	child := planFromRecipe(RecipeInput{
+		SessionID: childSessionID,
+		Task:      request.Question,
+		Timeouts:  parent.Timeouts,
+		Context:   parent.Context,
+		Skills:    parent.Skills,
+		TaskPlan:  parent.TaskPlan,
+	}, recipe, session.ProvenanceChild)
+	child.Schedule = boundedStaticChildSchedule(child.Schedule, request.Turns)
+	child.ChildPolicy = remainingStaticChildPolicy(normalizeChildPolicy(child.ChildPolicy), parent.ChildPolicy)
+	return compile(child)
+}
+
 func childRequestAllowed(policy session.ChildPolicy, recipeID string) error {
 	// ValidatePlan(parent) has already limited the mode to deny, ask or allow, so
 	// only the deny rejection is reachable here.
@@ -91,10 +134,28 @@ func boundedChildSchedule(schedule session.Schedule, parent session.Plan, reques
 	return schedule
 }
 
+func boundedStaticChildSchedule(schedule session.Schedule, requestedTurns int) session.Schedule {
+	if requestedTurns > 0 && requestedTurns < schedule.Turns {
+		schedule.Turns = requestedTurns
+	}
+	if schedule.Kind == "sequence" && len(schedule.Order) > schedule.Turns {
+		schedule.Order = schedule.Order[:schedule.Turns]
+	}
+	return schedule
+}
+
 func remainingChildPolicy(policy session.ChildPolicy, parent session.ChildPolicy) session.ChildPolicy {
 	policy.MaxDepth = minimum(policy.MaxDepth, parent.MaxDepth-1)
 	policy.MaxChildren = minimum(policy.MaxChildren, parent.MaxChildren-1)
 	policy.MaxTurns = minimum(policy.MaxTurns, parent.MaxTurns-1)
+	return policy
+}
+
+// A static child is declared by the immutable parent recipe, so it neither
+// consumes nor inherits the parent's dynamic-child capacity. Its descendants
+// still have one less available nesting level.
+func remainingStaticChildPolicy(policy session.ChildPolicy, parent session.ChildPolicy) session.ChildPolicy {
+	policy.MaxDepth = minimum(policy.MaxDepth, parent.MaxDepth-1)
 	return policy
 }
 
