@@ -5,17 +5,17 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/charlesnpx/convo-relay/internal/contracts"
+	"github.com/charlesnpx/convo-relay/internal/format"
 )
 
 func preflightError(code string, path string, message string, details map[string]any) error {
-	diagnostic := contracts.NewDiagnostic(code, contracts.DiagnosticPhasePreflight, path, message, details)
-	return contracts.NewDiagnosticError(message, diagnostic)
+	diagnostic := format.NewDiagnostic(code, format.DiagnosticPhasePreflight, path, message, details)
+	return format.NewDiagnosticError(message, diagnostic)
 }
 
 func wrapPreflightError(cause error, code string, path string, message string, details map[string]any) error {
-	diagnostic := contracts.NewDiagnostic(code, contracts.DiagnosticPhasePreflight, path, message, details)
-	return contracts.WrapDiagnosticError(cause, message, diagnostic)
+	diagnostic := format.NewDiagnostic(code, format.DiagnosticPhasePreflight, path, message, details)
+	return format.WrapDiagnosticError(cause, message, diagnostic)
 }
 
 func rejectUnknownFields(object map[string]any, allowed []string, path string, label string, code string) error {

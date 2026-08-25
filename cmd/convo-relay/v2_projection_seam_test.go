@@ -281,26 +281,6 @@ func (env *u2db3CLIEnv) run(t *testing.T, args ...string) u2db3CLIResult {
 	return result
 }
 
-func (env *u2db3CLIEnv) listStatus(t *testing.T, sessionID string) string {
-	t.Helper()
-	result := env.run(t, "list", "--home", env.relayHome, "--json")
-	u2db3RequireExit(t, result, 0)
-	report := u2db3Report(t, result)
-	sessions, ok := report["sessions"].([]any)
-	if !ok {
-		t.Fatalf("list sessions = %#v", report)
-	}
-	for _, raw := range sessions {
-		item, ok := raw.(map[string]any)
-		if !ok || item["session_id"] != sessionID {
-			continue
-		}
-		return u2db3Status(t, item)
-	}
-	t.Fatalf("session %q not listed: %#v", sessionID, report)
-	return ""
-}
-
 func u2db3ReplaceEnv(base []string, replacements map[string]string) []string {
 	result := make([]string, 0, len(base)+len(replacements))
 	for _, item := range base {
@@ -332,15 +312,6 @@ func u2db3Status(t *testing.T, report map[string]any) string {
 	status, ok := report["status"].(string)
 	if !ok {
 		t.Fatalf("status missing from %#v", report)
-	}
-	return status
-}
-
-func u2db3ValidationStatus(t *testing.T, report map[string]any) string {
-	t.Helper()
-	status, ok := report["validation_status"].(string)
-	if !ok {
-		t.Fatalf("validation status missing from %#v", report)
 	}
 	return status
 }

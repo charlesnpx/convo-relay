@@ -91,11 +91,10 @@ installation.
 make test
 make test-race
 make cross-compile
-make cross-compile-tests
 make package
 ```
 
-Cross-compilation is a release gate, not a runtime certification claim. `make cross-compile` builds every production package for `darwin/arm64` and `windows/amd64`, while `make cross-compile-tests` compiles the repository's practical test packages for those targets. These gates do not execute foreign binaries and do not certify runtime support on macOS or Windows.
+Cross-compilation is a release gate, not a runtime certification claim. `make cross-compile` builds every production package for `darwin/arm64` and `windows/amd64`; it does not execute foreign binaries or compile test packages for those targets.
 
 ## Usage
 
@@ -175,7 +174,7 @@ text, at most 1 MiB, with a 2 MiB total limit per input kind:
 ```bash
 convo-relay run "Review this migration plan" \
   --context docs/plan.md docs/schema.sql \
-  --skill docs/capabilities.md
+  --skill docs/review-guidance.md
 ```
 
 Investigation mode defaults to `auto`, which tells agents to inspect relevant
@@ -209,7 +208,6 @@ backend = "codex"
 model = "gpt-5.5"
 effort = "xhigh"
 description = "Deep implementation-risk review"
-capabilities = ["code", "reasoning"]
 
 [relay_recipes.review-panel]
 purpose = "Use for persistent contested implementation risks."
@@ -230,7 +228,6 @@ backend = "child"
 model = "implementation-review"
 effort = 2
 description = "Nested implementation review panel."
-capabilities = ["composite", "code", "review"]
 
 [relay_recipes.parent-review]
 purpose = "Use when a parent review needs a nested implementation panel."
@@ -277,21 +274,14 @@ convo-relay recipes compile review-panel --json
 
 `recipes list` shows usable recipes and recipes that require an integration bundle by default in human output. JSON output includes all statuses unless `--status` is supplied, including invalid or skipped parseable records that would otherwise be hidden by runtime normalization. `recipes show` reports declared recipe data, integration binding, and resolved participant/backend readiness. `recipes doctor` validates settings parseability, recipe/profile references, installation-only backend readiness, and grouped root-cause diagnostics. A missing integration bundle reports `requires_integration` without degrading list or doctor; pass `--integration-bundle <file>` to list, show, doctor, or `recipes compile` to bind an exact contract.
 
-The optional Witness defaults keep all existing v1 recipe names and contract
-bindings available. Parallel `witness-falsify-v2`,
-`witness-falsify-v2-codex`, and `witness-falsify-v2-claude` recipes bind
-`witnessed-review/witness-falsification-v2`; `economy-equivalence-v2`,
-`economy-equivalence-v2-codex`, and `economy-equivalence-v2-claude` bind
-`witnessed-review/economy-equivalence-v2`. These v2 names select the
-reachability-classified Witness generation. The defaults declare orchestration
-topology and policy only. Contract prompts, result schemas, and adjudication
-remain consumer-owned bundle data, and the relay treats each
-contract id as opaque.
+The optional Witness defaults are consumer-specific recipe aliases. They
+declare orchestration topology and policy only; prompts, result schemas, and
+adjudication remain consumer-owned bundle data. The relay treats each
+integration contract id as opaque.
 
-`recipes compile <id>` is a side-effect-free root-plan preflight. It emits a
-machine-readable `root_recipe_plan` and binds a matching integration bundle
-when the recipe declares a contract; it does not execute providers or create a
-session.
+`recipes compile <id>` is a side-effect-free root-launch preflight. It emits a
+machine-readable plan preview and binds a matching integration bundle when the
+recipe declares a contract; it does not execute providers or create a session.
 
 Run a configured recipe directly as the root session:
 
@@ -369,7 +359,8 @@ convo-relay show a1b2c3d4 --graph --json
 - `diagnostics` for attention-required status, recent sanitized provider failures, and scan metadata
 - `incomplete` / `export_ready` for export suitability
 
-`show --graph --json` returns contract-native debug output: the mutable `graph`, raw v1 `session_event` contracts under `events`, and strict v1 `validation`. Event contracts use `event_type`, `timestamp`, and nested `payload` fields.
+`show --graph --json` returns a derived graph plus canonical event summaries.
+The event log remains the durable authority; the graph is an inspection view.
 
 ### Export a session
 
@@ -382,24 +373,14 @@ convo-relay export verify evidence-bundle --json
 
 `export create` requires an explicit `-o` / `--output` path. Markdown exports include session status, incomplete state, task, session id, final ledger details, compact per-turn ledger counts, and transcript turns. JSON exports include the same structured session report as `show --json`, including diagnostics, and succeed for incomplete sessions when the partial transcript can be read.
 
-`--portable` is separate from those display exports. It accepts a terminal
-successor root session, validates its complete artifact-ref closure, and
-atomically publishes a new `relay-root-portable-export-v2` directory. The
-manifest binds canonical JSON payloads for the root projection, transcript,
-diagnostics, and every transitively referenced artifact. Source-session refs
-are rewritten to directory-local payload refs that retain source artifact id
-and digest. Every payload except the exact root-session, transcript, and
-diagnostics projections requires that source identity; the same source id may
-appear with different immutable digests, but an exact id/digest pair may appear
-only once. Required absolute source, relay-home, session, named-input source,
-and worktree paths are omitted. `export verify` rechecks the closed file set,
-payload digests, portable source refs, and one-to-one provider
-invocation/result lineage. Durable marker-only crashes can leave attempt gaps,
-so an export may begin with attempt 2 or omit an earlier attempt. With `--json`,
-an invalid export writes a structured `status: "invalid"` result to stdout and
-exits with status 1.
-Running, recovery-pending, v1, tampered, incomplete, or out-of-root sessions
-fail without publishing the final target.
+`--portable` is separate from display exports. It accepts a terminal recipe
+root session and atomically publishes a closed `relay.bundle/v1` directory:
+one manifest plus the root-session, transcript, and diagnostics payloads. The
+manifest inventory carries a BlobRef for each payload. `export verify`
+rechecks the closed file set, canonical payload JSON, and every blob digest.
+With `--json`, an invalid export writes `status: "invalid"` to stdout and exits
+with status 1. Running, incomplete, tampered, or non-root sessions fail without
+publishing the final target.
 
 ### Diagnose runtime and sessions
 
@@ -538,93 +519,21 @@ Root recipe sessions record the selected workspace mode. A `head-copy` session
 owns a detached worktree, and `clean` removes that worktree and its Git
 registration before removing the session files.
 
-Each session is stored under `~/.codex-claude/sessions/<uuid>/`:
+Each session is a managed directory below the configured relay home:
 
-```
-<uuid>/
-├── .git/              # Git repo (satisfies Codex's requirement)
-├── codex/             # Slot-scoped CODEX_HOME targets
-│   ├── slot_0/
-│   └── slot_1/
-├── gemini/            # Slot-scoped Gemini HOME targets
-│   └── slot_1/
-├── meta.json          # Task, mode, slots, ledger, backend state
-├── graph.json         # Durable execution graph: nodes, proposals, decisions, artifacts
-├── events.jsonl       # Append-only graph events
-├── proposals/         # Typed spawn proposals
-├── artifacts/         # Child traces, result envelopes, and admitted plans
-├── steering.json      # Pending operator steering prompts
-└── transcript.json    # Turn-by-turn dialogue plus facilitator ledger snapshots
+```text
+<session>/
+├── session.json        # immutable relay.plan/v1
+├── events.jsonl        # canonical relay.event/v1 stream
+├── blobs/sha256/       # content-addressed payload bytes
+└── runtime/            # local provider reconstruction data
 ```
 
-`meta.json` now looks like:
-
-```json
-{
-  "task": "...",
-  "initial_prompt": "...",
-  "title": "first 80 chars of the opening turn",
-  "round_limit_mode": "auto",
-  "rounds": null,
-  "max_rounds": 50,
-  "mode": "adversarial",
-  "slots": [
-    {
-      "backend": "claude",
-      "slot_id": "slot_0",
-      "label": "Claude Code",
-      "state": {
-        "session_id": "...",
-        "started": true,
-        "cwd": "/path/to/project",
-        "model": "sonnet",
-        "effort": "high"
-      }
-    },
-    {
-      "backend": "codex",
-      "slot_id": "slot_1",
-      "label": "Codex",
-      "state": {
-        "thread_id": "...",
-        "started": true,
-        "cwd": "/path/to/project",
-        "model": "gpt-5.4",
-        "effort": "xhigh"
-      }
-    }
-  ],
-  "ledger": {"settled": [], "contested": [], "withdrawn": []},
-  "facilitator_backend": "codex",
-  "facilitator_model": "gpt-5.5",
-  "investigation_mode": "auto",
-  "prompt_policy_version": "prompt-policy/v1",
-  "runtime_config_version": "runtime-config/v1",
-  "runtime_config_ref": {"kind": "artifact_ref", "schema_version": 1, "id": "artifacts/runtime_config/launch.json", "digest": "sha256:..."},
-  "launch_context_refs": [
-    {
-      "label": "ctx1",
-      "display_name": "plan.md",
-      "digest": "sha256:...",
-      "embedded": true,
-      "artifact_ref": {"kind": "artifact_ref", "schema_version": 1, "id": "artifacts/launch_context/ctx1.json", "digest": "sha256:..."}
-    }
-  ],
-  "input_bundle_refs": [
-    {"label": "ctx1", "bundle_kind": "context", "phase": "launch", "artifact_ref": {"kind": "artifact_ref", "schema_version": 1, "id": "artifacts/launch_context/ctx1.json", "digest": "sha256:..."}}
-  ],
-  "transient_recipe_refs": [
-    {"label": "recipe_file1", "recipe_ids": ["local-review"], "artifact_ref": {"kind": "artifact_ref", "schema_version": 1, "id": "artifacts/transient_recipes/recipe_file1.json", "digest": "sha256:..."}}
-  ],
-  "slot_replacement_history": [
-    {"logical_slot_id": "slot_0", "previous_slot_id": "slot_0", "new_slot_id": "slot_0_gen2", "previous_backend": "codex", "new_backend": "gemini", "applies_from_round": 3}
-  ],
-  "launch_cwd": "/path/to/project",
-  "created_at": "...",
-  "status": "completed",
-  "stop_reason": "converged"
-}
-```
+`session.json`, `events.jsonl`, and the referenced blobs are the durable
+authority. The `runtime/` directory is local implementation state used for
+resume and does not introduce another public format. `show --json` derives its
+report from that authority rather than from parallel metadata or transcript
+files.
 
 `convo-relay show <id> --json` returns:
 
@@ -683,33 +592,17 @@ Each session is stored under `~/.codex-claude/sessions/<uuid>/`:
 }
 ```
 
-Each `transcript.json` entry contains:
+Provider failures that look like bad or expired credentials are non-retryable so
+they do not consume the transient retry budget. Failed attempts persist
+sanitized provider-failure events with category, retryability, attempt count,
+phase, actor, backend, timeout/stall flags, return code, remediation, and
+redacted detail; raw provider stderr is not exposed by default.
 
-```json
-{
-  "round": 2,
-  "slot_id": "slot_0",
-  "from": "Claude Code",
-  "content": "...",
-  "ledger": {"settled": [], "contested": [], "withdrawn": []},
-  "timestamp": "...",
-  "provider_result": {
-    "backend": "claude",
-    "timed_out": false,
-    "stalled": false,
-    "recovered": false,
-    "return_code": 0,
-    "recovery_source": "",
-    "warnings": []
-  }
-}
-```
-
-Provider failures that look like bad or expired credentials are treated as non-retryable so they do not consume the full transient retry budget. Failed turns persist sanitized `provider_failure` events with category, retryability, attempt count, phase, actor, backend, timeout/stall flags, return code, remediation, and redacted detail; raw provider stderr is not exposed by default.
-
-Codex runs through an embedded agentbus adapter with `CODEX_HOME` redirected; each slot gets an isolated home that links `auth.json` and `config.toml` from `~/.codex`, and the relay deliberately uses Codex's trusted (`dangerFullAccess`) write posture. Gemini runs with a slot-scoped home while linking existing Gemini config where available. The original launch directory is persisted in `meta.json` so `resume` and `clean` stay tied to the same project context. Claude Code still uses the real `~/.claude/` config for auth and can write project transcripts; `clean` removes only relay-owned Claude artifacts for the saved launch directory, including legacy-compatible cleanup for pre-migration sessions. Override the base directory with `CODEX_CLAUDE_HOME`.
-
-Each slot also persists its own working directory inside `slots[*].state.cwd`. Claude normally uses the original launch directory. Codex also uses that launch directory when it is still inside a git repo; otherwise it falls back to the session git repo so the Codex app-server adapter has a valid repository context. Older pre-slot sessions can still be listed, shown, diffed, and cleaned, but `resume` requires the current slot-based session format.
+Codex runs through the embedded agentbus adapter with a slot-scoped
+`CODEX_HOME`. Gemini uses a slot-scoped home. Claude uses its configured
+same-user credentials. The launch workspace is recorded by the plan and its
+events so resume and clean retain the same project context. Override the relay
+home with `CODEX_CLAUDE_HOME`.
 
 ## License
 

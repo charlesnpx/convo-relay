@@ -129,7 +129,9 @@ convo-relay export create <session-id> --portable -o <bundle-directory> --json
 convo-relay export verify <bundle-directory> --json
 ```
 
-`show --graph --json` returns raw v1 `session_event` objects with `event_type`, `timestamp`, and `payload`; do not expect legacy flattened `type` or `ts` fields. Public artifact values are `artifact_ref` objects with `id` and `digest`, not filesystem path strings. Use `export verify` to validate a portable export directory and its manifest.
+`show --graph --json` returns a derived graph and summaries from the canonical
+event log. Treat BlobRef values as path-independent payload references. Use
+`export verify` to validate a portable bundle directory and its manifest.
 
 ### Status interpretation
 

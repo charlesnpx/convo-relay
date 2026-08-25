@@ -31,6 +31,17 @@ type BlobRef struct {
 	MediaType string `json:"media_type"`
 }
 
+// RefForBytes describes raw bytes using the one portable payload-reference
+// shape. It does not write anything to a store.
+func RefForBytes(body []byte, mediaType string) BlobRef {
+	mediaType = strings.TrimSpace(mediaType)
+	if mediaType == "" {
+		mediaType = defaultMediaType
+	}
+	sum := sha256.Sum256(body)
+	return BlobRef{SHA256: hex.EncodeToString(sum[:]), Size: int64(len(body)), MediaType: mediaType}
+}
+
 // Equal reports whether two references identify the same payload and metadata.
 func (r BlobRef) Equal(other BlobRef) bool {
 	return r.SHA256 == other.SHA256 && r.Size == other.Size && r.MediaType == other.MediaType

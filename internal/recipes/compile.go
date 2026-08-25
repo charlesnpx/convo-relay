@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/charlesnpx/convo-relay/internal/contracts"
+	"github.com/charlesnpx/convo-relay/internal/format"
 	"github.com/charlesnpx/convo-relay/internal/integration"
 )
 
@@ -14,9 +14,6 @@ const (
 	CompileTargetRoot  CompileTarget = "root"
 	CompileTargetChild CompileTarget = "child"
 
-	// A root plan materializes one schedule record per participant turn. This
-	// bound keeps malformed or impractical configuration from allocating an
-	// unbounded plan before execution can reject it.
 	maxCompiledParticipantTurns = 10_000
 )
 
@@ -29,8 +26,8 @@ type CompileOptions struct {
 	IntegrationBundle    *integration.Bundle
 }
 
-// RootOnlyRecipeError reports an integration-bound recipe that cannot be
-// compiled for nested or dynamic child execution.
+// RootOnlyRecipeError identifies a recipe that requires a root launch because
+// it binds an integration input bundle.
 type RootOnlyRecipeError struct {
 	RecipeID            string `json:"recipe_id"`
 	IntegrationContract string `json:"integration_contract"`
@@ -55,8 +52,8 @@ func (e *RootOnlyRecipeError) ToMap() map[string]any {
 	}
 }
 
-// CompileRecipe is the sole canonical recipe compiler. Callers must choose a
-// target explicitly; integration_contract never selects a target implicitly.
+// CompileRecipe checks a recipe and returns a non-durable plan preview. The
+// only durable plan is session.Plan, produced by plan.FromRecipe at launch.
 func CompileRecipe(
 	recipe map[string]any,
 	profiles map[string]map[string]any,
@@ -68,28 +65,20 @@ func CompileRecipe(
 		return nil, err
 	}
 	if diagnostics := validateRecipeRecord(recipe, "/recipe"); len(diagnostics) > 0 {
-		return nil, contracts.NewDiagnosticError("Relay recipe configuration is invalid.", diagnostics...)
+		return nil, format.NewDiagnosticError("Relay recipe configuration is invalid.", diagnostics...)
 	}
-	contractID := stringValue(recipe["integration_contract"])
-	recipePayload := normalizeRecipePayload(recipe)
-	if strings.TrimSpace(contractID) != "" && options.IntegrationBundle != nil && options.IntegrationBundle.SchemaVersion() == integration.BundleSchemaVersionV2 {
-		if _, represented := recipePayload["provider_retry"]; !represented {
-			recipePayload["provider_retry"] = ProviderRetryAllow
-			recipePayload["schema_version"] = 2
-		}
+	payload := normalizeRecipePayload(recipe)
+	if target == CompileTargetChild && strings.TrimSpace(stringValue(payload["integration_contract"])) != "" {
+		return nil, &RootOnlyRecipeError{RecipeID: stringValue(payload["id"]), IntegrationContract: stringValue(payload["integration_contract"])}
 	}
-	var compiled map[string]any
-	var err error
+	var (
+		compiled map[string]any
+		err      error
+	)
 	if target == CompileTargetChild {
-		if contractID := stringValue(recipePayload["integration_contract"]); strings.TrimSpace(contractID) != "" {
-			return nil, &RootOnlyRecipeError{
-				RecipeID:            stringValue(recipePayload["id"]),
-				IntegrationContract: contractID,
-			}
-		}
-		compiled, err = compileChildPlan(recipePayload, profiles, relayRecipes, options)
+		compiled, err = compileChildPlan(payload, profiles, relayRecipes, options)
 	} else {
-		compiled, err = compileRootPlan(recipePayload, profiles, relayRecipes, options)
+		compiled, err = compileRootPlan(payload, profiles, relayRecipes, options)
 	}
 	if err != nil {
 		return nil, err
@@ -97,19 +86,16 @@ func CompileRecipe(
 	if options.ValidateExecutable {
 		closureOptions := options
 		if closureOptions.MaxRelayBackendDepth <= 0 {
-			closureOptions.MaxRelayBackendDepth = intFromAny(recipePayload["max_depth"], 1)
+			closureOptions.MaxRelayBackendDepth = intFromAny(payload["max_depth"], 1)
 		}
-		visited := map[string]bool{strings.TrimSpace(stringValue(recipePayload["id"])): true}
-		if err := validateNestedChildCompileTargets(recipePayload, profiles, relayRecipes, closureOptions, visited); err != nil {
+		visited := map[string]bool{strings.TrimSpace(stringValue(payload["id"])): true}
+		if err := validateNestedChildCompileTargets(payload, profiles, relayRecipes, closureOptions, visited); err != nil {
 			return nil, err
 		}
 	}
 	return compiled, nil
 }
 
-// validateNestedChildCompileTargets validates every static child step before
-// the parent
-// plan can cross a persistence boundary.
 func validateNestedChildCompileTargets(
 	parent map[string]any,
 	profiles map[string]map[string]any,
@@ -123,30 +109,26 @@ func validateNestedChildCompileTargets(
 		if err != nil || stringValue(profile["backend"]) != "child" {
 			continue
 		}
-		childRecipeID := strings.TrimSpace(stringValue(profile["model"]))
-		childRecipe, exists := relayRecipes[childRecipeID]
-		if !exists || childRecipe == nil || visited[childRecipeID] {
+		childID := strings.TrimSpace(stringValue(profile["model"]))
+		childRecipe, exists := relayRecipes[childID]
+		if !exists || childRecipe == nil || visited[childID] {
 			continue
 		}
 		if diagnostics := validateRecipeRecord(childRecipe, "/recipe"); len(diagnostics) > 0 {
-			return contracts.NewDiagnosticError("Relay recipe configuration is invalid.", diagnostics...)
+			return format.NewDiagnosticError("Relay recipe configuration is invalid.", diagnostics...)
 		}
 		childPayload := normalizeRecipePayload(childRecipe)
-		if contractID := strings.TrimSpace(stringValue(childPayload["integration_contract"])); contractID != "" {
-			return &RootOnlyRecipeError{
-				RecipeID:            stringValue(childPayload["id"]),
-				IntegrationContract: contractID,
-			}
+		if integrationID := strings.TrimSpace(stringValue(childPayload["integration_contract"])); integrationID != "" {
+			return &RootOnlyRecipeError{RecipeID: stringValue(childPayload["id"]), IntegrationContract: integrationID}
 		}
-
 		childOptions := options
 		childOptions.CompositionPath = fmt.Sprintf("%s.slot_%d", compositionPath, index)
-		childOptions.RelayBackendDepth = options.RelayBackendDepth + 1
+		childOptions.RelayBackendDepth++
 		childOptions.IntegrationBundle = nil
 		if _, err := compileChildPlan(childPayload, profiles, relayRecipes, childOptions); err != nil {
 			return err
 		}
-		visited[childRecipeID] = true
+		visited[childID] = true
 		if err := validateNestedChildCompileTargets(childPayload, profiles, relayRecipes, childOptions, visited); err != nil {
 			return err
 		}
@@ -159,9 +141,9 @@ func validateCompileTarget(target CompileTarget) error {
 	case CompileTargetRoot, CompileTargetChild:
 		return nil
 	case "":
-		return contracts.NewValidationError("recipe compile target is required")
+		return format.NewValidationError("recipe compile target is required")
 	default:
-		return contracts.NewValidationError("unknown recipe compile target %q", target)
+		return format.NewValidationError("unknown recipe compile target %q", target)
 	}
 }
 
@@ -171,93 +153,29 @@ func compileChildPlan(
 	relayRecipes map[string]map[string]any,
 	options CompileOptions,
 ) (map[string]any, error) {
-	compositionPath := strings.TrimSpace(options.CompositionPath)
-	if compositionPath == "" {
-		compositionPath = "root"
-	}
-	// compiled_plan/v1 deliberately references the legacy child projection.
-	// The full normalized recipe remains available to root compilation.
-	recipePayload := normalizeLegacyRecipePayload(recipe)
+	compositionPath := defaultCompositionPath(options.CompositionPath)
 	if options.ValidateExecutable {
 		maxDepth := options.MaxRelayBackendDepth
 		if maxDepth <= 0 {
-			maxDepth = intFromAny(recipePayload["max_depth"], 1)
+			maxDepth = intFromAny(recipe["max_depth"], 1)
 		}
-		if issues := ExecutableIssues(recipePayload, profiles, relayRecipes, DepthPolicy{
-			RelayBackendDepth:    options.RelayBackendDepth,
-			MaxRelayBackendDepth: maxDepth,
-		}, compositionPath); len(issues) > 0 {
-			return nil, ChildRelayConfigError{
-				Message: "Child relay recipe is not executable by the in-process runner.",
-				Issues:  issues,
-			}
+		if issues := ExecutableIssues(recipe, profiles, relayRecipes, DepthPolicy{RelayBackendDepth: options.RelayBackendDepth, MaxRelayBackendDepth: maxDepth}, compositionPath); len(issues) > 0 {
+			return nil, ChildRelayConfigError{Message: "Child relay recipe is not executable by the in-process runner.", Issues: issues}
 		}
 	}
-
-	participants := stringSlice(recipePayload["participants"])
-	participantProfiles := make([]any, 0, len(participants))
-	for index, ref := range participants {
-		profile, err := compiledProfile(
-			ref,
-			profiles,
-			relayRecipes,
-			fmt.Sprintf("slot_%d", index),
-			fmt.Sprintf("%s.slot_%d", compositionPath, index),
-		)
-		if err != nil {
-			return nil, err
-		}
-		participantProfiles = append(participantProfiles, profile)
-	}
-	facilitatorProfile, err := compiledProfile(
-		stringValue(recipePayload["facilitator"]),
-		profiles,
-		relayRecipes,
-		"facilitator",
-		compositionPath+".facilitator",
-	)
+	participants, err := compileParticipants(recipe, profiles, relayRecipes, compositionPath)
 	if err != nil {
 		return nil, err
 	}
-	reducerProfile, err := compiledProfile(
-		stringValue(recipePayload["reducer"]),
-		profiles,
-		relayRecipes,
-		"reducer",
-		compositionPath+".reducer",
-	)
+	facilitator, err := compiledProfile(stringValue(recipe["facilitator"]), profiles, relayRecipes, "facilitator", compositionPath+".facilitator")
 	if err != nil {
 		return nil, err
 	}
-
-	recipeDigest, err := contracts.PayloadDigest(recipePayload)
+	reducer, err := compiledProfile(stringValue(recipe["reducer"]), profiles, relayRecipes, "reducer", compositionPath+".reducer")
 	if err != nil {
 		return nil, err
 	}
-	payload := map[string]any{
-		"kind":           "compiled_plan",
-		"schema_version": 1,
-		"recipe_ref": map[string]any{
-			"kind":           "artifact_ref",
-			"schema_version": 1,
-			"id":             "recipe:" + stringValue(recipePayload["id"]),
-			"digest":         recipeDigest,
-		},
-		"recipe_id":    recipePayload["id"],
-		"participants": participantProfiles,
-		"facilitator":  facilitatorProfile,
-		"reducer":      reducerProfile,
-		"mode":         recipePayload["mode"],
-		"round_bounds": map[string]any{
-			"max_rounds":     recipePayload["max_rounds"],
-			"default_rounds": recipePayload["max_rounds"],
-		},
-		"depth_policy": map[string]any{
-			"max_graph_depth": recipePayload["max_depth"],
-			"max_child_depth": recipePayload["max_depth"],
-		},
-	}
-	return normalizeCompiledPlanPayload(payload)
+	return preview(recipe, participants, facilitator, reducer), nil
 }
 
 func compileRootPlan(
@@ -268,249 +186,135 @@ func compileRootPlan(
 ) (map[string]any, error) {
 	compositionPath := defaultCompositionPath(options.CompositionPath)
 	if options.ValidateExecutable {
-		if issues := rootExecutableIssues(recipe, profiles, relayRecipes, DepthPolicy{
-			RelayBackendDepth:    options.RelayBackendDepth,
-			MaxRelayBackendDepth: options.MaxRelayBackendDepth,
-		}, compositionPath); len(issues) > 0 {
-			return nil, ChildRelayConfigError{
-				Message: "Root recipe is not executable by the in-process runner.",
-				Issues:  issues,
-			}
+		if issues := rootExecutableIssues(recipe, profiles, relayRecipes, DepthPolicy{RelayBackendDepth: options.RelayBackendDepth, MaxRelayBackendDepth: options.MaxRelayBackendDepth}, compositionPath); len(issues) > 0 {
+			return nil, ChildRelayConfigError{Message: "Root recipe is not executable by the in-process runner.", Issues: issues}
 		}
 	}
+	participants, err := compileParticipants(recipe, profiles, relayRecipes, compositionPath)
+	if err != nil {
+		return nil, rootCompileDiagnostic("invalid_root_participant", "/participants", "Root recipe participant profile could not be resolved.", map[string]any{"cause": err.Error()})
+	}
+	facilitator, err := compiledProfile(stringValue(recipe["facilitator"]), profiles, relayRecipes, "facilitator", compositionPath+".facilitator")
+	if err != nil {
+		return nil, rootCompileDiagnostic("invalid_root_facilitator", "/facilitator", "Root recipe facilitator profile could not be resolved.", map[string]any{"cause": err.Error()})
+	}
+	if stringValue(facilitator["kind"]) == "child_step" {
+		return nil, rootCompileDiagnostic("invalid_root_facilitator", "/facilitator", "Root recipe facilitator must resolve to a provider, not a child step.", nil)
+	}
+	turns, err := validatedRootParticipantTurns(recipe)
+	if err != nil {
+		return nil, err
+	}
+	schedule, err := integration.AlternatingSchedule(turns)
+	if err != nil {
+		return nil, format.NewValidationError("root recipe participant schedule: %v", err)
+	}
+	participantSchedule := make([]any, 0, len(schedule))
+	for _, turn := range schedule {
+		participantSchedule = append(participantSchedule, map[string]any{"participant_turn": turn.ParticipantTurn, "slot": turn.Slot})
+	}
+	resultSource := normalizeResultSource(recipe["result_source"])
+	var reducer map[string]any
+	if resultSource == integration.ResultSourceReducer {
+		reducer, err = compiledProfile(stringValue(recipe["reducer"]), profiles, relayRecipes, "reducer", compositionPath+".reducer")
+		if err != nil {
+			return nil, rootCompileDiagnostic("invalid_root_reducer", "/reducer", "Root recipe reducer profile could not be resolved.", map[string]any{"cause": err.Error()})
+		}
+		if stringValue(reducer["kind"]) == "child_step" {
+			return nil, rootCompileDiagnostic("invalid_root_reducer", "/reducer", "Root recipe reducer must resolve to a provider, not a child step.", nil)
+		}
+	}
+	result := preview(recipe, participants, facilitator, reducer)
+	result["participant_turns"] = turns
+	result["participant_schedule"] = participantSchedule
+	result["result_source"] = resultSource
+	lifecycle := normalizeLifecyclePayload(recipe["lifecycle"])
+	result["lifecycle"] = lifecycle
+	result["workspace_mode"] = "current"
+	if lifecycle["workspace_isolation"] == "ephemeral" {
+		result["workspace_mode"] = "head-copy"
+	}
+	if integrationID := strings.TrimSpace(stringValue(recipe["integration_contract"])); integrationID != "" {
+		selected, err := integration.SelectContract(options.IntegrationBundle, integrationID, integration.ScheduleRequirement{Turns: schedule, ResultSource: resultSource})
+		if err != nil {
+			return nil, err
+		}
+		result["integration"] = map[string]any{
+			"id":              selected.ID(),
+			"bundle_digest":   options.IntegrationBundle.Digest(),
+			"contract_digest": selected.Digest(),
+			"prompt_context":  selected.PromptContext().ToMap(),
+		}
+	}
+	return result, nil
+}
+
+func compileParticipants(recipe map[string]any, profiles map[string]map[string]any, relayRecipes map[string]map[string]any, compositionPath string) ([]any, error) {
 	participants := stringSlice(recipe["participants"])
 	if len(participants) != 2 {
-		return nil, contracts.NewValidationError("root recipe participants must contain exactly two entries")
+		return nil, format.NewValidationError("recipe participants must contain exactly two entries")
 	}
-	participantProfiles := make([]any, 0, len(participants))
+	compiled := make([]any, 0, len(participants))
 	for index, ref := range participants {
-		profile, err := compiledProfile(
-			ref,
-			profiles,
-			relayRecipes,
-			fmt.Sprintf("slot_%d", index),
-			fmt.Sprintf("%s.slot_%d", compositionPath, index),
-		)
+		profile, err := compiledProfile(ref, profiles, relayRecipes, fmt.Sprintf("slot_%d", index), fmt.Sprintf("%s.slot_%d", compositionPath, index))
 		if err != nil {
-			return nil, rootCompileDiagnostic(
-				"invalid_root_participant",
-				fmt.Sprintf("/participants/%d", index),
-				"Root recipe participant profile could not be resolved.",
-				map[string]any{"profile_ref": ref, "cause": err.Error()},
-			)
+			return nil, err
 		}
-		participantProfiles = append(participantProfiles, profile)
+		compiled = append(compiled, profile)
 	}
+	return compiled, nil
+}
 
-	facilitatorRef := strings.TrimSpace(stringValue(recipe["facilitator"]))
-	facilitatorProfile, err := compiledProfile(
-		facilitatorRef,
-		profiles,
-		relayRecipes,
-		"facilitator",
-		compositionPath+".facilitator",
-	)
-	if err != nil {
-		return nil, rootCompileDiagnostic(
-			"invalid_root_facilitator",
-			"/facilitator",
-			"Root recipe facilitator profile could not be resolved.",
-			map[string]any{"profile_ref": facilitatorRef, "cause": err.Error()},
-		)
-	}
-	if stringValue(facilitatorProfile["kind"]) == "child_step" {
-		return nil, rootCompileDiagnostic(
-			"invalid_root_facilitator",
-			"/facilitator",
-			"Root recipe facilitator must resolve to a provider, not a child step.",
-			map[string]any{"profile_ref": facilitatorRef},
-		)
-	}
-
-	participantTurns, err := validatedRootParticipantTurns(recipe)
-	if err != nil {
-		return nil, err
-	}
-	scheduledTurns, err := integration.AlternatingSchedule(participantTurns)
-	if err != nil {
-		return nil, contracts.NewValidationError("root recipe participant schedule: %v", err)
-	}
-	participantSchedule := make([]any, 0, len(scheduledTurns))
-	for _, turn := range scheduledTurns {
-		participantSchedule = append(participantSchedule, map[string]any{
-			"participant_turn": turn.ParticipantTurn,
-			"slot":             turn.Slot,
-		})
-	}
-
-	resultSource := normalizeResultSource(recipe["result_source"])
-	var reducerProfile map[string]any
-	if resultSource == integration.ResultSourceReducer {
-		reducerRef := strings.TrimSpace(stringValue(recipe["reducer"]))
-		reducerProfile, err = compiledProfile(
-			reducerRef,
-			profiles,
-			relayRecipes,
-			"reducer",
-			compositionPath+".reducer",
-		)
-		if err != nil {
-			return nil, rootCompileDiagnostic(
-				"invalid_root_reducer",
-				"/reducer",
-				"Root recipe reducer profile could not be resolved.",
-				map[string]any{"profile_ref": reducerRef, "cause": err.Error()},
-			)
-		}
-		if stringValue(reducerProfile["kind"]) == "child_step" {
-			return nil, rootCompileDiagnostic(
-				"invalid_root_reducer",
-				"/reducer",
-				"Root recipe reducer must resolve to a provider, not a child step.",
-				map[string]any{"profile_ref": reducerRef},
-			)
-		}
-	}
-
-	recipePayload := normalizeRecipePayload(recipe)
-	contractID := stringValue(recipePayload["integration_contract"])
-	recipeRef, err := contracts.ArtifactRefForPayload("recipe:"+stringValue(recipePayload["id"]), recipePayload)
-	if err != nil {
-		return nil, err
-	}
-	lifecycle := normalizeLifecyclePayload(recipePayload["lifecycle"])
-	workspaceMode := "current"
-	if lifecycle["workspace_isolation"] == "ephemeral" {
-		workspaceMode = "head-copy"
-	}
-	planFields := map[string]any{
-		"recipe_id":             recipePayload["id"],
-		"recipe_ref":            recipeRef,
-		"participant_turns":     participantTurns,
-		"participant_schedule":  participantSchedule,
-		"participants":          participantProfiles,
-		"facilitator":           facilitatorProfile,
-		"result_source":         resultSource,
-		"lifecycle":             lifecycle,
-		"workspace_mode":        workspaceMode,
-		"mode":                  recipePayload["mode"],
-		"auto_approval":         recipePayload["auto_approval"],
-		"required_capabilities": recipePayload["required_capabilities"],
-		"depth_policy": map[string]any{
-			"max_graph_depth": recipePayload["max_depth"],
+func preview(recipe map[string]any, participants []any, facilitator map[string]any, reducer map[string]any) map[string]any {
+	result := map[string]any{
+		"recipe_id":    recipe["id"],
+		"participants": participants,
+		"facilitator":  facilitator,
+		"mode":         recipe["mode"],
+		"round_bounds": map[string]any{
+			"max_rounds":     recipe["max_rounds"],
+			"default_rounds": recipe["max_rounds"],
 		},
+		"depth_policy":   map[string]any{"max_graph_depth": recipe["max_depth"], "max_child_depth": recipe["max_depth"]},
+		"provider_retry": recipe["provider_retry"],
 	}
-	_, providerRetryRepresented := recipePayload["provider_retry"]
-	if providerRetryRepresented {
-		planFields["provider_retry"] = EffectiveProviderRetry(recipePayload)
+	if reducer != nil {
+		result["reducer"] = reducer
 	}
-	if reducerProfile != nil {
-		planFields["reducer"] = reducerProfile
-	}
-
-	if strings.TrimSpace(contractID) != "" {
-		selected, err := integration.SelectContract(options.IntegrationBundle, contractID, integration.ScheduleRequirement{
-			Turns:        scheduledTurns,
-			ResultSource: resultSource,
-		})
-		if err != nil {
-			return nil, err
-		}
-		bundleArtifact, err := options.IntegrationBundle.ArtifactPayload()
-		if err != nil {
-			return nil, err
-		}
-		bundleRef, err := contracts.RootArtifactRefForPayload(contracts.RootArtifactKindIntegrationBundle, 0, bundleArtifact)
-		if err != nil {
-			return nil, err
-		}
-		contractArtifact, err := selected.ArtifactPayload()
-		if err != nil {
-			return nil, err
-		}
-		contractRef, err := contracts.RootArtifactRefForPayload(contracts.RootArtifactKindIntegrationContract, 0, contractArtifact)
-		if err != nil {
-			return nil, err
-		}
-		planFields["integration_bundle_ref"] = bundleRef
-		planFields["integration_bundle_digest"] = options.IntegrationBundle.Digest()
-		planFields["integration_contract_ref"] = contractRef
-		planFields["integration_contract_id"] = selected.ID()
-		planFields["integration_contract_digest"] = selected.Digest()
-		if selected.BundleVersion() == integration.BundleSchemaVersionV2 {
-			planFields["prompt_context"] = selected.PromptContext().ToMap()
-		}
-	}
-	if providerRetryRepresented {
-		return contracts.NormalizeRootArtifactVersion(contracts.RootArtifactKindRootRecipePlan, contracts.RootArtifactSchemaVersionV2, planFields)
-	}
-	return contracts.NormalizeRootArtifact(contracts.RootArtifactKindRootRecipePlan, planFields)
+	return result
 }
 
 func validatedRootParticipantTurns(recipe map[string]any) (int, error) {
-	participantTurns := intFromAny(recipe["participant_turns"], intFromAny(recipe["max_rounds"], 1))
-	if participantTurns > maxCompiledParticipantTurns {
-		return 0, rootCompileDiagnostic(
-			DiagnosticCodeInvalidParticipantTurns,
-			"/participant_turns",
-			fmt.Sprintf("Root recipe participant_turns must not exceed %d.", maxCompiledParticipantTurns),
-			map[string]any{"participant_turns": participantTurns, "maximum": maxCompiledParticipantTurns},
-		)
+	turns := intFromAny(recipe["participant_turns"], intFromAny(recipe["max_rounds"], 1))
+	if turns > maxCompiledParticipantTurns {
+		return 0, rootCompileDiagnostic(DiagnosticCodeInvalidParticipantTurns, "/participant_turns", fmt.Sprintf("Root recipe participant_turns must not exceed %d.", maxCompiledParticipantTurns), map[string]any{"participant_turns": turns, "maximum": maxCompiledParticipantTurns})
 	}
-	return participantTurns, nil
+	return turns, nil
 }
 
 func rootCompileDiagnostic(code string, path string, message string, details map[string]any) error {
-	diagnostic := contracts.NewDiagnostic(code, contracts.DiagnosticPhasePreflight, path, message, details)
-	return contracts.NewDiagnosticError(message, diagnostic)
+	diagnostic := format.NewDiagnostic(code, format.DiagnosticPhasePreflight, path, message, details)
+	return format.NewDiagnosticError(message, diagnostic)
 }
 
-func BuildCompileReport(
-	recipeID string,
-	config RuntimeConfig,
-	target CompileTarget,
-	options CompileOptions,
-) (map[string]any, error) {
+func BuildCompileReport(recipeID string, config RuntimeConfig, target CompileTarget, options CompileOptions) (map[string]any, error) {
 	if err := validateCompileTarget(target); err != nil {
 		return nil, err
 	}
 	recipe, ok := config.RelayRecipes[recipeID]
 	if !ok {
-		return nil, ChildRelayConfigError{
-			Message: "Relay recipe is not available for compilation.",
-			Issues: []ChildRecipeIssue{{
-				Category: "invalid_config",
-				Code:     "unknown_recipe",
-				Message:  fmt.Sprintf("Unknown relay recipe '%s'.", recipeID),
-				Path:     "recipe",
-				Detail:   map[string]any{"recipe_id": recipeID},
-			}},
-		}
+		return nil, ChildRelayConfigError{Message: "Relay recipe is not available for compilation.", Issues: []ChildRecipeIssue{{Category: "invalid_config", Code: "unknown_recipe", Message: fmt.Sprintf("Unknown relay recipe '%s'.", recipeID), Path: "recipe", Detail: map[string]any{"recipe_id": recipeID}}}}
 	}
 	compiled, err := CompileRecipe(recipe, config.BackendProfiles, config.RelayRecipes, target, options)
 	if err != nil {
 		return nil, err
 	}
-	var recipePayload map[string]any
-	effectiveRecipe := recipe
-	if target == CompileTargetChild {
-		recipePayload = ChildRecipeContractPayload(recipe)
-	} else {
-		recipePayload = RecipeContractPayload(recipe)
-		if providerRetry, successor := compiled["provider_retry"]; successor {
-			if _, represented := recipePayload["provider_retry"]; !represented {
-				effectiveRecipe = cloneObject(recipe)
-				effectiveRecipe["schema_version"] = 2
-				effectiveRecipe["provider_retry"] = providerRetry
-				recipePayload = RecipeContractPayload(effectiveRecipe)
-			}
-		}
-	}
-	recipeDigest, err := contracts.PayloadDigest(recipePayload)
+	payload := RecipePayload(recipe)
+	recipeDigest, err := format.SemanticJSONDigest(payload)
 	if err != nil {
 		return nil, err
 	}
-	compiledDigest, err := contracts.PayloadDigest(compiled)
+	compiledDigest, err := format.SemanticJSONDigest(compiled)
 	if err != nil {
 		return nil, err
 	}
@@ -518,33 +322,21 @@ func BuildCompileReport(
 		"recipe_id":            recipeID,
 		"target":               string(target),
 		"settings_path":        config.SettingsPath,
-		"recipe":               effectiveRecipe,
+		"recipe":               payload,
 		"recipe_digest":        recipeDigest,
 		"compiled_plan":        compiled,
 		"compiled_plan_digest": compiledDigest,
 	}
 	if trace, ok := transientRecipeDigestTraces(options.TransientSources)[recipeID]; ok {
-		if target == CompileTargetChild && trace.RecipeDigest != "" && trace.RecipeDigest != recipeDigest {
-			return nil, fmt.Errorf("transient recipe digest mismatch for %q: source metadata %s, compiled recipe %s", recipeID, trace.RecipeDigest, recipeDigest)
-		}
 		report["source_digest"] = trace.SourceDigest
 		report["source_type"] = trace.SourceType
 		report["source_path"] = trace.Path
 		report["source_display_name"] = trace.DisplayName
-		if target == CompileTargetRoot && trace.RecipeDigest != "" && trace.RecipeDigest != recipeDigest {
-			report["source_recipe_digest"] = trace.RecipeDigest
-		}
 	}
 	return report, nil
 }
 
-func compiledProfile(
-	ref string,
-	profiles map[string]map[string]any,
-	relayRecipes map[string]map[string]any,
-	slotID string,
-	compositionPath string,
-) (map[string]any, error) {
+func compiledProfile(ref string, profiles map[string]map[string]any, relayRecipes map[string]map[string]any, slotID string, compositionPath string) (map[string]any, error) {
 	profile, err := ResolveProfileRef(ref, profiles)
 	if err != nil {
 		return nil, err
@@ -553,29 +345,15 @@ func compiledProfile(
 	model := profile["model"]
 	effort := profile["effort"]
 	if backend == "child" {
-		childRecipeID := stringValue(model)
-		childRecipe, ok := relayRecipes[childRecipeID]
-		if effort == nil && ok {
-			effort = intFromAny(childRecipe["max_rounds"], 1)
+		childID := stringValue(model)
+		if effort == nil {
+			if childRecipe, ok := relayRecipes[childID]; ok {
+				effort = intFromAny(childRecipe["max_rounds"], 1)
+			}
 		}
-		return map[string]any{
-			"kind":             "child_step",
-			"slot_id":          slotID,
-			"profile_id":       fallbackString(profile["id"], ref),
-			"recipe_id":        childRecipeID,
-			"turns":            effort,
-			"composition_path": compositionPath,
-		}, nil
+		return map[string]any{"kind": "child_step", "slot_id": slotID, "profile_id": fallbackString(profile["id"], ref), "recipe_id": childID, "turns": effort, "composition_path": compositionPath}, nil
 	}
-	return map[string]any{
-		"slot_id":          slotID,
-		"profile_id":       fallbackString(profile["id"], ref),
-		"backend":          backend,
-		"model":            model,
-		"effort":           effort,
-		"composition_path": compositionPath,
-		"capabilities":     cleanStringList(profile["capabilities"], false),
-	}, nil
+	return map[string]any{"slot_id": slotID, "profile_id": fallbackString(profile["id"], ref), "backend": backend, "model": model, "effort": effort, "composition_path": compositionPath}, nil
 }
 
 func ResolveProfileRef(ref string, profiles map[string]map[string]any) (map[string]any, error) {
@@ -584,14 +362,7 @@ func ResolveProfileRef(ref string, profiles map[string]map[string]any) (map[stri
 		return cloneObject(profile), nil
 	}
 	if backendRegistry[profileRef] {
-		return map[string]any{
-			"id":           profileRef,
-			"backend":      profileRef,
-			"model":        nil,
-			"effort":       nil,
-			"description":  fmt.Sprintf("Direct %s backend", profileRef),
-			"capabilities": []any{},
-		}, nil
+		return map[string]any{"id": profileRef, "backend": profileRef, "model": nil, "effort": nil, "description": fmt.Sprintf("Direct %s backend", profileRef)}, nil
 	}
 	return nil, fmt.Errorf("Unknown backend profile or backend '%s'", profileRef)
 }

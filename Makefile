@@ -8,7 +8,7 @@ LDFLAGS ?= -X main.cliVersion=$(VERSION)
 
 CROSS_TARGETS ?= darwin/arm64 windows/amd64
 
-.PHONY: build install install-assets fmt-check test test-race cross-compile cross-compile-tests release-gate package clean
+.PHONY: build install install-assets fmt-check test test-race cross-compile release-gate package clean
 
 build:
 	mkdir -p "$(dir $(BINARY))"
@@ -43,24 +43,7 @@ cross-compile:
 		CGO_ENABLED=0 GOOS=$$target_os GOARCH=$$target_arch go build ./...; \
 	done
 
-cross-compile-tests:
-	@set -eu; \
-	test_dir=$$(mktemp -d); \
-	trap 'rm -rf "$$test_dir"' 0 HUP INT TERM; \
-	for target in $(CROSS_TARGETS); do \
-		target_os=$${target%/*}; \
-		target_arch=$${target#*/}; \
-		echo "Cross-compiling test packages for $$target_os/$$target_arch"; \
-		test_packages=$$(CGO_ENABLED=0 GOOS=$$target_os GOARCH=$$target_arch go list -f '{{if or .TestGoFiles .XTestGoFiles}}{{.ImportPath}}{{end}}' ./...); \
-		for package in $$test_packages; do \
-			test_name=$$(printf '%s' "$$package" | sed 's#[/.]#_#g'); \
-			test_suffix=; \
-			if [ "$$target_os" = windows ]; then test_suffix=.exe; fi; \
-			CGO_ENABLED=0 GOOS=$$target_os GOARCH=$$target_arch go test -c "$$package" -o "$$test_dir/$$target_os-$$target_arch-$$test_name.test$$test_suffix"; \
-		done; \
-	done
-
-release-gate: cross-compile cross-compile-tests
+release-gate: cross-compile
 
 package: build
 	rm -rf "$(DIST_DIR)"

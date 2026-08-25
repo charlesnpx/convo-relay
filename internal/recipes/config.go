@@ -9,7 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/charlesnpx/convo-relay/internal/contracts"
+	"github.com/charlesnpx/convo-relay/internal/format"
 	"github.com/pelletier/go-toml/v2"
 )
 
@@ -179,12 +179,11 @@ func NormalizeBackendProfiles(rawProfiles map[string]any) map[string]map[string]
 			continue
 		}
 		normalized[profileID] = map[string]any{
-			"id":           profileID,
-			"backend":      backend,
-			"model":        profile["model"],
-			"effort":       profile["effort"],
-			"description":  strings.TrimSpace(stringValue(profile["description"])),
-			"capabilities": cleanStringList(profile["capabilities"], false),
+			"id":          profileID,
+			"backend":     backend,
+			"model":       profile["model"],
+			"effort":      profile["effort"],
+			"description": strings.TrimSpace(stringValue(profile["description"])),
 		}
 		if strings.TrimSpace(stringValue(profile["origin"])) == "generated" {
 			normalized[profileID]["origin"] = "generated"
@@ -224,24 +223,23 @@ func normalizeRelayRecipesWithDefaults(rawRecipes map[string]any, defaults map[s
 			reducer = facilitator
 		}
 		payload := map[string]any{
-			"id":                    recipeID,
-			"purpose":               strings.TrimSpace(stringValue(recipe["purpose"])),
-			"participants":          participants,
-			"facilitator":           facilitator,
-			"reducer":               reducer,
-			"mode":                  normalizeMode(recipe["mode"]),
-			"max_rounds":            positiveInt(recipe["max_rounds"], 1),
-			"participant_turns":     positiveInt(recipe["participant_turns"], positiveInt(recipe["max_rounds"], 1)),
-			"result_source":         normalizeResultSource(recipe["result_source"]),
-			"integration_contract":  recipe["integration_contract"],
-			"max_depth":             positiveInt(recipe["max_depth"], 1),
-			"required_capabilities": cleanStringList(recipe["required_capabilities"], false),
-			"auto_approval":         normalizeAutoApproval(recipe["auto_approval"]),
-			"lifecycle":             recipe["lifecycle"],
-			"origin":                recipe["origin"],
-			"generated_from_ref":    recipe["generated_from_ref"],
-			"generated_source":      recipe["generated_source"],
-			"generated_recipe_id":   recipe["generated_recipe_id"],
+			"id":                   recipeID,
+			"purpose":              strings.TrimSpace(stringValue(recipe["purpose"])),
+			"participants":         participants,
+			"facilitator":          facilitator,
+			"reducer":              reducer,
+			"mode":                 normalizeMode(recipe["mode"]),
+			"max_rounds":           positiveInt(recipe["max_rounds"], 1),
+			"participant_turns":    positiveInt(recipe["participant_turns"], positiveInt(recipe["max_rounds"], 1)),
+			"result_source":        normalizeResultSource(recipe["result_source"]),
+			"integration_contract": recipe["integration_contract"],
+			"max_depth":            positiveInt(recipe["max_depth"], 1),
+			"auto_approval":        normalizeAutoApproval(recipe["auto_approval"]),
+			"lifecycle":            recipe["lifecycle"],
+			"origin":               recipe["origin"],
+			"generated_from_ref":   recipe["generated_from_ref"],
+			"generated_source":     recipe["generated_source"],
+			"generated_recipe_id":  recipe["generated_recipe_id"],
 		}
 		if _, represented := recipe["provider_retry"]; represented {
 			payload["provider_retry"] = recipe["provider_retry"]
@@ -349,7 +347,7 @@ func loadTransientRecipeSources(sources []TransientRecipeSource, rawProfiles map
 		source.ProfileIDs = profileIDs
 		effectiveRawRecipes := make(map[string]any, len(recipeIDs))
 		for _, recipeID := range recipeIDs {
-			effectiveRawRecipes[recipeID] = contracts.Materialize(rawRecipes[recipeID])
+			effectiveRawRecipes[recipeID] = format.Materialize(rawRecipes[recipeID])
 		}
 		source.effectiveRawRecipes = effectiveRawRecipes
 		files = append(files, source)
@@ -491,7 +489,7 @@ func recipeDigestsForIDs(recipeIDs []string, normalizedRecipes map[string]map[st
 		if recipe == nil {
 			continue
 		}
-		digest, err := contracts.ContractDigest(ChildRecipeContractPayload(recipe))
+		digest, err := format.SemanticJSONDigest(RecipePayload(recipe))
 		if err == nil {
 			result[recipeID] = digest
 		}

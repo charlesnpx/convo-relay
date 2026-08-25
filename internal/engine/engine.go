@@ -17,7 +17,6 @@ import (
 
 	"github.com/charlesnpx/convo-relay/internal/blobstore"
 	"github.com/charlesnpx/convo-relay/internal/eventlog"
-	"github.com/charlesnpx/convo-relay/internal/model"
 	"github.com/charlesnpx/convo-relay/internal/plan"
 	"github.com/charlesnpx/convo-relay/internal/provider"
 	"github.com/charlesnpx/convo-relay/internal/session"
@@ -71,6 +70,9 @@ type Deps struct {
 	Writer                *eventlog.Writer
 	Recipes               []plan.Recipe
 	ChildRequestExtractor ChildRequestExtractor
+	// RetrySleeper waits between retryable provider attempts. A nil value uses
+	// the context-aware production sleeper; tests can replace it to avoid time.
+	RetrySleeper func(context.Context, time.Duration) error
 }
 
 // Outcome contains the parent-facing result and execution classification needed
@@ -354,7 +356,7 @@ type executionState struct {
 	active *turnState
 
 	conversation        []conversationTurn
-	ledger              model.Ledger
+	ledger              ledger
 	lastResult          completedTurn
 	grantedTurns        int
 	conversationAtGrant int
@@ -521,7 +523,7 @@ func newAdmissionRunner(ctx context.Context, sess *session.Session, recipes []pl
 func newExecutionState() *executionState {
 	return &executionState{
 		phase:             phaseParticipant,
-		ledger:            model.EmptyLedger(),
+		ledger:            emptyLedger(),
 		provisionedInputs: make(map[string]blobstore.BlobRef),
 		requests:          make(map[string]*childState),
 		providerSessions:  make(map[string]string),
@@ -1212,6 +1214,9 @@ func (r *runner) serviceActiveTurn() error {
 	}
 	if failed := turn.latest("failed"); failed != nil {
 		if failed.Failure != nil && r.shouldRetry(failed.Failure, failed.Attempt) {
+			if err := r.waitForRetry(failed.Attempt); err != nil {
+				return err
+			}
 			return r.callActiveAttempt(turn, len(turn.Attempts)+1)
 		}
 		return &executionFailure{
@@ -1265,6 +1270,60 @@ func (r *runner) shouldRetry(failure *providerFailureState, attempt int) bool {
 		attempt < r.sess.Plan.ProviderRetry.MaxAttempts
 }
 
+func (r *runner) waitForRetry(failedAttempt int) error {
+	sleeper := r.deps.RetrySleeper
+	if sleeper == nil {
+		sleeper = sleepForRetry
+	}
+	return sleeper(r.ctx, retryBackoffForAttempt(failedAttempt))
+}
+
+// retryBackoffForAttempt implements the runner retry policy: wait one second
+// after the first retryable failure, double for each later failed attempt, and
+// cap each wait at 30 seconds.
+func retryBackoffForAttempt(failedAttempt int) time.Duration {
+	delay := time.Second
+	for attempt := 1; attempt < failedAttempt && delay < 30*time.Second; attempt++ {
+		if delay > 15*time.Second {
+			return 30 * time.Second
+		}
+		delay *= 2
+	}
+	return delay
+}
+
+func sleepForRetry(ctx context.Context, delay time.Duration) error {
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
+}
+
+func providerOutcomeForAttempt(backend string, result provider.TurnResult, callErr error) string {
+	observed := provider.ProviderResultForTurn(backend, result)
+	parts := make([]string, 0, 3)
+	if observed.TimedOut {
+		parts = append(parts, "timed_out")
+	}
+	if observed.Stalled {
+		parts = append(parts, "stalled")
+	}
+	if observed.Recovered {
+		parts = append(parts, "recovered")
+	}
+	if len(parts) > 0 {
+		return strings.Join(parts, "_")
+	}
+	if callErr != nil {
+		return "failed"
+	}
+	return "completed"
+}
+
 func (r *runner) callActiveAttempt(turn *turnState, attemptNumber int) error {
 	actor, err := r.actor(turn.ActorID)
 	if err != nil {
@@ -1292,11 +1351,13 @@ func (r *runner) callActiveAttempt(turn *turnState, attemptNumber int) error {
 	if putErr != nil {
 		return putErr
 	}
+	providerOutcome := providerOutcomeForAttempt(actor.Backend, result, callErr)
 	if callErr == nil {
 		if err := r.append(eventlog.AttemptFinishedPayload{
 			ActorID:           actor.ID,
 			Attempt:           attemptNumber,
 			Outcome:           "success",
+			ProviderOutcome:   providerOutcome,
 			ProviderSessionID: providerSessionID(backend),
 			Content:           ref,
 		}); err != nil {
@@ -1323,10 +1384,11 @@ func (r *runner) callActiveAttempt(turn *turnState, attemptNumber int) error {
 		return err
 	}
 	return r.append(eventlog.AttemptFinishedPayload{
-		ActorID: actor.ID,
-		Attempt: attemptNumber,
-		Outcome: "failed",
-		Content: ref,
+		ActorID:         actor.ID,
+		Attempt:         attemptNumber,
+		Outcome:         "failed",
+		ProviderOutcome: providerOutcome,
+		Content:         ref,
 	})
 }
 
@@ -1946,7 +2008,7 @@ func (r *runner) promptFor(actor session.Actor, round int, role eventlog.Role, r
 		}
 	}
 	if role == eventlog.FacilitatorRole {
-		counts := r.state.ledger.Counts()
+		counts := r.state.ledger.counts()
 		fmt.Fprintf(&builder, "\nReturn a JSON ledger with settled, contested, and withdrawn arrays. Current counts: settled=%d contested=%d withdrawn=%d.\n", counts.Settled, counts.Contested, counts.Withdrawn)
 	}
 	if role == eventlog.ReducerRole {
@@ -2048,7 +2110,7 @@ func readEvents(root string) ([]eventlog.Event, error) {
 
 var ledgerObject = regexp.MustCompile("(?s)\\{.*\\}")
 
-func parseLedger(raw string, fallback model.Ledger) model.Ledger {
+func parseLedger(raw string, fallback ledger) ledger {
 	candidate := ledgerObject.FindString(raw)
 	if candidate == "" {
 		return fallback
@@ -2057,7 +2119,7 @@ func parseLedger(raw string, fallback model.Ledger) model.Ledger {
 	if err := json.Unmarshal([]byte(candidate), &decoded); err != nil || !hasLedgerShape(decoded) {
 		return fallback
 	}
-	return model.ParseLedger(decoded)
+	return newLedger(decoded)
 }
 
 func hasLedgerShape(value any) bool {
@@ -2073,7 +2135,7 @@ func hasLedgerShape(value any) bool {
 	return true
 }
 
-func hasConverged(turns []conversationTurn, ledger model.Ledger) bool {
+func hasConverged(turns []conversationTurn, ledger ledger) bool {
 	if len(turns) < 4 {
 		return false
 	}
@@ -2085,15 +2147,15 @@ func hasConverged(turns []conversationTurn, ledger model.Ledger) bool {
 	if hasDoneSignal(last.Text) && hasDoneSignal(previous.Text) {
 		return true
 	}
-	counts := ledger.Counts()
+	counts := ledger.counts()
 	return counts.Contested == 0 && (counts.Settled > 0 || counts.Withdrawn > 0)
 }
 
-func hasNoLedgerSignal(turns []conversationTurn, ledger model.Ledger) bool {
+func hasNoLedgerSignal(turns []conversationTurn, ledger ledger) bool {
 	if len(turns) < 4 {
 		return false
 	}
-	counts := ledger.Counts()
+	counts := ledger.counts()
 	if counts.Settled != 0 || counts.Contested != 0 || counts.Withdrawn != 0 {
 		return false
 	}
@@ -2108,4 +2170,60 @@ func hasDoneSignal(text string) bool {
 		}
 	}
 	return false
+}
+
+type ledger struct {
+	settled   []string
+	contested []string
+	withdrawn []string
+}
+
+type ledgerCounts struct {
+	Settled   int
+	Contested int
+	Withdrawn int
+}
+
+func emptyLedger() ledger {
+	return ledger{settled: []string{}, contested: []string{}, withdrawn: []string{}}
+}
+
+func newLedger(value map[string]any) ledger {
+	return ledger{
+		settled:   normalizeLedgerItems(value["settled"]),
+		contested: normalizeLedgerItems(value["contested"]),
+		withdrawn: normalizeLedgerItems(value["withdrawn"]),
+	}
+}
+
+func normalizeLedgerItems(value any) []string {
+	var values []any
+	switch typed := value.(type) {
+	case []string:
+		values = make([]any, len(typed))
+		for index, item := range typed {
+			values[index] = item
+		}
+	case []any:
+		values = typed
+	default:
+		return []string{}
+	}
+	items := make([]string, 0, len(values))
+	for _, value := range values {
+		if text := strings.TrimSpace(fmt.Sprint(value)); text != "" {
+			items = append(items, text)
+		}
+	}
+	return items
+}
+
+func (l ledger) counts() ledgerCounts {
+	return ledgerCounts{Settled: len(l.settled), Contested: len(l.contested), Withdrawn: len(l.withdrawn)}
+}
+
+func (l ledger) MarshalJSON() ([]byte, error) {
+	return json.Marshal(map[string][]string{
+		"settled": l.settled, "contested": l.contested, "withdrawn": l.withdrawn,
+	})
 }

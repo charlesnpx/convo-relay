@@ -13,8 +13,9 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/charlesnpx/convo-relay/internal/contracts"
+	"github.com/charlesnpx/convo-relay/internal/blobstore"
 	"github.com/charlesnpx/convo-relay/internal/eventlog"
+	"github.com/charlesnpx/convo-relay/internal/format"
 	"github.com/charlesnpx/convo-relay/internal/relayv2"
 	"github.com/charlesnpx/convo-relay/internal/session"
 )
@@ -227,17 +228,10 @@ func TestVersionJSONReportsFlatFormatsWithoutProviderProbes(t *testing.T) {
 	os.Args = []string{"convo-relay", "version", "--json"}
 	defer func() { os.Args = oldArgs }()
 	output := captureStdout(t, main)
-	registry := contracts.PublicVersionRegistry()
-	formats := map[string]any{}
-	for _, format := range registry.NumericContracts() {
-		formats[format] = registry.Numeric(format)
-	}
-	for _, format := range registry.StringContracts() {
-		formats[format] = registry.Strings(format)
-	}
 	want := map[string]any{
-		"version": cliVersion,
-		"formats": formats,
+		"version":        cliVersion,
+		"formats":        format.PublicFormats(),
+		"digest_classes": format.DigestClasses(),
 	}
 	wantBody, err := json.MarshalIndent(want, "", "  ")
 	if err != nil || output != string(wantBody)+"\n" {
@@ -248,20 +242,20 @@ func TestVersionJSONReportsFlatFormatsWithoutProviderProbes(t *testing.T) {
 	}
 }
 
-func TestExportVerifyJSONReportsPortableV2(t *testing.T) {
+func TestExportVerifyJSONReportsPortableBundle(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "portable")
 	payloads := []struct {
 		kind  string
 		id    string
 		value any
 	}{
-		{kind: "root_session", id: "session", value: map[string]any{"kind": "portable_root_session", "terminal_status": "completed"}},
+		{kind: "root_session", id: "session", value: map[string]any{"terminal_status": "completed"}},
 		{kind: "participant_transcript", id: "transcript", value: []any{}},
 		{kind: "diagnostics", id: "diagnostics", value: map[string]any{"execution_kind": "recipe", "status": "completed"}},
 	}
 	inventory := make([]any, 0, len(payloads))
 	for _, payload := range payloads {
-		body, err := contracts.CanonicalJSONBytes(payload.value)
+		body, err := format.CanonicalJSONBytes(payload.value)
 		if err != nil {
 			t.Fatalf("encode payload: %v", err)
 		}
@@ -273,19 +267,16 @@ func TestExportVerifyJSONReportsPortableV2(t *testing.T) {
 			t.Fatalf("write payload: %v", err)
 		}
 		inventory = append(inventory, map[string]any{
-			"kind":         payload.kind,
-			"portable_id":  payload.id,
-			"path":         relative,
-			"media_type":   "application/json",
-			"size_bytes":   len(body),
-			"digest_class": string(contracts.DigestClassRawBytes),
-			"digest":       contracts.RawBytesDigest(body),
+			"kind":        payload.kind,
+			"portable_id": payload.id,
+			"path":        relative,
+			"blob":        blobstore.RefForBytes(body, "application/json"),
 		})
 	}
 	sort.Slice(inventory, func(left int, right int) bool {
 		return inventory[left].(map[string]any)["path"].(string) < inventory[right].(map[string]any)["path"].(string)
 	})
-	manifest, err := contracts.PortableExportManifest(map[string]any{
+	manifest, err := format.BundleManifest(map[string]any{
 		"convo_relay_version": "test",
 		"terminal_status":     "completed",
 		"stop_reason":         nil,
@@ -297,7 +288,7 @@ func TestExportVerifyJSONReportsPortableV2(t *testing.T) {
 	if err != nil {
 		t.Fatalf("portable manifest: %v", err)
 	}
-	body, err := contracts.CanonicalJSONBytes(manifest)
+	body, err := format.CanonicalJSONBytes(manifest)
 	if err != nil {
 		t.Fatalf("encode manifest: %v", err)
 	}
@@ -313,8 +304,49 @@ func TestExportVerifyJSONReportsPortableV2(t *testing.T) {
 	if err := json.Unmarshal([]byte(output), &report); err != nil {
 		t.Fatalf("decode export verify output %q: %v", output, err)
 	}
-	if report["status"] != "valid" || report["schema_version"] != contracts.PortableExportV2 {
+	if report["status"] != "valid" || report["format"] != format.BundleV1 {
 		t.Fatalf("export verify report = %#v", report)
+	}
+
+	legacyRoot := map[string]any{
+		"kind":            strings.Join([]string{"portable", "v2", "root", "session"}, "_"),
+		"terminal_status": "completed",
+	}
+	legacyBody, err := format.CanonicalJSONBytes(legacyRoot)
+	if err != nil {
+		t.Fatalf("encode legacy root payload: %v", err)
+	}
+	rootPath := filepath.Join(dir, "payloads", "root_session", "session.json")
+	if err := os.WriteFile(rootPath, legacyBody, 0o644); err != nil {
+		t.Fatalf("write legacy root payload: %v", err)
+	}
+	for _, raw := range inventory {
+		entry := raw.(map[string]any)
+		if entry["path"] == filepath.ToSlash(filepath.Join("payloads", "root_session", "session.json")) {
+			entry["blob"] = blobstore.RefForBytes(legacyBody, "application/json")
+		}
+	}
+	legacyManifest, err := format.BundleManifest(map[string]any{
+		"convo_relay_version": "test",
+		"terminal_status":     "completed",
+		"stop_reason":         nil,
+		"session_payload":     "payloads/root_session/session.json",
+		"transcript_payload":  "payloads/participant_transcript/transcript.json",
+		"diagnostics_payload": "payloads/diagnostics/diagnostics.json",
+		"payload_inventory":   inventory,
+	})
+	if err != nil {
+		t.Fatalf("legacy portable manifest: %v", err)
+	}
+	legacyManifestBody, err := format.CanonicalJSONBytes(legacyManifest)
+	if err != nil {
+		t.Fatalf("encode legacy manifest: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "manifest.json"), legacyManifestBody, 0o644); err != nil {
+		t.Fatalf("write legacy manifest: %v", err)
+	}
+	if _, err := v2VerifyPortableDirectory(dir); err == nil || !strings.Contains(err.Error(), "must omit kind") {
+		t.Fatalf("legacy root marker verification error = %v", err)
 	}
 }
 
@@ -339,7 +371,7 @@ func TestExportVerifyJSONFailureIsMachineReadable(t *testing.T) {
 		t.Fatalf("export verify invalid stderr = %q", stderr.String())
 	}
 	report := decodeJSONObject(t, stdout.String())
-	if report["schema_version"] != contracts.PortableExportV2 || report["status"] != "invalid" || strings.TrimSpace(stringValue(report["error"])) == "" {
+	if report["format"] != format.BundleV1 || report["status"] != "invalid" || strings.TrimSpace(stringValue(report["error"])) == "" {
 		t.Fatalf("export verify invalid report = %#v", report)
 	}
 }
@@ -433,9 +465,8 @@ auto_approval = "auto-safe"
 			t.Fatalf("generated recipe normalization = %#v", recipe)
 		}
 		compiledPlan := report["compiled_plan"].(map[string]any)
-		recipeRef := compiledPlan["recipe_ref"].(map[string]any)
-		if recipeRef["id"] != "recipe:gen-cli-review" || recipeRef["digest"] != report["recipe_digest"] {
-			t.Fatalf("compiled recipe ref = %#v, report digest = %v", recipeRef, report["recipe_digest"])
+		if compiledPlan["recipe_id"] != "gen-cli-review" || report["compiled_plan_digest"] == "" {
+			t.Fatalf("compiled plan preview = %#v", compiledPlan)
 		}
 	})
 
@@ -557,25 +588,21 @@ func TestRunRecipeCLIDispatchesDirectRootExecution(t *testing.T) {
 backend = "codex"
 model = "fake-a"
 effort = "medium"
-capabilities = []
 
 [backend_profiles.cli-b]
 backend = "codex"
 model = "fake-b"
 effort = "medium"
-capabilities = []
 
 [backend_profiles.cli-f]
 backend = "codex"
 model = "fake-f"
 effort = "medium"
-capabilities = []
 
 [backend_profiles.cli-r]
 backend = "codex"
 model = "fake-r"
 effort = "medium"
-capabilities = []
 `
 	if err := os.WriteFile(settingsPath, []byte(settings), 0o644); err != nil {
 		t.Fatalf("write settings: %v", err)
@@ -592,7 +619,6 @@ max_rounds = 2
 participant_turns = 2
 result_source = "last_turn"
 max_depth = 1
-required_capabilities = []
 auto_approval = "never"
 
 [relay_recipes.neutral-root.lifecycle]
@@ -612,7 +638,6 @@ participant_turns = 2
 result_source = "last_turn"
 integration_contract = "neutral/contract-v1"
 max_depth = 1
-required_capabilities = []
 auto_approval = "never"
 
 [relay_recipes.bound-root.lifecycle]
@@ -626,7 +651,6 @@ workspace_isolation = "inherited"
 	}
 	bundlePath := filepath.Join(launchCWD, "bundle.json")
 	bundleSource := `{
-  "schema_version": "relay-integration-bundle-v1",
   "id": "neutral/integration-v1",
   "contracts": {
     "neutral/contract-v1": {
@@ -665,7 +689,6 @@ max_rounds = 2
 participant_turns = 2
 result_source = "last_turn"
 max_depth = 1
-required_capabilities = []
 auto_approval = "never"
 
 [relay_recipes.generated-helper.lifecycle]
@@ -1045,19 +1068,16 @@ func TestRunRecipeCLIExecutesStaticChildParticipant(t *testing.T) {
 backend = "codex"
 model = "fake-parent"
 effort = "medium"
-capabilities = []
 
 [backend_profiles.facilitator]
 backend = "codex"
 model = "fake-facilitator"
 effort = "medium"
-capabilities = []
 
 [backend_profiles.static-child]
 backend = "child"
 model = "child-review"
 effort = 1
-capabilities = ["composite"]
 `
 	if err := os.WriteFile(settingsPath, []byte(settings), 0o644); err != nil {
 		t.Fatalf("write settings: %v", err)
@@ -1073,7 +1093,6 @@ max_rounds = 2
 participant_turns = 2
 result_source = "last_turn"
 max_depth = 1
-required_capabilities = []
 auto_approval = "never"
 
 [relay_recipes.static-parent.lifecycle]
@@ -1091,7 +1110,6 @@ max_rounds = 1
 participant_turns = 1
 result_source = "last_turn"
 max_depth = 1
-required_capabilities = []
 auto_approval = "never"
 
 [relay_recipes.child-review.lifecycle]
@@ -1267,16 +1285,12 @@ func TestEmitRunnerResultStillWritesStdoutWhenOutputSaveFails(t *testing.T) {
 
 func TestEmitRunnerResultWithRunErrorPersistsSelectedOutputRepresentation(t *testing.T) {
 	sessionDir := filepath.Join(t.TempDir(), "root-session")
-	canonicalRef := map[string]any{
-		"kind": "artifact_ref", "schema_version": 1, "id": "canonical_result:selected",
-		"digest": contracts.DigestPrefix + strings.Repeat("0", 64),
-	}
 	result := map[string]any{
 		"execution_kind": "recipe", "session_id": "invalid123", "session_dir": sessionDir,
 		"task": "Output task", "title": "Output title", "mode": "cooperative", "status": "invalid_result",
 		"actual_participant_turns": 2, "participant_turns": 2, "actual_rounds": 2, "max_rounds": 2,
-		"canonical_result_ref": canonicalRef,
-		"slots":                []any{map[string]any{"backend": "codex"}, map[string]any{"backend": "codex"}},
+		"result": "canonical result",
+		"slots":  []any{map[string]any{"backend": "codex"}, map[string]any{"backend": "codex"}},
 		"transcript": []any{
 			map[string]any{"round": 1, "from": "Participant A", "content": "First participant body", "ledger": map[string]any{"settled": []any{}, "contested": []any{}, "withdrawn": []any{}}},
 			map[string]any{"round": 2, "from": "Participant B", "content": "Second participant body", "ledger": map[string]any{"settled": []any{}, "contested": []any{}, "withdrawn": []any{}}},
@@ -1293,7 +1307,7 @@ func TestEmitRunnerResultWithRunErrorPersistsSelectedOutputRepresentation(t *tes
 	if err != nil {
 		t.Fatalf("read markdown output: %v", err)
 	}
-	if !strings.Contains(string(markdown), "# Relay Dialogue") || !strings.Contains(string(markdown), "Second participant body") || strings.Contains(string(markdown), `"canonical_result_ref"`) {
+	if !strings.Contains(string(markdown), "# Relay Dialogue") || !strings.Contains(string(markdown), "Second participant body") || strings.Contains(string(markdown), `"result"`) {
 		t.Fatalf("plain run output =\n%s", markdown)
 	}
 	if !strings.Contains(plainStdout.String(), "invalid_result") || !strings.Contains(plainStdout.String(), markdownPath) {
@@ -1312,7 +1326,7 @@ func TestEmitRunnerResultWithRunErrorPersistsSelectedOutputRepresentation(t *tes
 	jsonFile := decodeJSONObject(t, string(jsonBody))
 	jsonConsole := decodeJSONObject(t, jsonStdout.String())
 	for label, payload := range map[string]map[string]any{"file": jsonFile, "stdout": jsonConsole} {
-		if payload["status"] != "invalid_result" || payload["canonical_result_ref"] == nil || payload["transcript"] == nil {
+		if payload["status"] != "invalid_result" || payload["result"] != "canonical result" || payload["transcript"] == nil {
 			t.Fatalf("JSON %s envelope = %#v", label, payload)
 		}
 	}

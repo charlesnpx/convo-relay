@@ -5,8 +5,6 @@ import (
 	"fmt"
 	"regexp"
 	"strings"
-
-	"github.com/charlesnpx/convo-relay/internal/model"
 )
 
 type BackendRunError struct {
@@ -59,7 +57,20 @@ type ProviderFailure struct {
 	RawDetailHidden bool
 }
 
-type ProviderResult = model.ProviderResult
+// ProviderResult carries runtime observations used for retry classification
+// and user-facing diagnostics.
+type ProviderResult struct {
+	Backend         string
+	TimedOut        bool
+	Stalled         bool
+	Recovered       bool
+	ReturnCode      int
+	ReturnCodeKnown bool
+	RecoverySource  string
+	Warnings        []string
+	RetryableError  string
+	Extra           map[string]any
+}
 
 func newProviderResult(backend string, result processResult) ProviderResult {
 	return ProviderResult{

@@ -1,137 +1,68 @@
-# Provider Lifecycle Contract
+# Provider lifecycle contract
 
-This is the Phase 8-10 audit artifact for the Go migration.
+This document describes the provider behavior implemented by the current
+relay runtime.
 
-## Provider Lifecycle Behavior
+## Turn lifecycle
 
-The historical Python provider implementations exposed a common `TurnResult` with:
+Codex runs through the embedded agentbus adapter over `codex app-server` and
+retains the provider-confirmed thread id. Claude runs through the embedded
+agentbus stream-json adapter and retains the provider-confirmed session id.
+Gemini runs `gemini --output-format json` and accepts its documented response
+shapes plus recoverable text output. Each engine attempt owns one provider turn.
 
-- `content`
-- `timed_out`
-- `stalled`
-- `recovered`
+An errored or stalled Codex or Claude live session is discarded before the
+next attempt. The next attempt resumes from the provider-confirmed id when one
+exists. Relay readiness checks happen before normal run and resume; the engine
+does not rely on provider preflight hooks.
 
-Current transport behavior differs by backend:
+Providers are trusted same-user processes. Their slot-specific homes and
+workspaces organize state; they are not a security boundary and do not isolate
+the provider from repositories, session files, credentials, or other resources
+visible to that user.
 
-- Codex uses the embedded agentbus v0.9.1 Codex adapter over `codex app-server` JSON-RPC, tracks the provider-confirmed `thread_id`, resumes through engine `Resume`, and uses the relay's trusted (`dangerFullAccess`) write posture.
-- Gemini runs `gemini --output-format json`, parses `response`, `text`, `content`, `message`, or structured `error`, uses slot-scoped `HOME` and `GEMINI_CLI_HOME`, and can recover text from timeout or nonzero output.
-- Claude uses the embedded agentbus v0.9.1 Claude adapter to drive the Claude CLI with stream-json input and output, tracks the provider-confirmed `session_id`, resumes through engine `Resume`, and receives assistant text from stream events rather than project JSONL polling. The CLI can still write project transcripts; embedded cleanup and legacy-compatible cleanup remove relay-owned Claude artifacts.
+## Failure policy
 
-Codex and Claude make one engine `Session.Turn` per attempt. An errored or stalled turn drops the live session, and the next attempt resumes with the provider-confirmed id. Ordinary run and resume use the relay's internal readiness checks; they do not call engine `Backend.Preflight`.
+The runner classifies failures as `auth`, `configuration`, `transient`,
+`provider_error`, or `unknown`.
 
-The historical Python policy classified provider failures as retryable when they looked like API, auth, network, rate-limit, overload, 429, or 5xx failures, while treating local setup problems such as missing binaries, invalid options, and session-id collisions as non-retryable. Current Go intentionally treats auth-looking failures as non-retryable so bad or expired credentials do not consume the full transient retry budget.
+- Authentication-looking failures stop immediately and do not consume the
+  transient retry budget.
+- Retryable failures wait one second after the first failure, double each
+  later wait, and cap each wait at 30 seconds. Exhaustion marks the session
+  failed without creating a successful transcript turn for the failed attempt.
+- A hard timeout is recorded as a timed-out provider outcome.
+- The stream watchdog treats lack of stream activity for the configured stall
+  interval as a stalled turn. Any stream event, including an agentbus progress
+  heartbeat, resets the watchdog.
+- If usable assistant text is recovered while a process exits abnormally or is
+  interrupted, the turn can complete with `recovered: true`; otherwise the
+  failure policy decides whether to retry or terminate.
 
-## Durable Go Shape
+## Durable record
 
-New Go-created backend transcript entries and `turn_completed` event payloads include:
+For new records, `attempt.finished` carries the ordinary success-or-failure
+`outcome`, a BlobRef-backed content payload, the provider session id, and a
+compact `provider_outcome`. That classification is `completed`, `failed`, or
+an ordered combination of `timed_out`, `stalled`, and `recovered`; it therefore
+distinguishes normal completion, recovery, timeout, and stall without copying
+the runtime observation object into the event log.
 
-```json
-{
-  "provider_result": {
-    "backend": "codex",
-    "timed_out": false,
-    "stalled": false,
-    "recovered": false,
-    "return_code": 0,
-    "recovery_source": "",
-    "warnings": []
-  }
-}
-```
+An error-returning attempt also writes `provider.failed` before its
+`attempt.finished` record. It carries the actor, backend, category,
+retryability, attempt count, remediation code, and sanitized detail. Return
+codes, warning lists, recovery sources, and raw provider detail remain runtime
+observations rather than durable event fields. The immutable `relay.plan/v1`
+determines the provider policy that applies to the session.
 
-`retryable_error` is included only when a provider result is available and the provider output was classified as retryable.
+When an integration input is named, its bytes are read once before execution,
+stored as a session blob, and bound into the plan. Provider prompts load that
+recorded blob; the source path is not part of the provider lifecycle.
 
-Old sessions do not need this field. Inspectors and display paths must continue accepting Python-era transcript entries and events that omit `provider_result`.
+## Test boundary
 
-Retryable provider failures are not persisted as completed turns. They are retried by the runner with the Python-compatible backoff series `5s`, `10s`, `20s`, `40s`, `80s`, `160s`. If all attempts fail, the session is marked failed with a retry-exhaustion error and no successful transcript entry is appended for that turn.
-
-For root recipes, every provider is a trusted same-user process running with
-the invoking user's authority. Slot-scoped homes and detached worktrees
-organize lifecycle state; they are not sandboxes and do not isolate a provider
-from source repositories, session files, credentials, the network, or other
-same-user-visible resources.
-
-When an integration contract has named inputs, the runner reads each source
-once before execution, stores the bytes in the session blob store, and binds
-the plan to the resulting digest. Prompts subsequently load those recorded
-blobs; source paths and per-attempt source verification are not part of the
-provider lifecycle.
-
-Failed provider turns append a `provider_failure` event and mirror the sanitized failure payload into `meta.provider_failures`. Payloads include:
-
-- `phase`: `turn` or `facilitator`
-- `actor` and `backend`
-- `category`: `auth`, `configuration`, `transient`, `provider_error`, or `unknown`
-- `retryable` and `attempts`
-- `timed_out`, `stalled`, and `return_code`
-- `remediation_code` and `remediation`
-- `sanitized_detail` with credential-looking values redacted
-- `raw_detail_hidden`, which is always `true` for the current MVP
-
-## Field Semantics
-
-- `backend`: concrete provider/backend name that executed the turn.
-- `timed_out`: the provider hit the hard timeout.
-- `stalled`: the provider had no stream events before the stall timeout, so the relay interrupted its current session. Any stream event, including an agentbus `Progress` heartbeat, resets the watchdog.
-- `recovered`: the process had an abnormal outcome, but usable response text was recovered.
-- `return_code`: provider process exit code when known.
-- `recovery_source`: where recovered text came from, such as `event_stream`, `stdout`, or `output`.
-- `warnings`: human-readable lifecycle warnings suitable for show/debug output.
-- `retryable_error`: normalized provider error text that should be eligible for retry/backoff handling.
-
-## Go Test Boundary
-
-The permanent Go test boundary uses embedded-adapter protocol fakes and temporary fake provider binaries in `PATH`, not live provider credentials.
-
-### Covered by Go tests
-
-- success
-- malformed output
-- missing binary
-- auth failure classification
-- stderr-only non-retryable failure
-- nonzero exit without output
-- nonzero exit with recoverable output
-- timeout with recovered output
-- timeout without recovered output
-- retryable provider classification
-- retryable provider backoff and exhaustion
-- auth failure short-circuiting
-- sanitized `provider_failure` event persistence
-- historical session inspection without `provider_result`
-- interruption through the existing runner cancellation smoke
-- Gemini success, JSON shape variants, plain-text fallback, timeout recovery, nonzero failure, nonzero recovery, state, and slot-scoped home behavior
-- embedded Codex `app-server` JSON-RPC and Claude stream-json protocol fakes, including start, resume, and provider-confirmed id capture
-- stream-event stall-watchdog behavior, including agentbus `Progress` heartbeat resets, interruption, and partial recovery
-- hard-timeout and stalled soft outcomes with and without recovered text
-- cleanup of relay-owned Claude project transcripts, including legacy-compatible paths
-
-### Covered upstream in agentbus
-
-- process supervision
-
-### Covered by the existing Python baseline
-
-- Python orchestrator retryable provider backoff
-
-Implemented in Go Phase 9:
-
-- Gemini backend adapter
-- Gemini direct agent and profile resolution
-- Gemini slot restore and resume compatibility
-- Gemini output shape parsing and plain-text fallback
-- Gemini slot-scoped `HOME` and `GEMINI_CLI_HOME`
-- Gemini config seeding from `~/.gemini`, excluding `tmp` and `logs`
-- Gemini timeout, nonzero-exit recovery, retryable error, missing-binary, and stderr-only behavior
-
-Implemented in the current embedded-adapter runtime:
-
-- Codex `app-server` JSON-RPC and Claude stream-json transports through embedded agentbus adapters
-- one `Session.Turn` per attempt, provider-confirmed id capture, and resume after live-session disposal
-- Codex slot-scoped `CODEX_HOME` with linked auth/config and the trusted (`dangerFullAccess`) write posture
-- event-inactivity stall watchdogs that interrupt the session while preserving stalled and recovered outcomes
-- Claude stream-event assistant text and cleanup of relay-owned project transcripts, with legacy-compatible cleanup for pre-migration sessions
-- wire-compatible slot state: `thread_id` or `session_id`, `started`, `cwd`, `profile_id`, `model`, and `effort`
-- relay-owned readiness checks rather than engine `Backend.Preflight` during ordinary run or resume
-
-Future provider changes should extend this same fake-provider conformance boundary before relying on live provider smokes.
+The provider suite uses embedded-adapter protocol fakes and temporary fake
+provider executables. It covers provider mapping for Codex, Claude, and
+Gemini; retry classification and exhaustion; authentication short-circuiting;
+watchdog behavior; and partial-output recovery. Live credentials and live
+network calls are outside the automated test boundary.

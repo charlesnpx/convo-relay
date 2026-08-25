@@ -15,6 +15,9 @@ import (
 	"github.com/charlesnpx/convo-relay/internal/blobstore"
 )
 
+// FormatV1 identifies the canonical append-only event envelope.
+const FormatV1 = "relay.event/v1"
+
 // Type is one of the concrete v2 event type names.
 type Type string
 
@@ -162,6 +165,7 @@ type AttemptFinishedPayload struct {
 	ActorID           string            `json:"actor_id"`
 	Attempt           int               `json:"attempt"`
 	Outcome           string            `json:"outcome"`
+	ProviderOutcome   string            `json:"provider_outcome"`
 	ProviderSessionID string            `json:"provider_session_id"`
 	Content           blobstore.BlobRef `json:"content"`
 }
@@ -174,10 +178,24 @@ func (p AttemptFinishedPayload) validate() error {
 	if err := validateToken("outcome", p.Outcome); err != nil {
 		return err
 	}
+	if p.ProviderOutcome != "" && !validAttemptProviderOutcome(p.ProviderOutcome) {
+		return fmt.Errorf("attempt.finished provider_outcome %q is unsupported", p.ProviderOutcome)
+	}
 	if err := validateText("provider_session_id", p.ProviderSessionID); err != nil {
 		return err
 	}
 	return blobstore.ValidateRef(p.Content)
+}
+
+func validAttemptProviderOutcome(value string) bool {
+	switch value {
+	case "completed", "failed", "recovered", "timed_out", "stalled",
+		"timed_out_stalled", "timed_out_recovered", "stalled_recovered",
+		"timed_out_stalled_recovered":
+		return true
+	default:
+		return false
+	}
 }
 
 type ProviderFailedPayload struct {
@@ -409,6 +427,7 @@ func (event Event) MarshalJSON() ([]byte, error) {
 		return nil, err
 	}
 	return SemanticJSONBytes(encodeWireEvent{
+		Kind:    FormatV1,
 		Seq:     normalized.Seq,
 		EventID: normalized.EventID,
 		Time:    normalized.Time,
@@ -429,6 +448,7 @@ func (event *Event) UnmarshalJSON(body []byte) error {
 }
 
 type wireEvent struct {
+	Kind    string          `json:"kind"`
 	Seq     json.RawMessage `json:"seq"`
 	EventID string          `json:"event_id"`
 	Time    time.Time       `json:"time"`
@@ -437,6 +457,7 @@ type wireEvent struct {
 }
 
 type encodeWireEvent struct {
+	Kind    string    `json:"kind"`
 	Seq     uint64    `json:"seq"`
 	EventID string    `json:"event_id"`
 	Time    time.Time `json:"time"`
@@ -456,6 +477,9 @@ func decodeEvent(body []byte) (Event, error) {
 	}
 	if _, err := decoder.Token(); err != io.EOF {
 		return Event{}, err
+	}
+	if wire.Kind != FormatV1 {
+		return Event{}, fmt.Errorf("event kind must be %s", FormatV1)
 	}
 	seq, err := decodeCanonicalUint64(wire.Seq)
 	if err != nil {
@@ -503,6 +527,7 @@ func CanonicalEventBytes(event Event) ([]byte, error) {
 		return nil, err
 	}
 	return SemanticJSONBytes(encodeWireEvent{
+		Kind:    FormatV1,
 		Seq:     normalized.Seq,
 		EventID: normalized.EventID,
 		Time:    normalized.Time,
@@ -540,6 +565,7 @@ func normalizeEvent(event Event, requireSequence bool, localValues ...string) (E
 		return Event{}, err
 	}
 	if err := ValidatePortableValue(encodeWireEvent{
+		Kind:    FormatV1,
 		Seq:     event.Seq,
 		EventID: event.EventID,
 		Time:    event.Time,

@@ -216,9 +216,12 @@ func TestProviderRetryAndAuthFailure(t *testing.T) {
 	cases := []struct {
 		name         string
 		responses    []fakeResponse
+		maxAttempts  int
 		wantCalls    int
 		wantStatus   string
 		wantCategory string
+		wantAttempts []int
+		wantDelays   []time.Duration
 		wantError    bool
 	}{
 		{
@@ -230,6 +233,31 @@ func TestProviderRetryAndAuthFailure(t *testing.T) {
 			wantCalls:    2,
 			wantStatus:   statusCompleted,
 			wantCategory: "transient",
+			wantAttempts: []int{1},
+			wantDelays:   []time.Duration{time.Second},
+		},
+		{
+			name: "retryable_backoff_exhaustion",
+			responses: []fakeResponse{
+				{err: provider.RetryableProviderError{Detail: "temporarily unavailable"}},
+				{err: provider.RetryableProviderError{Detail: "temporarily unavailable"}},
+				{err: provider.RetryableProviderError{Detail: "temporarily unavailable"}},
+				{err: provider.RetryableProviderError{Detail: "temporarily unavailable"}},
+				{err: provider.RetryableProviderError{Detail: "temporarily unavailable"}},
+				{err: provider.RetryableProviderError{Detail: "temporarily unavailable"}},
+				{err: provider.RetryableProviderError{Detail: "temporarily unavailable"}},
+				{err: provider.RetryableProviderError{Detail: "temporarily unavailable"}},
+			},
+			maxAttempts:  8,
+			wantCalls:    8,
+			wantStatus:   statusFailed,
+			wantCategory: "transient",
+			wantAttempts: []int{1, 2, 3, 4, 5, 6, 7, 8},
+			wantDelays: []time.Duration{
+				time.Second, 2 * time.Second, 4 * time.Second, 8 * time.Second,
+				16 * time.Second, 30 * time.Second, 30 * time.Second,
+			},
+			wantError: true,
 		},
 		{
 			name:         "auth_never_retries",
@@ -237,18 +265,29 @@ func TestProviderRetryAndAuthFailure(t *testing.T) {
 			wantCalls:    1,
 			wantStatus:   statusFailed,
 			wantCategory: "auth",
+			wantAttempts: []int{1},
 			wantError:    true,
 		},
 	}
 	for _, test := range cases {
 		t.Run(test.name, func(t *testing.T) {
 			plan := dialoguePlan(1)
-			plan.ProviderRetry = session.ProviderRetry{Mode: "allow", MaxAttempts: 2}
+			maxAttempts := test.maxAttempts
+			if maxAttempts == 0 {
+				maxAttempts = 2
+			}
+			plan.ProviderRetry = session.ProviderRetry{Mode: "allow", MaxAttempts: maxAttempts}
 			alpha := &fakeBackend{name: "codex", slotID: "alpha", responses: test.responses}
 			beta := &fakeBackend{name: "codex", slotID: "beta"}
 			sess := createSession(t, plan)
+			var delays []time.Duration
+			deps := testDeps(map[string]*fakeBackend{"alpha": alpha, "beta": beta})
+			deps.RetrySleeper = func(_ context.Context, delay time.Duration) error {
+				delays = append(delays, delay)
+				return nil
+			}
 
-			outcome, err := Run(context.Background(), sess, testDeps(map[string]*fakeBackend{"alpha": alpha, "beta": beta}))
+			outcome, err := Run(context.Background(), sess, deps)
 			if (err != nil) != test.wantError {
 				t.Fatalf("Run error = %v, want error=%t", err, test.wantError)
 			}
@@ -257,12 +296,54 @@ func TestProviderRetryAndAuthFailure(t *testing.T) {
 				t.Fatalf("outcome=%#v calls=%d", outcome, len(alpha.prompts))
 			}
 			failures := providerFailures(events)
-			if len(failures) != 1 || failures[0].Category != test.wantCategory {
+			if len(failures) != len(test.wantAttempts) {
 				t.Fatalf("provider failures = %#v", failures)
+			}
+			for index, failure := range failures {
+				if failure.Category != test.wantCategory || failure.Attempts != test.wantAttempts[index] {
+					t.Fatalf("provider failures = %#v", failures)
+				}
 			}
 			if indexOfType(events, eventlog.ProviderFailed) >= indexOfType(events, eventlog.AttemptFinished) {
 				t.Fatalf("provider.failed must classify the failure before attempt.finished: %v", eventTypes(events))
 			}
+			if !reflect.DeepEqual(delays, test.wantDelays) {
+				t.Fatalf("retry delays = %v, want %v", delays, test.wantDelays)
+			}
+		})
+	}
+}
+
+func TestAttemptFinishedPersistsProviderOutcome(t *testing.T) {
+	cases := []struct {
+		name     string
+		response fakeResponse
+		want     string
+	}{
+		{name: "completed", response: fakeResponse{content: "ordinary result"}, want: "completed"},
+		{name: "recovered", response: fakeResponse{content: "recovered result", recovered: true}, want: "recovered"},
+		{name: "timed_out", response: fakeResponse{content: "[alpha timed out]", timedOut: true}, want: "timed_out"},
+		{name: "stalled", response: fakeResponse{content: "[alpha stalled]", stalled: true}, want: "stalled"},
+	}
+	for _, test := range cases {
+		t.Run(test.name, func(t *testing.T) {
+			plan := dialoguePlan(1)
+			alpha := &fakeBackend{name: "codex", slotID: "alpha", responses: []fakeResponse{test.response}}
+			beta := &fakeBackend{name: "codex", slotID: "beta"}
+			sess := createSession(t, plan)
+			if _, err := Run(context.Background(), sess, testDeps(map[string]*fakeBackend{"alpha": alpha, "beta": beta})); err != nil {
+				t.Fatalf("Run: %v", err)
+			}
+			for _, event := range sessionEvents(t, sess) {
+				payload, ok := event.Payload.(eventlog.AttemptFinishedPayload)
+				if ok && payload.ActorID == "alpha" {
+					if payload.ProviderOutcome != test.want {
+						t.Fatalf("provider outcome = %q, want %q", payload.ProviderOutcome, test.want)
+					}
+					return
+				}
+			}
+			t.Fatal("missing alpha attempt.finished")
 		})
 	}
 }
@@ -1827,6 +1908,9 @@ func TestBlobReferencesAreVerifiedBeforeEventAppend(t *testing.T) {
 type fakeResponse struct {
 	content       string
 	err           error
+	timedOut      bool
+	stalled       bool
+	recovered     bool
 	waitForCancel bool
 	started       chan struct{}
 }
@@ -1863,7 +1947,12 @@ func (b *fakeBackend) RunTurn(ctx context.Context, prompt string, _ provider.Tur
 		<-ctx.Done()
 		return provider.TurnResult{}, ctx.Err()
 	}
-	return provider.TurnResult{Content: response.content}, response.err
+	return provider.TurnResult{
+		Content:   response.content,
+		TimedOut:  response.timedOut,
+		Stalled:   response.stalled,
+		Recovered: response.recovered,
+	}, response.err
 }
 
 func (b *fakeBackend) SessionState() provider.SlotState { return b.state }

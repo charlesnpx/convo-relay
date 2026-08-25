@@ -29,7 +29,7 @@ func TestRoundTripEveryTypedEvent(t *testing.T) {
 		TurnStartedPayload{ActorID: "actor-a", Round: 1, Role: ParticipantRole},
 		TurnFinishedPayload{ActorID: "actor-a", Round: 1, Content: ref},
 		AttemptStartedPayload{ActorID: "actor-a", Attempt: 1},
-		AttemptFinishedPayload{ActorID: "actor-a", Attempt: 1, Outcome: "success", ProviderSessionID: "provider-a", Content: ref},
+		AttemptFinishedPayload{ActorID: "actor-a", Attempt: 1, Outcome: "success", ProviderOutcome: "completed", ProviderSessionID: "provider-a", Content: ref},
 		ProviderFailedPayload{ActorID: "actor-a", Backend: "codex", Category: "transport", Retryable: true, Attempts: 1, RemediationCode: "retry", SanitizedDetail: "temporary network failure"},
 		ChildRequestedPayload{RequestID: "request-one", RequesterActorID: "actor-a", RecipeID: "review", Question: ref},
 		ChildDecidedPayload{RequestID: "request-one", Admitted: true, Reason: "within budget", BudgetState: "remaining", Plan: &planRef},
@@ -64,6 +64,13 @@ func TestRoundTripEveryTypedEvent(t *testing.T) {
 	}
 	if _, ok := got[0].Payload.(SessionStartedPayload); !ok {
 		t.Fatalf("replay left first payload untyped: %T", got[0].Payload)
+	}
+	encoded, err := CanonicalEventBytes(want[0])
+	if err != nil {
+		t.Fatalf("encode event format: %v", err)
+	}
+	if !bytes.Contains(encoded, []byte(`"kind":"relay.event/v1"`)) {
+		t.Fatalf("event omitted relay.event/v1 kind: %s", encoded)
 	}
 }
 

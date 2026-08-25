@@ -34,9 +34,8 @@ const runtimeFilename = "v2-runtime.json"
 // portable immutable plan. It records no output and is only used to recreate
 // the imperative provider boundary for resume and operator child decisions.
 type Runtime struct {
-	SchemaVersion int           `json:"schema_version"`
-	SettingsPath  string        `json:"settings_path,omitempty"`
-	Recipes       []plan.Recipe `json:"recipes"`
+	SettingsPath string        `json:"settings_path,omitempty"`
+	Recipes      []plan.Recipe `json:"recipes"`
 }
 
 // SaveRuntime records local v2 execution dependencies once a session has
@@ -45,7 +44,6 @@ func SaveRuntime(sess *session.Session, value Runtime) error {
 	if sess == nil || strings.TrimSpace(sess.Root) == "" {
 		return errors.New("session is required to save v2 runtime")
 	}
-	value.SchemaVersion = 1
 	value.Recipes = append([]plan.Recipe{}, value.Recipes...)
 	body, err := json.Marshal(value)
 	if err != nil {
@@ -85,9 +83,6 @@ func LoadRuntime(sess *session.Session) (Runtime, error) {
 	var value Runtime
 	if err := json.Unmarshal(body, &value); err != nil {
 		return Runtime{}, fmt.Errorf("decode v2 runtime: %w", err)
-	}
-	if value.SchemaVersion != 1 {
-		return Runtime{}, fmt.Errorf("unsupported v2 runtime schema version %d", value.SchemaVersion)
 	}
 	for index, recipe := range value.Recipes {
 		if strings.TrimSpace(recipe.ID) == "" {
@@ -309,7 +304,7 @@ func recipeFromRecord(
 	profiles map[string]map[string]any,
 	relayRecipes map[string]map[string]any,
 ) (plan.Recipe, error) {
-	normalized := recipes.RecipeContractPayload(record)
+	normalized := recipes.RecipePayload(record)
 	id := strings.TrimSpace(stringValue(normalized["id"]))
 	if id == "" {
 		return plan.Recipe{}, errors.New("recipe id is required")
@@ -357,11 +352,9 @@ func recipeFromRecord(
 		retry.MaxAttempts = 1
 	}
 	return plan.Recipe{
-		Kind:          "recipe",
-		SchemaVersion: intValue(normalized["schema_version"], 1),
-		ID:            id,
-		Purpose:       stringValue(normalized["purpose"]),
-		Actors:        actors,
+		ID:      id,
+		Purpose: stringValue(normalized["purpose"]),
+		Actors:  actors,
 		Schedule: session.Schedule{
 			Kind:  "dialogue",
 			Turns: intValue(normalized["participant_turns"], intValue(normalized["max_rounds"], 1)),

@@ -12,8 +12,8 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/charlesnpx/convo-relay/internal/contracts"
 	"github.com/charlesnpx/convo-relay/internal/engine"
+	"github.com/charlesnpx/convo-relay/internal/format"
 	"github.com/charlesnpx/convo-relay/internal/readiness"
 	"github.com/charlesnpx/convo-relay/internal/recipes"
 	"github.com/charlesnpx/convo-relay/internal/relayv2"
@@ -25,6 +25,10 @@ func main() {
 	if len(os.Args) < 2 {
 		usage()
 		os.Exit(2)
+	}
+	if os.Args[1] == "--help" || os.Args[1] == "-h" {
+		usageTo(os.Stdout)
+		return
 	}
 
 	switch os.Args[1] {
@@ -49,10 +53,38 @@ func main() {
 	case "clean":
 		runClean(os.Args[2:])
 	default:
-		fmt.Fprintf(os.Stderr, "error: unknown command %q\n", os.Args[1])
+		if replacement, retired := retiredCommandReplacements[os.Args[1]]; retired {
+			fmt.Fprintf(os.Stderr, "error: command %q was removed; use %s\n", os.Args[1], replacement)
+		} else {
+			fmt.Fprintf(os.Stderr, "error: unknown command %q\n", os.Args[1])
+		}
 		usage()
 		os.Exit(2)
 	}
+}
+
+// Retired command names fail loudly rather than forwarding. The map is only
+// operator guidance; every replacement enters through its surviving command.
+var retiredCommandReplacements = map[string]string{
+	"--version":      "version",
+	"approve":        "control approve",
+	"backends":       "doctor",
+	"capabilities":   "version --json",
+	"cleanup":        "clean --all",
+	"compile-recipe": "recipes compile",
+	"contracts":      "show --json",
+	"create-session": "run",
+	"diff":           "show --diff",
+	"display":        "show --json",
+	"health":         "doctor",
+	"install-skills": "make install-assets",
+	"kill":           "control cancel",
+	"proposals":      "show --proposals",
+	"reject":         "control reject",
+	"show-graph":     "show --graph",
+	"steer":          "control steer",
+	"stop":           "control cancel",
+	"verify-export":  "export verify",
 }
 
 func runVersion(args []string) {
@@ -69,15 +101,11 @@ func runVersion(args []string) {
 		fmt.Println(cliVersion)
 		return
 	}
-	registry := contracts.PublicVersionRegistry()
-	formats := map[string]any{}
-	for _, format := range registry.NumericContracts() {
-		formats[format] = registry.Numeric(format)
-	}
-	for _, format := range registry.StringContracts() {
-		formats[format] = registry.Strings(format)
-	}
-	writeJSON(map[string]any{"version": cliVersion, "formats": formats})
+	writeJSON(map[string]any{
+		"version":        cliVersion,
+		"formats":        format.PublicFormats(),
+		"digest_classes": format.DigestClasses(),
+	})
 }
 
 func runRecipesCompile(args []string) {
@@ -145,7 +173,7 @@ func runRecipesCompile(args []string) {
 		fmt.Printf("Resolved backends: %s\n", strings.Join(stringItemsLocal(launch["agents"]), ","))
 	}
 	if compiled, ok := report["compiled_plan"].(map[string]any); ok {
-		fmt.Printf("Plan kind: %s/v%v\n", stringValue(compiled["kind"]), compiled["schema_version"])
+		fmt.Printf("Plan preview: %s participant turn(s)\n", stringValue(compiled["participant_turns"]))
 		if participants, ok := compiled["participants"].([]any); ok {
 			fmt.Println("Participants:")
 			for _, rawParticipant := range participants {
@@ -328,8 +356,8 @@ func failCompileRecipe(err error, jsonOutput bool) {
 	if jsonOutput {
 		var configErr recipes.ChildRelayConfigError
 		var rootOnly *recipes.RootOnlyRecipeError
-		var diagnosticErr *contracts.DiagnosticError
-		var validationErr contracts.ValidationError
+		var diagnosticErr *format.DiagnosticError
+		var validationErr format.ValidationError
 		switch {
 		case errors.As(err, &configErr):
 			writeJSON(configErr.ToMap())
@@ -555,7 +583,7 @@ func runExportCreate(args []string) {
 		if *jsonOutput {
 			writeJSON(map[string]any{
 				"output":          result.Directory,
-				"schema_version":  result.Manifest["schema_version"],
+				"format":          result.Manifest["kind"],
 				"manifest_digest": result.Manifest["manifest_digest"],
 				"terminal_status": result.Manifest["terminal_status"],
 			})
@@ -595,9 +623,9 @@ func runExportVerify(args []string) {
 	if err != nil {
 		if *jsonOutput {
 			writeJSON(map[string]any{
-				"schema_version": contracts.PortableExportV2,
-				"status":         "invalid",
-				"error":          err.Error(),
+				"format": format.BundleV1,
+				"status": "invalid",
+				"error":  err.Error(),
 			})
 			os.Exit(1)
 		}
@@ -1495,28 +1523,32 @@ func writeJSON(value any) {
 }
 
 func usage() {
-	fmt.Fprintln(os.Stderr, "usage:")
-	fmt.Fprintln(os.Stderr, "  convo-relay run --task <task> --agents codex,codex --rounds 2 --json")
-	fmt.Fprintln(os.Stderr, "  convo-relay run --task <task> --recipe <id> [--integration-bundle <path>] [--input name=path] [--workspace current|head-copy] --json")
-	fmt.Fprintln(os.Stderr, "  convo-relay resume <session-id-prefix> --mode steelman --rounds 1 --json")
-	fmt.Fprintln(os.Stderr, "  convo-relay list --home <relay-home> --json")
-	fmt.Fprintln(os.Stderr, "  convo-relay show <session-id-prefix> --json")
-	fmt.Fprintln(os.Stderr, "  convo-relay show <session-id-prefix> --graph --json")
-	fmt.Fprintln(os.Stderr, "  convo-relay show <session-id-prefix> --trace <node-id>")
-	fmt.Fprintln(os.Stderr, "  convo-relay control steer <session-id-prefix> <prompt>")
-	fmt.Fprintln(os.Stderr, "  convo-relay control approve <session-id-prefix> <proposal-id> --json")
-	fmt.Fprintln(os.Stderr, "  convo-relay control cancel <session-id-prefix>")
-	fmt.Fprintln(os.Stderr, "  convo-relay export create <session-id-prefix> -o transcript.md")
-	fmt.Fprintln(os.Stderr, "  convo-relay export create <session-id-prefix> --portable -o bundle-directory --json")
-	fmt.Fprintln(os.Stderr, "  convo-relay export verify <bundle-directory> --json")
-	fmt.Fprintln(os.Stderr, "  convo-relay recipes list --json")
-	fmt.Fprintln(os.Stderr, "  convo-relay recipes show review-panel")
-	fmt.Fprintln(os.Stderr, "  convo-relay recipes doctor")
-	fmt.Fprintln(os.Stderr, "  convo-relay recipes compile <id> [--integration-bundle <path>] --json")
-	fmt.Fprintln(os.Stderr, "  convo-relay clean <session-id-prefix>")
-	fmt.Fprintln(os.Stderr, "  convo-relay clean --all --home <relay-home> --json")
-	fmt.Fprintln(os.Stderr, "  convo-relay doctor [session-id-prefix] [--probe-auth] --json")
-	fmt.Fprintln(os.Stderr, "  convo-relay version [--json]")
+	usageTo(os.Stderr)
+}
+
+func usageTo(writer io.Writer) {
+	fmt.Fprintln(writer, "usage:")
+	fmt.Fprintln(writer, "  convo-relay run --task <task> --agents codex,codex --rounds 2 --json")
+	fmt.Fprintln(writer, "  convo-relay run --task <task> --recipe <id> [--integration-bundle <path>] [--input name=path] [--workspace current|head-copy] --json")
+	fmt.Fprintln(writer, "  convo-relay resume <session-id-prefix> --mode steelman --rounds 1 --json")
+	fmt.Fprintln(writer, "  convo-relay list --home <relay-home> --json")
+	fmt.Fprintln(writer, "  convo-relay show <session-id-prefix> --json")
+	fmt.Fprintln(writer, "  convo-relay show <session-id-prefix> --graph --json")
+	fmt.Fprintln(writer, "  convo-relay show <session-id-prefix> --trace <node-id>")
+	fmt.Fprintln(writer, "  convo-relay control steer <session-id-prefix> <prompt>")
+	fmt.Fprintln(writer, "  convo-relay control approve <session-id-prefix> <proposal-id> --json")
+	fmt.Fprintln(writer, "  convo-relay control cancel <session-id-prefix>")
+	fmt.Fprintln(writer, "  convo-relay export create <session-id-prefix> -o transcript.md")
+	fmt.Fprintln(writer, "  convo-relay export create <session-id-prefix> --portable -o bundle-directory --json")
+	fmt.Fprintln(writer, "  convo-relay export verify <bundle-directory> --json")
+	fmt.Fprintln(writer, "  convo-relay recipes list --json")
+	fmt.Fprintln(writer, "  convo-relay recipes show review-panel")
+	fmt.Fprintln(writer, "  convo-relay recipes doctor")
+	fmt.Fprintln(writer, "  convo-relay recipes compile <id> [--integration-bundle <path>] --json")
+	fmt.Fprintln(writer, "  convo-relay clean <session-id-prefix>")
+	fmt.Fprintln(writer, "  convo-relay clean --all --home <relay-home> --json")
+	fmt.Fprintln(writer, "  convo-relay doctor [session-id-prefix] [--probe-auth] --json")
+	fmt.Fprintln(writer, "  convo-relay version [--json]")
 }
 
 var cliVersion = "1.0.0"
