@@ -184,11 +184,11 @@ func TestRejectPendingChild(t *testing.T) {
 	if _, err := Run(context.Background(), sess, deps); err != nil {
 		t.Fatalf("Run: %v", err)
 	}
-	if err := RejectChild(context.Background(), sess, "child-request"); err != nil {
+	if err := RejectChild(context.Background(), sess, "child-request", ""); err != nil {
 		t.Fatalf("RejectChild: %v", err)
 	}
 	decision, found := childDecisionFor(sessionEvents(t, sess), "child-request")
-	if !found || decision.Admitted || decision.Plan != nil || !strings.Contains(decision.Reason, "operator") {
+	if !found || decision.Admitted || decision.Plan != nil || decision.Reason != "rejected by operator" {
 		t.Fatalf("rejection decision = %#v found=%t", decision, found)
 	}
 
@@ -220,7 +220,7 @@ func TestPendingChildCannotBeDecidedTwice(t *testing.T) {
 	if err := ApproveChild(context.Background(), sess, "child-request", deps.Recipes); err != nil {
 		t.Fatalf("ApproveChild: %v", err)
 	}
-	err := RejectChild(context.Background(), sess, "child-request")
+	err := RejectChild(context.Background(), sess, "child-request", "")
 	if err == nil || !strings.Contains(err.Error(), "existing admitted decision") {
 		t.Fatalf("second decision error = %v", err)
 	}

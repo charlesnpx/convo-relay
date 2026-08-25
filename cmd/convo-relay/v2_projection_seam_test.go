@@ -92,6 +92,21 @@ func TestV2CancellationProjectionSeam(t *testing.T) {
 	if got := u2db3Status(t, u2db3Report(t, show)); got != "interrupted" {
 		t.Fatalf("show cancellation status = %q", got)
 	}
+	beforeStrandedCancel, err := os.ReadFile(filepath.Join(sessionDir, "events.jsonl"))
+	if err != nil {
+		t.Fatalf("read events before stranded control cancel: %v", err)
+	}
+	stranded := env.run(t, "control", "cancel", "--home", env.relayHome, "--json", "cancelled")
+	if stranded.exitCode != 1 || !strings.Contains(stranded.stderr, "no owning process is active; the session is not running") {
+		t.Fatalf("stranded control cancel = exit %d stdout=%q stderr=%q", stranded.exitCode, stranded.stdout, stranded.stderr)
+	}
+	afterStrandedCancel, err := os.ReadFile(filepath.Join(sessionDir, "events.jsonl"))
+	if err != nil {
+		t.Fatalf("read events after stranded control cancel: %v", err)
+	}
+	if !bytes.Equal(afterStrandedCancel, beforeStrandedCancel) {
+		t.Fatalf("stranded control cancel appended durable state: before=%s after=%s", beforeStrandedCancel, afterStrandedCancel)
+	}
 	resumed := env.run(t, "resume", "--home", env.relayHome, "--timeout", "30", "--stall-timeout", "30", "--json", "cancelled")
 	u2db3RequireExit(t, resumed, 0)
 	if got := u2db3Status(t, u2db3Report(t, resumed)); got != "completed" {
@@ -101,6 +116,34 @@ func TestV2CancellationProjectionSeam(t *testing.T) {
 	u2db3RequireExit(t, show, 0)
 	if got := u2db3Status(t, u2db3Report(t, show)); got != "completed" {
 		t.Fatalf("show resumed status = %q", got)
+	}
+	beforeTerminalCancel, err := os.ReadFile(filepath.Join(sessionDir, "events.jsonl"))
+	if err != nil {
+		t.Fatalf("read events before terminal control cancel: %v", err)
+	}
+	terminal := env.run(t, "control", "cancel", "--home", env.relayHome, "--json", "cancelled")
+	u2db3RequireExit(t, terminal, 0)
+	if got := u2db3Status(t, u2db3Report(t, terminal)); got != "completed" {
+		t.Fatalf("terminal control cancel status = %q", got)
+	}
+	afterTerminalCancel, err := os.ReadFile(filepath.Join(sessionDir, "events.jsonl"))
+	if err != nil {
+		t.Fatalf("read events after terminal control cancel: %v", err)
+	}
+	if !bytes.Equal(afterTerminalCancel, beforeTerminalCancel) {
+		t.Fatalf("terminal control cancel appended durable state: before=%s after=%s", beforeTerminalCancel, afterTerminalCancel)
+	}
+}
+
+func TestV2ControlApproveRetiredFlagsRejected(t *testing.T) {
+	env := newU2DB3CLIEnv(t, "approve-flags")
+	for _, name := range []string{"rounds", "timeout", "stall-timeout", "settings"} {
+		t.Run(name, func(t *testing.T) {
+			rejected := env.run(t, "control", "approve", "--"+name, "1")
+			if rejected.exitCode != 2 || !strings.Contains(rejected.stderr, "flag provided but not defined: -"+name) {
+				t.Fatalf("control approve --%s = exit %d stdout=%q stderr=%q", name, rejected.exitCode, rejected.stdout, rejected.stderr)
+			}
+		})
 	}
 }
 
@@ -201,8 +244,7 @@ func TestV2AskModeProjectionSeam(t *testing.T) {
 
 	proposalID := env.proposalID(t, "ask-mode")
 	approval := env.run(t,
-		"control", "approve", "--home", env.relayHome, "--proposal", proposalID, "--rounds", "1",
-		"--timeout", "30", "--stall-timeout", "30", "ask-mode",
+		"control", "approve", "--home", env.relayHome, "--proposal", proposalID, "ask-mode",
 	)
 	u2db3RequireExit(t, approval, 0)
 	resumed := env.run(t, "resume", "--home", env.relayHome, "--timeout", "30", "--stall-timeout", "30", "--json", "ask-mode")
@@ -228,6 +270,62 @@ func TestV2AskModeProjectionSeam(t *testing.T) {
 	decidedProposal, ok := proposals[0].(map[string]any)
 	if !ok || decidedProposal["status"] != "collapsed" {
 		t.Fatalf("decided proposal = %#v", proposals[0])
+	}
+}
+
+func TestV2ControlRejectCarriesReason(t *testing.T) {
+	env := newU2DB3CLIEnv(t, "ask")
+	if err := os.WriteFile(env.settingsPath, []byte(u2db3AskSettings), 0o600); err != nil {
+		t.Fatalf("write ask-mode settings: %v", err)
+	}
+	initial := env.run(t,
+		"run", "--home", env.relayHome, "--session-id", "reject-reason",
+		"--task", "reject with an operator reason", "--agents", "gemini", "--rounds", "1", "--dynamic", "ask",
+		"--settings", env.settingsPath, "--launch-cwd", env.workDir,
+		"--timeout", "30", "--stall-timeout", "30", "--json",
+	)
+	u2db3RequireExit(t, initial, 0)
+	proposalID := env.proposalID(t, "reject-reason")
+	const reason = "custom operator refusal"
+	rejected := env.run(t,
+		"control", "reject", "--home", env.relayHome, "--proposal", proposalID, "--reason", reason, "--json", "reject-reason",
+	)
+	u2db3RequireExit(t, rejected, 0)
+
+	sessionDir := u2db3SessionDir(t, env.relayHome, "reject-reason")
+	sess, found, err := relayv2.Open(sessionDir)
+	if err != nil || !found {
+		t.Fatalf("open rejected v2 session: session=%#v found=%v err=%v", sess, found, err)
+	}
+	events, err := relayv2.Events(sess)
+	if err != nil {
+		t.Fatalf("read rejected events: %v", err)
+	}
+	foundDecision := false
+	for _, event := range events {
+		decision, ok := event.Payload.(eventlog.ChildDecidedPayload)
+		if !ok || decision.RequestID != proposalID {
+			continue
+		}
+		if decision.Reason != reason {
+			t.Fatalf("durable child.decided reason = %q, want %q", decision.Reason, reason)
+		}
+		foundDecision = true
+	}
+	if !foundDecision {
+		t.Fatalf("durable child.decided for %q missing from %#v", proposalID, events)
+	}
+
+	proposalView := env.run(t, "show", "--proposals", "--home", env.relayHome, "--json", "reject-reason")
+	u2db3RequireExit(t, proposalView, 0)
+	proposalReport := u2db3Report(t, proposalView)
+	proposals, ok := proposalReport["proposals"].([]any)
+	if !ok || len(proposals) != 1 {
+		t.Fatalf("rejected proposal view = %#v", proposalReport)
+	}
+	proposal, ok := proposals[0].(map[string]any)
+	if !ok || proposal["reason"] != reason {
+		t.Fatalf("rejected proposal reason = %#v", proposals[0])
 	}
 }
 

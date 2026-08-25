@@ -266,7 +266,8 @@ func ApproveChild(ctx context.Context, sess *session.Session, requestID string, 
 }
 
 // RejectChild resolves one pending ask-mode request without admitting it.
-func RejectChild(ctx context.Context, sess *session.Session, requestID string) error {
+// An empty reason keeps the operator-default durable decision text.
+func RejectChild(ctx context.Context, sess *session.Session, requestID string, reason string) error {
 	runner, err := newAdmissionRunner(ctx, sess, nil)
 	if err != nil {
 		return err
@@ -276,7 +277,11 @@ func RejectChild(ctx context.Context, sess *session.Session, requestID string) e
 	if err != nil {
 		return err
 	}
-	return runner.rejectChild(child, "rejected by operator", "rejected")
+	reason = strings.TrimSpace(reason)
+	if reason == "" {
+		reason = "rejected by operator"
+	}
+	return runner.rejectChild(child, reason, "rejected")
 }
 
 func checkResumeLifecycle(sess *session.Session, prompt string) error {
