@@ -65,6 +65,13 @@ func TestRoundTripEveryTypedEvent(t *testing.T) {
 	if _, ok := got[0].Payload.(SessionStartedPayload); !ok {
 		t.Fatalf("replay left first payload untyped: %T", got[0].Payload)
 	}
+	encoded, err := CanonicalEventBytes(want[0])
+	if err != nil {
+		t.Fatalf("encode event format: %v", err)
+	}
+	if !bytes.Contains(encoded, []byte(`"kind":"relay.event/v1"`)) {
+		t.Fatalf("event omitted relay.event/v1 kind: %s", encoded)
+	}
 }
 
 func TestTurnBudgetGrantedPayloadRequiresGrantorAndPositiveTurns(t *testing.T) {

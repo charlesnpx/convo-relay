@@ -14,6 +14,7 @@ import (
 
 	"github.com/charlesnpx/convo-relay/internal/blobstore"
 	"github.com/charlesnpx/convo-relay/internal/eventlog"
+	"github.com/charlesnpx/convo-relay/internal/format"
 )
 
 // Relay modes frame how actors address one another.
@@ -38,8 +39,8 @@ const (
 )
 
 const (
-	PlanKind        = "relay.plan/v1"
-	SchemaVersion   = 1
+	PlanKind        = format.PlanV1
+	SchemaVersion   = format.SessionSchemaVersion
 	SessionFilename = "session.json"
 )
 

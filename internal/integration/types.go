@@ -3,13 +3,11 @@ package integration
 import (
 	"fmt"
 
-	"github.com/charlesnpx/convo-relay/internal/contracts"
+	"github.com/charlesnpx/convo-relay/internal/format"
 )
 
 const (
-	BundleSchemaVersionV1 = contracts.IntegrationBundleV1
-	BundleSchemaVersionV2 = contracts.IntegrationBundleV2
-	DefaultMediaType      = "application/octet-stream"
+	DefaultMediaType = "application/octet-stream"
 
 	CardinalityOne  = "one"
 	CardinalityMany = "many"
@@ -17,7 +15,6 @@ const (
 	ResultSourceLastTurn = "last_turn"
 	ResultSourceReducer  = "reducer"
 
-	PromptContextPolicyVersion    = contracts.PromptContextProjectionV1
 	ParticipantTranscriptComplete = "complete"
 	FacilitatorLedgerInclude      = "include"
 	FacilitatorLedgerTraceOnly    = "trace_only"
@@ -34,10 +31,9 @@ const (
 // Bundle is the normalized, immutable representation of one consumer-owned
 // integration bundle.
 type Bundle struct {
-	schemaVersion string
-	id            string
-	contracts     map[string]*Contract
-	digest        string
+	id        string
+	contracts map[string]*Contract
+	digest    string
 }
 
 type Contract struct {
@@ -49,7 +45,6 @@ type Contract struct {
 }
 
 type PromptContextProjection struct {
-	SchemaVersion         string
 	ParticipantTranscript string
 	FacilitatorLedger     string
 }
@@ -89,29 +84,20 @@ type ScheduleRequirement struct {
 }
 
 type SelectedContract struct {
-	id            string
-	contract      *Contract
-	digest        string
-	bundleVersion string
+	id       string
+	contract *Contract
+	digest   string
 }
 
 func (b *Bundle) ToMap() map[string]any {
 	contractMaps := make(map[string]any, len(b.contracts))
 	for id, contract := range b.contracts {
-		contractMaps[id] = contract.toMap(b.schemaVersion)
+		contractMaps[id] = contract.ToMap()
 	}
 	return map[string]any{
-		"schema_version": b.schemaVersion,
-		"id":             b.id,
-		"contracts":      contractMaps,
+		"id":        b.id,
+		"contracts": contractMaps,
 	}
-}
-
-func (b *Bundle) SchemaVersion() string {
-	if b == nil {
-		return ""
-	}
-	return b.schemaVersion
 }
 
 func (b *Bundle) ID() string {
@@ -128,18 +114,6 @@ func (b *Bundle) Digest() string {
 	return b.digest
 }
 
-func (b *Bundle) ArtifactPayload() (map[string]any, error) {
-	fields := map[string]any{
-		"bundle_id":     b.ID(),
-		"bundle_digest": b.Digest(),
-		"bundle":        b.ToMap(),
-	}
-	if b.SchemaVersion() == BundleSchemaVersionV2 {
-		return contracts.NormalizeRootArtifactVersion(contracts.RootArtifactKindIntegrationBundle, contracts.RootArtifactSchemaVersionV2, fields)
-	}
-	return contracts.NormalizeRootArtifact(contracts.RootArtifactKindIntegrationBundle, fields)
-}
-
 func (b *Bundle) Contract(id string) (*Contract, bool) {
 	if b == nil {
 		return nil, false
@@ -152,10 +126,6 @@ func (b *Bundle) Contract(id string) (*Contract, bool) {
 }
 
 func (c *Contract) ToMap() map[string]any {
-	return c.toMap(BundleSchemaVersionV1)
-}
-
-func (c *Contract) toMap(bundleVersion string) map[string]any {
 	turns := make([]any, 0, len(c.Turns))
 	for _, turn := range c.Turns {
 		turns = append(turns, map[string]any{
@@ -170,7 +140,7 @@ func (c *Contract) toMap(bundleVersion string) map[string]any {
 	}
 	result := map[string]any{"format": c.Result.Format}
 	if c.Result.Schema != nil {
-		result["schema"] = contracts.Materialize(c.Result.Schema)
+		result["schema"] = format.Materialize(c.Result.Schema)
 	}
 	payload := map[string]any{
 		"turns":  turns,
@@ -180,9 +150,7 @@ func (c *Contract) toMap(bundleVersion string) map[string]any {
 	if c.Reducer != nil {
 		payload["reducer"] = map[string]any{"instructions": c.Reducer.Instructions}
 	}
-	if bundleVersion == BundleSchemaVersionV2 {
-		payload["prompt_context"] = c.PromptContext.ToMap()
-	}
+	payload["prompt_context"] = c.PromptContext.ToMap()
 	return payload
 }
 
@@ -212,20 +180,9 @@ func (d *InputDeclaration) ToMap() map[string]any {
 }
 
 func (s *SelectedContract) ToMap() map[string]any {
-	version := s.bundleVersion
-	if version == "" {
-		version = BundleSchemaVersionV1
-	}
-	payload := s.contract.toMap(version)
+	payload := s.contract.ToMap()
 	payload["id"] = s.id
 	return payload
-}
-
-func (s *SelectedContract) BundleVersion() string {
-	if s == nil {
-		return ""
-	}
-	return s.bundleVersion
 }
 
 func (s *SelectedContract) PromptContext() PromptContextProjection {
@@ -256,18 +213,6 @@ func (s *SelectedContract) Digest() string {
 	return s.digest
 }
 
-func (s *SelectedContract) ArtifactPayload() (map[string]any, error) {
-	fields := map[string]any{
-		"contract_id":     s.ID(),
-		"contract_digest": s.Digest(),
-		"contract":        s.ToMap(),
-	}
-	if s.BundleVersion() == BundleSchemaVersionV2 {
-		return contracts.NormalizeRootArtifactVersion(contracts.RootArtifactKindIntegrationContract, contracts.RootArtifactSchemaVersionV2, fields)
-	}
-	return contracts.NormalizeRootArtifact(contracts.RootArtifactKindIntegrationContract, fields)
-}
-
 func AlternatingSchedule(participantTurns int) ([]ScheduledTurn, error) {
 	if participantTurns < 1 {
 		return nil, fmt.Errorf("participant turns must be positive")
@@ -283,7 +228,7 @@ func AlternatingSchedule(participantTurns int) ([]ScheduledTurn, error) {
 }
 
 func cloneMap(value map[string]any) map[string]any {
-	cloned, _ := contracts.Materialize(value).(map[string]any)
+	cloned, _ := format.Materialize(value).(map[string]any)
 	return cloned
 }
 
@@ -297,7 +242,7 @@ func cloneContract(contract *Contract) *Contract {
 		Result:        contract.Result,
 		PromptContext: contract.PromptContext,
 	}
-	cloned.Result.Schema = contracts.Materialize(contract.Result.Schema)
+	cloned.Result.Schema = format.Materialize(contract.Result.Schema)
 	if contract.Reducer != nil {
 		reducer := *contract.Reducer
 		cloned.Reducer = &reducer

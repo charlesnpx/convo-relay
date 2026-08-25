@@ -1,8 +1,6 @@
 package integration
 
 import (
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"math"
@@ -11,7 +9,7 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/charlesnpx/convo-relay/internal/contracts"
+	"github.com/charlesnpx/convo-relay/internal/format"
 	jsonschema "github.com/santhosh-tekuri/jsonschema/v6"
 )
 
@@ -26,7 +24,7 @@ func LoadBundleFile(path string, maxBytes int64) (*Bundle, error) {
 			map[string]any{"source_path": path},
 		)
 	}
-	data, err := contracts.ReadFileBytesLimited(absolutePath, maxBytes)
+	data, err := format.ReadFileBytesLimited(absolutePath, maxBytes)
 	if err != nil {
 		return nil, wrapPreflightError(
 			err,
@@ -44,7 +42,7 @@ func LoadBundleFile(path string, maxBytes int64) (*Bundle, error) {
 }
 
 func DecodeBundleBytes(data []byte) (*Bundle, error) {
-	object, err := contracts.DecodeStrictJSONObjectBytes(data)
+	object, err := format.DecodeStrictJSONObjectBytes(data)
 	if err != nil {
 		return nil, err
 	}
@@ -67,8 +65,8 @@ func SelectContract(bundle *Bundle, contractID string, requirement ScheduleRequi
 	if err := validateContractSchedule(contractID, contract, requirement); err != nil {
 		return nil, err
 	}
-	selected := &SelectedContract{id: contractID, contract: contract, bundleVersion: bundle.schemaVersion}
-	digest, err := integrationSemanticDigestForVersion(selected.ToMap(), selected.bundleVersion)
+	selected := &SelectedContract{id: contractID, contract: contract}
+	digest, err := format.SemanticJSONDigest(selected.ToMap())
 	if err != nil {
 		return nil, wrapPreflightError(
 			err,
@@ -86,17 +84,11 @@ func normalizeBundle(object map[string]any) (*Bundle, error) {
 	if err := rejectUnknownFields(object, []string{"schema_version", "id", "contracts"}, "", "integration bundle", DiagnosticCodeInvalidBundle); err != nil {
 		return nil, err
 	}
-	version, err := contracts.RequireStringVersion(object, contracts.ContractIntegrationBundle)
-	if err != nil {
-		return nil, preflightError(
-			contracts.DiagnosticCodeUnsupportedContractVersion,
-			"/schema_version",
-			"Unsupported integration bundle schema version.",
-			map[string]any{
-				"observed":  object["schema_version"],
-				"supported": []any{BundleSchemaVersionV1, BundleSchemaVersionV2},
-			},
-		)
+	if rawVersion, exists := object["schema_version"]; exists {
+		version, ok := rawVersion.(string)
+		if !ok || (version != "relay-integration-bundle-v1" && version != "relay-integration-bundle-v2") {
+			return nil, preflightError(DiagnosticCodeInvalidBundle, "/schema_version", "Integration bundle schema_version is not recognized.", map[string]any{"observed": rawVersion})
+		}
 	}
 	bundleID, err := requireString(object, "id", "", false, DiagnosticCodeInvalidBundle)
 	if err != nil {
@@ -110,11 +102,7 @@ func normalizeBundle(object map[string]any) (*Bundle, error) {
 		return nil, preflightError(DiagnosticCodeInvalidBundle, "/contracts", "contracts must contain at least one contract.", nil)
 	}
 
-	bundle := &Bundle{
-		schemaVersion: version,
-		id:            bundleID,
-		contracts:     make(map[string]*Contract, len(contractObjects)),
-	}
+	bundle := &Bundle{id: bundleID, contracts: make(map[string]*Contract, len(contractObjects))}
 	for _, contractID := range sortedKeys(contractObjects) {
 		if strings.TrimSpace(contractID) == "" {
 			return nil, preflightError(DiagnosticCodeInvalidBundle, appendPointer("/contracts", contractID), "Contract ids must be non-empty opaque strings.", nil)
@@ -124,13 +112,13 @@ func normalizeBundle(object map[string]any) (*Bundle, error) {
 		if !ok {
 			return nil, preflightError(DiagnosticCodeInvalidBundle, path, "Integration contract must be an object.", nil)
 		}
-		contract, err := normalizeContract(contractObject, path, version)
+		contract, err := normalizeContract(contractObject, path)
 		if err != nil {
 			return nil, err
 		}
 		bundle.contracts[contractID] = contract
 	}
-	digest, err := integrationSemanticDigestForVersion(bundle.ToMap(), bundle.schemaVersion)
+	digest, err := format.SemanticJSONDigest(bundle.ToMap())
 	if err != nil {
 		return nil, wrapPreflightError(err, DiagnosticCodeInvalidBundle, "", "Integration bundle could not be hashed.", nil)
 	}
@@ -138,12 +126,8 @@ func normalizeBundle(object map[string]any) (*Bundle, error) {
 	return bundle, nil
 }
 
-func normalizeContract(object map[string]any, path string, bundleVersion string) (*Contract, error) {
-	allowed := []string{"turns", "reducer", "inputs", "result"}
-	if bundleVersion == BundleSchemaVersionV2 {
-		allowed = append(allowed, "prompt_context")
-	}
-	if err := rejectUnknownFields(object, allowed, path, "integration contract", DiagnosticCodeInvalidBundle); err != nil {
+func normalizeContract(object map[string]any, path string) (*Contract, error) {
+	if err := rejectUnknownFields(object, []string{"turns", "reducer", "inputs", "result", "prompt_context"}, path, "integration contract", DiagnosticCodeInvalidBundle); err != nil {
 		return nil, err
 	}
 	turnValues, err := requireArray(object, "turns", path, DiagnosticCodeInvalidBundle)
@@ -224,7 +208,6 @@ func normalizeContract(object map[string]any, path string, bundleVersion string)
 		return nil, err
 	}
 	promptContext := PromptContextProjection{
-		SchemaVersion:         PromptContextPolicyVersion,
 		ParticipantTranscript: ParticipantTranscriptComplete,
 		FacilitatorLedger:     FacilitatorLedgerInclude,
 	}
@@ -245,7 +228,6 @@ func normalizePromptContext(object map[string]any, path string) (PromptContextPr
 	if err := rejectUnknownFields(object, []string{"participant_transcript", "facilitator_ledger"}, path, "prompt context projection", DiagnosticCodeInvalidBundle); err != nil {
 		return PromptContextProjection{}, err
 	}
-	version := PromptContextPolicyVersion
 	participantTranscript := ParticipantTranscriptComplete
 	if raw, exists := object["participant_transcript"]; exists {
 		value, ok := raw.(string)
@@ -273,30 +255,9 @@ func normalizePromptContext(object map[string]any, path string) (PromptContextPr
 		facilitatorLedger = value
 	}
 	return PromptContextProjection{
-		SchemaVersion:         version,
 		ParticipantTranscript: participantTranscript,
 		FacilitatorLedger:     facilitatorLedger,
 	}, nil
-}
-
-// integrationSemanticDigest hashes every field in a normalized integration
-// value. ContractDigest deliberately omits storage metadata keys recursively,
-// but those same names are valid semantic data in opaque integration maps and
-// JSON Schemas.
-func integrationSemanticDigest(value any) (string, error) {
-	canonical, err := contracts.CanonicalJSONBytes(value)
-	if err != nil {
-		return "", err
-	}
-	sum := sha256.Sum256(canonical)
-	return contracts.DigestPrefix + hex.EncodeToString(sum[:]), nil
-}
-
-func integrationSemanticDigestForVersion(value any, version string) (string, error) {
-	if version == BundleSchemaVersionV2 {
-		return contracts.SemanticJSONDigest(value)
-	}
-	return integrationSemanticDigest(value)
 }
 
 func normalizeTurn(object map[string]any, path string) (TurnDeclaration, error) {
@@ -379,29 +340,29 @@ func normalizeResult(object map[string]any, path string) (ResultDeclaration, err
 	if err := rejectUnknownFields(object, []string{"format", "schema", "transport"}, path, "result declaration", DiagnosticCodeInvalidBundle); err != nil {
 		return ResultDeclaration{}, err
 	}
-	format, exists := object["format"].(string)
-	if !exists || strings.TrimSpace(format) == "" {
+	resultFormat, exists := object["format"].(string)
+	if !exists || strings.TrimSpace(resultFormat) == "" {
 		// Existing consumer bundles used transport for the only formerly-supported
 		// format. Normalize that input spelling away rather than retaining it in
 		// the selected contract or plan.
-		format, _ = object["transport"].(string)
+		resultFormat, _ = object["transport"].(string)
 	}
-	if format != "text" && format != "json" {
+	if resultFormat != "text" && resultFormat != "json" {
 		return ResultDeclaration{}, preflightError(
 			DiagnosticCodeInvalidBundle,
 			appendPointer(path, "format"),
 			"result.format must be text or json.",
-			map[string]any{"format": format},
+			map[string]any{"format": resultFormat},
 		)
 	}
 	schema, exists := object["schema"]
 	if !exists {
-		return ResultDeclaration{Format: format}, nil
+		return ResultDeclaration{Format: resultFormat}, nil
 	}
 	if err := validateStandardSchema(schema, appendPointer(path, "schema")); err != nil {
 		return ResultDeclaration{}, err
 	}
-	return ResultDeclaration{Format: format, Schema: contracts.Materialize(schema)}, nil
+	return ResultDeclaration{Format: resultFormat, Schema: format.Materialize(schema)}, nil
 }
 
 const resultSchemaURL = "https://convo-relay.invalid/integration-result-schema.json"
@@ -416,7 +377,7 @@ func validateStandardSchema(schema any, path string) error {
 	compiler := jsonschema.NewCompiler()
 	compiler.DefaultDraft(jsonschema.Draft2020)
 	compiler.UseLoader(resultSchemaLoader{})
-	if err := compiler.AddResource(resultSchemaURL, contracts.Materialize(schema)); err != nil {
+	if err := compiler.AddResource(resultSchemaURL, format.Materialize(schema)); err != nil {
 		return wrapPreflightError(err, DiagnosticCodeInvalidSchema, path, "Result schema could not be registered.", map[string]any{"error": err.Error()})
 	}
 	if _, err := compiler.Compile(resultSchemaURL); err != nil {

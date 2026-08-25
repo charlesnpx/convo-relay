@@ -46,10 +46,8 @@ type Flags struct {
 // Actor/profile resolution happens before this boundary; the plan compiler
 // never parses raw recipe JSON or carries profile references.
 type Recipe struct {
-	Kind          string `json:"kind"`
-	SchemaVersion int    `json:"schema_version"`
-	ID            string `json:"id"`
-	Purpose       string `json:"purpose"`
+	ID      string `json:"id"`
+	Purpose string `json:"purpose"`
 
 	Actors        []session.Actor      `json:"actors"`
 	Schedule      session.Schedule     `json:"schedule"`
@@ -64,11 +62,8 @@ type Recipe struct {
 	ProviderRetry       session.ProviderRetry `json:"provider_retry"`
 	IntegrationContract string                `json:"integration_contract,omitempty"`
 	MaxDepth            int                   `json:"max_depth"`
-	// RequiredCapabilities remains at the recipe parse boundary: it does not
-	// affect execution; no reader; not carried into session.Plan.
-	RequiredCapabilities []string          `json:"required_capabilities"`
-	AutoApproval         string            `json:"auto_approval"`
-	Lifecycle            session.Lifecycle `json:"lifecycle"`
+	AutoApproval        string                `json:"auto_approval"`
+	Lifecycle           session.Lifecycle     `json:"lifecycle"`
 
 	Workspace   session.Workspace   `json:"workspace"`
 	Inputs      []session.Input     `json:"inputs"`

@@ -1,109 +1,93 @@
-# Public contract version registry
+# Public formats
 
-Convo Relay dispatches every public successor payload from its declared
-`schema_version`. Readers never infer a version from the presence of fields.
-The implementation registry in `internal/contracts` is authoritative and is
-reported under the flat `formats` object from `convo-relay version --json`.
+Convo Relay has three durable public formats. `convo-relay version --json`
+reports them under `formats` and reports the supported digest classes under
+`digest_classes`. It does not inspect a session or run a provider.
 
-| Contract | Supported versions |
-|---|---|
-| normalized recipe | numeric `1`, `2` |
-| root recipe plan | numeric `1`, `2` |
-| integration bundle | `relay-integration-bundle-v1`, `relay-integration-bundle-v2` |
-| selected integration contract | numeric `1`, `2` |
-| root artifact | numeric `1`, `2` |
-| execution workspace | numeric `1`, `2` |
-| root session result | numeric `1`, `2` |
-| prompt policy | `prompt-policy/v1`, `prompt-policy/v2` |
-| prompt-context projection | `relay-prompt-context-v1` |
-| provider retry policy | `relay-provider-retry-policy-v1` |
-| provider invocation | `relay-provider-invocation-v2` |
-| rendered prompt | `relay-rendered-prompt-v1` |
-| digest profile | `relay-root-digests-v1` |
-| portable export | `relay-root-portable-export-v2` |
-| workspace mechanisms | `inherited`, `detached_writable_git_worktree` |
+| Format | Purpose | Durable location |
+|---|---|---|
+| `relay.plan/v1` | Immutable compiled execution plan | `session.json` |
+| `relay.event/v1` | Canonical append-only execution record | `events.jsonl` |
+| `relay.bundle/v1` | Portable closure manifest | `manifest.json` in an exported bundle |
 
-Existing v1 payloads retain their released field sets and digest meanings.
-Successor-only fields are rejected when placed under a v1 identifier. Unknown
-versions fail with the typed `unsupported_contract_version` diagnostic.
+## `relay.plan/v1`
 
-`convo-relay version --json` projects this registry without inspecting
-sessions, provider executables, authentication, or backend readiness. Runtime
-availability remains the separate concern of `doctor`.
+A plan is the complete, immutable execution shape selected before the session
+starts. Its root contains `"kind":"relay.plan/v1"` and the session's one
+`schema_version`, currently `1`. Nested plan records do not carry independent
+version fields.
 
-## `relay-root-digests-v1`
+The plan records actors, schedule, lifecycle policy, workspace mode, named
+inputs, and result policy. Payload-bearing plan fields use the shared BlobRef
+shape below. Resuming a session may add events; it never mutates this plan.
 
-The successor digest profile has three classes:
+## `relay.event/v1`
 
-- `raw-bytes` is SHA-256 over the bytes exactly as supplied, including a final
-  newline when one exists.
-- `semantic-json` first requires one valid UTF-8 JSON value with no duplicate
-  object members or trailing value. Objects are ordered by UTF-8 key bytes;
-  arrays retain order. Strings use JSON escaping without HTML escaping (the
-  Unicode line and paragraph separators are written as `\u2028` and `\u2029`).
-  Valid surrogate pairs retain their Unicode scalar value; escaped unpaired
-  high or low surrogates normalize to U+FFFD before JSON string escaping.
-  Exact decimal numbers use a minimal significand and an optional lowercase
-  base-10 exponent, so `1`, `1.0`, and `1e0` are identical and negative zero
-  is `0`. The canonical bytes have no trailing newline.
-- `storage-envelope` applies the semantic JSON rules after removing only the
-  exact JSON Pointers registered for that artifact kind. The initial profile
-  excludes `/identity`, `/source/git_root`, `/source/launch_cwd`,
-  `/source_after/git_root`, and `/source_after/launch_cwd` from
-  `execution_workspace`; every other registered root-artifact kind has an
-  empty exclusion list. A semantic member named `path`, `created_at`, or
-  `storage_id` is therefore always bound unless its exact pointer is listed.
+The event log is a canonical JSONL stream. Each record has
+`"kind":"relay.event/v1"`, a positive `seq`, an `event_id`, a UTC `time`, a
+closed `type`, and that type's typed `payload`. Event payloads do not carry
+separate version fields.
 
-All three classes use the lowercase form `sha256:<64 lowercase hex>`. The
-manifest-inventory digest is the `semantic-json` digest of the ordered typed
-payload inventory. Unknown profile ids fail closed. Released v1 payloads keep
-using the legacy recursive exclusion algorithm and retain their existing
-bytes and digest values.
+Readers reject malformed middle records, invalid type/payload combinations,
+and non-canonical JSON. A truncated final record is recoverable as an
+interrupted tail. The event sequence, together with the immutable plan and
+referenced blobs, is the authority for all session views.
 
-The Go tests and the small Node verifier consume the same fixture file at
-`testdata/contracts/relay-root-digests-v1.json`.
+## `relay.bundle/v1`
 
-## `relay-root-portable-export-v2`
+A portable bundle is a closed directory with a `manifest.json` whose
+`kind` is `relay.bundle/v1`. Its manifest names exactly three exported
+payloads: the root-session projection, participant transcript, and diagnostics
+projection. `payload_inventory` is sorted by path and each entry has:
 
-A portable export is a closed directory containing `manifest.json` and only
-the JSON files named by its ascending `payload_inventory` under
-`payloads/<kind>/<portable-id>.json`. Each inventory entry records its type,
-portable id, relative path, byte count, `raw-bytes` digest, media type, and the
-path-safe source artifact id plus source digest when the payload originated in
-the session. Source identity is required for every inventory entry except the
-exact `root_session/session`, `participant_transcript/transcript`, and
-`diagnostics/diagnostics` projections. Exact source id/digest pairs are unique;
-one source id may occur with multiple digests to represent immutable revisions.
+```json
+{
+  "kind": "root_session",
+  "portable_id": "session",
+  "path": "payloads/root_session/session.json",
+  "blob": {
+    "sha256": "<64 lowercase hexadecimal characters>",
+    "size": 123,
+    "media_type": "application/json"
+  }
+}
+```
 
-The manifest records the relay version, digest profile, terminal status and
-stop reason, and the inventory paths for the portable root projection,
-participant transcript, and diagnostics. `inventory_digest` is the
-`semantic-json` digest of the complete ordered inventory. `manifest_digest`
-is the `semantic-json` digest of the manifest with only `manifest_digest`
-removed. Payload files use the released canonical JSON representation so
-legacy numeric spellings remain verifiable.
+The verifier rejects a missing payload, altered payload, symlink, unexpected
+file, unknown manifest field, duplicate identity, out-of-order inventory, or
+digest mismatch. `inventory_digest` is the semantic JSON digest of the ordered
+inventory. `manifest_digest` is the semantic JSON digest of the manifest with
+only `manifest_digest` omitted.
 
-Source artifact refs are resolved and digest-checked before export, then
-rewritten as portable payload refs carrying the directory-local portable id and
-the source artifact id/digest. Provider invocation v2 records must carry a
-non-null provider-result ref for launched attempts; unlaunched pre-launch
-failures keep that ref null. Verifiers reject provider invocation/result
-identity mismatches, orphan or shared results, and duplicate invocation-attempt
-identities. Attempt numbers need not start at 1 or be contiguous because a
-durable marker-only crash can consume an attempt without producing an exported
-invocation.
-Portable payload identity omits these runtime-only fields:
+## Shared BlobRef
 
-- execution-workspace identity, source Git root, and source launch CWD;
-- named-input source paths and materialized input paths;
-- runtime-snapshot settings path and input/transient-source paths; and
-- provider-state CWD and settings path.
+Every payload reference has the same nested form:
 
-All other semantic content remains bound. A verifier rejects unknown manifest
-fields, unsupported versions or digest profiles, duplicate ids or paths,
-unlisted files, symlinks, missing payload links, source-session artifact refs,
-and byte-count or digest mismatches. Verification uses no source-session path,
-so relocation and source cleanup do not affect the result.
-`export verify --json` reports verification failures on stdout as
-`{"schema_version":"relay-root-portable-export-v2","status":"invalid","error":"..."}`
-and exits with status 1; argument errors retain the ordinary CLI error path.
+```json
+{"sha256":"<64 lowercase hexadecimal characters>","size":123,"media_type":"text/plain; charset=utf-8"}
+```
+
+`sha256` is the SHA-256 of the raw payload bytes, `size` is the byte count, and
+`media_type` describes the referenced bytes. It is deliberately independent
+of a local path or session directory.
+
+## Digest classes
+
+There are two digest classes:
+
+- `raw-bytes` hashes bytes exactly as supplied. BlobRef values use this class.
+- `semantic-json` requires one strict UTF-8 JSON value, rejects duplicate keys
+  and trailing content, canonicalizes member order and exact decimal spelling,
+  then hashes the canonical bytes. Plans and bundle manifest digests use this
+  class.
+
+Semantic JSON digest strings use `sha256:<64 lowercase hexadecimal
+characters>`. A semantic JSON value has no trailing newline. These are the
+only digest meanings exposed by the public formats.
+
+## Compatibility boundary
+
+Only the formats above are accepted for new durable data. There is no registry
+of parallel public contract families and no conversion path for retired
+durable versions. Configuration files and command JSON reports are inputs or
+projections, not additional durable format families.

@@ -7,7 +7,7 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/charlesnpx/convo-relay/internal/contracts"
+	"github.com/charlesnpx/convo-relay/internal/format"
 	"github.com/charlesnpx/convo-relay/internal/integration"
 	"github.com/charlesnpx/convo-relay/internal/readiness"
 )
@@ -644,7 +644,7 @@ func catalogIntegrationIssues(err error) []ChildRecipeIssue {
 }
 
 func catalogDiagnosticIssues(err error, category string, fallbackCode string) []ChildRecipeIssue {
-	var diagnosticError *contracts.DiagnosticError
+	var diagnosticError *format.DiagnosticError
 	if errors.As(err, &diagnosticError) && len(diagnosticError.Diagnostics) > 0 {
 		issues := make([]ChildRecipeIssue, 0, len(diagnosticError.Diagnostics))
 		for _, diagnostic := range diagnosticError.Diagnostics {

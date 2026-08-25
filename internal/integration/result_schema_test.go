@@ -8,7 +8,6 @@ import (
 
 func TestResultSchemaValidatesDocumentsWithJSONSchema(t *testing.T) {
 	bundle, err := DecodeBundleBytes([]byte(`{
-  "schema_version": "relay-integration-bundle-v2",
   "id": "result-schema-test",
   "contracts": {
     "result-schema": {

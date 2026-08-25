@@ -7,7 +7,7 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/charlesnpx/convo-relay/internal/contracts"
+	"github.com/charlesnpx/convo-relay/internal/format"
 )
 
 const (
@@ -21,23 +21,22 @@ const (
 )
 
 var allowedRecipeFields = map[string]bool{
-	"kind":                  true,
-	"schema_version":        true,
-	"id":                    true,
-	"purpose":               true,
-	"participants":          true,
-	"facilitator":           true,
-	"reducer":               true,
-	"mode":                  true,
-	"max_rounds":            true,
-	"participant_turns":     true,
-	"result_source":         true,
-	"provider_retry":        true,
-	"integration_contract":  true,
-	"max_depth":             true,
-	"required_capabilities": true,
-	"auto_approval":         true,
-	"lifecycle":             true,
+	"kind":                 true,
+	"schema_version":       true,
+	"id":                   true,
+	"purpose":              true,
+	"participants":         true,
+	"facilitator":          true,
+	"reducer":              true,
+	"mode":                 true,
+	"max_rounds":           true,
+	"participant_turns":    true,
+	"result_source":        true,
+	"provider_retry":       true,
+	"integration_contract": true,
+	"max_depth":            true,
+	"auto_approval":        true,
+	"lifecycle":            true,
 	// Generated-source metadata is retained by normalization and is valid in
 	// runtime snapshots that are reapplied with transient sources.
 	"origin":              true,
@@ -56,7 +55,7 @@ var allowedLifecycleFields = map[string]bool{
 // ValidateRawRelayRecipes rejects execution-affecting configuration errors
 // before NormalizeRelayRecipes has an opportunity to default or discard them.
 func ValidateRawRelayRecipes(rawRecipes map[string]any) error {
-	diagnostics := make([]contracts.Diagnostic, 0)
+	diagnostics := make([]format.Diagnostic, 0)
 	for _, recipeID := range sortedObjectKeys(rawRecipes) {
 		path := appendRecipePointer("/relay_recipes", recipeID)
 		recipe, ok := rawRecipes[recipeID].(map[string]any)
@@ -74,11 +73,11 @@ func ValidateRawRelayRecipes(rawRecipes map[string]any) error {
 	if len(diagnostics) == 0 {
 		return nil
 	}
-	return contracts.NewDiagnosticError("Relay recipe configuration is invalid.", diagnostics...)
+	return format.NewDiagnosticError("Relay recipe configuration is invalid.", diagnostics...)
 }
 
-func validateRecipeRecord(recipe map[string]any, path string) []contracts.Diagnostic {
-	diagnostics := make([]contracts.Diagnostic, 0)
+func validateRecipeRecord(recipe map[string]any, path string) []format.Diagnostic {
+	diagnostics := make([]format.Diagnostic, 0)
 	keys := sortedObjectKeys(recipe)
 	for _, field := range keys {
 		if allowedRecipeFields[field] {
@@ -109,23 +108,6 @@ func validateRecipeRecord(recipe map[string]any, path string) []contracts.Diagno
 			diagnostics = append(diagnostics, invalidRecipeField(path, "kind", "must equal recipe"))
 		}
 	}
-	declaredVersion := int64(0)
-	if value, exists := recipe["schema_version"]; exists {
-		integer, ok := strictInteger(value)
-		if !ok || (integer != 1 && integer != 2) {
-			diagnostics = append(diagnostics, invalidRecipeField(path, "schema_version", "must equal numeric version 1 or 2"))
-		} else {
-			declaredVersion = integer
-		}
-	}
-	_, providerRetryRepresented := recipe["provider_retry"]
-	if declaredVersion == 1 && providerRetryRepresented {
-		diagnostics = append(diagnostics, invalidRecipeField(path, "provider_retry", "is not allowed by recipe schema version 1"))
-	}
-	if declaredVersion == 2 && !providerRetryRepresented {
-		diagnostics = append(diagnostics, invalidRecipeField(path, "provider_retry", "is required by recipe schema version 2"))
-	}
-
 	if value, exists := recipe["participants"]; exists {
 		participants, ok := strictStringList(value)
 		if !ok || len(participants) != 2 || strings.TrimSpace(participants[0]) == "" || strings.TrimSpace(participants[1]) == "" {
@@ -135,13 +117,6 @@ func validateRecipeRecord(recipe map[string]any, path string) []contracts.Diagno
 				"Relay recipe participants must contain exactly two non-empty strings.",
 				nil,
 			))
-		}
-	}
-	for _, field := range []string{"required_capabilities"} {
-		if value, exists := recipe[field]; exists {
-			if _, ok := strictStringList(value); !ok {
-				diagnostics = append(diagnostics, invalidRecipeField(path, field, "must be a list of strings"))
-			}
 		}
 	}
 
@@ -216,8 +191,8 @@ func validateRecipeRecord(recipe map[string]any, path string) []contracts.Diagno
 	return diagnostics
 }
 
-func validateLifecycleRecord(lifecycle map[string]any, path string) []contracts.Diagnostic {
-	diagnostics := make([]contracts.Diagnostic, 0)
+func validateLifecycleRecord(lifecycle map[string]any, path string) []format.Diagnostic {
+	diagnostics := make([]format.Diagnostic, 0)
 	for _, field := range sortedObjectKeys(lifecycle) {
 		if !allowedLifecycleFields[field] {
 			diagnostics = append(diagnostics, recipeDiagnostic(
@@ -245,7 +220,7 @@ func validateLifecycleRecord(lifecycle map[string]any, path string) []contracts.
 	return diagnostics
 }
 
-func invalidRecipeField(path string, field string, requirement string) contracts.Diagnostic {
+func invalidRecipeField(path string, field string, requirement string) format.Diagnostic {
 	return recipeDiagnostic(
 		DiagnosticCodeInvalidRecipeField,
 		appendRecipePointer(path, field),
@@ -254,8 +229,8 @@ func invalidRecipeField(path string, field string, requirement string) contracts
 	)
 }
 
-func recipeDiagnostic(code string, path string, message string, details map[string]any) contracts.Diagnostic {
-	return contracts.NewDiagnostic(code, contracts.DiagnosticPhasePreflight, path, message, details)
+func recipeDiagnostic(code string, path string, message string, details map[string]any) format.Diagnostic {
+	return format.NewDiagnostic(code, format.DiagnosticPhasePreflight, path, message, details)
 }
 
 func appendRecipePointer(path string, token string) string {

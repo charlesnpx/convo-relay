@@ -1,4 +1,4 @@
-# Root recipe and integration contracts
+# Root recipe and integration guide
 
 Convo Relay can execute a configured recipe as the root session. This mode is
 for bounded procedures that need an exact turn schedule, named inputs ingested
@@ -21,31 +21,23 @@ than the caller's source paths.
 ## Portability gate
 
 Cross-compilation is a release gate, not evidence of runtime certification.
-CI builds every production package and compiles practical test packages for
-`darwin/arm64` and `windows/amd64`. It does not execute foreign binaries and
+CI builds production packages for `darwin/arm64` and `windows/amd64`. It does
+not execute foreign binaries or compile test packages for those targets, and
 does not certify runtime support on macOS or Windows.
 
 The Linux test job keeps `go vet ./...` and `go test ./... -count=1` as
 separate validation steps.
 
-A live-process graceful stop is unsupported on Windows. The request returns
-an explicit error without changing session state or removing PID and cleanup
-evidence; `kill` and `stop --kill` retain the force-kill path.
+A separate control process cannot signal an active relay process. `control
+cancel` reports that fact without mutating session state; interrupt the owning
+relay process directly.
 
-## One compiler, explicit targets
+## One compiler
 
-`recipes.CompileRecipe` is the only canonical exported recipe compiler. Every
-Go caller supplies one of these targets:
-
-- `recipes.CompileTargetRoot` produces `root_recipe_plan/v1`.
-- `recipes.CompileTargetChild` produces the compatible `compiled_plan/v1`
-  child payload.
-
-The compiler never derives a target from `integration_contract`. A zero or
-unknown target is a validation error. A contractless recipe can compile for
-either target. An integration-bound recipe needs a matching bundle for the
-root target and returns the typed `recipes.RootOnlyRecipeError` for the child
-target.
+`recipes.CompileRecipe` is the canonical recipe compiler. The CLI exposes its
+root-launch preview; the only durable plan is `relay.plan/v1`, created when a
+session is launched. An integration-bound recipe needs a matching input bundle
+before that launch can proceed.
 
 The CLI exposes the root-plan preflight shape:
 
@@ -53,10 +45,10 @@ The CLI exposes the root-plan preflight shape:
 convo-relay recipes compile <id> [--integration-bundle <path>]
 ```
 
-`recipes compile` does not execute a provider or create a session. It always
-emits the root plan and binds a matching bundle when the recipe declares a
-contract. Internal callers still select explicit targets; child profiles,
-proposal children, and dynamic children always select the child target.
+`recipes compile` does not execute a provider or create a session. It emits a
+validated preview and binds a matching bundle when the recipe declares a
+contract. Child profiles and dynamic children reuse the same runtime model;
+they do not create a separate public plan format.
 
 ## Running a root recipe
 
@@ -89,7 +81,6 @@ opaque contract IDs; the recipe binds exactly one matching contract.
 
 ```json
 {
-  "schema_version": "relay-integration-bundle-v1",
   "id": "example-bundle",
   "contracts": {
     "example/bounded-procedure-v1": {
@@ -134,23 +125,13 @@ and selected-contract digests are recorded separately.
 
 ## Default Witness recipes
 
-The optional default catalog preserves the six v1 recipe names and their v1
-contract bindings. It also provides six parallel v2 names:
-
-| Generation | Recipe ids | Opaque integration contract |
-|---|---|---|
-| defect v1 | `witness-falsify`, `witness-falsify-codex`, `witness-falsify-claude` | `witnessed-review/witness-falsification-v1` |
-| defect v2 | `witness-falsify-v2`, `witness-falsify-v2-codex`, `witness-falsify-v2-claude` | `witnessed-review/witness-falsification-v2` |
-| economy v1 | `economy-equivalence`, `economy-equivalence-codex`, `economy-equivalence-claude` | `witnessed-review/economy-equivalence-v1` |
-| economy v2 | `economy-equivalence-v2`, `economy-equivalence-v2-codex`, `economy-equivalence-v2-claude` | `witnessed-review/economy-equivalence-v2` |
-
-The v2 names select the reachability-classified Witness generation. Every
-default supplies only orchestration topology and policy: participant,
-facilitator, and reducer assignments; turn and result-source policy; retry,
-lifecycle, depth, approval, and conversation mode. The consumer's integration
-bundle continues to own every prompt, result schema, and adjudication rule.
-The relay does not interpret either generation's
-contract id.
+The optional default catalog supplies Witness recipe aliases for the supported
+consumer-owned review procedures. Each default supplies only orchestration
+topology and policy: participant, facilitator, and reducer assignments; turn
+and result-source policy; retry, lifecycle, depth, approval, and conversation
+mode. The consumer's integration bundle owns prompts, result schema, and
+adjudication rules. The relay treats an integration contract id as an opaque
+selector, not as another public format version.
 
 `result.schema` is validated through standard JSON Schema Draft 2020-12.
 External result-schema loading is disabled.
@@ -180,11 +161,11 @@ steering = "forbid"    # or "allow"
 dynamic = "forbid"     # or "allow"
 ```
 
-Lifecycle rejections occur before session mutation. `stop`, `kill`, and
-`clean` remain administrative controls. Recoverable sessions resume from
-persisted checkpoints, runtime configuration, recipe, bundle, contract, and
-input blobs. Completed participant or reducer work is not replayed when
-its durable checkpoint and artifacts are valid.
+Lifecycle rejections occur before session mutation. `control cancel` and
+`clean` are the administrative controls. Recoverable sessions resume from the
+immutable plan, canonical event log, and referenced input blobs. Completed
+participant or reducer work is not replayed when durable events and blobs are
+valid.
 
 Root execution uses `--workspace current|head-copy`. `current` uses the launch
 directory as supplied. `head-copy` requires a Git repository and creates a
@@ -201,11 +182,10 @@ canonical result. Invalid output keeps the transcript and raw result,
 sets the session to `invalid_result`, records typed diagnostics, and returns a
 nonzero command status.
 
-Root sessions persist digest-checked refs for the recipe, plan, runtime
-configuration, optional bundle and selected contract, named inputs, workspace,
-checkpoints, reducer invocation, raw result, validation report, and canonical
-result when valid. Target-specific execution fields stay in their respective
-root or child plan digests.
+Root sessions persist an immutable plan, canonical append-only events, and
+digest-checked blobs. Recipe inputs, workspace provenance, provider outcomes,
+and results are derived from those durable records rather than retained as
+parallel artifact contracts.
 
 Existing administration commands use the same generic projection:
 

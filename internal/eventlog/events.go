@@ -15,6 +15,9 @@ import (
 	"github.com/charlesnpx/convo-relay/internal/blobstore"
 )
 
+// FormatV1 identifies the canonical append-only event envelope.
+const FormatV1 = "relay.event/v1"
+
 // Type is one of the concrete v2 event type names.
 type Type string
 
@@ -409,6 +412,7 @@ func (event Event) MarshalJSON() ([]byte, error) {
 		return nil, err
 	}
 	return SemanticJSONBytes(encodeWireEvent{
+		Kind:    FormatV1,
 		Seq:     normalized.Seq,
 		EventID: normalized.EventID,
 		Time:    normalized.Time,
@@ -429,6 +433,7 @@ func (event *Event) UnmarshalJSON(body []byte) error {
 }
 
 type wireEvent struct {
+	Kind    string          `json:"kind"`
 	Seq     json.RawMessage `json:"seq"`
 	EventID string          `json:"event_id"`
 	Time    time.Time       `json:"time"`
@@ -437,6 +442,7 @@ type wireEvent struct {
 }
 
 type encodeWireEvent struct {
+	Kind    string    `json:"kind"`
 	Seq     uint64    `json:"seq"`
 	EventID string    `json:"event_id"`
 	Time    time.Time `json:"time"`
@@ -456,6 +462,9 @@ func decodeEvent(body []byte) (Event, error) {
 	}
 	if _, err := decoder.Token(); err != io.EOF {
 		return Event{}, err
+	}
+	if wire.Kind != FormatV1 {
+		return Event{}, fmt.Errorf("event kind must be %s", FormatV1)
 	}
 	seq, err := decodeCanonicalUint64(wire.Seq)
 	if err != nil {
@@ -503,6 +512,7 @@ func CanonicalEventBytes(event Event) ([]byte, error) {
 		return nil, err
 	}
 	return SemanticJSONBytes(encodeWireEvent{
+		Kind:    FormatV1,
 		Seq:     normalized.Seq,
 		EventID: normalized.EventID,
 		Time:    normalized.Time,
@@ -540,6 +550,7 @@ func normalizeEvent(event Event, requireSequence bool, localValues ...string) (E
 		return Event{}, err
 	}
 	if err := ValidatePortableValue(encodeWireEvent{
+		Kind:    FormatV1,
 		Seq:     event.Seq,
 		EventID: event.EventID,
 		Time:    event.Time,

@@ -219,6 +219,7 @@ func TestProviderRetryAndAuthFailure(t *testing.T) {
 		wantCalls    int
 		wantStatus   string
 		wantCategory string
+		wantAttempts []int
 		wantError    bool
 	}{
 		{
@@ -230,6 +231,19 @@ func TestProviderRetryAndAuthFailure(t *testing.T) {
 			wantCalls:    2,
 			wantStatus:   statusCompleted,
 			wantCategory: "transient",
+			wantAttempts: []int{1},
+		},
+		{
+			name: "retryable_backoff_exhaustion",
+			responses: []fakeResponse{
+				{err: provider.RetryableProviderError{Detail: "temporarily unavailable"}},
+				{err: provider.RetryableProviderError{Detail: "temporarily unavailable"}},
+			},
+			wantCalls:    2,
+			wantStatus:   statusFailed,
+			wantCategory: "transient",
+			wantAttempts: []int{1, 2},
+			wantError:    true,
 		},
 		{
 			name:         "auth_never_retries",
@@ -237,6 +251,7 @@ func TestProviderRetryAndAuthFailure(t *testing.T) {
 			wantCalls:    1,
 			wantStatus:   statusFailed,
 			wantCategory: "auth",
+			wantAttempts: []int{1},
 			wantError:    true,
 		},
 	}
@@ -257,8 +272,13 @@ func TestProviderRetryAndAuthFailure(t *testing.T) {
 				t.Fatalf("outcome=%#v calls=%d", outcome, len(alpha.prompts))
 			}
 			failures := providerFailures(events)
-			if len(failures) != 1 || failures[0].Category != test.wantCategory {
+			if len(failures) != len(test.wantAttempts) {
 				t.Fatalf("provider failures = %#v", failures)
+			}
+			for index, failure := range failures {
+				if failure.Category != test.wantCategory || failure.Attempts != test.wantAttempts[index] {
+					t.Fatalf("provider failures = %#v", failures)
+				}
 			}
 			if indexOfType(events, eventlog.ProviderFailed) >= indexOfType(events, eventlog.AttemptFinished) {
 				t.Fatalf("provider.failed must classify the failure before attempt.finished: %v", eventTypes(events))

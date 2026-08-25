@@ -50,12 +50,6 @@ func selectNamedRecipe(requestedID string, recipes []Recipe) (Recipe, error) {
 }
 
 func validateRecipeProjection(recipe Recipe) error {
-	if recipe.Kind != "" && recipe.Kind != "recipe" {
-		return fmt.Errorf("recipe kind must be recipe")
-	}
-	if recipe.SchemaVersion != 0 && recipe.SchemaVersion != 1 && recipe.SchemaVersion != 2 {
-		return fmt.Errorf("recipe schema_version must be 1 or 2")
-	}
 	if strings.TrimSpace(recipe.ID) == "" {
 		return fmt.Errorf("recipe id is required")
 	}
