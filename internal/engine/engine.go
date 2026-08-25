@@ -59,8 +59,9 @@ type ChildRequest struct {
 }
 
 // ChildRequestExtractor returns requests emitted by a participant or
-// facilitator result. A nil extractor means turns cannot request children.
-type ChildRequestExtractor func(session.Actor, eventlog.Role, provider.TurnResult) []ChildRequest
+// facilitator result. The immutable parent plan lets ingress selection respect
+// the parent's keep-list. A nil extractor means turns cannot request children.
+type ChildRequestExtractor func(session.Plan, session.Actor, eventlog.Role, provider.TurnResult) []ChildRequest
 
 // Deps contains the small imperative boundary required by Run. Writer is
 // optional: when absent, Run opens the session's event writer itself. Recipes
@@ -91,8 +92,9 @@ type PendingChild struct {
 	Question         string
 }
 
-// Run starts an empty session log and executes until the plan is terminal or
-// an ask-mode child request needs an operator decision.
+// Run starts a session with no execution history and executes until the plan is
+// terminal or an ask-mode child request needs an operator decision. Launch
+// provisioning events may already be present; they are not execution history.
 func Run(ctx context.Context, sess *session.Session, deps Deps) (Outcome, error) {
 	runner, err := newRunner(ctx, sess, deps)
 	if err != nil {
@@ -104,8 +106,11 @@ func Run(ctx context.Context, sess *session.Session, deps Deps) (Outcome, error)
 	if err != nil {
 		return Outcome{}, err
 	}
-	if len(events) != 0 {
-		return Outcome{}, errors.New("session already has events; use Resume")
+	if err := runStartGuard(events); err != nil {
+		return Outcome{}, err
+	}
+	if err := runner.rebuildProvisioningState(events); err != nil {
+		return Outcome{}, err
 	}
 	if err := runner.append(eventlog.SessionStartedPayload{PlanDigest: runner.planDigest, SessionID: sess.Plan.SessionID}); err != nil {
 		return Outcome{}, err
@@ -115,7 +120,9 @@ func Run(ctx context.Context, sess *session.Session, deps Deps) (Outcome, error)
 
 // Resume replays a started session and continues only work left by its
 // immutable plan plus an explicit turn-budget extension when requestedTurns is
-// positive.
+// positive. A provisioning-only launch is also resumed by recording its first
+// session.started event, so a crash before the first turn never re-ingests
+// inputs.
 func Resume(ctx context.Context, sess *session.Session, deps Deps, prompt string, requestedTurns int) (Outcome, error) {
 	if requestedTurns < 0 {
 		return Outcome{}, errors.New("resume extra turns must not be negative")
@@ -135,6 +142,15 @@ func Resume(ctx context.Context, sess *session.Session, deps Deps, prompt string
 	}
 	if len(events) == 0 {
 		return Outcome{}, errors.New("cannot resume a session with no session.started event")
+	}
+	if err := runStartGuard(events); err == nil {
+		if err := runner.rebuildProvisioningState(events); err != nil {
+			return Outcome{}, err
+		}
+		if err := runner.append(eventlog.SessionStartedPayload{PlanDigest: runner.planDigest, SessionID: sess.Plan.SessionID}); err != nil {
+			return Outcome{}, err
+		}
+		return runner.execute()
 	}
 	if err := runner.rebuildExecutionState(events); err != nil {
 		return Outcome{}, err
@@ -332,6 +348,9 @@ type executionState struct {
 	terminal       *eventlog.SessionFinishedPayload
 	phase          executionPhase
 
+	provisionedInputs map[string]blobstore.BlobRef
+	workspacePrepared bool
+
 	active *turnState
 
 	conversation        []conversationTurn
@@ -386,6 +405,7 @@ type childState struct {
 	Decided bool
 	Plan    *session.Plan
 	Status  string
+	Result  blobstore.BlobRef
 }
 
 func (child *childState) decided() bool   { return child != nil && child.Decided }
@@ -412,6 +432,10 @@ type executionFailure struct {
 
 func (e *executionFailure) Error() string { return e.cause.Error() }
 func (e *executionFailure) Unwrap() error { return e.cause }
+
+type staticChildAwaitingError struct{}
+
+func (*staticChildAwaitingError) Error() string { return "static child is awaiting a decision" }
 
 func newStateRunner(sess *session.Session) (*runner, error) {
 	if sess == nil {
@@ -496,10 +520,11 @@ func newAdmissionRunner(ctx context.Context, sess *session.Session, recipes []pl
 
 func newExecutionState() *executionState {
 	return &executionState{
-		phase:            phaseParticipant,
-		ledger:           model.EmptyLedger(),
-		requests:         make(map[string]*childState),
-		providerSessions: make(map[string]string),
+		phase:             phaseParticipant,
+		ledger:            model.EmptyLedger(),
+		provisionedInputs: make(map[string]blobstore.BlobRef),
+		requests:          make(map[string]*childState),
+		providerSessions:  make(map[string]string),
 	}
 }
 
@@ -601,17 +626,51 @@ func stringValue(value any) string {
 	return text
 }
 
-// rebuildExecutionState is the sole replay path. It drives every event through
-// reduceEvent, which is also called by append during a live execution.
+// rebuildProvisioningState replays a launch prefix before its session.started
+// event. This is the crash-recovery state between provisioning and execution.
+func (r *runner) rebuildProvisioningState(events []eventlog.Event) error {
+	if err := r.replayEvents(events); err != nil {
+		return err
+	}
+	if r.state.sessionStarted {
+		return errors.New("provisioning prefix has session.started event")
+	}
+	return nil
+}
+
+// rebuildExecutionState replays an execution history. It drives every event
+// through reduceEvent, which is also called by append during a live execution.
 func (r *runner) rebuildExecutionState(events []eventlog.Event) error {
+	if err := r.replayEvents(events); err != nil {
+		return err
+	}
+	if !r.state.sessionStarted {
+		return errors.New("session has no session.started event")
+	}
+	return nil
+}
+
+func (r *runner) replayEvents(events []eventlog.Event) error {
 	r.state = newExecutionState()
 	for _, event := range events {
 		if err := r.reduceEvent(event); err != nil {
 			return err
 		}
 	}
-	if !r.state.sessionStarted {
-		return errors.New("session has no session.started event")
+	return nil
+}
+
+// runStartGuard is the one classification for the Run boundary. The two
+// provisioning types form the only allowed prefix; every other durable event
+// records execution and makes the session Resume-only.
+func runStartGuard(events []eventlog.Event) error {
+	for _, event := range events {
+		switch event.Type {
+		case eventlog.InputIngested, eventlog.WorkspacePrepared:
+			continue
+		default:
+			return fmt.Errorf("session already has execution event %q; use Resume", event.Type)
+		}
 	}
 	return nil
 }
@@ -624,6 +683,33 @@ func (r *runner) reduceEvent(event eventlog.Event) error {
 		return errors.New("execution state is required")
 	}
 	switch payload := event.Payload.(type) {
+	case eventlog.InputIngestedPayload:
+		if state.sessionStarted {
+			return errors.New("input.ingested follows session.started")
+		}
+		if _, exists := state.provisionedInputs[payload.LogicalName]; exists {
+			return fmt.Errorf("duplicate input.ingested for %q", payload.LogicalName)
+		}
+		for _, input := range r.sess.Plan.Inputs {
+			if input.Name != payload.LogicalName {
+				continue
+			}
+			if !input.Content.Equal(payload.Content) {
+				return fmt.Errorf("input.ingested for %q does not match immutable plan", payload.LogicalName)
+			}
+			state.provisionedInputs[payload.LogicalName] = payload.Content
+			return nil
+		}
+		return fmt.Errorf("input.ingested for undeclared input %q", payload.LogicalName)
+	case eventlog.WorkspacePreparedPayload:
+		if state.sessionStarted {
+			return errors.New("workspace.prepared follows session.started")
+		}
+		if state.workspacePrepared {
+			return errors.New("session has more than one workspace.prepared event")
+		}
+		state.workspacePrepared = true
+		return nil
 	case eventlog.SessionStartedPayload:
 		if state.sessionStarted {
 			return errors.New("session has more than one session.started event")
@@ -780,6 +866,7 @@ func (r *runner) reduceEvent(event eventlog.Event) error {
 			return err
 		}
 		child.Status = payload.Status
+		child.Result = payload.Result
 		if payload.Status == statusCompleted {
 			state.childResults = append(state.childResults, text)
 		}
@@ -970,6 +1057,12 @@ func (r *runner) execute() (Outcome, error) {
 				if cancelErr := r.ctx.Err(); cancelErr != nil {
 					return r.finishInterrupted(cancelErr)
 				}
+				var awaiting *staticChildAwaitingError
+				if errors.As(err, &awaiting) {
+					outcome := r.outcome()
+					outcome.Status = statusAwaitingDecision
+					return outcome, nil
+				}
 				reason := stopProviderFailed
 				var failure *executionFailure
 				if errors.As(err, &failure) {
@@ -1100,11 +1193,14 @@ func (r *runner) serviceActiveTurn() error {
 	if turn == nil {
 		return nil
 	}
+	actor, err := r.actor(turn.ActorID)
+	if err != nil {
+		return err
+	}
+	if actor.Backend == "child" {
+		return r.serviceStaticChildTurn(turn, actor)
+	}
 	if success := turn.latest("success"); success != nil {
-		actor, err := r.actor(turn.ActorID)
-		if err != nil {
-			return err
-		}
 		content, err := r.readBlob(success.Content)
 		if err != nil {
 			return err
@@ -1274,7 +1370,7 @@ func (r *runner) persistChildRequests(turn *turnState, actor session.Actor, resu
 	if r.deps.ChildRequestExtractor == nil || (turn.Role != eventlog.ParticipantRole && turn.Role != eventlog.FacilitatorRole) {
 		return nil
 	}
-	for index, child := range r.deps.ChildRequestExtractor(actor, turn.Role, result) {
+	for index, child := range r.deps.ChildRequestExtractor(r.sess.Plan, actor, turn.Role, result) {
 		requestID := strings.TrimSpace(child.ID)
 		if requestID == "" {
 			requestID = fmt.Sprintf("%s-child-%d-%d", actor.ID, turn.Round, index+1)
@@ -1300,6 +1396,113 @@ func (r *runner) persistChildRequests(turn *turnState, actor session.Actor, resu
 		}
 	}
 	return nil
+}
+
+func staticChildRequestID(actorID string, round int) string {
+	return fmt.Sprintf("static-%s-%d", actorID, round)
+}
+
+func (r *runner) staticChildForTurn(turn *turnState, actor session.Actor) (*childState, error) {
+	if turn == nil || turn.Role != eventlog.ParticipantRole {
+		return nil, errors.New("static child step must run as a participant turn")
+	}
+	requestID := staticChildRequestID(actor.ID, turn.Round)
+	if child, found := r.state.requests[requestID]; found {
+		if child.Request.RequesterActorID != actor.ID || child.Request.RecipeID != actor.ChildRecipeID {
+			return nil, fmt.Errorf("static child request %q does not match actor %q", requestID, actor.ID)
+		}
+		return child, nil
+	}
+	resumePrompt, err := r.applySteering(turn.Round)
+	if err != nil {
+		return nil, err
+	}
+	question, err := r.putText(r.promptFor(actor, turn.Round, turn.Role, resumePrompt))
+	if err != nil {
+		return nil, err
+	}
+	if err := r.append(eventlog.ChildRequestedPayload{
+		RequestID:        requestID,
+		RequesterActorID: actor.ID,
+		RecipeID:         actor.ChildRecipeID,
+		Question:         question,
+	}); err != nil {
+		return nil, err
+	}
+	child, found := r.state.requests[requestID]
+	if !found {
+		return nil, errors.New("static child request was not reduced")
+	}
+	return child, nil
+}
+
+func (r *runner) serviceStaticChildTurn(turn *turnState, actor session.Actor) error {
+	child, err := r.staticChildForTurn(turn, actor)
+	if err != nil {
+		return err
+	}
+	if !child.decided() {
+		if err := r.admitStaticChild(actor, child); err != nil {
+			return err
+		}
+	}
+	if !child.admitted() {
+		return errors.New("static child step was not admitted")
+	}
+	if !child.completed() {
+		awaiting, err := r.runChild(child)
+		if err != nil {
+			return err
+		}
+		if awaiting {
+			return &staticChildAwaitingError{}
+		}
+	}
+	if child.Status == statusFailed {
+		return &executionFailure{
+			reason: stopChildFailed,
+			cause:  fmt.Errorf("static child step %q finished failed", child.Request.RequestID),
+		}
+	}
+	if child.Status != statusCompleted || child.Result == (blobstore.BlobRef{}) {
+		return errors.New("static child step did not produce a completed result")
+	}
+	return r.append(eventlog.TurnFinishedPayload{
+		ActorID: turn.ActorID,
+		Round:   turn.Round,
+		Content: child.Result,
+	})
+}
+
+func (r *runner) admitStaticChild(actor session.Actor, child *childState) error {
+	childPlan, err := r.staticChildPlanFor(actor, child)
+	if err != nil {
+		return fmt.Errorf("compile static child step %q: %w", actor.ID, err)
+	}
+	planRef, err := r.persistAdmittedChildPlan(childPlan)
+	if err != nil {
+		return err
+	}
+	return r.append(eventlog.ChildDecidedPayload{
+		RequestID:   child.Request.RequestID,
+		Admitted:    true,
+		Reason:      "admitted by static child step",
+		BudgetState: "available",
+		Plan:        &planRef,
+	})
+}
+
+func (r *runner) staticChildPlanFor(actor session.Actor, child *childState) (session.Plan, error) {
+	question, err := r.readBlob(child.Request.Question)
+	if err != nil {
+		return session.Plan{}, err
+	}
+	return plan.ForStaticChild(r.sess.Plan, plan.ChildRequest{
+		SessionID: r.childSessionID(child.Request.RequestID),
+		RecipeID:  actor.ChildRecipeID,
+		Question:  question,
+		Turns:     actor.ChildTurns,
+	}, r.deps.Recipes)
 }
 
 func (r *runner) servicePendingChildren() (bool, error) {

@@ -51,16 +51,11 @@ organize lifecycle state; they are not sandboxes and do not isolate a provider
 from source repositories, session files, credentials, the network, or other
 same-user-visible resources.
 
-When an integration contract has named inputs, the retry boundary verifies
-the retained snapshots immediately before and after each participant,
-facilitator, and reducer attempt. The post-attempt verification uses a finite
-orchestration-owned context that remains live after provider or caller
-cancellation. Retained inputs are not immutable or filesystem read-only, so a
-provider can change them between checks. A failed boundary check suppresses
-retry and rejects the response before it can enter transcript, facilitator,
-reducer, raw-result, validation, or canonical-result artifacts. A provider
-error, timeout, stall, or cancellation from the same attempt is retained only
-as a secondary, sanitized cause.
+When an integration contract has named inputs, the runner reads each source
+once before execution, stores the bytes in the session blob store, and binds
+the plan to the resulting digest. Prompts subsequently load those recorded
+blobs; source paths and per-attempt source verification are not part of the
+provider lifecycle.
 
 Failed provider turns append a `provider_failure` event and mirror the sanitized failure payload into `meta.provider_failures`. Payloads include:
 

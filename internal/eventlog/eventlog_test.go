@@ -37,7 +37,7 @@ func TestRoundTripEveryTypedEvent(t *testing.T) {
 		SteeringQueuedPayload{Prompt: ref},
 		SteeringAppliedPayload{Prompt: ref, Round: 1},
 		InputIngestedPayload{LogicalName: "brief", Content: ref},
-		WorkspacePreparedPayload{Mode: "head-copy", Commit: "abcdef", TreeHash: "123456"},
+		WorkspacePreparedPayload{Mode: "head-copy", Commit: "abcdef", TreeHash: "123456", RelativePath: "subdir"},
 		ResultProducedPayload{Result: ref, Format: "text", ValidationOutcome: "valid"},
 		SessionFinishedPayload{Status: "completed", StopReason: "converged"},
 	} {

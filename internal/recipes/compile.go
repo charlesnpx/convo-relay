@@ -107,9 +107,8 @@ func CompileRecipe(
 	return compiled, nil
 }
 
-// validateNestedChildCompileTargets closes the gap between validating relay
-// linkage and validating the recipes reached through that linkage. Every
-// reachable relay participant is compiled under child rules before the parent
+// validateNestedChildCompileTargets validates every static child step before
+// the parent
 // plan can cross a persistence boundary.
 func validateNestedChildCompileTargets(
 	parent map[string]any,
@@ -121,7 +120,7 @@ func validateNestedChildCompileTargets(
 	compositionPath := defaultCompositionPath(options.CompositionPath)
 	for index, ref := range stringSlice(parent["participants"]) {
 		profile, err := ResolveProfileRef(ref, profiles)
-		if err != nil || stringValue(profile["backend"]) != "relay" {
+		if err != nil || stringValue(profile["backend"]) != "child" {
 			continue
 		}
 		childRecipeID := strings.TrimSpace(stringValue(profile["model"]))
@@ -254,8 +253,8 @@ func compileChildPlan(
 			"default_rounds": recipePayload["max_rounds"],
 		},
 		"depth_policy": map[string]any{
-			"max_graph_depth":         recipePayload["max_depth"],
-			"max_relay_backend_depth": 1,
+			"max_graph_depth": recipePayload["max_depth"],
+			"max_child_depth": recipePayload["max_depth"],
 		},
 	}
 	return normalizeCompiledPlanPayload(payload)
@@ -319,11 +318,11 @@ func compileRootPlan(
 			map[string]any{"profile_ref": facilitatorRef, "cause": err.Error()},
 		)
 	}
-	if stringValue(facilitatorProfile["backend"]) == "relay" {
+	if stringValue(facilitatorProfile["kind"]) == "child_step" {
 		return nil, rootCompileDiagnostic(
 			"invalid_root_facilitator",
 			"/facilitator",
-			"Root recipe facilitator must resolve to a non-relay provider.",
+			"Root recipe facilitator must resolve to a provider, not a child step.",
 			map[string]any{"profile_ref": facilitatorRef},
 		)
 	}
@@ -363,11 +362,11 @@ func compileRootPlan(
 				map[string]any{"profile_ref": reducerRef, "cause": err.Error()},
 			)
 		}
-		if stringValue(reducerProfile["backend"]) == "relay" {
+		if stringValue(reducerProfile["kind"]) == "child_step" {
 			return nil, rootCompileDiagnostic(
 				"invalid_root_reducer",
 				"/reducer",
-				"Root recipe reducer must resolve to a non-relay provider.",
+				"Root recipe reducer must resolve to a provider, not a child step.",
 				map[string]any{"profile_ref": reducerRef},
 			)
 		}
@@ -380,19 +379,23 @@ func compileRootPlan(
 		return nil, err
 	}
 	lifecycle := normalizeLifecyclePayload(recipePayload["lifecycle"])
+	workspaceMode := "current"
+	if lifecycle["workspace_isolation"] == "ephemeral" {
+		workspaceMode = "head-copy"
+	}
 	planFields := map[string]any{
-		"recipe_id":                   recipePayload["id"],
-		"recipe_ref":                  recipeRef,
-		"participant_turns":           participantTurns,
-		"participant_schedule":        participantSchedule,
-		"participants":                participantProfiles,
-		"facilitator":                 facilitatorProfile,
-		"result_source":               resultSource,
-		"lifecycle":                   lifecycle,
-		"workspace_isolation_minimum": lifecycle["workspace_isolation"],
-		"mode":                        recipePayload["mode"],
-		"auto_approval":               recipePayload["auto_approval"],
-		"required_capabilities":       recipePayload["required_capabilities"],
+		"recipe_id":             recipePayload["id"],
+		"recipe_ref":            recipeRef,
+		"participant_turns":     participantTurns,
+		"participant_schedule":  participantSchedule,
+		"participants":          participantProfiles,
+		"facilitator":           facilitatorProfile,
+		"result_source":         resultSource,
+		"lifecycle":             lifecycle,
+		"workspace_mode":        workspaceMode,
+		"mode":                  recipePayload["mode"],
+		"auto_approval":         recipePayload["auto_approval"],
+		"required_capabilities": recipePayload["required_capabilities"],
 		"depth_policy": map[string]any{
 			"max_graph_depth": recipePayload["max_depth"],
 		},
@@ -549,12 +552,20 @@ func compiledProfile(
 	backend := stringValue(profile["backend"])
 	model := profile["model"]
 	effort := profile["effort"]
-	if backend == "relay" {
+	if backend == "child" {
 		childRecipeID := stringValue(model)
 		childRecipe, ok := relayRecipes[childRecipeID]
 		if effort == nil && ok {
 			effort = intFromAny(childRecipe["max_rounds"], 1)
 		}
+		return map[string]any{
+			"kind":             "child_step",
+			"slot_id":          slotID,
+			"profile_id":       fallbackString(profile["id"], ref),
+			"recipe_id":        childRecipeID,
+			"turns":            effort,
+			"composition_path": compositionPath,
+		}, nil
 	}
 	return map[string]any{
 		"slot_id":          slotID,

@@ -3,6 +3,8 @@ package engine
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"os"
@@ -19,6 +21,7 @@ import (
 	"github.com/charlesnpx/convo-relay/internal/provider"
 	"github.com/charlesnpx/convo-relay/internal/session"
 	"github.com/charlesnpx/convo-relay/internal/sessionview"
+	"github.com/charlesnpx/convo-relay/internal/workspace"
 )
 
 func TestRunDialogueEventOrderAndBlobs(t *testing.T) {
@@ -573,7 +576,7 @@ func TestResumeRebuildsChildBudgets(t *testing.T) {
 	child := &fakeBackend{name: "codex", slotID: "child-alpha", responses: []fakeResponse{{content: "must not run"}}}
 	deps := testDeps(map[string]*fakeBackend{"alpha": alpha, "beta": beta, "child-alpha": child})
 	deps.Recipes = []plan.Recipe{childRecipe()}
-	deps.ChildRequestExtractor = func(actor session.Actor, role eventlog.Role, _ provider.TurnResult) []ChildRequest {
+	deps.ChildRequestExtractor = func(_ session.Plan, actor session.Actor, role eventlog.Role, _ provider.TurnResult) []ChildRequest {
 		if actor.ID == "beta" && role == eventlog.ParticipantRole {
 			return []ChildRequest{{ID: "child-two", Request: plan.ChildRequest{RecipeID: "child", Question: "second child question"}}}
 		}
@@ -676,7 +679,7 @@ func TestResumeMaterializesChildRequestsFromSuccessfulAttempt(t *testing.T) {
 			deps := testDeps(map[string]*fakeBackend{"alpha": alpha, "beta": beta})
 			deps.Recipes = []plan.Recipe{childRecipe()}
 			extractorCalls := 0
-			deps.ChildRequestExtractor = func(actor session.Actor, role eventlog.Role, result provider.TurnResult) []ChildRequest {
+			deps.ChildRequestExtractor = func(_ session.Plan, actor session.Actor, role eventlog.Role, result provider.TurnResult) []ChildRequest {
 				extractorCalls++
 				if actor.ID != "alpha" || role != eventlog.ParticipantRole {
 					t.Errorf("recovered extractor input = actor=%q role=%q", actor.ID, role)
@@ -805,6 +808,101 @@ func TestEmptyReducerResultIsInvalid(t *testing.T) {
 	}
 }
 
+func TestRunStartGuardProvisioningAndExecutionPartitions(t *testing.T) {
+	t.Run("provisioning only runs", func(t *testing.T) {
+		sess := createProvisionedSession(t)
+		alpha := &fakeBackend{name: "codex", slotID: "alpha", responses: []fakeResponse{{content: "runs after provisioning"}}}
+		beta := &fakeBackend{name: "codex", slotID: "beta"}
+
+		if _, err := Run(context.Background(), sess, testDeps(map[string]*fakeBackend{"alpha": alpha, "beta": beta})); err != nil {
+			t.Fatalf("Run provisioning prefix: %v", err)
+		}
+		events := sessionEvents(t, sess)
+		if got := eventTypes(events[:3]); !reflect.DeepEqual(got, []eventlog.Type{eventlog.InputIngested, eventlog.WorkspacePrepared, eventlog.SessionStarted}) {
+			t.Fatalf("provisioning start event order = %v", got)
+		}
+		if got := countType(events, eventlog.InputIngested); got != 1 {
+			t.Fatalf("input.ingested count = %d, want 1", got)
+		}
+	})
+
+	t.Run("execution history is refused", func(t *testing.T) {
+		sess := createProvisionedSession(t)
+		store, err := sess.BlobStore(blobstore.Limits{})
+		if err != nil {
+			t.Fatalf("open blobs: %v", err)
+		}
+		writer, err := sess.EventWriter(store)
+		if err != nil {
+			t.Fatalf("open writer: %v", err)
+		}
+		appendEvent(t, writer, eventlog.TurnStartedPayload{ActorID: "alpha", Round: 1, Role: eventlog.ParticipantRole})
+		if err := writer.Close(); err != nil {
+			t.Fatalf("close writer: %v", err)
+		}
+		before, err := os.ReadFile(filepath.Join(sess.Root, eventlog.EventsFilename))
+		if err != nil {
+			t.Fatalf("read before: %v", err)
+		}
+
+		alpha := &fakeBackend{name: "codex", slotID: "alpha"}
+		beta := &fakeBackend{name: "codex", slotID: "beta"}
+		if _, err := Run(context.Background(), sess, testDeps(map[string]*fakeBackend{"alpha": alpha, "beta": beta})); err == nil || !strings.Contains(err.Error(), "execution event") {
+			t.Fatalf("Run execution history error = %v", err)
+		}
+		after, err := os.ReadFile(filepath.Join(sess.Root, eventlog.EventsFilename))
+		if err != nil {
+			t.Fatalf("read after: %v", err)
+		}
+		if !bytes.Equal(before, after) {
+			t.Fatalf("Run guard mutated execution history: before=%q after=%q", before, after)
+		}
+	})
+}
+
+func TestResumeRecoversNonGitCurrentProvisioningPrefix(t *testing.T) {
+	sess := createNonGitCurrentPreparedSession(t)
+	alpha := &fakeBackend{name: "codex", slotID: "alpha", responses: []fakeResponse{{content: "resume after provisioning"}}}
+	beta := &fakeBackend{name: "codex", slotID: "beta"}
+	if err := os.Truncate(filepath.Join(sess.Root, eventlog.EventsFilename), 0); err != nil {
+		t.Fatalf("remove prepared event to simulate crash gap: %v", err)
+	}
+	if beforeRepair := sessionEvents(t, sess); len(beforeRepair) != 0 {
+		t.Fatalf("events before workspace repair = %v, want none", eventTypes(beforeRepair))
+	}
+	if _, err := workspace.Recover(context.Background(), sess); err != nil {
+		t.Fatalf("repair current workspace before Resume: %v", err)
+	}
+	beforeResume := sessionEvents(t, sess)
+	if got := eventTypes(beforeResume); !reflect.DeepEqual(got, []eventlog.Type{eventlog.WorkspacePrepared}) {
+		t.Fatalf("events after workspace repair = %v, want only workspace.prepared", got)
+	}
+	prepared, ok := beforeResume[0].Payload.(eventlog.WorkspacePreparedPayload)
+	if !ok || prepared.Mode != workspace.ModeCurrent || prepared.Commit != "" || prepared.TreeHash != "" || prepared.RelativePath != "" {
+		t.Fatalf("repaired non-Git workspace.prepared = %#v", beforeResume[0].Payload)
+	}
+
+	if _, err := Resume(context.Background(), sess, testDeps(map[string]*fakeBackend{"alpha": alpha, "beta": beta}), "", 0); err != nil {
+		t.Fatalf("Resume provisioning prefix: %v", err)
+	}
+	if _, err := workspace.Recover(context.Background(), sess); err != nil {
+		t.Fatalf("repeat workspace recovery after Resume: %v", err)
+	}
+	events := sessionEvents(t, sess)
+	if got := countType(events, eventlog.InputIngested); got != 0 {
+		t.Fatalf("input.ingested count after Resume = %d, want 0", got)
+	}
+	if got := countType(events, eventlog.WorkspacePrepared); got != 1 {
+		t.Fatalf("workspace.prepared count after Resume = %d, want 1", got)
+	}
+	if got := countType(events, eventlog.SessionStarted); got != 1 {
+		t.Fatalf("session.started count after Resume = %d, want 1", got)
+	}
+	if got := countType(events, eventlog.TurnFinished); got != 1 {
+		t.Fatalf("turn.finished count after Resume = %d, want 1", got)
+	}
+}
+
 func TestResumeLifecycleGuardsBeforeMutation(t *testing.T) {
 	for _, test := range []struct {
 		name     string
@@ -818,7 +916,7 @@ func TestResumeLifecycleGuardsBeforeMutation(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			plan := dialoguePlan(1)
 			plan.Lifecycle = &session.Lifecycle{
-				Resume: test.resume, Steering: test.steering, Dynamic: "forbid", WorkspaceIsolation: "inherited",
+				Resume: test.resume, Steering: test.steering, Dynamic: "forbid",
 			}
 			sess := createSession(t, plan)
 			seedLog(t, sess, func(_ *blobstore.Store, _ *eventlog.Writer) {})
@@ -922,7 +1020,7 @@ func TestChildRequestsAdmitAndRejectWithoutRunningDeniedChildren(t *testing.T) {
 			child := &fakeBackend{name: "codex", slotID: "child-alpha", responses: []fakeResponse{{content: "child result"}}}
 			deps := testDeps(map[string]*fakeBackend{"alpha": alpha, "beta": beta, "child-alpha": child})
 			deps.Recipes = []plan.Recipe{childRecipe()}
-			deps.ChildRequestExtractor = func(actor session.Actor, role eventlog.Role, _ provider.TurnResult) []ChildRequest {
+			deps.ChildRequestExtractor = func(_ session.Plan, actor session.Actor, role eventlog.Role, _ provider.TurnResult) []ChildRequest {
 				if actor.ID != "alpha" || role != eventlog.ParticipantRole {
 					return nil
 				}
@@ -969,6 +1067,53 @@ func TestChildRequestsAdmitAndRejectWithoutRunningDeniedChildren(t *testing.T) {
 				t.Fatalf("denied child completed = %#v", completed)
 			}
 		})
+	}
+}
+
+func TestStaticChildParticipantExecutesThroughChildPath(t *testing.T) {
+	parent := dialoguePlan(2)
+	parent.Actors = []session.Actor{
+		{ID: "alpha", Backend: "codex"},
+		{ID: "beta", Backend: "child", ChildRecipeID: "child", ChildTurns: 1},
+	}
+	parent.ChildPolicy = session.ChildPolicy{
+		Mode: "deny", MaxDepth: 1, MaxChildren: 0, MaxTurns: 0, AllowedRecipes: []string{},
+	}
+	home := t.TempDir()
+	sess := createSessionIn(t, home, parent)
+	alpha := &fakeBackend{name: "codex", slotID: "alpha", responses: []fakeResponse{{content: "provider participant"}}}
+	child := &fakeBackend{name: "codex", slotID: "child-alpha", responses: []fakeResponse{{content: "static child result"}}}
+	deps := testDeps(map[string]*fakeBackend{"alpha": alpha, "child-alpha": child})
+	deps.Recipes = []plan.Recipe{childRecipe()}
+
+	outcome, err := Run(context.Background(), sess, deps)
+	if err != nil {
+		t.Fatalf("Run static child participant: %v", err)
+	}
+	if outcome.Status != statusCompleted || outcome.Result != "static child result" {
+		t.Fatalf("static child outcome = %#v", outcome)
+	}
+	if len(alpha.prompts) != 1 || len(child.prompts) != 1 {
+		t.Fatalf("provider prompts = %d, child prompts = %d", len(alpha.prompts), len(child.prompts))
+	}
+	events := sessionEvents(t, sess)
+	if got := countType(events, eventlog.ChildRequested); got != 1 {
+		t.Fatalf("child.requested count = %d, want 1", got)
+	}
+	decisions := childDecisions(events)
+	if len(decisions) != 1 || !decisions[0].Admitted || decisions[0].Reason != "admitted by static child step" {
+		t.Fatalf("static child decision = %#v", decisions)
+	}
+	completed := childCompletions(events)
+	if len(completed) != 1 || completed[0].Status != statusCompleted {
+		t.Fatalf("static child completion = %#v", completed)
+	}
+	store, err := sess.BlobStore(blobstore.Limits{})
+	if err != nil {
+		t.Fatalf("open parent blobs: %v", err)
+	}
+	if got := readBlob(t, store, completed[0].Result); got != "static child result" {
+		t.Fatalf("static child result blob = %q", got)
 	}
 }
 
@@ -1770,7 +1915,6 @@ func dialoguePlan(turns int) session.Plan {
 		Inputs:        []session.Input{},
 		Context:       []session.Input{},
 		Skills:        []session.Input{},
-		MatchKeywords: []string{},
 		ChildPolicy:   session.ChildPolicy{Mode: "deny", MaxDepth: 0, MaxChildren: 0, MaxTurns: 0, AllowedRecipes: []string{}},
 		Result:        session.Result{Source: "last_turn", Format: "text"},
 	}
@@ -1798,7 +1942,6 @@ func sequencePlan() session.Plan {
 		Inputs:        []session.Input{},
 		Context:       []session.Input{},
 		Skills:        []session.Input{},
-		MatchKeywords: []string{},
 		ChildPolicy:   session.ChildPolicy{Mode: "deny", MaxDepth: 0, MaxChildren: 0, MaxTurns: 0, AllowedRecipes: []string{}},
 		Result:        session.Result{Source: "reducer", Format: "text"},
 	}
@@ -1829,6 +1972,52 @@ func createSessionIn(t *testing.T, home string, plan session.Plan) *session.Sess
 	sess, err := session.Create(home, plan)
 	if err != nil {
 		t.Fatalf("create session: %v", err)
+	}
+	return sess
+}
+
+func createProvisionedSession(t *testing.T) *session.Session {
+	t.Helper()
+	body := []byte("provisioned input")
+	sum := sha256.Sum256(body)
+	plan := dialoguePlan(1)
+	plan.Inputs = []session.Input{{
+		Name: "brief",
+		Content: blobstore.BlobRef{
+			SHA256:    hex.EncodeToString(sum[:]),
+			Size:      int64(len(body)),
+			MediaType: mediaTypePlainTextUTF8,
+		},
+	}}
+	sess := createSession(t, plan)
+	store, err := sess.BlobStore(blobstore.Limits{})
+	if err != nil {
+		t.Fatalf("open provisioned blobs: %v", err)
+	}
+	stored, err := store.PutBytes(body, mediaTypePlainTextUTF8)
+	if err != nil {
+		t.Fatalf("store provisioned input: %v", err)
+	}
+	if !stored.Equal(plan.Inputs[0].Content) {
+		t.Fatalf("stored provisioned input = %#v, want %#v", stored, plan.Inputs[0].Content)
+	}
+	writer, err := sess.EventWriter(store)
+	if err != nil {
+		t.Fatalf("open provisioning writer: %v", err)
+	}
+	appendEvent(t, writer, eventlog.InputIngestedPayload{LogicalName: "brief", Content: stored})
+	appendEvent(t, writer, eventlog.WorkspacePreparedPayload{Mode: "current", Commit: "abcdef", TreeHash: "123456"})
+	if err := writer.Close(); err != nil {
+		t.Fatalf("close provisioning writer: %v", err)
+	}
+	return sess
+}
+
+func createNonGitCurrentPreparedSession(t *testing.T) *session.Session {
+	t.Helper()
+	sess := createSession(t, dialoguePlan(1))
+	if _, err := workspace.Prepare(context.Background(), sess, workspace.Options{LaunchCWD: t.TempDir(), Mode: workspace.ModeCurrent}); err != nil {
+		t.Fatalf("prepare non-Git current workspace: %v", err)
 	}
 	return sess
 }

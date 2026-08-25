@@ -1,10 +1,9 @@
 # Root recipe and integration contracts
 
 Convo Relay can execute a configured recipe as the root session. This mode is
-for bounded procedures that need an exact turn schedule, named input
-snapshots with boundary integrity checks, an optional fresh reducer,
-declarative result validation, and durable inspection. It is separate from
-using `relay` as one participant backend.
+for bounded procedures that need an exact turn schedule, named inputs ingested
+as content-addressed blobs, an optional fresh reducer, declarative
+`result.schema` validation, and durable inspection.
 
 ## Trust boundary
 
@@ -14,9 +13,10 @@ read-only, placed under a separate user, or isolated from credentials or the
 network. It can access any source repository, session path, or other resource
 visible to that user, regardless of the selected workspace policy.
 
-The integrity and workspace controls below detect and report changes at
-orchestration boundaries. They do not prevent a provider from making changes
-between checks and are not a security boundary.
+Workspace mode selects an execution directory; it does not limit a provider's
+authority. Named-input source paths are ingested into digest-addressed session
+blobs before execution, so later execution reads the recorded blobs rather
+than the caller's source paths.
 
 ## Portability gate
 
@@ -55,9 +55,8 @@ convo-relay recipes compile <id> [--integration-bundle <path>]
 
 `recipes compile` does not execute a provider or create a session. It always
 emits the root plan and binds a matching bundle when the recipe declares a
-contract. Internal callers still select explicit targets; nested relay
-profiles, relay-backed participants, proposal children, and dynamic children
-always select the child target.
+contract. Internal callers still select explicit targets; child profiles,
+proposal children, and dynamic children always select the child target.
 
 ## Running a root recipe
 
@@ -67,7 +66,7 @@ convo-relay run "Evaluate the supplied records" \
   --settings ./settings.toml \
   --integration-bundle ./integration.json \
   --input source=./source.json \
-  --workspace-isolation ephemeral \
+  --workspace head-copy \
   --json -o ./session-result.json
 ```
 
@@ -78,9 +77,9 @@ relay runs retain their existing flags and behavior.
 
 The root runner performs preflight before creating a session or launching a
 provider. It resolves the recipe and profiles, compiles the root plan, binds
-the selected contract and inputs, checks backend readiness and workspace
-feasibility, then persists retained input snapshots and verifies them before
-the first participant turn.
+the selected contract and inputs, checks backend readiness, ingests named
+inputs as blobs, and prepares the selected workspace mode before the first
+participant turn.
 
 ## Integration bundle
 
@@ -113,19 +112,14 @@ opaque contract IDs; the recipe binds exactly one matching contract.
         "source": {
           "required": true,
           "cardinality": "one",
-          "media_type": "application/json",
-          "max_bytes": 262144,
-          "schema": {
-            "type": "object"
-          }
+          "max_bytes": 262144
         }
       },
       "result": {
         "transport": "json",
         "schema": {
           "type": "object"
-        },
-        "assertions": []
+        }
       }
     }
   }
@@ -153,75 +147,21 @@ contract bindings. It also provides six parallel v2 names:
 The v2 names select the reachability-classified Witness generation. Every
 default supplies only orchestration topology and policy: participant,
 facilitator, and reducer assignments; turn and result-source policy; retry,
-lifecycle, isolation, depth, approval, and conversation mode. The consumer's
-integration bundle continues to own every prompt, result schema, assertion,
-and adjudication rule. The relay does not interpret either generation's
+lifecycle, depth, approval, and conversation mode. The consumer's integration
+bundle continues to own every prompt, result schema, and adjudication rule.
+The relay does not interpret either generation's
 contract id.
 
-The supported JSON Schema 2020-12 subset includes `type`, `required`,
-`properties`, `items`, `enum`, `const`, string and array length bounds,
-numeric bounds, `additionalProperties`, `oneOf`, `allOf`,
-`if`/`then`/`else`, local `$defs`, and local `$ref`. Unsupported keywords,
-boolean root schemas, unresolved local references, and remote or relative
-references fail preflight.
-
-Cross-document checks use four generic assertions:
-
-- `unique` verifies the values selected by one JSON Pointer pattern.
-- `set_equal` compares selected value sets without order or duplicates.
-- `value_equal` compares exactly one value from each operand.
-- `field_equal_by_key` compares one value per uniquely keyed array item.
-
-JSON Pointer wildcards occupy a whole segment. Array expansion preserves
-order and object expansion sorts keys lexically. Assertion declarations and
-sources are validated before execution; data mismatches produce typed result
-validation diagnostics.
+`result.schema` is validated through standard JSON Schema Draft 2020-12.
+External result-schema loading is disabled.
 
 ## Named inputs
 
-`--input <name>=<path>` may be repeated. Names must exactly match the selected
-contract. Cardinality, byte size, media type, UTF-8 or JSON requirements, and
-optional schemas are checked before provider launch. Repeated `many` values
-retain caller order. The effective per-file ceiling is the smaller of the
-contract's `max_bytes` and the runtime `named_input_max_bytes`; the aggregate
-runtime ceiling counts raw source bytes before base64 persistence and uses
-checked integer accounting.
-
-The public limit diagnostics remain `named_input_file_too_large` for an
-individual input and `named_input_total_too_large` for the aggregate ceiling.
-Internal accounting may retain a more specific resource classification.
-
-The session persists an ordered manifest plus content-addressed input
-artifacts. The execution area receives retained copies, and participant and
-reducer prompts receive their paths and content metadata as data. The
-facilitator is integrity-checked too, but its prompt receives neither the
-named-input projection nor workspace provenance.
-
-Retained copies are writable snapshots, not immutable files and not a
-filesystem read-only guarantee. Orchestration verifies their exact directory
-layout, type, mode, size, and digest before and after every participant,
-facilitator, and reducer attempt—including every retry—then again before
-result validation. The mandatory post-attempt check uses a bounded
-orchestration-owned context that survives provider or caller cancellation. A
-mismatch or verifier failure discards that attempt's output, prevents retry,
-and terminates with `named_input_integrity_failed`; any provider failure or
-cancellation remains a secondary cause. A provider can still mutate a copy
-between checks, so detection occurs at the next boundary.
-
-Provider-boundary failures record a 1-based `provider_attempt` in the
-authoritative `named_input_integrity_failure` record and its diagnostic
-details. Non-provider boundaries omit that field. A post-attempt verifier that
-cannot complete reports the content-free mismatch category
-`verification_incomplete`.
-
-Recovery verifies any present retained materialization before session writes
-or provider construction and never repairs mismatched evidence. A narrowly
-defined legacy session with no descriptor, retained directory, artifact,
-index, or graph evidence may materialize the persisted manifest once and
-immediately verify it. Inspection and recovery use persisted bytes and
-digests, not current source paths. Positional `--context` remains available
-for ordinary runs; it is rejected when a selected contract declares named
-inputs.
+`--input <name>=<path>` reads each named source once, applies configured byte
+limits, hashes the bytes, and stores them in the session blob store. The plan
+and `input.ingested` event bind the logical name to that blob digest, size, and
+media type; the source path is not retained after ingestion. Prompt material
+is subsequently read from the bound blobs rather than from caller files.
 
 ## Execution, lifecycle, and recovery
 
@@ -238,48 +178,26 @@ Recipes may declare:
 resume = "allow"       # or "forbid"
 steering = "forbid"    # or "allow"
 dynamic = "forbid"     # or "allow"
-workspace_isolation = "ephemeral"
 ```
 
 Lifecycle rejections occur before session mutation. `stop`, `kill`, and
 `clean` remain administrative controls. Recoverable sessions resume from
 persisted checkpoints, runtime configuration, recipe, bundle, contract, and
-input snapshots. Completed participant or reducer work is not replayed when
+input blobs. Completed participant or reducer work is not replayed when
 its durable checkpoint and artifacts are valid.
 
-Workspace policies are ordered `inherited`, `read_only`, and `ephemeral`; a
-CLI request may strengthen but not weaken the recipe minimum. The
-`read_only` name does not create a read-only filesystem. Both `read_only` and
-`ephemeral` use writable, session-managed detached worktrees. They do not
-protect the source repository or session state from a trusted same-user
-provider.
-
-Preflight inventories only the source set defined by the workspace contract,
-not every same-user-visible path. Required detached execution starts from the
-committed tree; a dirty source requires an explicit override and still uses
-committed content rather than staged, unstaged, or untracked changes.
-Repository inventory includes at most eight repositories, counting the
-superproject as depth 1. A ninth repository and an initialized-repository
-cycle report `workspace_inventory_depth_exceeded` and
-`workspace_inventory_cycle_detected`, respectively; file or byte ceilings use
-`workspace_inventory_limit_exceeded`.
-Orchestration records source identity and checks that inventoried set again
-at terminal finalization. Failed or interrupted root sessions retain their
-managed worktree and Git registration until cleanup succeeds.
-
-Committed content is materialized from raw Git objects. This deliberately
-does not run Git LFS smudging, clean/smudge filters, `working-tree-encoding`,
-end-of-line conversion, export attributes, or other checkout transforms. An
-LFS-managed path therefore contains its committed pointer blob. Gitlinks are
-materialized as counted empty directories; submodule content is not fetched
-or recursively materialized.
+Root execution uses `--workspace current|head-copy`. `current` uses the launch
+directory as supplied. `head-copy` requires a Git repository and creates a
+detached worktree at the recorded HEAD commit and tree hash. Neither mode
+limits a trusted same-user provider; cleaning a head-copy session removes the
+owned worktree and its Git registration.
 
 ## Results, persistence, and administration
 
 JSON result transport accepts exactly one JSON value without Markdown fences,
 prefixes, suffixes, or trailing values. The raw candidate is always retained.
-A valid candidate is schema- and assertion-checked, canonicalized, and stored
-as the canonical result. Invalid output keeps the transcript and raw result,
+A valid candidate is schema-checked, canonicalized, and stored as the
+canonical result. Invalid output keeps the transcript and raw result,
 sets the session to `invalid_result`, records typed diagnostics, and returns a
 nonzero command status.
 
@@ -293,8 +211,8 @@ Existing administration commands use the same generic projection:
 
 - `show`, `list`, and `export create` report root execution and validation
   state.
-- `doctor` checks artifacts, input bytes, checkpoints, retained workspace,
-  source integrity, recovery, cleanup state, and backend readiness.
+- `doctor` checks artifacts, input blobs, checkpoints, workspace recovery,
+  cleanup state, and backend readiness.
 - `clean` restores provider-owned resources, removes the managed workspace,
   and only then removes session files; retryable failures retain the session.
 

@@ -15,6 +15,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 
 	"github.com/charlesnpx/convo-relay/internal/engine"
@@ -24,7 +25,6 @@ import (
 	"github.com/charlesnpx/convo-relay/internal/provider"
 	"github.com/charlesnpx/convo-relay/internal/recipes"
 	"github.com/charlesnpx/convo-relay/internal/session"
-	"github.com/charlesnpx/convo-relay/internal/store"
 	"github.com/charlesnpx/convo-relay/internal/workspace"
 )
 
@@ -113,7 +113,7 @@ func ExecutionCWD(ctx context.Context, sess *session.Session) (string, error) {
 	if sess == nil {
 		return "", errors.New("session is required")
 	}
-	recovered, err := workspace.Recover(ctx, store.New(sess.Root))
+	recovered, err := workspace.Recover(ctx, sess)
 	if err != nil {
 		return "", err
 	}
@@ -165,7 +165,7 @@ func isFacilitator(value session.Plan, actorID string) bool {
 func NewChildRequestExtractor(catalog []plan.Recipe) engine.ChildRequestExtractor {
 	recipes := append([]plan.Recipe{}, catalog...)
 	sort.Slice(recipes, func(left, right int) bool { return recipes[left].ID < recipes[right].ID })
-	return func(_ session.Actor, role eventlog.Role, result provider.TurnResult) []engine.ChildRequest {
+	return func(parent session.Plan, _ session.Actor, role eventlog.Role, result provider.TurnResult) []engine.ChildRequest {
 		if role != eventlog.FacilitatorRole {
 			return nil
 		}
@@ -175,7 +175,7 @@ func NewChildRequestExtractor(catalog []plan.Recipe) engine.ChildRequestExtracto
 		}
 		requests := make([]engine.ChildRequest, 0, len(contested))
 		for _, item := range contested {
-			recipeID := childRecipeForItem(item, recipes)
+			recipeID := childRecipeForItem(parent.ChildPolicy, recipes)
 			if recipeID == "" {
 				continue
 			}
@@ -242,13 +242,18 @@ func ledgerStrings(raw json.RawMessage) ([]string, bool) {
 	return values, true
 }
 
-func childRecipeForItem(item string, catalog []plan.Recipe) string {
-	lowered := strings.ToLower(item)
+// childRecipeForItem selects the first allowed recipe declared by the parent
+// child policy that is present in the catalog; otherwise it selects the
+// review-panel convention; otherwise it selects the first catalog recipe by
+// sorted ID.
+func childRecipeForItem(policy session.ChildPolicy, catalog []plan.Recipe) string {
+	byID := make(map[string]bool, len(catalog))
 	for _, recipe := range catalog {
-		for _, keyword := range recipe.MatchKeywords {
-			if keyword != "" && strings.Contains(lowered, strings.ToLower(keyword)) {
-				return recipe.ID
-			}
+		byID[recipe.ID] = true
+	}
+	for _, allowed := range policy.AllowedRecipes {
+		if recipeID := strings.TrimSpace(allowed); recipeID != "" && byID[recipeID] {
+			return recipeID
 		}
 	}
 	for _, recipe := range catalog {
@@ -276,12 +281,12 @@ func RecipeFromRuntime(config recipes.RuntimeConfig, recipeID string) (plan.Reci
 	if !found || record == nil {
 		return plan.Recipe{}, fmt.Errorf("recipe %q was not found", recipeID)
 	}
-	return recipeFromRecord(record, config.BackendProfiles)
+	return recipeFromRecord(record, config.BackendProfiles, config.RelayRecipes)
 }
 
-// RecipesFromRuntime returns the executable provider-backed subset of a
-// catalog. Unsupported relay pseudo-backends are deliberately omitted: they
-// are not constructible by provider.NewBackend and cannot silently enter v2.
+// RecipesFromRuntime returns the executable catalog, including declared static
+// child steps. The engine resolves those child steps rather than asking a
+// provider factory to construct a pseudo-backend.
 func RecipesFromRuntime(config recipes.RuntimeConfig) ([]plan.Recipe, error) {
 	ids := make([]string, 0, len(config.RelayRecipes))
 	for recipeID := range config.RelayRecipes {
@@ -299,7 +304,11 @@ func RecipesFromRuntime(config recipes.RuntimeConfig) ([]plan.Recipe, error) {
 	return items, nil
 }
 
-func recipeFromRecord(record map[string]any, profiles map[string]map[string]any) (plan.Recipe, error) {
+func recipeFromRecord(
+	record map[string]any,
+	profiles map[string]map[string]any,
+	relayRecipes map[string]map[string]any,
+) (plan.Recipe, error) {
 	normalized := recipes.RecipeContractPayload(record)
 	id := strings.TrimSpace(stringValue(normalized["id"]))
 	if id == "" {
@@ -311,13 +320,13 @@ func recipeFromRecord(record map[string]any, profiles map[string]map[string]any)
 	}
 	actors := make([]session.Actor, 0, 4)
 	for index, reference := range participantRefs {
-		actor, err := actorFromProfile(fmt.Sprintf("slot_%d", index), reference, profiles)
+		actor, err := actorFromProfile(fmt.Sprintf("slot_%d", index), reference, profiles, relayRecipes)
 		if err != nil {
 			return plan.Recipe{}, fmt.Errorf("recipe %q participant %d: %w", id, index, err)
 		}
 		actors = append(actors, actor)
 	}
-	facilitator, err := actorFromProfile("facilitator", stringValue(normalized["facilitator"]), profiles)
+	facilitator, err := actorFromProfile("facilitator", stringValue(normalized["facilitator"]), profiles, relayRecipes)
 	if err != nil {
 		return plan.Recipe{}, fmt.Errorf("recipe %q facilitator: %w", id, err)
 	}
@@ -325,7 +334,7 @@ func recipeFromRecord(record map[string]any, profiles map[string]map[string]any)
 	resultSource := stringValue(normalized["result_source"])
 	var reducer *session.Reducer
 	if resultSource == integration.ResultSourceReducer {
-		reducerActor, err := actorFromProfile("reducer", stringValue(normalized["reducer"]), profiles)
+		reducerActor, err := actorFromProfile("reducer", stringValue(normalized["reducer"]), profiles, relayRecipes)
 		if err != nil {
 			return plan.Recipe{}, fmt.Errorf("recipe %q reducer: %w", id, err)
 		}
@@ -334,14 +343,13 @@ func recipeFromRecord(record map[string]any, profiles map[string]map[string]any)
 	}
 	lifecycleRecord, _ := normalized["lifecycle"].(map[string]any)
 	lifecycle := session.Lifecycle{
-		Resume:             stringValue(lifecycleRecord["resume"]),
-		Steering:           stringValue(lifecycleRecord["steering"]),
-		Dynamic:            stringValue(lifecycleRecord["dynamic"]),
-		WorkspaceIsolation: stringValue(lifecycleRecord["workspace_isolation"]),
+		Resume:   stringValue(lifecycleRecord["resume"]),
+		Steering: stringValue(lifecycleRecord["steering"]),
+		Dynamic:  stringValue(lifecycleRecord["dynamic"]),
 	}
-	workspace := session.Workspace{Mode: "current", Isolation: lifecycle.WorkspaceIsolation}
-	if lifecycle.WorkspaceIsolation == "ephemeral" {
-		workspace.Mode = "head-copy"
+	workspacePlan := session.Workspace{Mode: workspace.ModeCurrent}
+	if stringValue(lifecycleRecord["workspace_isolation"]) == "ephemeral" {
+		workspacePlan.Mode = workspace.ModeHeadCopy
 	}
 	retryMode := recipes.EffectiveProviderRetry(normalized)
 	retry := session.ProviderRetry{Mode: retryMode, MaxAttempts: 7}
@@ -368,9 +376,8 @@ func recipeFromRecord(record map[string]any, profiles map[string]map[string]any)
 		IntegrationContract: stringValue(normalized["integration_contract"]),
 		MaxDepth:            intValue(normalized["max_depth"], 1),
 		AutoApproval:        stringValue(normalized["auto_approval"]),
-		MatchKeywords:       stringValues(normalized["match_keywords"]),
 		Lifecycle:           lifecycle,
-		Workspace:           workspace,
+		Workspace:           workspacePlan,
 		ChildPolicy: session.ChildPolicy{
 			Mode:           childPolicyMode(stringValue(normalized["auto_approval"])),
 			MaxDepth:       intValue(normalized["max_depth"], 1),
@@ -382,12 +389,40 @@ func recipeFromRecord(record map[string]any, profiles map[string]map[string]any)
 	}, nil
 }
 
-func actorFromProfile(id, reference string, profiles map[string]map[string]any) (session.Actor, error) {
+func actorFromProfile(
+	id, reference string,
+	profiles map[string]map[string]any,
+	relayRecipes map[string]map[string]any,
+) (session.Actor, error) {
 	profile, err := recipes.ResolveProfileRef(reference, profiles)
 	if err != nil {
 		return session.Actor{}, err
 	}
 	backend := strings.TrimSpace(stringValue(profile["backend"]))
+	if backend == "child" {
+		recipeID := strings.TrimSpace(stringValue(profile["model"]))
+		if recipeID == "" {
+			return session.Actor{}, fmt.Errorf("profile %q child step has no recipe id", reference)
+		}
+		childRecipe, found := relayRecipes[recipeID]
+		if !found || childRecipe == nil {
+			return session.Actor{}, fmt.Errorf("profile %q child step references unknown recipe %q", reference, recipeID)
+		}
+		turns := intValue(profile["effort"], 0)
+		if turns == 0 {
+			turns = intValue(childRecipe["max_rounds"], 1)
+		}
+		if turns < 1 {
+			return session.Actor{}, fmt.Errorf("profile %q child step turns must be positive", reference)
+		}
+		return session.Actor{
+			ID:            id,
+			Backend:       "child",
+			ProfileID:     firstNonEmpty(stringValue(profile["id"]), reference),
+			ChildRecipeID: recipeID,
+			ChildTurns:    turns,
+		}, nil
+	}
 	if !provider.KnownBackend(backend) {
 		return session.Actor{}, fmt.Errorf("profile %q resolves to unsupported v2 backend %q", reference, backend)
 	}
@@ -446,6 +481,10 @@ func intValue(value any, fallback int) int {
 	case json.Number:
 		if parsed, err := typed.Int64(); err == nil {
 			return int(parsed)
+		}
+	case string:
+		if parsed, err := strconv.Atoi(strings.TrimSpace(typed)); err == nil {
+			return parsed
 		}
 	}
 	return fallback

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"path"
 	"regexp"
 	"strconv"
 	"strings"
@@ -334,9 +335,10 @@ func (p InputIngestedPayload) validate() error {
 }
 
 type WorkspacePreparedPayload struct {
-	Mode     string `json:"mode"`
-	Commit   string `json:"commit"`
-	TreeHash string `json:"tree_hash"`
+	Mode         string `json:"mode"`
+	Commit       string `json:"commit"`
+	TreeHash     string `json:"tree_hash"`
+	RelativePath string `json:"relative_path,omitempty"`
 }
 
 func (WorkspacePreparedPayload) eventType() Type { return WorkspacePrepared }
@@ -344,10 +346,32 @@ func (p WorkspacePreparedPayload) validate() error {
 	if p.Mode != "current" && p.Mode != "head-copy" {
 		return errors.New("workspace.prepared mode must be current or head-copy")
 	}
-	if err := validateToken("commit", p.Commit); err != nil {
-		return err
+	if p.Mode == "head-copy" || p.Commit != "" || p.TreeHash != "" {
+		if err := validateToken("commit", p.Commit); err != nil {
+			return err
+		}
+		if err := validateToken("tree_hash", p.TreeHash); err != nil {
+			return err
+		}
 	}
-	return validateToken("tree_hash", p.TreeHash)
+	return validateWorkspaceRelativePath(p.RelativePath)
+}
+
+func validateWorkspaceRelativePath(value string) error {
+	if value == "" {
+		return nil
+	}
+	if strings.ContainsAny(value, "\\\\\r\n\x00") {
+		return errors.New("relative_path must use portable slash-separated path components")
+	}
+	if path.IsAbs(value) {
+		return errors.New("relative_path must be relative")
+	}
+	cleaned := path.Clean(value)
+	if cleaned != value || cleaned == ".." || strings.HasPrefix(cleaned, "../") {
+		return errors.New("relative_path must stay within the repository")
+	}
+	return nil
 }
 
 type ResultProducedPayload struct {

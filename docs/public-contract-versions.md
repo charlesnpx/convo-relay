@@ -20,7 +20,6 @@ reported under the flat `formats` object from `convo-relay version --json`.
 | provider invocation | `relay-provider-invocation-v2` |
 | rendered prompt | `relay-rendered-prompt-v1` |
 | digest profile | `relay-root-digests-v1` |
-| workspace isolation report | `relay-workspace-isolation-v1` |
 | portable export | `relay-root-portable-export-v2` |
 | workspace mechanisms | `inherited`, `detached_writable_git_worktree` |
 
@@ -96,7 +95,7 @@ invocation.
 Portable payload identity omits these runtime-only fields:
 
 - execution-workspace identity, source Git root, and source launch CWD;
-- named-input source paths and retained-input directory/materialized paths;
+- named-input source paths and materialized input paths;
 - runtime-snapshot settings path and input/transient-source paths; and
 - provider-state CWD and settings path.
 

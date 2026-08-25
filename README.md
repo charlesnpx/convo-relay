@@ -1,8 +1,8 @@
 # convo-relay
 
-Orchestrate live dialogues between AI coding backends such as **OpenAI Codex CLI**, **Claude Code**, **Gemini CLI**, and a composite **Relay** backend.
+Orchestrate live dialogues between AI coding backends such as **OpenAI Codex CLI**, **Claude Code**, and **Gemini CLI**.
 
-Give it a task like "review this auth module for vulnerabilities", "debate monorepo vs polyrepo", or "collaboratively write integration tests", and it runs a structured back-and-forth conversation between two backend slots. Every debater turn is saved, and a separate facilitator tracks what is settled, contested, and withdrawn. The common case is `codex,claude`, but the relay also supports reversed ordering, mixed pairs such as `codex,gemini`, same-backend pairs such as `claude,claude` or `codex,codex`, the composite `relay` backend, and single-value shorthand like `--agents claude`, `--agents codex`, or `--agents gemini`.
+Give it a task like "review this auth module for vulnerabilities", "debate monorepo vs polyrepo", or "collaboratively write integration tests", and it runs a structured back-and-forth conversation between two backend slots. Every debater turn is saved, and a separate facilitator tracks what is settled, contested, and withdrawn. The common case is `codex,claude`, but the relay also supports reversed ordering, mixed pairs such as `codex,gemini`, same-backend pairs such as `claude,claude` or `codex,codex`, and single-value shorthand like `--agents claude`, `--agents codex`, or `--agents gemini`.
 
 ## Why this approach
 
@@ -92,11 +92,8 @@ make test
 make test-race
 make cross-compile
 make cross-compile-tests
-make smoke-fake-providers
 make package
 ```
-
-`make smoke-fake-providers` is the Go-only release smoke gate. It builds the CLI, shadows `codex`, `claude`, and `gemini` with deterministic fake provider binaries in `PATH`, writes sessions into a temp relay home, and checks the required provider matrix plus `resume`, `clean --all`, `clean`, and `show --graph --json`. Live Codex, Claude, and Gemini runs are useful local release evidence, but they are optional and are not required for CI.
 
 Cross-compilation is a release gate, not a runtime certification claim. `make cross-compile` builds every production package for `darwin/arm64` and `windows/amd64`, while `make cross-compile-tests` compiles the repository's practical test packages for those targets. These gates do not execute foreign binaries and do not certify runtime support on macOS or Windows.
 
@@ -154,15 +151,6 @@ Use Gemini in a mixed relay:
 convo-relay run "Compare implementation risks" --agents codex,gemini
 ```
 
-Use a relay as one backend slot. The relay backend runs a nested relay through a recipe and returns one collapsed parent-facing result:
-
-```bash
-convo-relay run "Pressure-test this design" --agents codex,relay --model-b review-panel
-convo-relay run "Compare two approaches" --agents relay,relay --model-a review-panel --model-b one-pass-review
-```
-
-Nested relay recursion is bounded by `CONVO_RELAY_BACKEND_MAX_DEPTH` and defaults to one relay-backend layer.
-
 Pin different models or effort levels per slot:
 
 ```bash
@@ -213,7 +201,7 @@ convo-relay control approve a1b2c3d4 sp_123456789abc
 convo-relay control reject a1b2c3d4 sp_123456789abc --reason "too broad"
 ```
 
-Dynamic expansion uses predeclared backend profiles and relay recipes. Built-in profiles include `codex-deep`, `codex-fast`, `claude-code`, `gemini-vision`, and `relay-review`; built-in recipes include `review-panel`, `vision-review`, and `one-pass-review`. Override or extend them with a TOML file:
+Dynamic expansion uses predeclared backend profiles and relay recipes. Built-in profiles include `codex-deep`, `codex-fast`, `claude-code`, `gemini-vision`, and `review-panel-child`; built-in recipes include `review-panel`, `vision-review`, and `one-pass-review`. Override or extend them with a TOML file:
 
 ```toml
 [backend_profiles.codex-reviewer]
@@ -234,12 +222,13 @@ max_depth = 1
 auto_approval = "ask"
 ```
 
-Relay profiles can also be participants inside recipes. In a relay profile, `model` is the child recipe id and `effort` is the admitted child round count. If `effort` is omitted, the child recipe's `max_rounds` is used. Facilitator and reducer profiles must still point at normal backends.
+Static child profiles can also be participants inside recipes. In a child profile, `model` is the child recipe id and `effort` is the admitted child round count. If `effort` is omitted, the child recipe's `max_rounds` is used. Facilitator and reducer profiles must still point at normal backends.
 
 ```toml
 [backend_profiles.impl-panel]
-backend = "relay"
+backend = "child"
 model = "implementation-review"
+effort = 2
 description = "Nested implementation review panel."
 capabilities = ["composite", "code", "review"]
 
@@ -271,8 +260,7 @@ recipe checks, and persisted as transient recipe artifacts:
 
 ```bash
 convo-relay run "Review this patch" \
-  --agents relay,codex \
-  --model-a local-review \
+  --agents codex,claude \
   --recipe-file ./local-recipes.toml
 ```
 
@@ -287,7 +275,7 @@ convo-relay recipes doctor
 convo-relay recipes compile review-panel --json
 ```
 
-`recipes list` shows usable recipes and recipes that require an integration bundle by default in human output. JSON output includes all statuses unless `--status` is supplied, including invalid or skipped parseable records that would otherwise be hidden by runtime normalization. `recipes show` reports declared recipe data, integration binding, and resolved participant/backend readiness. `recipes doctor` validates settings parseability, recipe/profile references, nested relay profile rules, installation-only backend readiness, and grouped root-cause diagnostics. A missing integration bundle reports `requires_integration` without degrading list or doctor; pass `--integration-bundle <file>` to list, show, doctor, or `recipes compile` to bind an exact contract.
+`recipes list` shows usable recipes and recipes that require an integration bundle by default in human output. JSON output includes all statuses unless `--status` is supplied, including invalid or skipped parseable records that would otherwise be hidden by runtime normalization. `recipes show` reports declared recipe data, integration binding, and resolved participant/backend readiness. `recipes doctor` validates settings parseability, recipe/profile references, installation-only backend readiness, and grouped root-cause diagnostics. A missing integration bundle reports `requires_integration` without degrading list or doctor; pass `--integration-bundle <file>` to list, show, doctor, or `recipes compile` to bind an exact contract.
 
 The optional Witness defaults keep all existing v1 recipe names and contract
 bindings available. Parallel `witness-falsify-v2`,
@@ -296,8 +284,8 @@ bindings available. Parallel `witness-falsify-v2`,
 `economy-equivalence-v2-codex`, and `economy-equivalence-v2-claude` bind
 `witnessed-review/economy-equivalence-v2`. These v2 names select the
 reachability-classified Witness generation. The defaults declare orchestration
-topology and policy only. Contract prompts, result schemas, assertions, and
-adjudication remain consumer-owned bundle data, and the relay treats each
+topology and policy only. Contract prompts, result schemas, and adjudication
+remain consumer-owned bundle data, and the relay treats each
 contract id as opaque.
 
 `recipes compile <id>` is a side-effect-free root-plan preflight. It emits a
@@ -313,16 +301,15 @@ convo-relay run "Evaluate the supplied records" \
   --settings ./settings.toml \
   --integration-bundle ./integration.json \
   --input source=./source.json \
-  --workspace-isolation ephemeral \
+  --workspace head-copy \
   --json -o ./session-result.json
 ```
 
-Root recipe mode uses the recipe's exact participant-turn schedule, optional fresh reducer, lifecycle minimum, named inputs, and declarative result contract. It has no compile-target flag because it always selects the root target. Ordinary runs and nested relay execution continue to use their existing paths.
+Root recipe mode uses the recipe's exact participant-turn schedule, optional fresh reducer, named inputs, and declarative result contract. It has no compile-target flag because it always selects the root target. Ordinary runs continue to use their existing path.
 
-For contracts with named inputs, `--investigation context_only` accepts bound
-`--input name=path` values as its authority and records their stable names and
-artifact refs in `prompt-policy/v2`. This is provider guidance, not a sandbox or
-proof of provider behavior.
+For contracts with named inputs, `--input name=path` reads each source once,
+stores it as a content-addressed session blob, and records its stable name and
+digest in the plan.
 
 Root recipes may set `provider_retry = "forbid"` to permit only one runner
 launch per provider invocation; omission preserves the legacy `allow` policy.
@@ -332,13 +319,11 @@ Integration bundle v2 adds a `prompt_context` projection. Participant history
 is complete; `facilitator_ledger = "trace_only"` retains facilitator artifacts
 while excluding that ledger from later participant and reducer prompts.
 
-Provider CLIs are trusted same-user processes. They run with the invoking user's authority and are not a sandbox or security boundary: they can access any source, session, credential, network, or other path the user can access. Named inputs are copied into the session and integrity-checked before and after every provider attempt, during recovery, and before result validation. Those copies are snapshots, not immutable or filesystem read-only objects; a provider can change them between checks, and orchestration detects that change at the next boundary.
+Provider CLIs are trusted same-user processes. They run with the invoking user's authority and are not a sandbox or security boundary: they can access any source, session, credential, network, or other path the user can access. Named-input source paths do not survive ingestion; providers receive prompt material loaded from the digest-bound session blobs.
 
-The `read_only` and `ephemeral` workspace policy names are compatibility and lifecycle values. Both execute in a writable, session-managed detached worktree. They neither make the filesystem read-only nor protect the source repository or session state from a same-user provider. Failed or interrupted worktrees remain registered for inspection until cleanup succeeds.
+Root recipes use `--workspace current|head-copy`. `current` executes in the launch directory, while `head-copy` executes in a detached worktree at the recorded HEAD commit and tree hash. Neither mode is a security boundary.
 
-See [Root recipe and integration contracts](docs/root-recipe-integration.md) for the unified compiler API, bundle and schema subset, assertions, recovery, persistence, inspection, cleanup, raw Git-object materialization, and trust-boundary contracts.
-
-When a top-level slot uses the `relay` backend, `--model-a` or `--model-b` selects the relay backend recipe for that slot. Nested relay profiles do not read those top-level model flags; their recipe and profile selection comes from the settings file.
+See [Root recipe and integration contracts](docs/root-recipe-integration.md) for the unified compiler API, bundle contracts, JSON Schema result validation, blob ingestion, workspace modes, recovery, persistence, inspection, cleanup, and trust-boundary contracts.
 
 Limit a run to 3 rounds:
 
@@ -406,8 +391,8 @@ are rewritten to directory-local payload refs that retain source artifact id
 and digest. Every payload except the exact root-session, transcript, and
 diagnostics projections requires that source identity; the same source id may
 appear with different immutable digests, but an exact id/digest pair may appear
-only once. Required absolute source, relay-home, session, retained-input, and
-worktree paths are omitted. `export verify` rechecks the closed file set,
+only once. Required absolute source, relay-home, session, named-input source,
+and worktree paths are omitted. `export verify` rechecks the closed file set,
 payload digests, portable source refs, and one-to-one provider
 invocation/result lineage. Durable marker-only crashes can leave attempt gaps,
 so an export may begin with attempt 2 or omit an earlier attempt. With `--json`,
@@ -514,7 +499,7 @@ Then read /tmp/auth-review.md and summarize what each agent found.
 | `--timeout N`, `--patience N` | run, resume | Per-turn timeout in seconds (default: 600) |
 | `--mode {cooperative,adversarial,steelman}` | run, resume | Conversation mode. On `resume`, applies a typed mode control for subsequent rounds |
 | `--agents AGENT[,AGENT]` | run | One backend for shorthand (`claude`, `codex`, or `gemini`), or an explicit backend pair (default: `codex,claude`) |
-| `--model-a MODEL`, `--model-b MODEL` | run, resume | Model for slot A / slot B. For a top-level `relay` slot, this is the relay recipe id |
+| `--model-a MODEL`, `--model-b MODEL` | run, resume | Model for slot A / slot B |
 | `--effort-a EFFORT`, `--effort-b EFFORT` | run, resume | Effort for slot A / slot B |
 | `--replace-a BACKEND_OR_PROFILE`, `--replace-b BACKEND_OR_PROFILE` | resume | Explicitly replace logical slot A / slot B at the resume boundary and start a new slot generation |
 | `--quick` | run, resume | Force exactly 3 rounds |
@@ -522,8 +507,8 @@ Then read /tmp/auth-review.md and summarize what each agent found.
 | `--skill FILE [FILE ...]` | run, resume | Attach UTF-8 capability files and persist labeled input-bundle artifacts |
 | `--recipe-file FILE` | run | Attach session-scoped transient relay recipes from TOML and persist the source artifact |
 | `--recipe ID` | run | Execute a configured recipe directly as the root session |
-| `--input NAME=PATH` | run --recipe | Bind one named contract input; repeat for many-valued inputs |
-| `--workspace-isolation {inherited,read_only,ephemeral}` | run --recipe | Request a root workspace lifecycle policy; `read_only` and `ephemeral` both use writable detached worktrees |
+| `--input NAME=PATH` | run --recipe | Read a named file once and bind its content-addressed blob to the root plan |
+| `--workspace {current,head-copy}` | run --recipe | Execute in the launch directory or a detached worktree at recorded HEAD |
 | `--task-plan FILE` | run | Attach the launch task plan from a JSON or markdown/text file |
 | `--investigation {auto,normal,context_only}` | run | Prompt policy for evidence behavior. Default `auto` cites inspected files/context; `normal` is conceptual; `context_only` requires `--context` and avoids repo exploration |
 | `--dynamic {off,ask,auto-safe}` | run | Enable dynamic spawn proposal handling. Default is `off` |
@@ -542,18 +527,16 @@ Then read /tmp/auth-review.md and summarize what each agent found.
 | `--probe-auth` | doctor | Run supported non-model authentication probes |
 | `--limit N` | list, clean --all | Max sessions to show or scan |
 
-## Session isolation
+## Session boundaries
 
 Session separation is an organizational and provider-state boundary, not a
 security boundary. Backend processes run as the current user and retain that
 user's filesystem and network authority, including access to source and
 session paths outside the slot-scoped directories.
 
-Successor root runs persist `relay-workspace-isolation-v1`. The report names
-the observed inherited or detached-writable-worktree mechanism and records
-source separation and post-run mutation detection independently. It always
-reports filesystem, network, process, and same-user containment as `none`;
-an `ephemeral` policy label does not imply any of those controls.
+Root recipe sessions record the selected workspace mode. A `head-copy` session
+owns a detached worktree, and `clean` removes that worktree and its Git
+registration before removing the session files.
 
 Each session is stored under `~/.codex-claude/sessions/<uuid>/`:
 

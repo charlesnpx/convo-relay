@@ -4,7 +4,7 @@ var backendRegistry = map[string]bool{
 	"claude": true,
 	"codex":  true,
 	"gemini": true,
-	"relay":  true,
+	"child":  true,
 }
 
 var defaultBackendProfiles = map[string]map[string]any{
@@ -40,12 +40,12 @@ var defaultBackendProfiles = map[string]map[string]any{
 		"description":  "Gemini profile for visual, screenshot, and image-heavy questions.",
 		"capabilities": []any{"vision", "large-context"},
 	},
-	"relay-review": {
-		"id":           "relay-review",
-		"backend":      "relay",
+	"review-panel-child": {
+		"id":           "review-panel-child",
+		"backend":      "child",
 		"model":        "review-panel",
 		"effort":       "2",
-		"description":  "Composite relay backend using the review-panel recipe.",
+		"description":  "Static child step using the review-panel recipe.",
 		"capabilities": []any{"composite", "debate"},
 	},
 }
@@ -281,7 +281,7 @@ var defaultRelayRecipeRecords = map[string]map[string]any{
 	},
 	"review-panel": {
 		"id":                    "review-panel",
-		"purpose":               "Use when an unresolved implementation or design risk needs a focused child relay.",
+		"purpose":               "Use when an unresolved implementation or design risk needs a focused child step.",
 		"participants":          []any{"codex-deep", "codex-fast"},
 		"facilitator":           "codex-fast",
 		"reducer":               "codex-deep",
@@ -290,7 +290,6 @@ var defaultRelayRecipeRecords = map[string]map[string]any{
 		"max_depth":             1,
 		"required_capabilities": []any{},
 		"auto_approval":         "ask",
-		"match_keywords":        []any{},
 	},
 	"vision-review": {
 		"id":                    "vision-review",
@@ -303,7 +302,6 @@ var defaultRelayRecipeRecords = map[string]map[string]any{
 		"max_depth":             1,
 		"required_capabilities": []any{"vision"},
 		"auto_approval":         "ask",
-		"match_keywords":        []any{"image", "screenshot", "visual", "ui", "diagram", "mockup"},
 	},
 	"one-pass-review": {
 		"id":                    "one-pass-review",
@@ -316,7 +314,6 @@ var defaultRelayRecipeRecords = map[string]map[string]any{
 		"max_depth":             2,
 		"required_capabilities": []any{},
 		"auto_approval":         "ask",
-		"match_keywords":        []any{},
 	},
 }
 

@@ -6,35 +6,26 @@ import (
 	"strings"
 )
 
-const DefaultRelayRecipeID = "review-panel"
-
 type ClosureOptions struct {
 	IncludeReducer        bool
 	IncludeNestedReducers bool
-	DefaultRelayRecipe    string
 }
 
-// ResolveBackendClosure returns the registered backends required by a recipe.
-// It consumes the supplied records as-is: callers retain responsibility for
-// recipe normalization and structural validation.
+// ResolveBackendClosure returns the concrete provider backends required by a
+// recipe. A child participant is composition, not a provider: its recipe is
+// traversed but child itself is never registered as a backend.
 func ResolveBackendClosure(
 	recipe map[string]any,
 	profiles map[string]map[string]any,
-	relayRecipes map[string]map[string]any,
+	childRecipes map[string]map[string]any,
 	options ClosureOptions,
 ) ([]string, error) {
 	if recipe == nil {
 		return nil, fmt.Errorf("recipe is required")
 	}
-	if strings.TrimSpace(options.DefaultRelayRecipe) == "" {
-		options.DefaultRelayRecipe = DefaultRelayRecipeID
-	}
 	resolver := closureResolver{
-		profiles:     profiles,
-		relayRecipes: relayRecipes,
-		options:      options,
-		backends:     map[string]bool{},
-		active:       map[string]bool{},
+		profiles: profiles, childRecipes: childRecipes, options: options,
+		backends: map[string]bool{}, active: map[string]bool{},
 	}
 	rootID := strings.TrimSpace(valueString(recipe["id"]))
 	if rootID == "" {
@@ -53,7 +44,7 @@ func ResolveBackendClosure(
 
 type closureResolver struct {
 	profiles     map[string]map[string]any
-	relayRecipes map[string]map[string]any
+	childRecipes map[string]map[string]any
 	options      ClosureOptions
 	backends     map[string]bool
 	active       map[string]bool
@@ -61,7 +52,7 @@ type closureResolver struct {
 
 func (r *closureResolver) walkRecipe(recipeID string, recipe map[string]any, includeReducer bool) error {
 	if r.active[recipeID] {
-		return fmt.Errorf("relay recipe cycle includes %q", recipeID)
+		return fmt.Errorf("recipe cycle includes %q", recipeID)
 	}
 	r.active[recipeID] = true
 	defer delete(r.active, recipeID)
@@ -105,30 +96,28 @@ func (r *closureResolver) walkReference(reference string, path string) error {
 		backend = strings.TrimSpace(valueString(profile["backend"]))
 		childRecipeID = strings.TrimSpace(valueString(profile["model"]))
 	}
+	if backend == "child" {
+		if childRecipeID == "" {
+			return fmt.Errorf("%s child participant has no child recipe", path)
+		}
+		child, exists := r.childRecipes[childRecipeID]
+		if !exists || child == nil {
+			return fmt.Errorf("%s references unknown child recipe %q", path, childRecipeID)
+		}
+		return r.walkRecipe(childRecipeID, child, r.options.IncludeNestedReducers)
+	}
 	if !isRegistered(backend) {
 		return fmt.Errorf("%s references unknown backend or profile %q", path, reference)
 	}
 	r.backends[backend] = true
-	if backend != "relay" {
-		return nil
-	}
-	if childRecipeID == "" {
-		childRecipeID = r.options.DefaultRelayRecipe
-	}
-	child, exists := r.relayRecipes[childRecipeID]
-	if !exists || child == nil {
-		return fmt.Errorf("%s relay backend references unknown child recipe %q", path, childRecipeID)
-	}
-	return r.walkRecipe(childRecipeID, child, r.options.IncludeNestedReducers)
+	return nil
 }
 
 func stringValues(value any) ([]string, bool) {
 	items, ok := value.([]any)
 	if !ok {
 		if typed, typedOK := value.([]string); typedOK {
-			result := make([]string, len(typed))
-			copy(result, typed)
-			return result, true
+			return append([]string(nil), typed...), true
 		}
 		return nil, false
 	}

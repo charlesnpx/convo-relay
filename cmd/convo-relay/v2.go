@@ -17,12 +17,12 @@ import (
 	"github.com/charlesnpx/convo-relay/internal/engine"
 	"github.com/charlesnpx/convo-relay/internal/eventlog"
 	"github.com/charlesnpx/convo-relay/internal/integration"
+	"github.com/charlesnpx/convo-relay/internal/namedinputs"
 	"github.com/charlesnpx/convo-relay/internal/plan"
 	"github.com/charlesnpx/convo-relay/internal/recipes"
 	"github.com/charlesnpx/convo-relay/internal/relayv2"
 	"github.com/charlesnpx/convo-relay/internal/session"
 	"github.com/charlesnpx/convo-relay/internal/sessionview"
-	"github.com/charlesnpx/convo-relay/internal/store"
 	"github.com/charlesnpx/convo-relay/internal/workspace"
 )
 
@@ -38,13 +38,8 @@ type v2Input struct {
 }
 
 type v2WorkspaceOptions struct {
-	LaunchCWD         string
-	MinimumPolicy     string
-	RequestedPolicy   string
-	RequestedExplicit bool
-	AllowDirtySource  bool
-	Limits            recipes.RuntimeLimits
-	WarningCallback   func(v2WorkspaceWarning)
+	LaunchCWD string
+	Mode      string
 }
 
 type v2WorkspaceWarning struct {
@@ -94,8 +89,7 @@ type v2RecipeRunOptions struct {
 	TransientSources      []recipes.TransientRecipeSource
 	IntegrationBundlePath string
 	InputBindings         []string
-	WorkspaceIsolation    string
-	WorkspaceExplicit     bool
+	WorkspaceMode         string
 	AllowDirtySource      bool
 	SettingsPath          string
 	LaunchCWD             string
@@ -194,7 +188,7 @@ func v2RunOrdinary(ctx context.Context, options v2OrdinaryRunOptions) (map[strin
 		TimeoutSeconds:      options.TimeoutSeconds,
 		StallTimeoutSeconds: options.StallTimeoutSeconds,
 		Dynamic:             options.Dynamic,
-		Workspace:           session.Workspace{Mode: "current", Isolation: "inherited"},
+		Workspace:           session.Workspace{Mode: workspace.ModeCurrent},
 		Context:             v2Inputs(contexts),
 		Skills:              v2Inputs(skills),
 		TaskPlan:            taskPlan,
@@ -217,9 +211,8 @@ func v2RunOrdinary(ctx context.Context, options v2OrdinaryRunOptions) (map[strin
 		return nil, err
 	}
 	materialized, err := v2PrepareWorkspace(ctx, sess, v2WorkspaceOptions{
-		LaunchCWD:     launchCWD,
-		MinimumPolicy: v2WorkspaceMinimum(planValue),
-		Limits:        config.EffectiveLimits(),
+		LaunchCWD: launchCWD,
+		Mode:      planValue.Workspace.Mode,
 	})
 	if err != nil {
 		return nil, err
@@ -228,6 +221,10 @@ func v2RunOrdinary(ctx context.Context, options v2OrdinaryRunOptions) (map[strin
 }
 
 func v2RunRecipe(ctx context.Context, options v2RecipeRunOptions) (map[string]any, error) {
+	workspaceMode, err := v2WorkspaceMode(options.WorkspaceMode)
+	if err != nil {
+		return nil, err
+	}
 	config, _, err := recipes.LoadRuntimeConfigWithTransientSources(options.SettingsPath, options.TransientSources)
 	if err != nil {
 		return nil, err
@@ -240,7 +237,7 @@ func v2RunRecipe(ctx context.Context, options v2RecipeRunOptions) (map[string]an
 	if err != nil {
 		return nil, err
 	}
-	inputs, err := v2ReadNamedInputs(options.InputBindings, options.LaunchCWD)
+	inputs, err := v2ReadNamedInputs(options.InputBindings, options.LaunchCWD, config.EffectiveLimits())
 	if err != nil {
 		return nil, err
 	}
@@ -261,7 +258,7 @@ func v2RunRecipe(ctx context.Context, options v2RecipeRunOptions) (map[string]an
 		options.Investigation,
 		contexts,
 		skills,
-		inputs,
+		namedinputs.Inputs(inputs),
 		taskPlan,
 		bundle,
 	)
@@ -274,21 +271,16 @@ func v2RunRecipe(ctx context.Context, options v2RecipeRunOptions) (map[string]an
 	}
 	launchCWD := v2LaunchCWD(options.LaunchCWD)
 	runtime := relayv2.Runtime{SettingsPath: config.SettingsPath, Recipes: catalog}
-	if err := v2PersistInputs(sess, contexts, skills, inputs); err != nil {
+	if err := v2PersistInputs(sess, contexts, skills); err != nil {
+		return nil, err
+	}
+	if err := namedinputs.Persist(sess, inputs); err != nil {
 		return nil, err
 	}
 	if err := relayv2.SaveRuntime(sess, runtime); err != nil {
 		return nil, err
 	}
-	materialized, err := v2PrepareWorkspace(ctx, sess, v2WorkspaceOptions{
-		LaunchCWD:         launchCWD,
-		MinimumPolicy:     v2WorkspaceMinimum(planValue),
-		RequestedPolicy:   options.WorkspaceIsolation,
-		RequestedExplicit: options.WorkspaceExplicit,
-		AllowDirtySource:  options.AllowDirtySource,
-		Limits:            config.EffectiveLimits(),
-		WarningCallback:   options.WorkspaceWarning,
-	})
+	materialized, err := v2PrepareWorkspace(ctx, sess, v2WorkspaceOptions{LaunchCWD: launchCWD, Mode: workspaceMode})
 	if err != nil {
 		return nil, err
 	}
@@ -314,14 +306,11 @@ func v2RunResume(ctx context.Context, sessionDir string, options v2ResumeOptions
 	return v2Run(ctx, sess, runtime, executionCWD, true, options.Prompt, options.RequestedTurns)
 }
 
-func v2WorkspaceMinimum(value session.Plan) string {
-	if strings.TrimSpace(value.Workspace.Isolation) != "" {
-		return value.Workspace.Isolation
+func v2WorkspaceMode(mode string) (string, error) {
+	if mode != workspace.ModeCurrent && mode != workspace.ModeHeadCopy {
+		return "", fmt.Errorf("workspace mode must be %s or %s", workspace.ModeCurrent, workspace.ModeHeadCopy)
 	}
-	if value.Workspace.Mode == "head-copy" {
-		return workspace.PolicyEphemeral
-	}
-	return workspace.PolicyInherited
+	return mode, nil
 }
 
 func v2LaunchCWD(value string) string {
@@ -389,9 +378,8 @@ func v2ReadPromptInputs(paths []string, prefix string, sourceAnchor string) ([]v
 	return inputs, nil
 }
 
-func v2ReadNamedInputs(bindings []string, sourceAnchor string) ([]v2Input, error) {
-	inputs := make([]v2Input, 0, len(bindings))
-	seen := map[string]bool{}
+func v2ReadNamedInputs(bindings []string, sourceAnchor string, limits recipes.RuntimeLimits) ([]namedinputs.Prepared, error) {
+	values := make([]namedinputs.Binding, 0, len(bindings))
 	for _, binding := range bindings {
 		name, filename, found := strings.Cut(binding, "=")
 		name = strings.TrimSpace(name)
@@ -399,31 +387,9 @@ func v2ReadNamedInputs(bindings []string, sourceAnchor string) ([]v2Input, error
 		if !found || name == "" || filename == "" {
 			return nil, fmt.Errorf("--input must be name=path")
 		}
-		if seen[name] {
-			return nil, fmt.Errorf("duplicate --input name %q", name)
-		}
-		seen[name] = true
-		if !filepath.IsAbs(filename) && strings.TrimSpace(sourceAnchor) != "" {
-			filename = filepath.Join(sourceAnchor, filename)
-		}
-		absolute, err := filepath.Abs(filename)
-		if err != nil {
-			return nil, err
-		}
-		info, err := os.Stat(absolute)
-		if err != nil {
-			return nil, fmt.Errorf("input %q is unreadable: %w", name, err)
-		}
-		if !info.Mode().IsRegular() {
-			return nil, fmt.Errorf("input %q is not a regular file", name)
-		}
-		body, err := os.ReadFile(absolute)
-		if err != nil {
-			return nil, fmt.Errorf("read input %q: %w", name, err)
-		}
-		inputs = append(inputs, v2Input{Input: v2SessionInput(name, body), Body: body})
+		values = append(values, namedinputs.Binding{Name: name, Path: filename})
 	}
-	return inputs, nil
+	return namedinputs.Read(values, sourceAnchor, namedinputs.Limits{MaxFileBytes: limits.NamedInputMaxBytes, MaxTotalBytes: limits.NamedInputTotalMaxBytes})
 }
 
 func v2SessionInput(name string, body []byte) session.Input {
@@ -547,32 +513,7 @@ func v2PrepareWorkspace(ctx context.Context, sess *session.Session, options v2Wo
 			return nil, err
 		}
 	}
-	snapshot, err := workspace.Preflight(ctx, workspace.Options{
-		LaunchCWD:         launchCWD,
-		SessionDir:        sess.Root,
-		SessionPathSource: workspace.SessionPathResolved,
-		MinimumPolicy:     options.MinimumPolicy,
-		RequestedPolicy:   options.RequestedPolicy,
-		RequestedExplicit: options.RequestedExplicit,
-		AllowDirtySource:  options.AllowDirtySource,
-		InventoryMaxFiles: options.Limits.RepositoryInventoryMaxFiles,
-		InventoryMaxBytes: options.Limits.RepositoryInventoryMaxBytes,
-	})
-	if err != nil {
-		return nil, err
-	}
-	if options.WarningCallback != nil && snapshot.AllowDirtySource() {
-		changes := snapshot.SourceChanges()
-		if changes.Dirty() {
-			options.WarningCallback(v2WorkspaceWarning{
-				Message:          "using committed HEAD for isolated execution; working-tree changes are excluded",
-				StagedChanges:    changes.Staged,
-				UnstagedChanges:  changes.Unstaged,
-				UntrackedChanges: changes.Untracked,
-			})
-		}
-	}
-	return workspace.Materialize(ctx, store.New(sess.Root), snapshot)
+	return workspace.Prepare(ctx, sess, workspace.Options{LaunchCWD: launchCWD, Mode: options.Mode})
 }
 
 func v2Run(ctx context.Context, sess *session.Session, runtime relayv2.Runtime, executionCWD string, resume bool, prompt string, requestedTurns int) (map[string]any, error) {
@@ -599,7 +540,7 @@ func v2RecipePlan(
 	investigation string,
 	contexts []v2Input,
 	skills []v2Input,
-	inputs []v2Input,
+	inputs []session.Input,
 	taskPlan json.RawMessage,
 	bundle *integration.Bundle,
 ) (session.Plan, []plan.Recipe, error) {
@@ -607,7 +548,7 @@ func v2RecipePlan(
 	if err != nil {
 		return session.Plan{}, nil, err
 	}
-	recipe.Inputs = v2Inputs(inputs)
+	recipe.Inputs = append([]session.Input(nil), inputs...)
 	if strings.TrimSpace(investigation) != "" {
 		recipe.Investigation = investigation
 	}
@@ -622,9 +563,9 @@ func v2RecipePlan(
 		}
 		contract := selected.Contract()
 		if contract != nil {
-			recipe.Result.Format = contract.Result.Transport
+			recipe.Result.Format = contract.Result.Format
 			if contract.Result.Schema != nil {
-				body, err := json.Marshal(contract.Result.Schema.Document())
+				body, err := json.Marshal(contract.Result.Schema)
 				if err != nil {
 					return session.Plan{}, nil, err
 				}

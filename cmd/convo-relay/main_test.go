@@ -19,6 +19,80 @@ import (
 	"github.com/charlesnpx/convo-relay/internal/session"
 )
 
+const fakeCodexAppServerScript = `#!/usr/bin/env python3
+import json
+import os
+import sys
+from pathlib import Path
+
+root_recipe_log = os.environ.get("ROOT_RECIPE_CLI_LOG", "")
+if root_recipe_log:
+    with open(root_recipe_log, "a", encoding="utf-8") as log:
+        log.write(" ".join(sys.argv[1:]) + "\n")
+
+def send(value):
+    print(json.dumps(value), flush=True)
+
+def response(request, result):
+    send({"id": request.get("id"), "result": result})
+
+def prompt_from(params):
+    items = params.get("input", [])
+    if items and isinstance(items[0], dict):
+        return str(items[0].get("text", ""))
+    return ""
+
+def main():
+    if "--version" in sys.argv:
+        print("0.143.0")
+        return 0
+    if len(sys.argv) < 2 or sys.argv[1] != "app-server":
+        print("expected codex app-server", file=sys.stderr)
+        return 2
+    thread_id = "root-recipe-codex"
+    turn_number = 0
+    for raw in sys.stdin:
+        try:
+            request = json.loads(raw)
+        except json.JSONDecodeError:
+            continue
+        method = request.get("method", "")
+        params = request.get("params", {}) or {}
+        if method == "initialize":
+            response(request, {"serverInfo": {"name": "root-recipe-codex"}})
+        elif method in ("thread/start", "thread/resume"):
+            thread_id = params.get("threadId") or thread_id
+            response(request, {"thread": {"id": thread_id}})
+        elif method == "model/list":
+            response(request, {"data": [{"id": "root-recipe-codex", "supportedReasoningEfforts": ["low", "high"]}]})
+        elif method == "turn/start":
+            turn_number += 1
+            turn_id = f"turn-{turn_number}"
+            response(request, {"turn": {"id": turn_id}})
+            prompt = prompt_from(params)
+            if "Return the updated ledger as JSON" in prompt:
+                text = '{"settled":["root"],"contested":[],"withdrawn":[]}'
+            elif root_recipe_log and "Invalid structured result" in prompt:
+                text = "not a JSON result"
+            elif root_recipe_log and "Integration Contract Instructions for This Turn" in prompt:
+                text = '{"value":"cli"}'
+            else:
+                text = "Fake Codex root recipe"
+            send({"method": "item/completed", "params": {
+                "item": {"id": f"item-{turn_number}", "type": "agentMessage", "text": text},
+            }})
+            send({"method": "turn/completed", "params": {
+                "threadId": thread_id,
+                "turn": {"id": turn_id, "status": "completed"},
+            }})
+        elif method == "turn/interrupt":
+            response(request, {})
+    return 0
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+`
+
 func TestParseFlagsAllowsFlagsAfterPositionals(t *testing.T) {
 	flags := flag.NewFlagSet("test", flag.ContinueOnError)
 	flags.SetOutput(io.Discard)
@@ -73,6 +147,22 @@ func TestRecipeCLIValidators(t *testing.T) {
 	}
 }
 
+func TestV2WorkspaceModeAcceptsOnlySurvivingModes(t *testing.T) {
+	for _, want := range []string{"current", "head-copy"} {
+		got, err := v2WorkspaceMode(want)
+		if err != nil || got != want {
+			t.Fatalf("workspace mode %q = %q, %v", want, got, err)
+		}
+	}
+	for _, invalid := range []string{"ephemeral", " current "} {
+		if _, err := v2WorkspaceMode(invalid); err == nil ||
+			!strings.Contains(err.Error(), "current") ||
+			!strings.Contains(err.Error(), "head-copy") {
+			t.Fatalf("invalid workspace mode %q error = %v", invalid, err)
+		}
+	}
+}
+
 func TestDoctorJSONRetainsBackendReadinessByDefault(t *testing.T) {
 	dir := t.TempDir()
 	logPath := filepath.Join(dir, "backends.log")
@@ -108,7 +198,7 @@ esac`)
 		t.Fatalf("doctor backend report metadata = %#v", doctor["backends"])
 	}
 	backends, ok := report["backends"].([]any)
-	if !ok || len(backends) != 4 {
+	if !ok || len(backends) != 3 {
 		t.Fatalf("backend records = %#v", report["backends"])
 	}
 	for _, raw := range backends[:3] {
@@ -120,10 +210,6 @@ esac`)
 		if auth["attempted"] != false || auth["status"] != "not_run" {
 			t.Fatalf("default authentication probe = %#v", auth)
 		}
-	}
-	relay := backends[3].(map[string]any)
-	if relay["backend"] != "relay" || relay["status"] != "ready" || relay["executable_path"] != "built-in" {
-		t.Fatalf("relay record = %#v", relay)
 	}
 	assertBackendProbeLog(t, logPath, []string{"claude:--version", "codex:--version", "gemini:--version"})
 }
@@ -284,7 +370,7 @@ esac`)
 	output := captureStdout(t, func() {
 		runDoctor([]string{"--probe-auth"})
 	})
-	for _, expected := range []string{"Health:", "Backend readiness:", "claude  ready", "codex   auth_failed", "gemini  unsupported_probe", "relay   ready", "auth=unauthenticated", "auth=unsupported"} {
+	for _, expected := range []string{"Health:", "Backend readiness:", "claude  ready", "codex   auth_failed", "gemini  unsupported_probe", "auth=unauthenticated", "auth=unsupported"} {
 		if !strings.Contains(output, expected) {
 			t.Fatalf("human backend output missing %q:\n%s", expected, output)
 		}
@@ -430,7 +516,6 @@ func TestRecipeRunStructuralOverridesUseOnlyVisitedFlags(t *testing.T) {
 		{name: "rounds", value: "1"},
 		{name: "max-rounds", value: "1"},
 		{name: "quick"},
-		{name: "dynamic", value: "ask"},
 	}
 	for _, override := range structural {
 		t.Run(override.name, func(t *testing.T) {
@@ -509,7 +594,6 @@ result_source = "last_turn"
 max_depth = 1
 required_capabilities = []
 auto_approval = "never"
-match_keywords = []
 
 [relay_recipes.neutral-root.lifecycle]
 resume = "allow"
@@ -530,7 +614,6 @@ integration_contract = "neutral/contract-v1"
 max_depth = 1
 required_capabilities = []
 auto_approval = "never"
-match_keywords = []
 
 [relay_recipes.bound-root.lifecycle]
 resume = "allow"
@@ -584,7 +667,6 @@ result_source = "last_turn"
 max_depth = 1
 required_capabilities = []
 auto_approval = "never"
-match_keywords = []
 
 [relay_recipes.generated-helper.lifecycle]
 resume = "allow"
@@ -791,8 +873,8 @@ workspace_isolation = "inherited"
 		"--recipe-file", "root-recipes.toml",
 		"--session-dir", dirtySessionDir,
 		"--launch-cwd", launchCWD,
-		"--workspace-isolation", "ephemeral",
-		"--allow-dirty-source",
+		// U3b §2 (mode collapse): exercise the surviving head-copy operator mode.
+		"--workspace", "head-copy",
 		"--json",
 	)
 	dirtyCommand.Env = command.Env
@@ -807,14 +889,8 @@ workspace_isolation = "inherited"
 	if dirtyResult["status"] != "completed" || dirtyResult["session_id"] == nil {
 		t.Fatalf("dirty-source JSON stdout = %#v", dirtyResult)
 	}
-	if strings.Contains(dirtyStdout.String(), "warning:") {
-		t.Fatalf("dirty-source warning contaminated JSON stdout:\n%s", dirtyStdout.String())
-	}
-	if warning := dirtyStderr.String(); !strings.Contains(warning, "warning:") ||
-		!strings.Contains(warning, "staged=0") ||
-		!strings.Contains(warning, "unstaged=1") ||
-		!strings.Contains(warning, "untracked=0") {
-		t.Fatalf("dirty-source stderr warning = %q", warning)
+	if warning := dirtyStderr.String(); warning != "" {
+		t.Fatalf("head-copy run wrote unexpected stderr: %q", warning)
 	}
 
 	for _, mode := range []struct {
@@ -948,6 +1024,163 @@ workspace_isolation = "inherited"
 				t.Fatalf("rejected command created session, err = %v", statErr)
 			}
 		})
+	}
+}
+
+func TestRunRecipeCLIExecutesStaticChildParticipant(t *testing.T) {
+	tempDir := t.TempDir()
+	binary := filepath.Join(tempDir, "convo-relay")
+	build := exec.Command("go", "build", "-o", binary, ".")
+	if output, err := build.CombinedOutput(); err != nil {
+		t.Fatalf("build CLI: %v\n%s", err, output)
+	}
+
+	launchCWD := filepath.Join(tempDir, "launch")
+	if err := os.MkdirAll(launchCWD, 0o755); err != nil {
+		t.Fatalf("mkdir launch CWD: %v", err)
+	}
+	settingsPath := filepath.Join(launchCWD, "settings.toml")
+	settings := `
+[backend_profiles.parent]
+backend = "codex"
+model = "fake-parent"
+effort = "medium"
+capabilities = []
+
+[backend_profiles.facilitator]
+backend = "codex"
+model = "fake-facilitator"
+effort = "medium"
+capabilities = []
+
+[backend_profiles.static-child]
+backend = "child"
+model = "child-review"
+effort = 1
+capabilities = ["composite"]
+`
+	if err := os.WriteFile(settingsPath, []byte(settings), 0o644); err != nil {
+		t.Fatalf("write settings: %v", err)
+	}
+	recipePath := filepath.Join(launchCWD, "static-recipes.toml")
+	recipes := `
+[relay_recipes.static-parent]
+purpose = "Root recipe with a declared static child participant."
+participants = ["parent", "static-child"]
+facilitator = "facilitator"
+mode = "cooperative"
+max_rounds = 2
+participant_turns = 2
+result_source = "last_turn"
+max_depth = 1
+required_capabilities = []
+auto_approval = "never"
+
+[relay_recipes.static-parent.lifecycle]
+resume = "allow"
+steering = "allow"
+dynamic = "forbid"
+workspace_isolation = "inherited"
+
+[relay_recipes.child-review]
+purpose = "Child review used by the static participant."
+participants = ["parent", "parent"]
+facilitator = "facilitator"
+mode = "cooperative"
+max_rounds = 1
+participant_turns = 1
+result_source = "last_turn"
+max_depth = 1
+required_capabilities = []
+auto_approval = "never"
+
+[relay_recipes.child-review.lifecycle]
+resume = "allow"
+steering = "allow"
+dynamic = "forbid"
+workspace_isolation = "inherited"
+`
+	if err := os.WriteFile(recipePath, []byte(recipes), 0o644); err != nil {
+		t.Fatalf("write recipes: %v", err)
+	}
+
+	compile := exec.Command(binary,
+		"recipes", "compile", "static-parent",
+		"--settings", settingsPath,
+		"--recipe-file", recipePath,
+		"--json",
+	)
+	compiledOutput, err := compile.CombinedOutput()
+	if err != nil {
+		t.Fatalf("compile static child recipe: %v\n%s", err, compiledOutput)
+	}
+	compiled := decodeJSONObject(t, string(compiledOutput))
+	compiledPlan, _ := compiled["compiled_plan"].(map[string]any)
+	participants, _ := compiledPlan["participants"].([]any)
+	if len(participants) != 2 {
+		t.Fatalf("compiled static child participants = %#v", compiledPlan["participants"])
+	}
+	childStep, _ := participants[1].(map[string]any)
+	if childStep["kind"] != "child_step" || childStep["recipe_id"] != "child-review" || intValue(childStep["turns"]) != 1 {
+		t.Fatalf("compiled child step = %#v", childStep)
+	}
+
+	fakeBin := filepath.Join(tempDir, "bin")
+	if err := os.MkdirAll(fakeBin, 0o755); err != nil {
+		t.Fatalf("mkdir fake bin: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(fakeBin, "codex"), []byte(fakeCodexAppServerScript), 0o755); err != nil {
+		t.Fatalf("write fake codex: %v", err)
+	}
+	sessionDir := filepath.Join(tempDir, "session")
+	command := exec.Command(binary,
+		"run", "Execute the declared static child.",
+		"--recipe", "static-parent",
+		"--settings", settingsPath,
+		"--recipe-file", recipePath,
+		"--session-dir", sessionDir,
+		"--launch-cwd", launchCWD,
+		"--json",
+	)
+	command.Env = append(os.Environ(), "PATH="+fakeBin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	rawResult, err := command.CombinedOutput()
+	if err != nil {
+		t.Fatalf("run static child recipe: %v\n%s", err, rawResult)
+	}
+	result := decodeJSONObject(t, string(rawResult))
+	if result["status"] != "completed" || result["execution_kind"] != "recipe" || result["recipe_id"] != "static-parent" {
+		t.Fatalf("static child recipe result = %#v", result)
+	}
+
+	sess, err := session.Open(sessionDir)
+	if err != nil {
+		t.Fatalf("open static child parent session: %v", err)
+	}
+	events, err := relayv2.Events(sess)
+	if err != nil {
+		t.Fatalf("read static child events: %v", err)
+	}
+	var requested eventlog.ChildRequestedPayload
+	var decided eventlog.ChildDecidedPayload
+	var completed eventlog.ChildCompletedPayload
+	for _, event := range events {
+		switch payload := event.Payload.(type) {
+		case eventlog.ChildRequestedPayload:
+			requested = payload
+		case eventlog.ChildDecidedPayload:
+			decided = payload
+		case eventlog.ChildCompletedPayload:
+			completed = payload
+		}
+	}
+	if requested.RequesterActorID != "slot_1" || requested.RecipeID != "child-review" {
+		t.Fatalf("static child request = %#v", requested)
+	}
+	if !decided.Admitted || decided.Reason != "admitted by static child step" || decided.Plan == nil {
+		t.Fatalf("static child decision = %#v", decided)
+	}
+	if completed.RequestID != requested.RequestID || completed.Status != "completed" || completed.ChildSessionID == "" {
+		t.Fatalf("static child completion = %#v", completed)
 	}
 }
 

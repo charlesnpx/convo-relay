@@ -3,6 +3,8 @@ package integration
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
+	"fmt"
 	"math"
 	"path/filepath"
 	"sort"
@@ -10,6 +12,7 @@ import (
 	"strings"
 
 	"github.com/charlesnpx/convo-relay/internal/contracts"
+	jsonschema "github.com/santhosh-tekuri/jsonschema/v6"
 )
 
 func LoadBundleFile(path string, maxBytes int64) (*Bundle, error) {
@@ -37,7 +40,6 @@ func LoadBundleFile(path string, maxBytes int64) (*Bundle, error) {
 	if err != nil {
 		return nil, err
 	}
-	bundle.sourcePath = absolutePath
 	return bundle, nil
 }
 
@@ -66,9 +68,6 @@ func SelectContract(bundle *Bundle, contractID string, requirement ScheduleRequi
 		return nil, err
 	}
 	selected := &SelectedContract{id: contractID, contract: contract, bundleVersion: bundle.schemaVersion}
-	if err := validateAssertionDeclarations(selected); err != nil {
-		return nil, err
-	}
 	digest, err := integrationSemanticDigestForVersion(selected.ToMap(), selected.bundleVersion)
 	if err != nil {
 		return nil, wrapPreflightError(
@@ -368,161 +367,62 @@ func normalizeInput(object map[string]any, path string) (*InputDeclaration, erro
 			return nil, err
 		}
 	}
-	var schema *CompiledSchema
-	if rawSchema, exists := object["schema"]; exists {
-		schema, err = CompileSchema(rawSchema, appendPointer(path, "schema"))
-		if err != nil {
-			return nil, err
-		}
-	}
 	return &InputDeclaration{
 		Required:    required,
 		Cardinality: cardinality,
 		MediaType:   mediaType,
 		MaxBytes:    maxBytes,
-		Schema:      schema,
 	}, nil
 }
 
 func normalizeResult(object map[string]any, path string) (ResultDeclaration, error) {
-	if err := rejectUnknownFields(object, []string{"transport", "schema", "assertions"}, path, "result declaration", DiagnosticCodeInvalidBundle); err != nil {
+	if err := rejectUnknownFields(object, []string{"format", "schema", "transport"}, path, "result declaration", DiagnosticCodeInvalidBundle); err != nil {
 		return ResultDeclaration{}, err
 	}
-	transport, err := requireString(object, "transport", path, false, DiagnosticCodeInvalidBundle)
-	if err != nil {
-		return ResultDeclaration{}, err
+	format, exists := object["format"].(string)
+	if !exists || strings.TrimSpace(format) == "" {
+		// Existing consumer bundles used transport for the only formerly-supported
+		// format. Normalize that input spelling away rather than retaining it in
+		// the selected contract or plan.
+		format, _ = object["transport"].(string)
 	}
-	if transport != ResultTransportJSON {
+	if format != "text" && format != "json" {
 		return ResultDeclaration{}, preflightError(
 			DiagnosticCodeInvalidBundle,
-			appendPointer(path, "transport"),
-			"Version 1 result transport must be json.",
-			map[string]any{"transport": transport},
+			appendPointer(path, "format"),
+			"result.format must be text or json.",
+			map[string]any{"format": format},
 		)
 	}
-	rawSchema, exists := object["schema"]
+	schema, exists := object["schema"]
 	if !exists {
-		return ResultDeclaration{}, preflightError(DiagnosticCodeInvalidSchema, appendPointer(path, "schema"), "Result schema is required.", nil)
+		return ResultDeclaration{Format: format}, nil
 	}
-	schema, err := CompileSchema(rawSchema, appendPointer(path, "schema"))
-	if err != nil {
+	if err := validateStandardSchema(schema, appendPointer(path, "schema")); err != nil {
 		return ResultDeclaration{}, err
 	}
-	assertions := []AssertionDeclaration{}
-	if rawAssertions, exists := object["assertions"]; exists {
-		items, ok := rawAssertions.([]any)
-		if !ok {
-			return ResultDeclaration{}, preflightError(DiagnosticCodeInvalidAssertion, appendPointer(path, "assertions"), "assertions must be an array.", nil)
-		}
-		assertions = make([]AssertionDeclaration, 0, len(items))
-		for index, item := range items {
-			assertionPath := appendPointer(appendPointer(path, "assertions"), strconv.Itoa(index))
-			assertionObject, ok := item.(map[string]any)
-			if !ok {
-				return ResultDeclaration{}, preflightError(DiagnosticCodeInvalidAssertion, assertionPath, "Assertion declaration must be an object.", nil)
-			}
-			assertion, err := normalizeAssertion(assertionObject, assertionPath)
-			if err != nil {
-				return ResultDeclaration{}, err
-			}
-			assertions = append(assertions, assertion)
-		}
-	}
-	return ResultDeclaration{Transport: ResultTransportJSON, Schema: schema, Assertions: assertions}, nil
+	return ResultDeclaration{Format: format, Schema: contracts.Materialize(schema)}, nil
 }
 
-func normalizeAssertion(object map[string]any, path string) (AssertionDeclaration, error) {
-	assertionType, err := requireString(object, "type", path, false, DiagnosticCodeInvalidAssertion)
-	if err != nil {
-		return AssertionDeclaration{}, err
-	}
-	switch assertionType {
-	case "unique":
-		if err := rejectUnknownFields(object, []string{"type", "source", "pointer"}, path, "unique assertion", DiagnosticCodeInvalidAssertion); err != nil {
-			return AssertionDeclaration{}, err
-		}
-		source, err := requireString(object, "source", path, false, DiagnosticCodeInvalidAssertion)
-		if err != nil {
-			return AssertionDeclaration{}, err
-		}
-		pointer, err := requireString(object, "pointer", path, true, DiagnosticCodeInvalidAssertion)
-		if err != nil {
-			return AssertionDeclaration{}, err
-		}
-		return AssertionDeclaration{Type: assertionType, Source: source, Pointer: pointer}, nil
-	case "set_equal", "value_equal":
-		if err := rejectUnknownFields(object, []string{"type", "left", "right"}, path, assertionType+" assertion", DiagnosticCodeInvalidAssertion); err != nil {
-			return AssertionDeclaration{}, err
-		}
-		left, err := normalizeAssertionOperand(object["left"], appendPointer(path, "left"), false)
-		if err != nil {
-			return AssertionDeclaration{}, err
-		}
-		right, err := normalizeAssertionOperand(object["right"], appendPointer(path, "right"), false)
-		if err != nil {
-			return AssertionDeclaration{}, err
-		}
-		return AssertionDeclaration{Type: assertionType, Left: left, Right: right}, nil
-	case "field_equal_by_key":
-		if err := rejectUnknownFields(object, []string{"type", "left", "right"}, path, "field_equal_by_key assertion", DiagnosticCodeInvalidAssertion); err != nil {
-			return AssertionDeclaration{}, err
-		}
-		left, err := normalizeAssertionOperand(object["left"], appendPointer(path, "left"), true)
-		if err != nil {
-			return AssertionDeclaration{}, err
-		}
-		right, err := normalizeAssertionOperand(object["right"], appendPointer(path, "right"), true)
-		if err != nil {
-			return AssertionDeclaration{}, err
-		}
-		return AssertionDeclaration{Type: assertionType, Left: left, Right: right}, nil
-	default:
-		return AssertionDeclaration{}, preflightError(
-			DiagnosticCodeInvalidAssertion,
-			appendPointer(path, "type"),
-			"Unsupported assertion type.",
-			map[string]any{"type": assertionType},
-		)
-	}
+const resultSchemaURL = "https://convo-relay.invalid/integration-result-schema.json"
+
+type resultSchemaLoader struct{}
+
+func (resultSchemaLoader) Load(url string) (any, error) {
+	return nil, fmt.Errorf("external result schema loading is disabled: %s", url)
 }
 
-func normalizeAssertionOperand(value any, path string, fields bool) (*AssertionOperand, error) {
-	object, ok := value.(map[string]any)
-	if !ok {
-		return nil, preflightError(DiagnosticCodeInvalidAssertion, path, "Assertion operand must be an object.", nil)
+func validateStandardSchema(schema any, path string) error {
+	compiler := jsonschema.NewCompiler()
+	compiler.DefaultDraft(jsonschema.Draft2020)
+	compiler.UseLoader(resultSchemaLoader{})
+	if err := compiler.AddResource(resultSchemaURL, contracts.Materialize(schema)); err != nil {
+		return wrapPreflightError(err, DiagnosticCodeInvalidSchema, path, "Result schema could not be registered.", map[string]any{"error": err.Error()})
 	}
-	allowed := []string{"source", "pointer"}
-	if fields {
-		allowed = []string{"source", "items_pointer", "key_pointer", "value_pointer"}
+	if _, err := compiler.Compile(resultSchemaURL); err != nil {
+		return wrapPreflightError(err, DiagnosticCodeInvalidSchema, path, "Result schema is invalid.", map[string]any{"error": err.Error()})
 	}
-	if err := rejectUnknownFields(object, allowed, path, "assertion operand", DiagnosticCodeInvalidAssertion); err != nil {
-		return nil, err
-	}
-	source, err := requireString(object, "source", path, false, DiagnosticCodeInvalidAssertion)
-	if err != nil {
-		return nil, err
-	}
-	operand := &AssertionOperand{Source: source}
-	if !fields {
-		operand.Pointer, err = requireString(object, "pointer", path, true, DiagnosticCodeInvalidAssertion)
-		if err != nil {
-			return nil, err
-		}
-		return operand, nil
-	}
-	operand.ItemsPointer, err = requireString(object, "items_pointer", path, true, DiagnosticCodeInvalidAssertion)
-	if err != nil {
-		return nil, err
-	}
-	operand.KeyPointer, err = requireString(object, "key_pointer", path, true, DiagnosticCodeInvalidAssertion)
-	if err != nil {
-		return nil, err
-	}
-	operand.ValuePointer, err = requireString(object, "value_pointer", path, true, DiagnosticCodeInvalidAssertion)
-	if err != nil {
-		return nil, err
-	}
-	return operand, nil
+	return nil
 }
 
 func validateContractSchedule(contractID string, contract *Contract, requirement ScheduleRequirement) error {
@@ -595,6 +495,42 @@ func requirePositiveInteger(object map[string]any, key string, path string) (int
 		return 0, preflightError(DiagnosticCodeInvalidBundle, appendPointer(path, key), key+" must be a positive integer.", nil)
 	}
 	return parsed, nil
+}
+
+func nonNegativeJSONInteger(value any) (int64, bool) {
+	switch typed := value.(type) {
+	case json.Number:
+		parsed, err := strconv.ParseInt(typed.String(), 10, 64)
+		return parsed, err == nil && parsed >= 0
+	case int:
+		return int64(typed), typed >= 0
+	case int8:
+		return int64(typed), typed >= 0
+	case int16:
+		return int64(typed), typed >= 0
+	case int32:
+		return int64(typed), typed >= 0
+	case int64:
+		return typed, typed >= 0
+	case uint:
+		if uint64(typed) > math.MaxInt64 {
+			return 0, false
+		}
+		return int64(typed), true
+	case uint8:
+		return int64(typed), true
+	case uint16:
+		return int64(typed), true
+	case uint32:
+		return int64(typed), true
+	case uint64:
+		if typed > math.MaxInt64 {
+			return 0, false
+		}
+		return int64(typed), true
+	default:
+		return 0, false
+	}
 }
 
 func sortedKeys(object map[string]any) []string {

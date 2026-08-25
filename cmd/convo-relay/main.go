@@ -654,7 +654,7 @@ func runRelay(args []string) {
 	task := flags.String("task", "", "Task text for the relay")
 	recipeID := flags.String("recipe", "", "Run a configured recipe as the direct root execution")
 	integrationBundlePath := flags.String("integration-bundle", "", "Integration bundle JSON for an integration-bound root recipe")
-	workspaceIsolation := flags.String("workspace-isolation", "inherited", "Root recipe workspace isolation: inherited, read_only, or ephemeral")
+	workspaceMode := flags.String("workspace", "current", "Root recipe workspace mode: current or head-copy")
 	allowDirtySource := flags.Bool("allow-dirty-source", false, "Use committed HEAD for isolated root execution when the source is dirty")
 	var inputBindings repeatableFlagValue
 	flags.Var(&inputBindings, "input", "Bind a named root recipe input as name=path; may be repeated")
@@ -696,11 +696,15 @@ func runRelay(args []string) {
 	if err := parseFlags(flags, cleanedArgs); err != nil {
 		os.Exit(2)
 	}
+	if _, err := v2WorkspaceMode(*workspaceMode); err != nil {
+		fmt.Fprintf(os.Stderr, "error: %s\n", err)
+		os.Exit(2)
+	}
 	if *task == "" && len(flags.Args()) > 0 {
 		*task = strings.Join(flags.Args(), " ")
 	}
 	visited := visitedFlagNames(flags)
-	recipeRequested := strings.TrimSpace(*recipeID) != "" || visited["recipe"] || visited["integration-bundle"] || visited["workspace-isolation"] || visited["allow-dirty-source"] || visited["input"]
+	recipeRequested := strings.TrimSpace(*recipeID) != "" || visited["recipe"] || visited["integration-bundle"] || visited["workspace"] || visited["allow-dirty-source"] || visited["input"]
 	if recipeRequested {
 		if strings.TrimSpace(*recipeID) == "" {
 			fmt.Fprintln(os.Stderr, "error: --recipe is required when root recipe run options are used")
@@ -738,8 +742,7 @@ func runRelay(args []string) {
 			TransientSources:      transientRecipeSources,
 			IntegrationBundlePath: anchorRecipeCLIPath(sourceAnchor, *integrationBundlePath),
 			InputBindings:         append([]string{}, inputBindings...),
-			WorkspaceIsolation:    *workspaceIsolation,
-			WorkspaceExplicit:     visited["workspace-isolation"],
+			WorkspaceMode:         *workspaceMode,
 			AllowDirtySource:      *allowDirtySource,
 			SettingsPath:          anchorRecipeCLIPath(sourceAnchor, *settingsPath),
 			LaunchCWD:             sourceAnchor,
@@ -1494,7 +1497,7 @@ func writeJSON(value any) {
 func usage() {
 	fmt.Fprintln(os.Stderr, "usage:")
 	fmt.Fprintln(os.Stderr, "  convo-relay run --task <task> --agents codex,codex --rounds 2 --json")
-	fmt.Fprintln(os.Stderr, "  convo-relay run --task <task> --recipe <id> [--integration-bundle <path>] [--input name=path] [--workspace-isolation inherited|read_only|ephemeral] --json")
+	fmt.Fprintln(os.Stderr, "  convo-relay run --task <task> --recipe <id> [--integration-bundle <path>] [--input name=path] [--workspace current|head-copy] --json")
 	fmt.Fprintln(os.Stderr, "  convo-relay resume <session-id-prefix> --mode steelman --rounds 1 --json")
 	fmt.Fprintln(os.Stderr, "  convo-relay list --home <relay-home> --json")
 	fmt.Fprintln(os.Stderr, "  convo-relay show <session-id-prefix> --json")

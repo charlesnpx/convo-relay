@@ -82,12 +82,11 @@ type Plan struct {
 	Inputs        []Input       `json:"inputs"`
 	// Context and Skills are the durable, blob-addressed forms of --context and
 	// --skill. Their source paths deliberately do not enter the portable plan.
-	Context       []Input         `json:"context"`
-	Skills        []Input         `json:"skills"`
-	TaskPlan      json.RawMessage `json:"task_plan,omitempty"`
-	MatchKeywords []string        `json:"match_keywords"`
-	ChildPolicy   ChildPolicy     `json:"child_policy"`
-	Result        Result          `json:"result"`
+	Context     []Input         `json:"context"`
+	Skills      []Input         `json:"skills"`
+	TaskPlan    json.RawMessage `json:"task_plan,omitempty"`
+	ChildPolicy ChildPolicy     `json:"child_policy"`
+	Result      Result          `json:"result"`
 	// Lifecycle carries recipe controls that do not select a second execution
 	// path. Dynamic and workspace controls are also projected onto ChildPolicy
 	// and Workspace by the compiler.
@@ -100,11 +99,13 @@ type Plan struct {
 }
 
 type Actor struct {
-	ID        string `json:"id"`
-	Backend   string `json:"backend"`
-	Model     string `json:"model"`
-	Effort    string `json:"effort"`
-	ProfileID string `json:"profile_id,omitempty"`
+	ID            string `json:"id"`
+	Backend       string `json:"backend"`
+	Model         string `json:"model"`
+	Effort        string `json:"effort"`
+	ProfileID     string `json:"profile_id,omitempty"`
+	ChildRecipeID string `json:"child_recipe_id,omitempty"`
+	ChildTurns    int    `json:"child_turns,omitempty"`
 }
 
 type Schedule struct {
@@ -141,8 +142,7 @@ type ProviderRetry struct {
 }
 
 type Workspace struct {
-	Mode      string `json:"mode"`
-	Isolation string `json:"isolation,omitempty"`
+	Mode string `json:"mode"`
 }
 
 type Input struct {
@@ -185,10 +185,9 @@ type IntegrationTurn struct {
 // enforcement remains with the execution unit; the plan records the policy
 // that it must enforce.
 type Lifecycle struct {
-	Resume             string `json:"resume"`
-	Steering           string `json:"steering"`
-	Dynamic            string `json:"dynamic"`
-	WorkspaceIsolation string `json:"workspace_isolation"`
+	Resume   string `json:"resume"`
+	Steering string `json:"steering"`
+	Dynamic  string `json:"dynamic"`
 }
 
 // Session is a decoded immutable plan plus its machine-local directory. Root
@@ -428,6 +427,7 @@ func ValidatePlan(plan Plan) error {
 		return errors.New("plan must contain at least one actor")
 	}
 	actorIDs := make(map[string]bool, len(plan.Actors))
+	childActors := make(map[string]bool, len(plan.Actors))
 	for _, actor := range plan.Actors {
 		if err := validateToken("actor.id", actor.ID); err != nil {
 			return err
@@ -438,6 +438,17 @@ func ValidatePlan(plan Plan) error {
 		actorIDs[actor.ID] = false
 		switch actor.Backend {
 		case "claude", "codex", "gemini":
+			if actor.ChildRecipeID != "" || actor.ChildTurns != 0 {
+				return fmt.Errorf("provider actor %q must not declare a child step", actor.ID)
+			}
+		case "child":
+			if err := validateToken("actor.child_recipe_id", actor.ChildRecipeID); err != nil {
+				return err
+			}
+			if actor.ChildTurns < 0 {
+				return errors.New("actor.child_turns must not be negative")
+			}
+			childActors[actor.ID] = true
 		default:
 			return fmt.Errorf("actor backend %q is not supported", actor.Backend)
 		}
@@ -458,6 +469,9 @@ func ValidatePlan(plan Plan) error {
 		if _, exists := actorIDs[plan.Facilitator.Actor]; !exists {
 			return errors.New("facilitator actor is not in actors")
 		}
+		if childActors[plan.Facilitator.Actor] {
+			return errors.New("facilitator actor must not be a child step")
+		}
 		if plan.Facilitator.Cadence < 1 {
 			return errors.New("facilitator cadence must be positive")
 		}
@@ -465,6 +479,9 @@ func ValidatePlan(plan Plan) error {
 	if plan.Reducer != nil {
 		if _, exists := actorIDs[plan.Reducer.Actor]; !exists {
 			return errors.New("reducer actor is not in actors")
+		}
+		if childActors[plan.Reducer.Actor] {
+			return errors.New("reducer actor must not be a child step")
 		}
 	}
 	controlActorCount := 0
@@ -518,9 +535,6 @@ func ValidatePlan(plan Plan) error {
 	if plan.Workspace.Mode != "current" && plan.Workspace.Mode != "head-copy" {
 		return errors.New("workspace mode must be current or head-copy")
 	}
-	if plan.Workspace.Isolation != "" && plan.Workspace.Isolation != "inherited" && plan.Workspace.Isolation != "read_only" && plan.Workspace.Isolation != "ephemeral" {
-		return errors.New("workspace isolation must be inherited, read_only, or ephemeral")
-	}
 	for _, group := range []struct {
 		label  string
 		inputs []Input
@@ -532,9 +546,6 @@ func ValidatePlan(plan Plan) error {
 		if err := validateInputs(group.label, group.inputs); err != nil {
 			return err
 		}
-	}
-	if err := validateUniqueTokens("match_keywords", plan.MatchKeywords); err != nil {
-		return err
 	}
 	if len(plan.TaskPlan) > 0 {
 		if _, err := eventlog.SemanticJSONBytesRaw(plan.TaskPlan); err != nil {
@@ -560,8 +571,8 @@ func ValidatePlan(plan Plan) error {
 	if plan.Result.Source == "reducer" && plan.Reducer == nil {
 		return errors.New("reducer result source requires a reducer")
 	}
-	if err := validateToken("result.format", plan.Result.Format); err != nil {
-		return err
+	if plan.Result.Format != "text" && plan.Result.Format != "json" {
+		return errors.New("result format must be text or json")
 	}
 	if len(plan.Result.Schema) > 0 {
 		if _, err := eventlog.SemanticJSONBytesRaw(plan.Result.Schema); err != nil {
@@ -576,20 +587,6 @@ func ValidatePlan(plan Plan) error {
 	}
 	if plan.Lifecycle != nil && plan.Lifecycle.Resume == "forbid" && plan.ChildPolicy.Mode == "ask" {
 		return errors.New("lifecycle.resume forbid is incompatible with child_policy.mode ask")
-	}
-	// A recipe's declared workspace isolation is a minimum. The executable
-	// workspace may strengthen it but never weaken it, per the documented
-	// operator contract. Validated here because the plan is the only place both
-	// values are visible: the compiler emits consistent pairs, but Create and
-	// Open would otherwise persist a contradiction the engine cannot execute
-	// unambiguously - it would have to choose between the recorded minimum and
-	// the weaker executable value.
-	if plan.Lifecycle != nil {
-		minimum, minimumKnown := workspaceIsolationRank(plan.Lifecycle.WorkspaceIsolation)
-		effective, effectiveKnown := workspaceIsolationRank(plan.Workspace.Isolation)
-		if minimumKnown && effectiveKnown && effective < minimum {
-			return fmt.Errorf("workspace isolation %q weakens the recipe minimum %q", plan.Workspace.Isolation, plan.Lifecycle.WorkspaceIsolation)
-		}
 	}
 	if plan.IntegrationContract != "" {
 		if err := validateToken("integration_contract", plan.IntegrationContract); err != nil {
@@ -721,12 +718,7 @@ func validateLifecycle(value *Lifecycle) error {
 			return fmt.Errorf("%s must be allow or forbid", field.label)
 		}
 	}
-	switch value.WorkspaceIsolation {
-	case "inherited", "read_only", "ephemeral":
-		return nil
-	default:
-		return errors.New("lifecycle.workspace_isolation must be inherited, read_only, or ephemeral")
-	}
+	return nil
 }
 
 func validateLogicalName(value string) error {
@@ -788,20 +780,4 @@ func (plan Plan) Equal(other Plan) bool {
 func portableProjection(plan Plan) Plan {
 	plan.Task = ""
 	return plan
-}
-
-// workspaceIsolationRank orders the isolation policies weakest to strongest,
-// matching internal/workspace.policyRank, which is the authority. An empty or
-// unrecognised value reports unknown so the enum checks own that rejection.
-func workspaceIsolationRank(value string) (int, bool) {
-	switch value {
-	case "inherited":
-		return 0, true
-	case "read_only":
-		return 1, true
-	case "ephemeral":
-		return 2, true
-	default:
-		return 0, false
-	}
 }

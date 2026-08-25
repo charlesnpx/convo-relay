@@ -34,7 +34,6 @@ func normalizeRecipePayload(data map[string]any) map[string]any {
 func normalizeLegacyRecipePayload(data map[string]any) map[string]any {
 	participants := cleanStringList(data["participants"], false)
 	requiredCapabilities := cleanStringList(data["required_capabilities"], false)
-	matchKeywords := cleanStringList(data["match_keywords"], true)
 	payload := map[string]any{
 		"kind":                  "recipe",
 		"schema_version":        1,
@@ -48,7 +47,6 @@ func normalizeLegacyRecipePayload(data map[string]any) map[string]any {
 		"max_depth":             positiveInt(data["max_depth"], 1),
 		"required_capabilities": requiredCapabilities,
 		"auto_approval":         normalizeAutoApproval(data["auto_approval"]),
-		"match_keywords":        matchKeywords,
 	}
 	if strings.TrimSpace(stringValue(data["origin"])) == "generated" {
 		payload["origin"] = "generated"
@@ -158,8 +156,8 @@ func normalizeCompiledPlanPayload(data map[string]any) (map[string]any, error) {
 			"default_rounds": positiveInt(roundBounds["default_rounds"], 1),
 		},
 		"depth_policy": map[string]any{
-			"max_graph_depth":         positiveInt(depthPolicy["max_graph_depth"], 1),
-			"max_relay_backend_depth": positiveInt(depthPolicy["max_relay_backend_depth"], 1),
+			"max_graph_depth": positiveInt(depthPolicy["max_graph_depth"], 1),
+			"max_child_depth": positiveInt(depthPolicy["max_child_depth"], 1),
 		},
 	}, nil
 }

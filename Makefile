@@ -8,7 +8,7 @@ LDFLAGS ?= -X main.cliVersion=$(VERSION)
 
 CROSS_TARGETS ?= darwin/arm64 windows/amd64
 
-.PHONY: build install install-assets fmt-check test test-race cross-compile cross-compile-tests smoke-fake-providers release-gate package clean
+.PHONY: build install install-assets fmt-check test test-race cross-compile cross-compile-tests release-gate package clean
 
 build:
 	mkdir -p "$(dir $(BINARY))"
@@ -32,7 +32,7 @@ test: fmt-check
 	go test ./... -count=1
 
 test-race:
-	go test -race ./internal/store ./cmd/convo-relay -count=1
+	go test -race ./internal/engine ./internal/sessionstore ./cmd/convo-relay -count=1
 
 cross-compile:
 	@set -eu; \
@@ -60,10 +60,7 @@ cross-compile-tests:
 		done; \
 	done
 
-smoke-fake-providers:
-	CONVO_RELAY_RUN_SMOKE_MATRIX=1 go test ./cmd/convo-relay -run TestGoOnlySmokeMatrix -count=1 -v
-
-release-gate: cross-compile cross-compile-tests smoke-fake-providers
+release-gate: cross-compile cross-compile-tests
 
 package: build
 	rm -rf "$(DIST_DIR)"

@@ -7,7 +7,6 @@ import (
 )
 
 const (
-	BundleSchemaVersion   = contracts.IntegrationBundleV1
 	BundleSchemaVersionV1 = contracts.IntegrationBundleV1
 	BundleSchemaVersionV2 = contracts.IntegrationBundleV2
 	DefaultMediaType      = "application/octet-stream"
@@ -15,7 +14,6 @@ const (
 	CardinalityOne  = "one"
 	CardinalityMany = "many"
 
-	ResultTransportJSON  = "json"
 	ResultSourceLastTurn = "last_turn"
 	ResultSourceReducer  = "reducer"
 
@@ -26,26 +24,19 @@ const (
 )
 
 const (
-	DiagnosticCodeBundleReadFailed       = "integration_bundle_read_failed"
-	DiagnosticCodeInvalidBundle          = "invalid_integration_bundle"
-	DiagnosticCodeContractNotFound       = "integration_contract_not_found"
-	DiagnosticCodeScheduleMismatch       = "integration_schedule_mismatch"
-	DiagnosticCodeInvalidSchema          = "invalid_integration_schema"
-	DiagnosticCodeUnsupportedSchema      = "unsupported_schema_keyword"
-	DiagnosticCodeInvalidSchemaReference = "invalid_schema_reference"
-	DiagnosticCodeSchemaMismatch         = "schema_mismatch"
-	DiagnosticCodeInvalidAssertion       = "invalid_assertion_declaration"
-	DiagnosticCodeAssertionFailed        = "assertion_failed"
+	DiagnosticCodeBundleReadFailed = "integration_bundle_read_failed"
+	DiagnosticCodeInvalidBundle    = "invalid_integration_bundle"
+	DiagnosticCodeContractNotFound = "integration_contract_not_found"
+	DiagnosticCodeScheduleMismatch = "integration_schedule_mismatch"
+	DiagnosticCodeInvalidSchema    = "invalid_integration_schema"
 )
 
 // Bundle is the normalized, immutable representation of one consumer-owned
-// integration bundle. SourcePath is informational and is deliberately absent
-// from ToMap and Digest.
+// integration bundle.
 type Bundle struct {
 	schemaVersion string
 	id            string
 	contracts     map[string]*Contract
-	sourcePath    string
 	digest        string
 }
 
@@ -78,29 +69,11 @@ type InputDeclaration struct {
 	Cardinality string
 	MediaType   string
 	MaxBytes    int64
-	Schema      *CompiledSchema
 }
 
 type ResultDeclaration struct {
-	Transport  string
-	Schema     *CompiledSchema
-	Assertions []AssertionDeclaration
-}
-
-type AssertionDeclaration struct {
-	Type    string
-	Source  string
-	Pointer string
-	Left    *AssertionOperand
-	Right   *AssertionOperand
-}
-
-type AssertionOperand struct {
-	Source       string
-	Pointer      string
-	ItemsPointer string
-	KeyPointer   string
-	ValuePointer string
+	Format string
+	Schema any
 }
 
 // ScheduledTurn is the compiler-owned schedule entry against which a selected
@@ -148,13 +121,6 @@ func (b *Bundle) ID() string {
 	return b.id
 }
 
-func (b *Bundle) SourcePath() string {
-	if b == nil {
-		return ""
-	}
-	return b.sourcePath
-}
-
 func (b *Bundle) Digest() string {
 	if b == nil {
 		return ""
@@ -185,17 +151,6 @@ func (b *Bundle) Contract(id string) (*Contract, bool) {
 	return cloneContract(contract), true
 }
 
-func (b *Bundle) Contracts() map[string]*Contract {
-	if b == nil {
-		return nil
-	}
-	result := make(map[string]*Contract, len(b.contracts))
-	for id, contract := range b.contracts {
-		result[id] = cloneContract(contract)
-	}
-	return result
-}
-
 func (c *Contract) ToMap() map[string]any {
 	return c.toMap(BundleSchemaVersionV1)
 }
@@ -213,10 +168,9 @@ func (c *Contract) toMap(bundleVersion string) map[string]any {
 	for name, input := range c.Inputs {
 		inputs[name] = input.ToMap()
 	}
-	result := map[string]any{
-		"transport":  c.Result.Transport,
-		"schema":     c.Result.Schema.Document(),
-		"assertions": assertionMaps(c.Result.Assertions),
+	result := map[string]any{"format": c.Result.Format}
+	if c.Result.Schema != nil {
+		result["schema"] = contracts.Materialize(c.Result.Schema)
 	}
 	payload := map[string]any{
 		"turns":  turns,
@@ -253,9 +207,6 @@ func (d *InputDeclaration) ToMap() map[string]any {
 		"cardinality": d.Cardinality,
 		"media_type":  d.MediaType,
 		"max_bytes":   d.MaxBytes,
-	}
-	if d.Schema != nil {
-		payload["schema"] = d.Schema.Document()
 	}
 	return payload
 }
@@ -317,42 +268,6 @@ func (s *SelectedContract) ArtifactPayload() (map[string]any, error) {
 	return contracts.NormalizeRootArtifact(contracts.RootArtifactKindIntegrationContract, fields)
 }
 
-func assertionMaps(assertions []AssertionDeclaration) []any {
-	result := make([]any, 0, len(assertions))
-	for _, assertion := range assertions {
-		result = append(result, assertion.ToMap())
-	}
-	return result
-}
-
-func (a AssertionDeclaration) ToMap() map[string]any {
-	payload := map[string]any{"type": a.Type}
-	switch a.Type {
-	case "unique":
-		payload["source"] = a.Source
-		payload["pointer"] = a.Pointer
-	case "set_equal", "value_equal", "field_equal_by_key":
-		payload["left"] = a.Left.ToMap(a.Type == "field_equal_by_key")
-		payload["right"] = a.Right.ToMap(a.Type == "field_equal_by_key")
-	}
-	return payload
-}
-
-func (o *AssertionOperand) ToMap(fields bool) map[string]any {
-	if fields {
-		return map[string]any{
-			"source":        o.Source,
-			"items_pointer": o.ItemsPointer,
-			"key_pointer":   o.KeyPointer,
-			"value_pointer": o.ValuePointer,
-		}
-	}
-	return map[string]any{
-		"source":  o.Source,
-		"pointer": o.Pointer,
-	}
-}
-
 func AlternatingSchedule(participantTurns int) ([]ScheduledTurn, error) {
 	if participantTurns < 1 {
 		return nil, fmt.Errorf("participant turns must be positive")
@@ -382,6 +297,7 @@ func cloneContract(contract *Contract) *Contract {
 		Result:        contract.Result,
 		PromptContext: contract.PromptContext,
 	}
+	cloned.Result.Schema = contracts.Materialize(contract.Result.Schema)
 	if contract.Reducer != nil {
 		reducer := *contract.Reducer
 		cloned.Reducer = &reducer
@@ -393,18 +309,6 @@ func cloneContract(contract *Contract) *Contract {
 		}
 		declaration := *input
 		cloned.Inputs[name] = &declaration
-	}
-	cloned.Result.Assertions = make([]AssertionDeclaration, len(contract.Result.Assertions))
-	for index, assertion := range contract.Result.Assertions {
-		cloned.Result.Assertions[index] = assertion
-		if assertion.Left != nil {
-			left := *assertion.Left
-			cloned.Result.Assertions[index].Left = &left
-		}
-		if assertion.Right != nil {
-			right := *assertion.Right
-			cloned.Result.Assertions[index].Right = &right
-		}
 	}
 	return cloned
 }

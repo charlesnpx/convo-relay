@@ -116,7 +116,7 @@ func TestNestedAskWaitsForGrandchildDecision(t *testing.T) {
 	grandchildRecipe.Actors = []session.Actor{{ID: "grandchild-alpha", Backend: "codex"}}
 	grandchildRecipe.Schedule.Order = []string{"grandchild-alpha"}
 	deps.Recipes = []plan.Recipe{nestedChildRecipe, grandchildRecipe}
-	deps.ChildRequestExtractor = func(actor session.Actor, role eventlog.Role, _ provider.TurnResult) []ChildRequest {
+	deps.ChildRequestExtractor = func(_ session.Plan, actor session.Actor, role eventlog.Role, _ provider.TurnResult) []ChildRequest {
 		if role != eventlog.ParticipantRole {
 			return nil
 		}
@@ -305,7 +305,7 @@ func childRequest(identifier, question string) ChildRequest {
 }
 
 func childRequests(requests ...ChildRequest) ChildRequestExtractor {
-	return func(actor session.Actor, role eventlog.Role, _ provider.TurnResult) []ChildRequest {
+	return func(_ session.Plan, actor session.Actor, role eventlog.Role, _ provider.TurnResult) []ChildRequest {
 		if actor.ID != "alpha" || role != eventlog.ParticipantRole {
 			return nil
 		}

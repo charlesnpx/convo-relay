@@ -94,33 +94,6 @@ func LoadRuntimeConfigWithTransientSources(settingsPath string, sources []Transi
 	}, transientFiles, nil
 }
 
-func ApplyTransientRecipeSources(base RuntimeConfig, sources []TransientRecipeSource) (RuntimeConfig, []TransientRecipeSource, error) {
-	if err := ValidateRuntimeLimits(base.EffectiveLimits()); err != nil {
-		return RuntimeConfig{}, nil, err
-	}
-	rawProfiles := runtimeMapAsRaw(base.BackendProfiles)
-	rawRecipes := runtimeMapAsRaw(base.RelayRecipes)
-	transientFiles, err := loadTransientRecipeSources(sources, rawProfiles, rawRecipes)
-	if err != nil {
-		return RuntimeConfig{}, nil, err
-	}
-	if err := ValidateRawRelayRecipes(rawRecipes); err != nil {
-		return RuntimeConfig{}, nil, err
-	}
-	normalizedProfiles := NormalizeBackendProfiles(rawProfiles)
-	normalizedRecipes := NormalizeRelayRecipes(rawRecipes)
-	populateTransientRecipeDigests(transientFiles, normalizedRecipes)
-	if err := validateTransientRecipes(transientFiles, normalizedProfiles, normalizedRecipes); err != nil {
-		return RuntimeConfig{}, nil, err
-	}
-	return RuntimeConfig{
-		BackendProfiles: normalizedProfiles,
-		RelayRecipes:    normalizedRecipes,
-		Limits:          base.EffectiveLimits(),
-		SettingsPath:    strings.TrimSpace(base.SettingsPath),
-	}, transientFiles, nil
-}
-
 func ReadTransientRecipeSources(recipeFiles []string, generatedRecipeFiles []string, stdin io.Reader) ([]TransientRecipeSource, error) {
 	sourceSpecs := make([]TransientRecipeSource, 0, len(recipeFiles)+len(generatedRecipeFiles))
 	for _, path := range recipeFiles {
@@ -264,7 +237,6 @@ func normalizeRelayRecipesWithDefaults(rawRecipes map[string]any, defaults map[s
 			"max_depth":             positiveInt(recipe["max_depth"], 1),
 			"required_capabilities": cleanStringList(recipe["required_capabilities"], false),
 			"auto_approval":         normalizeAutoApproval(recipe["auto_approval"]),
-			"match_keywords":        cleanStringList(recipe["match_keywords"], true),
 			"lifecycle":             recipe["lifecycle"],
 			"origin":                recipe["origin"],
 			"generated_from_ref":    recipe["generated_from_ref"],
@@ -536,14 +508,6 @@ func populateTransientRecipeDigests(files []TransientRecipeSource, normalizedRec
 		files[index].RecipeDigests = recipeDigestsForIDs(files[index].RecipeIDs, effectiveRecipes)
 		files[index].effectiveRawRecipes = nil
 	}
-}
-
-func runtimeMapAsRaw(values map[string]map[string]any) map[string]any {
-	result := make(map[string]any, len(values))
-	for key, value := range values {
-		result[key] = cloneObject(value)
-	}
-	return result
 }
 
 func validateTransientRecipes(files []TransientRecipeFile, profiles map[string]map[string]any, relayRecipes map[string]map[string]any) error {

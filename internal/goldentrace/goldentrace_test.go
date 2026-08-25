@@ -849,6 +849,9 @@ func TestBoundedChildRelayWithAdmission(t *testing.T) {
 	)
 	requireExit(t, parent, 0)
 	proposalID := graphProposalID(t, env, "child-parent")
+	if selected := jsonString(t, requiredJSONField(t, graphProposal(t, env, "child-parent", proposalID), "selected_recipe_id", "graph proposal"), "graph proposal.selected_recipe_id"); selected != "review-panel" {
+		t.Fatalf("contested ledger selected recipe %q, want review-panel convention", selected)
+	}
 	beforeApproval := listSessions(t, env)
 	approval := env.run(t,
 		"control", "approve", "--home", env.relayHome, "--proposal", proposalID, "child-parent",
@@ -934,7 +937,8 @@ func TestCommittedHeadExecution(t *testing.T) {
 		"--session-id", "committed-head",
 		"--task", "TRACE_COMMITTED_HEAD_TASK", "--recipe", "trace-isolated",
 		"--settings", fixturePath(t, env, "root-recipes.toml"), "--launch-cwd", source,
-		"--workspace-isolation", "ephemeral", "--allow-dirty-source",
+		// U3b §2 (mode collapse): exercise the surviving head-copy operator mode.
+		"--workspace", "head-copy",
 	)
 	requireExit(t, run, 0)
 	if resultStatus(t, report) != "completed" {

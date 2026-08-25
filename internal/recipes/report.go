@@ -68,14 +68,6 @@ type RecipeIssueGroup struct {
 	Recipes []string           `json:"recipes,omitempty"`
 }
 
-func BuildRecipeCatalogReport(settingsPath string) (RecipeCatalogReport, error) {
-	return BuildRecipeCatalogReportWithOptions(settingsPath, RecipeCatalogOptions{})
-}
-
-func BuildRecipeCatalogReportWithTransientSources(settingsPath string, sources []TransientRecipeSource) (RecipeCatalogReport, error) {
-	return BuildRecipeCatalogReportWithOptions(settingsPath, RecipeCatalogOptions{TransientSources: sources})
-}
-
 // LoadIntegrationBundle applies the settings-scoped bundle byte limit without
 // requiring every catalog recipe to be executable first.
 func LoadIntegrationBundle(settingsPath string, bundlePath string) (*integration.Bundle, error) {

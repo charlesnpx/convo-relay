@@ -37,7 +37,6 @@ var allowedRecipeFields = map[string]bool{
 	"max_depth":             true,
 	"required_capabilities": true,
 	"auto_approval":         true,
-	"match_keywords":        true,
 	"lifecycle":             true,
 	// Generated-source metadata is retained by normalization and is valid in
 	// runtime snapshots that are reapplied with transient sources.
@@ -138,7 +137,7 @@ func validateRecipeRecord(recipe map[string]any, path string) []contracts.Diagno
 			))
 		}
 	}
-	for _, field := range []string{"required_capabilities", "match_keywords"} {
+	for _, field := range []string{"required_capabilities"} {
 		if value, exists := recipe[field]; exists {
 			if _, ok := strictStringList(value); !ok {
 				diagnostics = append(diagnostics, invalidRecipeField(path, field, "must be a list of strings"))
