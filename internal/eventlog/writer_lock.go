@@ -14,16 +14,22 @@ var writerLeaseRegistry = struct {
 	held map[string]struct{}
 }{held: make(map[string]struct{})}
 
-// writerLease combines an OS lock, which excludes other processes, with a
+// WriterLease combines an OS lock, which excludes other processes, with a
 // small process-local registry. The registry gives same-process callers the
 // same non-blocking failure semantics on platforms where advisory locks are
 // process scoped.
-type writerLease struct {
+type WriterLease struct {
 	file *os.File
 	key  string
 }
 
-func acquireWriterLease(sessionDir string) (*writerLease, error) {
+// AcquireWriterLease acquires the same non-blocking OS lock used by Writer.
+// A WriterLockedError means an event writer currently owns the session.
+func AcquireWriterLease(sessionDir string) (*WriterLease, error) {
+	return acquireWriterLease(sessionDir)
+}
+
+func acquireWriterLease(sessionDir string) (*WriterLease, error) {
 	root, err := filepath.Abs(sessionDir)
 	if err != nil {
 		return nil, err
@@ -87,10 +93,10 @@ func acquireWriterLease(sessionDir string) (*writerLease, error) {
 		return nil, errors.New("event writer lock path changed while waiting for the lock")
 	}
 	writerLeaseRegistry.held[lockPath] = struct{}{}
-	return &writerLease{file: file, key: lockPath}, nil
+	return &WriterLease{file: file, key: lockPath}, nil
 }
 
-func (l *writerLease) Release() error {
+func (l *WriterLease) Release() error {
 	if l == nil {
 		return nil
 	}

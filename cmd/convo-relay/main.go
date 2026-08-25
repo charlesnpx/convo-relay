@@ -18,6 +18,7 @@ import (
 	"github.com/charlesnpx/convo-relay/internal/readiness"
 	"github.com/charlesnpx/convo-relay/internal/recipes"
 	"github.com/charlesnpx/convo-relay/internal/runner"
+	"github.com/charlesnpx/convo-relay/internal/sessionstore"
 )
 
 func main() {
@@ -373,7 +374,7 @@ func runList(args []string) {
 	if err := parseFlags(flags, args); err != nil {
 		os.Exit(2)
 	}
-	sessions, err := runner.ListSessions(*relayHome, *limit)
+	sessions, err := sessionstore.ListSessions(*relayHome, *limit)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error: %s\n", err)
 		os.Exit(1)
@@ -1079,7 +1080,7 @@ func runClean(args []string) {
 	relayHome := flags.String("home", "", "Optional relay home; defaults to CODEX_CLAUDE_HOME or ~/.codex-claude")
 	all := flags.Bool("all", false, "Mark orphaned sessions under --home")
 	limit := flags.Int("limit", 500, "Maximum sessions to scan with --all")
-	force := flags.Bool("force", false, "Also mark sessions without PID files as orphaned with --all")
+	force := flags.Bool("force", false, "Bypass the active-writer check")
 	jsonOutput := flags.Bool("json", false, "Emit machine-readable clean JSON")
 	if err := parseFlags(flags, args); err != nil {
 		os.Exit(2)
@@ -1089,7 +1090,7 @@ func runClean(args []string) {
 			fmt.Fprintln(os.Stderr, "error: clean --all does not accept a session argument")
 			os.Exit(2)
 		}
-		report, err := runner.CleanupSessions(*relayHome, *limit, *force)
+		report, err := sessionstore.CleanupSessions(*relayHome, *limit, *force)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "error: %s\n", err)
 			os.Exit(1)
@@ -1111,7 +1112,7 @@ func runClean(args []string) {
 		return
 	}
 	resolvedSessionDir, _ := resolveSessionDirAndArgs(*sessionDir, *sessionID, *relayHome, flags.Args())
-	report, err := runner.CleanSession(resolvedSessionDir)
+	report, err := sessionstore.CleanSession(resolvedSessionDir, *force)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error: %s\n", err)
 		os.Exit(1)
@@ -1322,7 +1323,7 @@ func resolveSessionDirAndArgs(sessionDir string, sessionID string, relayHome str
 }
 
 func resolveSessionDirOrExit(sessionDir string, sessionID string, relayHome string) string {
-	resolved, err := runner.ResolveSessionDir(relayHome, sessionDir, sessionID)
+	resolved, err := sessionstore.ResolveSessionDir(relayHome, sessionDir, sessionID)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error: %s\n", err)
 		os.Exit(2)
