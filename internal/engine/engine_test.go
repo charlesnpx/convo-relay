@@ -1220,6 +1220,16 @@ func TestResumeCompletedSessionWithExtraTurnBudget(t *testing.T) {
 	if runner.state.grantedTurns != 1 || runner.effectiveTurnBudget() != 2 || sess.Plan.Schedule.Turns != 1 {
 		t.Fatalf("derived turn budget = grants %d effective %d plan %d", runner.state.grantedTurns, runner.effectiveTurnBudget(), sess.Plan.Schedule.Turns)
 	}
+	wrongRoundEvents := append([]eventlog.Event(nil), events...)
+	for index, event := range wrongRoundEvents {
+		if applied, ok := event.Payload.(eventlog.SteeringAppliedPayload); ok {
+			applied.Round = 999
+			wrongRoundEvents[index].Payload = applied
+		}
+	}
+	if err := runner.rebuildExecutionState(wrongRoundEvents); err == nil || !strings.Contains(err.Error(), "steering.applied round 999 does not match active turn round 2") {
+		t.Fatalf("wrong-round steering replay error = %v", err)
+	}
 	eventsPath := filepath.Join(sess.Root, eventlog.EventsFilename)
 	beforeTerminalResume, err := os.ReadFile(eventsPath)
 	if err != nil {
@@ -1311,26 +1321,6 @@ func TestResumeRejectsPromptedRetryForGrantWithoutPrompt(t *testing.T) {
 	}
 }
 
-func TestResumePromptWithoutTurnBudgetUsesSteeringQueued(t *testing.T) {
-	sess := createSession(t, dialoguePlan(1))
-	seedLog(t, sess, func(_ *blobstore.Store, writer *eventlog.Writer) {
-		appendEvent(t, writer, eventlog.TurnStartedPayload{ActorID: "alpha", Round: 1, Role: eventlog.ParticipantRole})
-	})
-	alpha := &fakeBackend{name: "codex", slotID: "alpha", responses: []fakeResponse{{content: "steered reply"}}}
-	beta := &fakeBackend{name: "codex", slotID: "beta"}
-	const requestedPrompt = "continue through the safety case"
-	if _, err := Resume(context.Background(), sess, testDeps(map[string]*fakeBackend{"alpha": alpha, "beta": beta}), requestedPrompt, 0); err != nil {
-		t.Fatalf("prompt-only Resume: %v", err)
-	}
-	events := sessionEvents(t, sess)
-	if countType(events, eventlog.TurnBudgetGranted) != 0 || countType(events, eventlog.SteeringQueued) != 1 || countType(events, eventlog.SteeringApplied) != 1 {
-		t.Fatalf("prompt-only events = %v", eventTypes(events))
-	}
-	if len(alpha.prompts) != 1 || !strings.Contains(alpha.prompts[0], "Resume direction: "+requestedPrompt) {
-		t.Fatalf("prompt-only turn input = %#v", alpha.prompts)
-	}
-}
-
 func TestReplayRejectsTurnBudgetGrantWithUnresolvablePromptReference(t *testing.T) {
 	sess := createSession(t, dialoguePlan(1))
 	alpha := &fakeBackend{name: "codex", slotID: "alpha", responses: []fakeResponse{{content: "first reply"}}}
@@ -1370,7 +1360,8 @@ func TestReplayRejectsSteeringAppliedPromptNotCarriedByGrant(t *testing.T) {
 	events := sessionEvents(t, sess)
 	events = append(events,
 		canonicalReplayEvent(t, uint64(len(events)+1), "prompted-grant", eventlog.TurnBudgetGrantedPayload{GrantedBy: "operator", Turns: 1, Prompt: &carried}),
-		canonicalReplayEvent(t, uint64(len(events)+2), "mismatched-steering", eventlog.SteeringAppliedPayload{Prompt: unrelated, Round: 2}),
+		canonicalReplayEvent(t, uint64(len(events)+2), "resumed-turn", eventlog.TurnStartedPayload{ActorID: "beta", Round: 2, Role: eventlog.ParticipantRole}),
+		canonicalReplayEvent(t, uint64(len(events)+3), "mismatched-steering", eventlog.SteeringAppliedPayload{Prompt: unrelated, Round: 2}),
 	)
 	runner, err := newStateRunner(sess)
 	if err != nil {

@@ -746,6 +746,12 @@ func (r *runner) reduceEvent(event eventlog.Event) error {
 		state.steering = append(state.steering, &steeringState{Ref: payload.Prompt, Text: text})
 		return nil
 	case eventlog.SteeringAppliedPayload:
+		if state.active == nil {
+			return errors.New("steering.applied has no active turn")
+		}
+		if payload.Round != state.active.Round {
+			return fmt.Errorf("steering.applied round %d does not match active turn round %d", payload.Round, state.active.Round)
+		}
 		for _, steering := range state.steering {
 			if steering.Consumed || steering.AppliedRound != 0 || !steering.Ref.Equal(payload.Prompt) {
 				continue
