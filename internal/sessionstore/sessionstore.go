@@ -217,8 +217,7 @@ func cleanupSessionsWithRemover(home string, limit int, force bool, removeSessio
 	}
 	marked := []any{}
 	for _, summary := range sessions {
-		status := stringValue(summary["status"])
-		if status != "running" && status != "orphaned" {
+		if stringValue(summary["status"]) != "running" {
 			continue
 		}
 		report, err := cleanSessionWithRemover(stringValue(summary["path"]), removeSession, force)

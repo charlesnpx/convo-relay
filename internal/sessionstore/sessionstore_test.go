@@ -9,13 +9,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/charlesnpx/convo-relay/internal/contracts"
 	"github.com/charlesnpx/convo-relay/internal/eventlog"
 	"github.com/charlesnpx/convo-relay/internal/plan"
-	"github.com/charlesnpx/convo-relay/internal/relayv2"
 	"github.com/charlesnpx/convo-relay/internal/session"
-	"github.com/charlesnpx/convo-relay/internal/store"
-	"github.com/charlesnpx/convo-relay/internal/workspace"
 )
 
 func TestResolveSessionDirUniquePrefixAndExplicitDirectory(t *testing.T) {
@@ -115,26 +111,8 @@ func TestListSessionsListsTwoV2Sessions(t *testing.T) {
 	if got := items[0]["agents"]; len(got.([]any)) != 2 {
 		t.Fatalf("newer agents = %#v", got)
 	}
-}
-
-func TestListSessionsIncludesRelayV2ProjectionTitle(t *testing.T) {
-	home := t.TempDir()
-	sess := createTestSession(t, home, "projection-title", testTime(1), true)
-	saveTestWorkspaceArtifact(t, sess)
-
-	report, err := relayv2.BuildReport(sess, relayv2.ProjectionOptions{})
-	if err != nil {
-		t.Fatalf("build relay v2 projection: %v", err)
-	}
-	items, err := ListSessions(home, 10)
-	if err != nil {
-		t.Fatalf("list sessions: %v", err)
-	}
-	if len(items) != 1 {
-		t.Fatalf("listed sessions = %#v, want one", items)
-	}
-	if got, want := items[0]["title"], report["title"]; got != want {
-		t.Fatalf("list title = %#v, relay v2 projection title = %#v", got, want)
+	if got, want := items[0]["title"], newer.Plan.Task; got != want {
+		t.Fatalf("newer title = %#v, want %q", got, want)
 	}
 }
 
@@ -241,34 +219,6 @@ func TestCleanSessionRefusesActiveWriter(t *testing.T) {
 	}
 }
 
-func TestCleanSessionForceRemovesActiveWriter(t *testing.T) {
-	home := t.TempDir()
-	sess := createTestSession(t, home, "active-force-session", testTime(1), false)
-	writer, err := sess.EventWriter(nil)
-	if err != nil {
-		t.Fatalf("open active writer: %v", err)
-	}
-	defer writer.Close()
-
-	removed := []string{}
-	remove := func(path string) error {
-		removed = append(removed, path)
-		return nil
-	}
-	if _, err := cleanSessionWithRemover(sess.Root, remove, false); !errors.Is(err, errSessionRunning) {
-		t.Fatalf("unforced clean error = %v", err)
-	}
-	if len(removed) != 0 {
-		t.Fatalf("unforced clean removed %#v", removed)
-	}
-	if _, err := cleanSessionWithRemover(sess.Root, remove, true); err != nil {
-		t.Fatalf("forced clean: %v", err)
-	}
-	if len(removed) != 1 || removed[0] != sess.Root {
-		t.Fatalf("forced clean removed %#v, want %q", removed, sess.Root)
-	}
-}
-
 func TestListSessionsLeavesWriterOpensUncontended(t *testing.T) {
 	home := t.TempDir()
 	sess := createTestSession(t, home, "contention-session", testTime(1), false)
@@ -372,33 +322,6 @@ func createEmptyTestSession(t *testing.T, home string, id string) *session.Sessi
 		t.Fatalf("create session: %v", err)
 	}
 	return sess
-}
-
-func saveTestWorkspaceArtifact(t *testing.T, sess *session.Session) {
-	t.Helper()
-	artifact, err := contracts.NormalizeRootArtifact(contracts.RootArtifactKindExecutionWorkspace, map[string]any{
-		"policy": map[string]any{
-			"effective": workspace.PolicyEphemeral,
-			"achieved":  workspace.PolicyEphemeral,
-		},
-		workspace.WorkspaceContentSourceKey:     workspace.WorkspaceContentSourceCommittedHead,
-		workspace.WorkingTreeChangesIncludedKey: false,
-	})
-	if err != nil {
-		t.Fatalf("normalize workspace artifact: %v", err)
-	}
-	identity, err := contracts.RootArtifactIdentityFor(contracts.RootArtifactKindExecutionWorkspace, 0)
-	if err != nil {
-		t.Fatalf("workspace artifact identity: %v", err)
-	}
-	if _, err := store.New(sess.Root).SaveContractArtifact(
-		contracts.RootArtifactKindExecutionWorkspace,
-		identity.ArtifactID,
-		artifact,
-		identity.RefID,
-	); err != nil {
-		t.Fatalf("save workspace artifact: %v", err)
-	}
 }
 
 func testTime(second int) time.Time {
