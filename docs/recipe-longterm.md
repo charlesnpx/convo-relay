@@ -183,7 +183,6 @@ The Go implementation now owns the relevant boundaries:
 
 - `internal/contracts` owns strict portable child relay contracts and digests.
 - `internal/store` owns artifact persistence, artifact indexes, and strict event validation.
-- `internal/runner` owns dynamic proposal approval and child relay execution.
 - `testdata/contracts/` contains portable contract fixtures for Go compatibility tests.
 
 The contract inspector already validates nested child artifacts. The relay backend already proves that a parent session can run child relays, persist their refs, and expose them through `contracts --json` and `show --graph --json`.
