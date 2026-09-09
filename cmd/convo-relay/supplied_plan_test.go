@@ -17,6 +17,7 @@ import (
 	"github.com/charlesnpx/convo-relay/v2/internal/eventlog"
 	"github.com/charlesnpx/convo-relay/v2/internal/relayv2"
 	"github.com/charlesnpx/convo-relay/v2/internal/session"
+	relayplan "github.com/charlesnpx/convo-relay/v2/plan"
 	"github.com/charlesnpx/convo-relay/v2/result"
 )
 
@@ -59,6 +60,46 @@ func TestSuppliedPlanRunsAndPersistsItsFields(t *testing.T) {
 	if err := result.Validate(decoded); err != nil {
 		t.Fatalf("validate run result: %v", err)
 	}
+}
+
+func TestSuppliedPlanPreservesCallerIdentityAndDigest(t *testing.T) {
+	installSuppliedCodex(t, fakeCodexAppServerScript)
+	planValue := suppliedPlanFixture("pending", nil)
+	planValue.Provenance = session.ProvenanceOrdinary
+	wantDigest, err := relayplan.Digest(planValue)
+	if err != nil {
+		t.Fatalf("digest supplied plan: %v", err)
+	}
+	sessionDir := filepath.Join(t.TempDir(), "session")
+	if _, err := v2RunSuppliedPlan(context.Background(), v2SuppliedPlanRunOptions{
+		SessionDir: sessionDir,
+		PlanPath:   writeSuppliedPlan(t, planValue),
+		LaunchCWD:  t.TempDir(),
+	}); err != nil {
+		t.Fatalf("run supplied plan: %v", err)
+	}
+	got, err := session.Open(sessionDir)
+	if err != nil {
+		t.Fatalf("open supplied session: %v", err)
+	}
+	if got.Plan.SessionID != planValue.SessionID || got.Digest != wantDigest || !reflect.DeepEqual(got.Plan, planValue) {
+		t.Fatalf("stored plan identity/digest = session_id %q, provenance %q, digest %q; want session_id %q, provenance %q, digest %q", got.Plan.SessionID, got.Plan.Provenance, got.Digest, planValue.SessionID, planValue.Provenance, wantDigest)
+	}
+	events, err := relayv2.Events(got)
+	if err != nil {
+		t.Fatalf("read supplied plan events: %v", err)
+	}
+	for _, event := range events {
+		started, ok := event.Payload.(eventlog.SessionStartedPayload)
+		if !ok {
+			continue
+		}
+		if started.SessionID != planValue.SessionID || started.PlanDigest != wantDigest {
+			t.Fatalf("session.started binding = %#v, want session_id %q and plan_digest %q", started, planValue.SessionID, wantDigest)
+		}
+		return
+	}
+	t.Fatal("supplied plan event log has no session.started binding")
 }
 
 func TestSuppliedPlanWithBlobsExportsPortableBundle(t *testing.T) {
@@ -131,6 +172,64 @@ func TestSuppliedPlanWithBlobsExportsPortableBundle(t *testing.T) {
 	}
 	if !bytes.Equal(payload, input) {
 		t.Fatalf("supplied portable input payload = %q, want %q", payload, input)
+	}
+}
+
+func TestSuppliedPlanWithReducerExportsProducedResult(t *testing.T) {
+	installSuppliedCodex(t, strings.Replace(fakeCodexAppServerScript,
+		`            elif root_recipe_log and "Invalid structured result" in prompt:`,
+		"            elif \"FINAL-ANSWER-ZEBRA\" in prompt:\n                text = \"FINAL-ANSWER-ZEBRA\"\n            elif root_recipe_log and \"Invalid structured result\" in prompt:", 1))
+	planValue := suppliedPlanFixture("portable-reducer-session", nil)
+	planValue.Actors = append(planValue.Actors, session.Actor{ID: "red", Backend: "codex"})
+	planValue.Reducer = &session.Reducer{Actor: "red"}
+	planValue.Instructions = &session.Instructions{ReducerInstructions: "Reply exactly FINAL-ANSWER-ZEBRA"}
+	planValue.Result.Source = relayplan.ResultSourceReducer
+	sessionDir := filepath.Join(t.TempDir(), "session")
+	if _, err := v2RunSuppliedPlan(context.Background(), v2SuppliedPlanRunOptions{
+		SessionDir: sessionDir,
+		PlanPath:   writeSuppliedPlan(t, planValue),
+		LaunchCWD:  t.TempDir(),
+	}); err != nil {
+		t.Fatalf("run supplied reducer plan: %v", err)
+	}
+	sess, err := session.Open(sessionDir)
+	if err != nil {
+		t.Fatalf("open supplied reducer session: %v", err)
+	}
+	report, err := relayv2.BuildReport(sess, relayv2.ProjectionOptions{})
+	if err != nil {
+		t.Fatalf("build supplied reducer report: %v", err)
+	}
+	bundle := filepath.Join(t.TempDir(), "portable")
+	if _, err := v2ExportPortable(sess, bundle, "test"); err != nil {
+		t.Fatalf("export supplied reducer bundle: %v", err)
+	}
+	body, err := os.ReadFile(filepath.Join(bundle, "payloads", "root_session", "session.json"))
+	if err != nil {
+		t.Fatalf("read supplied reducer root payload: %v", err)
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(body, &payload); err != nil {
+		t.Fatalf("decode supplied reducer root payload: %v", err)
+	}
+	root, ok := payload["root"].(map[string]any)
+	if !ok {
+		t.Fatalf("supplied reducer root payload root = %#v", payload["root"])
+	}
+	if root["execution_kind"] != report.ExecutionKind {
+		t.Fatalf("supplied reducer execution_kind mismatch: root = %#v, top-level = %#v", root["execution_kind"], report.ExecutionKind)
+	}
+	t.Logf("supplied reducer execution_kind: root=%v, top-level=%v", root["execution_kind"], report.ExecutionKind)
+	rootResult, ok := root["result"].(map[string]any)
+	if !ok || rootResult["value"] != "FINAL-ANSWER-ZEBRA" {
+		t.Fatalf("supplied reducer root result = %#v, want produced result", root["result"])
+	}
+	verified, err := v2VerifyPortableDirectory(bundle)
+	if err != nil {
+		t.Fatalf("verify supplied reducer bundle: %v", err)
+	}
+	if verified["status"] != "valid" {
+		t.Fatalf("supplied reducer verification = %#v", verified)
 	}
 }
 

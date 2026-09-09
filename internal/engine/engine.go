@@ -20,6 +20,7 @@ import (
 	"github.com/charlesnpx/convo-relay/v2/internal/plan"
 	"github.com/charlesnpx/convo-relay/v2/internal/provider"
 	"github.com/charlesnpx/convo-relay/v2/internal/session"
+	relayplan "github.com/charlesnpx/convo-relay/v2/plan"
 	jsonschema "github.com/santhosh-tekuri/jsonschema/v6"
 )
 
@@ -326,11 +327,10 @@ type runner struct {
 	closeLog   bool
 	planDigest string
 
-	backends     map[string]provider.Backend
-	participants []session.Actor
-	actors       map[string]session.Actor
-	material     string
-	state        *executionState
+	backends map[string]provider.Backend
+	actors   map[string]session.Actor
+	material string
+	state    *executionState
 }
 
 type executionPhase string
@@ -483,7 +483,6 @@ func newRunner(ctx context.Context, sess *session.Session, deps Deps) (*runner, 
 	runner.backends = make(map[string]provider.Backend, len(sess.Plan.Actors))
 	runner.actors = make(map[string]session.Actor, len(sess.Plan.Actors))
 	runner.material = material
-	runner.participants = participantActors(sess.Plan)
 	for _, actor := range sess.Plan.Actors {
 		runner.actors[actor.ID] = actor
 	}
@@ -533,23 +532,6 @@ func (r *runner) closeOwnedWriter() {
 	if r != nil && r.closeLog && r.writer != nil {
 		_ = r.writer.Close()
 	}
-}
-
-func participantActors(value session.Plan) []session.Actor {
-	controls := map[string]bool{}
-	if value.Facilitator != nil {
-		controls[value.Facilitator.Actor] = true
-	}
-	if value.Reducer != nil {
-		controls[value.Reducer.Actor] = true
-	}
-	participants := make([]session.Actor, 0, len(value.Actors))
-	for _, actor := range value.Actors {
-		if !controls[actor.ID] {
-			participants = append(participants, actor)
-		}
-	}
-	return participants
 }
 
 // append makes an event durable, then updates exactly the same state reducer
@@ -1137,17 +1119,11 @@ func (r *runner) nextTurn() (turnSpec, error) {
 			return turnSpec{}, errors.New("participant phase has no remaining turn")
 		}
 		round := len(r.state.conversation) + 1
-		if r.sess.Plan.Schedule.Kind == "dialogue" {
-			if len(r.participants) == 0 {
-				return turnSpec{}, errors.New("dialogue schedule has no participant actors")
-			}
-			return turnSpec{
-				Actor: r.participants[len(r.state.conversation)%len(r.participants)],
-				Round: round,
-				Role:  eventlog.ParticipantRole,
-			}, nil
+		actorID, err := relayplan.ParticipantActorForTurn(r.sess.Plan, round)
+		if err != nil {
+			return turnSpec{}, err
 		}
-		actor, err := r.actor(r.sess.Plan.Schedule.Order[len(r.state.conversation)%len(r.sess.Plan.Schedule.Order)])
+		actor, err := r.actor(actorID)
 		if err != nil {
 			return turnSpec{}, err
 		}

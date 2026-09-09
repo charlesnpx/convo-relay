@@ -294,10 +294,6 @@ func v2RunSuppliedPlan(ctx context.Context, options v2SuppliedPlanRunOptions) (m
 	if err != nil {
 		return nil, err
 	}
-	value.Provenance = session.ProvenanceSupplied
-	if strings.TrimSpace(value.SessionID) == "" || strings.TrimSpace(value.SessionID) == "pending" {
-		value.SessionID = v2SessionID("")
-	}
 	if err := session.ValidatePlan(value); err != nil {
 		return nil, fmt.Errorf("validate supplied plan: %w", err)
 	}

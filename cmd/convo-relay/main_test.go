@@ -307,6 +307,57 @@ func TestExportVerifyJSONReportsPortableBundle(t *testing.T) {
 	if report["status"] != "valid" || report["format"] != format.BundleV1 {
 		t.Fatalf("export verify report = %#v", report)
 	}
+	binary := filepath.Join(t.TempDir(), "convo-relay")
+	build := exec.Command("go", "build", "-o", binary, ".")
+	if output, err := build.CombinedOutput(); err != nil {
+		t.Fatalf("build export verifier: %v\n%s", err, output)
+	}
+	for _, test := range []struct {
+		name   string
+		mutate func(map[string]any)
+	}{
+		{name: "manifest", mutate: func(value map[string]any) {
+			value["unexpected_manifest_field"] = true
+		}},
+		{name: "inventory", mutate: func(value map[string]any) {
+			value["payload_inventory"].([]any)[0].(map[string]any)["unexpected_inventory_field"] = true
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			candidateBody, err := json.Marshal(manifest)
+			if err != nil {
+				t.Fatalf("clone manifest: %v", err)
+			}
+			var candidate map[string]any
+			if err := json.Unmarshal(candidateBody, &candidate); err != nil {
+				t.Fatalf("decode cloned manifest: %v", err)
+			}
+			test.mutate(candidate)
+			invalidBody, err := format.CanonicalJSONBytes(candidate)
+			if err != nil {
+				t.Fatalf("encode invalid manifest: %v", err)
+			}
+			if err := os.WriteFile(filepath.Join(dir, "manifest.json"), invalidBody, 0o644); err != nil {
+				t.Fatalf("write invalid manifest: %v", err)
+			}
+			command := exec.Command(binary, "export", "verify", dir, "--json")
+			var stdout, stderr bytes.Buffer
+			command.Stdout = &stdout
+			command.Stderr = &stderr
+			err = command.Run()
+			var exitErr *exec.ExitError
+			if !errors.As(err, &exitErr) || exitErr.ExitCode() != 1 {
+				t.Fatalf("export verify unknown %s field exit = %v, stdout=%q, stderr=%q", test.name, err, stdout.String(), stderr.String())
+			}
+			if stderr.Len() != 0 {
+				t.Fatalf("export verify unknown %s field stderr = %q", test.name, stderr.String())
+			}
+			invalidReport := decodeJSONObject(t, stdout.String())
+			if invalidReport["format"] != format.BundleV1 || invalidReport["status"] != "invalid" {
+				t.Fatalf("export verify unknown %s field report = %#v", test.name, invalidReport)
+			}
+		})
+	}
 
 	legacyRoot := map[string]any{
 		"kind":            strings.Join([]string{"portable", "v2", "root", "session"}, "_"),

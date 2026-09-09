@@ -160,7 +160,9 @@ func BuildReport(sess *session.Session, options ProjectionOptions) (relayresult.
 			"budget_state":       diagnostics.BudgetState,
 		},
 	}
-	if sess.Plan.Provenance == relayplan.ProvenanceRecipe || sess.Plan.Provenance == relayplan.ProvenanceChild {
+	if sess.Plan.Provenance == relayplan.ProvenanceRecipe ||
+		sess.Plan.Provenance == relayplan.ProvenanceChild ||
+		sess.Plan.Provenance == relayplan.ProvenanceSupplied {
 		report["root"] = rootProjection(sess.Plan, status, participantTurns, result, validation, workspaceState, providerSessions, len(ledgerView.Attempts), reducerAttempts)
 	}
 	body, err := json.Marshal(report)
@@ -339,7 +341,7 @@ func resultProjection(events []eventlog.Event, blobs *blobstore.Store) (string, 
 
 func rootProjection(value session.Plan, status string, turns int, result string, validation string, workspaceState map[string]any, providerSessions map[string]string, invocations int, reducerAttempts int) map[string]any {
 	return map[string]any{
-		"execution_kind": "recipe",
+		"execution_kind": executionKind(value),
 		"status":         status,
 		"recipe":         recipeProjection(value),
 		"turns": map[string]any{

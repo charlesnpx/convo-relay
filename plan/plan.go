@@ -418,6 +418,44 @@ type Lifecycle struct {
 	Dynamic string `json:"dynamic"`
 }
 
+// ParticipantActorForTurn returns the participant actor selected by the
+// schedule for a one-based turn. It supports turns beyond the configured
+// schedule so the engine can apply the same selection rule to explicitly
+// granted resume turns; callers validating an immutable plan should enforce
+// the plan's configured turn range separately.
+func ParticipantActorForTurn(value Plan, turn int) (string, error) {
+	if turn < 1 {
+		return "", fmt.Errorf("participant turn %d must be positive", turn)
+	}
+	controls := make(map[string]bool, 2)
+	if value.Facilitator != nil {
+		controls[value.Facilitator.Actor] = true
+	}
+	if value.Reducer != nil {
+		controls[value.Reducer.Actor] = true
+	}
+	participants := make([]string, 0, len(value.Actors))
+	for _, actor := range value.Actors {
+		if !controls[actor.ID] {
+			participants = append(participants, actor.ID)
+		}
+	}
+	switch value.Schedule.Kind {
+	case ScheduleDialogue:
+		if len(participants) == 0 {
+			return "", errors.New("dialogue schedule has no participant actors")
+		}
+		return participants[(turn-1)%len(participants)], nil
+	case ScheduleSequence:
+		if len(value.Schedule.Order) == 0 {
+			return "", errors.New("sequence schedule has no participant order")
+		}
+		return value.Schedule.Order[(turn-1)%len(value.Schedule.Order)], nil
+	default:
+		return "", fmt.Errorf("schedule kind %q is not supported", value.Schedule.Kind)
+	}
+}
+
 // Validate checks the complete portable plan and returns an error naming the
 // invalid field or relationship. It never applies defaults or panics; any
 // failed required, enum, relationship, JSON, blob, or portability check makes
@@ -694,6 +732,13 @@ func validateInstructions(value Plan, actors map[string]bool) error {
 		if (value.Facilitator != nil && turn.Actor == value.Facilitator.Actor) ||
 			(value.Reducer != nil && turn.Actor == value.Reducer.Actor) {
 			return fmt.Errorf("instruction must name a participant actor, got %q", turn.Actor)
+		}
+		scheduledActor, err := ParticipantActorForTurn(value, turn.ParticipantTurn)
+		if err != nil {
+			return fmt.Errorf("select actor for instruction participant turn %d: %w", turn.ParticipantTurn, err)
+		}
+		if turn.Actor != scheduledActor {
+			return fmt.Errorf("instruction for participant turn %d names actor %q, but schedule selects actor %q", turn.ParticipantTurn, turn.Actor, scheduledActor)
 		}
 		if strings.TrimSpace(turn.Instructions) == "" || strings.Contains(turn.Instructions, "\x00") {
 			return fmt.Errorf("instruction for participant turn %d is invalid", turn.ParticipantTurn)

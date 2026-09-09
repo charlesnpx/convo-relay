@@ -35,24 +35,6 @@ func ValidateBundleManifest(value any) (map[string]any, error) {
 	if !ok {
 		return nil, NewValidationError("portable bundle manifest must be an object")
 	}
-	if err := rejectUnknown(manifest, []string{
-		"kind", "convo_relay_version", "terminal_status", "stop_reason",
-		"session_payload", "transcript_payload", "diagnostics_payload", "payload_inventory",
-		"inventory_digest", "manifest_digest",
-	}, "portable bundle manifest"); err != nil {
-		return nil, err
-	}
-	if inventory, ok := manifest["payload_inventory"].([]any); ok {
-		for _, raw := range inventory {
-			entry, entryOK := Materialize(raw).(map[string]any)
-			if !entryOK {
-				continue
-			}
-			if err := rejectUnknown(entry, []string{"kind", "portable_id", "path", "blob"}, "portable bundle inventory entry"); err != nil {
-				return nil, err
-			}
-		}
-	}
 	decoded, err := decodeBundleManifest(manifest)
 	if err != nil {
 		return nil, err
@@ -85,17 +67,4 @@ func encodeBundleManifest(value bundle.Manifest) (map[string]any, error) {
 		return nil, err
 	}
 	return manifest, nil
-}
-
-func rejectUnknown(object map[string]any, allowed []string, label string) error {
-	allowedSet := make(map[string]bool, len(allowed))
-	for _, key := range allowed {
-		allowedSet[key] = true
-	}
-	for _, key := range sortedKeys(object) {
-		if !allowedSet[key] {
-			return NewValidationError("%s has unsupported field %q", label, key)
-		}
-	}
-	return nil
 }

@@ -1,6 +1,7 @@
 package format
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/charlesnpx/convo-relay/v2/internal/blobstore"
@@ -35,5 +36,14 @@ func TestBundleManifestRoundTripsBlobRef(t *testing.T) {
 	}
 	if _, err := ValidateBundleManifest(decoded); err != nil {
 		t.Fatalf("validate decoded manifest: %v", err)
+	}
+	decoded["unexpected_manifest_field"] = true
+	if _, err := ValidateBundleManifest(decoded); err == nil || !strings.Contains(err.Error(), "unexpected_manifest_field") {
+		t.Fatalf("unknown manifest field error = %v", err)
+	}
+	delete(decoded, "unexpected_manifest_field")
+	decoded["payload_inventory"].([]any)[0].(map[string]any)["unexpected_inventory_field"] = true
+	if _, err := ValidateBundleManifest(decoded); err == nil || !strings.Contains(err.Error(), "unexpected_inventory_field") {
+		t.Fatalf("unknown inventory field error = %v", err)
 	}
 }

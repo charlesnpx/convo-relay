@@ -59,3 +59,37 @@ func TestPlanRoundTripAndMissingRequiredField(t *testing.T) {
 		t.Fatalf("missing session_id error = %v", err)
 	}
 }
+
+func TestPlanRejectsInstructionForUnscheduledActor(t *testing.T) {
+	value := Plan{
+		Kind:          PlanKind,
+		SchemaVersion: SchemaVersion,
+		SessionID:     "instruction-schedule",
+		Provenance:    ProvenanceSupplied,
+		Task:          "validate instruction ownership",
+		Timeouts:      Timeouts{TurnSeconds: 10, StallSeconds: 5},
+		Mode:          ModeCooperative,
+		Investigation: InvestigationNormal,
+		Actors: []Actor{
+			{ID: "slot_0", Backend: ActorBackendCodex},
+			{ID: "slot_1", Backend: ActorBackendCodex},
+		},
+		Schedule:      Schedule{Kind: ScheduleSequence, Turns: 2, Order: []string{"slot_0", "slot_1"}},
+		ProviderRetry: ProviderRetry{Mode: ProviderRetryForbid, MaxAttempts: 1},
+		Workspace:     Workspace{Mode: WorkspaceModeCurrent},
+		Inputs:        []Input{},
+		Context:       []Input{},
+		Skills:        []Input{},
+		ChildPolicy:   ChildPolicy{Mode: ChildPolicyDeny, AllowedRecipes: []string{}},
+		Result:        Result{Source: ResultSourceLastTurn, Format: ResultFormatText},
+		Instructions: &Instructions{Turns: []TurnInstruction{{
+			ParticipantTurn: 1,
+			Actor:           "slot_1",
+			Instructions:    "reply with BANANA",
+		}}},
+	}
+	err := Validate(value)
+	if err == nil || !strings.Contains(err.Error(), "participant turn 1") || !strings.Contains(err.Error(), "slot_1") || !strings.Contains(err.Error(), "slot_0") {
+		t.Fatalf("unscheduled instruction error = %v, want turn and both actors", err)
+	}
+}
