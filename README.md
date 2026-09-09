@@ -488,6 +488,8 @@ Then read /tmp/auth-review.md and summarize what each agent found.
 | `--skill FILE [FILE ...]` | run, resume | Attach UTF-8 capability files and persist labeled input-bundle artifacts |
 | `--recipe-file FILE` | run | Attach session-scoped transient relay recipes from TOML and persist the source artifact |
 | `--recipe ID` | run | Execute a configured recipe directly as the root session |
+| `--plan FILE` | run | Execute a supplied immutable plan document as the root session |
+| `--blobs DIR` | run --plan | Supply `sha256/<digest>` payload files referenced by the plan |
 | `--input NAME=PATH` | run --recipe | Read a named file once and bind its content-addressed blob to the root plan |
 | `--workspace {current,head-copy}` | run --recipe | Execute in the launch directory or a detached worktree at recorded HEAD |
 | `--task-plan FILE` | run | Attach the launch task plan from a JSON or markdown/text file |

@@ -75,7 +75,7 @@ def main():
                 text = '{"settled":["root"],"contested":[],"withdrawn":[]}'
             elif root_recipe_log and "Invalid structured result" in prompt:
                 text = "not a JSON result"
-            elif root_recipe_log and "Integration Contract Instructions for This Turn" in prompt:
+            elif root_recipe_log and "Instructions for This Turn" in prompt:
                 text = '{"value":"cli"}'
             else:
                 text = "Fake Codex root recipe"
@@ -796,9 +796,8 @@ workspace_isolation = "inherited"
 	if err != nil {
 		t.Fatalf("open bound v2 session: %v", err)
 	}
-	if boundSession.Plan.IntegrationContract != "neutral/contract-v1" ||
-		boundSession.Plan.IntegrationInstructions == nil ||
-		len(boundSession.Plan.IntegrationInstructions.Turns) != 2 ||
+	if boundSession.Plan.Instructions == nil ||
+		len(boundSession.Plan.Instructions.Turns) != 2 ||
 		boundSession.Plan.Result.Format != "json" {
 		t.Fatalf("bound v2 plan = %#v", boundSession.Plan)
 	}

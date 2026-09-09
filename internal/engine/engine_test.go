@@ -24,6 +24,54 @@ import (
 	"github.com/charlesnpx/convo-relay/internal/workspace"
 )
 
+func TestOrderedInputContentsBindDigestAndPromptOrder(t *testing.T) {
+	first := []byte("first ordered payload")
+	second := []byte("second ordered payload")
+	firstRef := blobstore.RefForBytes(first, mediaTypePlainTextUTF8)
+	secondRef := blobstore.RefForBytes(second, mediaTypePlainTextUTF8)
+	value := dialoguePlan(1)
+	value.Inputs = []session.Input{{
+		Name:     "ordered",
+		Contents: []blobstore.BlobRef{firstRef, secondRef},
+	}}
+	sess := createSession(t, value)
+	store, err := sess.BlobStore(blobstore.Limits{})
+	if err != nil {
+		t.Fatalf("open input blobs: %v", err)
+	}
+	for body, ref := range map[string]blobstore.BlobRef{
+		string(first):  firstRef,
+		string(second): secondRef,
+	} {
+		if _, err := store.PutBytes([]byte(body), ref.MediaType); err != nil {
+			t.Fatalf("store ordered input: %v", err)
+		}
+	}
+	prompt, err := loadPromptMaterial(store, value)
+	if err != nil {
+		t.Fatalf("project ordered input prompt: %v", err)
+	}
+	if strings.Index(prompt, string(first)) >= strings.Index(prompt, string(second)) {
+		t.Fatalf("prompt contents are out of order: %q", prompt)
+	}
+	digest, err := session.PlanDigest(value)
+	if err != nil {
+		t.Fatalf("digest ordered input plan: %v", err)
+	}
+	reordered := value
+	reordered.Inputs = []session.Input{{
+		Name:     "ordered",
+		Contents: []blobstore.BlobRef{secondRef, firstRef},
+	}}
+	reorderedDigest, err := session.PlanDigest(reordered)
+	if err != nil {
+		t.Fatalf("digest reordered input plan: %v", err)
+	}
+	if digest == reorderedDigest {
+		t.Fatalf("reordering input contents did not change plan digest %s", digest)
+	}
+}
+
 func TestRunDialogueEventOrderAndBlobs(t *testing.T) {
 	plan := dialoguePlan(4)
 	alpha := &fakeBackend{name: "codex", slotID: "alpha", responses: []fakeResponse{{content: "alpha one"}, {content: "alpha two"}}}
@@ -2072,11 +2120,11 @@ func createProvisionedSession(t *testing.T) *session.Session {
 	plan := dialoguePlan(1)
 	plan.Inputs = []session.Input{{
 		Name: "brief",
-		Content: blobstore.BlobRef{
+		Contents: []blobstore.BlobRef{{
 			SHA256:    hex.EncodeToString(sum[:]),
 			Size:      int64(len(body)),
 			MediaType: mediaTypePlainTextUTF8,
-		},
+		}},
 	}}
 	sess := createSession(t, plan)
 	store, err := sess.BlobStore(blobstore.Limits{})
@@ -2087,8 +2135,8 @@ func createProvisionedSession(t *testing.T) *session.Session {
 	if err != nil {
 		t.Fatalf("store provisioned input: %v", err)
 	}
-	if !stored.Equal(plan.Inputs[0].Content) {
-		t.Fatalf("stored provisioned input = %#v, want %#v", stored, plan.Inputs[0].Content)
+	if !stored.Equal(plan.Inputs[0].Contents[0]) {
+		t.Fatalf("stored provisioned input = %#v, want %#v", stored, plan.Inputs[0].Contents[0])
 	}
 	writer, err := sess.EventWriter(store)
 	if err != nil {

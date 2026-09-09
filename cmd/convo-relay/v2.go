@@ -100,6 +100,15 @@ type v2RecipeRunOptions struct {
 	WorkspaceWarning      func(v2WorkspaceWarning)
 }
 
+type v2SuppliedPlanRunOptions struct {
+	SessionDir   string
+	RelayHome    string
+	PlanPath     string
+	BlobsPath    string
+	SettingsPath string
+	LaunchCWD    string
+}
+
 type v2ResumeOptions struct {
 	Prompt         string
 	RequestedTurns int
@@ -287,6 +296,114 @@ func v2RunRecipe(ctx context.Context, options v2RecipeRunOptions) (map[string]an
 	return v2Run(ctx, sess, runtime, materialized.ExecutionCWD, false, "", 0)
 }
 
+func v2RunSuppliedPlan(ctx context.Context, options v2SuppliedPlanRunOptions) (map[string]any, error) {
+	value, err := readSuppliedPlan(options.PlanPath)
+	if err != nil {
+		return nil, err
+	}
+	value.Provenance = session.ProvenanceSupplied
+	if strings.TrimSpace(value.SessionID) == "" || strings.TrimSpace(value.SessionID) == "pending" {
+		value.SessionID = v2SessionID("")
+	}
+	if err := session.ValidatePlan(value); err != nil {
+		return nil, fmt.Errorf("validate supplied plan: %w", err)
+	}
+	if len(session.BlobRefs(value)) > 0 && strings.TrimSpace(options.BlobsPath) == "" {
+		return nil, errors.New("supplied plan references blobs; --blobs is required")
+	}
+	config, _, err := recipes.LoadRuntimeConfigWithTransientSources(options.SettingsPath, nil)
+	if err != nil {
+		return nil, err
+	}
+	catalog, err := relayv2.RecipesFromRuntime(config)
+	if err != nil {
+		return nil, err
+	}
+	sess, err := v2CreateSession(options.RelayHome, options.SessionDir, value)
+	if err != nil {
+		return nil, err
+	}
+	if err := materializeSuppliedPlanBlobs(sess, value, options.BlobsPath); err != nil {
+		return nil, err
+	}
+	runtime := relayv2.Runtime{SettingsPath: config.SettingsPath, Recipes: catalog}
+	if err := relayv2.SaveRuntime(sess, runtime); err != nil {
+		return nil, err
+	}
+	materialized, err := v2PrepareWorkspace(ctx, sess, v2WorkspaceOptions{
+		LaunchCWD: options.LaunchCWD,
+		Mode:      value.Workspace.Mode,
+	})
+	if err != nil {
+		return nil, err
+	}
+	return v2Run(ctx, sess, runtime, materialized.ExecutionCWD, false, "", 0)
+}
+
+func readSuppliedPlan(filename string) (session.Plan, error) {
+	body, err := os.ReadFile(filename)
+	if err != nil {
+		return session.Plan{}, fmt.Errorf("read supplied plan %q: %w", filename, err)
+	}
+	canonical, err := eventlog.SemanticJSONBytesRaw(body)
+	if err != nil {
+		return session.Plan{}, fmt.Errorf("decode supplied plan %q: %w", filename, err)
+	}
+	var value session.Plan
+	if err := eventlog.DecodeCanonicalJSON(canonical, &value); err != nil {
+		return session.Plan{}, fmt.Errorf("decode supplied plan %q: %w", filename, err)
+	}
+	return value, nil
+}
+
+func materializeSuppliedPlanBlobs(sess *session.Session, value session.Plan, sourceDir string) error {
+	if len(session.BlobRefs(value)) == 0 {
+		return nil
+	}
+	blobs, err := sess.BlobStore(blobstore.Limits{})
+	if err != nil {
+		return err
+	}
+	groups := []struct {
+		label  string
+		inputs []session.Input
+	}{
+		{label: "input", inputs: value.Inputs},
+		{label: "context", inputs: value.Context},
+		{label: "skill", inputs: value.Skills},
+	}
+	for _, group := range groups {
+		for _, input := range group.inputs {
+			for _, ref := range input.Contents {
+				filename := filepath.Join(sourceDir, blobstore.SHA256Directory, ref.SHA256)
+				info, err := os.Lstat(filename)
+				if err != nil {
+					return fmt.Errorf("blob %s for %s %q is unavailable: %w", ref.SHA256, group.label, input.Name, err)
+				}
+				if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
+					return fmt.Errorf("blob %s for %s %q is not a regular file", ref.SHA256, group.label, input.Name)
+				}
+				body, err := os.ReadFile(filename)
+				if err != nil {
+					return fmt.Errorf("read blob %s for %s %q: %w", ref.SHA256, group.label, input.Name, err)
+				}
+				actual := blobstore.RefForBytes(body, ref.MediaType)
+				if actual.SHA256 != ref.SHA256 || actual.Size != ref.Size {
+					return fmt.Errorf("blob %s for %s %q does not match its digest or size", ref.SHA256, group.label, input.Name)
+				}
+				stored, err := blobs.PutBytes(body, ref.MediaType)
+				if err != nil {
+					return fmt.Errorf("materialize blob %s for %s %q: %w", ref.SHA256, group.label, input.Name, err)
+				}
+				if !stored.Equal(ref) {
+					return fmt.Errorf("materialized blob %s for %s %q does not match the plan reference", ref.SHA256, group.label, input.Name)
+				}
+			}
+		}
+	}
+	return nil
+}
+
 func v2RunResume(ctx context.Context, sessionDir string, options v2ResumeOptions) (map[string]any, error) {
 	sess, err := session.Open(sessionDir)
 	if err != nil {
@@ -396,11 +513,11 @@ func v2SessionInput(name string, body []byte) session.Input {
 	sum := sha256.Sum256(body)
 	return session.Input{
 		Name: name,
-		Content: blobstore.BlobRef{
+		Contents: []blobstore.BlobRef{{
 			SHA256:    hex.EncodeToString(sum[:]),
 			Size:      int64(len(body)),
 			MediaType: v2TextMediaType,
-		},
+		}},
 	}
 }
 
@@ -428,11 +545,15 @@ func v2PersistInputs(sess *session.Session, groups ...[]v2Input) error {
 	}
 	for _, group := range groups {
 		for _, value := range group {
-			stored, err := blobs.PutBytes(value.Body, value.Input.Content.MediaType)
+			if len(value.Input.Contents) != 1 {
+				return fmt.Errorf("persisted input %q must contain exactly one payload", value.Input.Name)
+			}
+			content := value.Input.Contents[0]
+			stored, err := blobs.PutBytes(value.Body, content.MediaType)
 			if err != nil {
 				return err
 			}
-			if !stored.Equal(value.Input.Content) {
+			if !stored.Equal(content) {
 				return fmt.Errorf("persisted input %q does not match compiled blob reference", value.Input.Name)
 			}
 		}
@@ -572,7 +693,7 @@ func v2RecipePlan(
 				recipe.Result.Schema = body
 			}
 		}
-		instructions, err := v2IntegrationInstructions(selected)
+		instructions, err := v2InstructionsFromContract(selected)
 		if err != nil {
 			return session.Plan{}, nil, err
 		}
@@ -588,7 +709,7 @@ func v2RecipePlan(
 		if err != nil {
 			return session.Plan{}, nil, err
 		}
-		compiled.IntegrationInstructions = instructions
+		compiled.Instructions = instructions
 		if err := session.ValidatePlan(compiled); err != nil {
 			return session.Plan{}, nil, err
 		}
@@ -617,7 +738,7 @@ func v2RecipePlan(
 	return compiled, catalog, nil
 }
 
-func v2IntegrationInstructions(selected *integration.SelectedContract) (*session.IntegrationInstructions, error) {
+func v2InstructionsFromContract(selected *integration.SelectedContract) (*session.Instructions, error) {
 	if selected == nil {
 		return nil, nil
 	}
@@ -625,11 +746,11 @@ func v2IntegrationInstructions(selected *integration.SelectedContract) (*session
 	if contract == nil {
 		return nil, errors.New("selected integration contract has no contract body")
 	}
-	value := &session.IntegrationInstructions{
-		Turns: make([]session.IntegrationTurn, 0, len(contract.Turns)),
+	value := &session.Instructions{
+		Turns: make([]session.TurnInstruction, 0, len(contract.Turns)),
 	}
 	for _, turn := range contract.Turns {
-		value.Turns = append(value.Turns, session.IntegrationTurn{
+		value.Turns = append(value.Turns, session.TurnInstruction{
 			ParticipantTurn: turn.ParticipantTurn,
 			Actor:           turn.Slot,
 			Instructions:    turn.Instructions,

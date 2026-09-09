@@ -39,7 +39,7 @@ func TestAlteredMaterializedNamedInputIsRejectedWithDigestMismatch(t *testing.T)
 	if err := os.WriteFile(target, []byte("altered"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	err = VerifyPath(target, compiled.Inputs[0].Content)
+	err = VerifyPath(target, compiled.Inputs[0].Contents[0])
 	if err == nil || !strings.Contains(err.Error(), "digest mismatch") || errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("VerifyPath error = %v, want digest mismatch", err)
 	}

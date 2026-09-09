@@ -36,6 +36,7 @@ const (
 	ProvenanceOrdinary = "ordinary"
 	ProvenanceRecipe   = "recipe"
 	ProvenanceChild    = "child"
+	ProvenanceSupplied = "supplied"
 )
 
 const (
@@ -50,7 +51,8 @@ type Plan struct {
 	Kind          string `json:"kind"`
 	SchemaVersion int    `json:"schema_version"`
 	SessionID     string `json:"session_id"`
-	// Provenance records where the plan came from: ordinary, recipe, or child.
+	// Provenance records where the plan came from: ordinary, recipe, child, or
+	// supplied.
 	// It is a label for operators and inspectors. Nothing may branch on it to
 	// choose execution behaviour - one plan, one engine.
 	Provenance string `json:"provenance"`
@@ -91,12 +93,11 @@ type Plan struct {
 	// Lifecycle carries recipe controls that do not select a second execution
 	// path. Dynamic and workspace controls are also projected onto ChildPolicy
 	// and Workspace by the compiler.
-	Lifecycle           *Lifecycle `json:"lifecycle,omitempty"`
-	IntegrationContract string     `json:"integration_contract,omitempty"`
-	// IntegrationInstructions is the executable prompt projection of a selected
-	// integration contract. It is immutable plan data rather than local runtime
-	// configuration so retries and resume retain the same contract turn text.
-	IntegrationInstructions *IntegrationInstructions `json:"integration_instructions,omitempty"`
+	Lifecycle *Lifecycle `json:"lifecycle,omitempty"`
+	// Instructions is the executable prompt projection of per-turn and reducer
+	// instructions. It is immutable plan data rather than local runtime
+	// configuration so retries and resume retain the same instruction text.
+	Instructions *Instructions `json:"instructions,omitempty"`
 }
 
 type Actor struct {
@@ -147,8 +148,8 @@ type Workspace struct {
 }
 
 type Input struct {
-	Name    string            `json:"name"`
-	Content blobstore.BlobRef `json:"content"`
+	Name     string              `json:"name"`
+	Contents []blobstore.BlobRef `json:"contents"`
 }
 
 type ChildPolicy struct {
@@ -165,18 +166,17 @@ type Result struct {
 	Schema json.RawMessage `json:"schema,omitempty"`
 }
 
-// IntegrationInstructions contains only the contract text the engine needs
-// while executing a selected integration-bound recipe. Bundle provenance and
-// local source paths deliberately do not enter the portable plan.
-type IntegrationInstructions struct {
-	Turns               []IntegrationTurn `json:"turns,omitempty"`
+// Instructions contains only the text the engine needs for participant turns
+// and the reducer. Bundle provenance and local source paths deliberately do
+// not enter the portable plan.
+type Instructions struct {
+	Turns               []TurnInstruction `json:"turns,omitempty"`
 	ReducerInstructions string            `json:"reducer_instructions,omitempty"`
 }
 
-// IntegrationTurn binds one selected contract instruction to the compiled
-// participant turn and actor. ParticipantTurn is one-based, matching the
-// dialogue schedule and integration contract declarations.
-type IntegrationTurn struct {
+// TurnInstruction binds instruction text to a participant turn and actor.
+// ParticipantTurn is one-based, matching the schedule.
+type TurnInstruction struct {
 	ParticipantTurn int    `json:"participant_turn"`
 	Actor           string `json:"actor"`
 	Instructions    string `json:"instructions"`
@@ -349,7 +349,7 @@ func BlobRefs(plan Plan) []blobstore.BlobRef {
 	refs := make([]blobstore.BlobRef, 0, len(plan.Inputs)+len(plan.Context)+len(plan.Skills))
 	for _, inputs := range [][]Input{plan.Inputs, plan.Context, plan.Skills} {
 		for _, input := range inputs {
-			refs = append(refs, input.Content)
+			refs = append(refs, input.Contents...)
 		}
 	}
 	return refs
@@ -389,15 +389,15 @@ func ValidateEventBindings(plan Plan, events []eventlog.Event) error {
 // ValidatePlan is the sole typed boundary validator for compiled plans.
 func ValidatePlan(plan Plan) error {
 	if plan.Kind != PlanKind {
-		return fmt.Errorf("plan kind must be %s", PlanKind)
+		return fmt.Errorf("plan kind %q does not match build value %q", plan.Kind, PlanKind)
 	}
 	if plan.SchemaVersion != SchemaVersion {
-		return fmt.Errorf("plan schema_version must be %d", SchemaVersion)
+		return fmt.Errorf("plan schema_version %d does not match build value %d", plan.SchemaVersion, SchemaVersion)
 	}
 	switch plan.Provenance {
-	case ProvenanceOrdinary, ProvenanceRecipe, ProvenanceChild:
+	case ProvenanceOrdinary, ProvenanceRecipe, ProvenanceChild, ProvenanceSupplied:
 	default:
-		return fmt.Errorf("plan provenance must be one of %s, %s, %s", ProvenanceOrdinary, ProvenanceRecipe, ProvenanceChild)
+		return fmt.Errorf("plan provenance must be one of %s, %s, %s, %s", ProvenanceOrdinary, ProvenanceRecipe, ProvenanceChild, ProvenanceSupplied)
 	}
 	if (plan.Provenance == ProvenanceRecipe || plan.Provenance == ProvenanceChild) && plan.RecipeID == "" {
 		return errors.New("plan compiled from a recipe must record recipe_id")
@@ -589,55 +589,50 @@ func ValidatePlan(plan Plan) error {
 	if plan.Lifecycle != nil && plan.Lifecycle.Resume == "forbid" && plan.ChildPolicy.Mode == "ask" {
 		return errors.New("lifecycle.resume forbid is incompatible with child_policy.mode ask")
 	}
-	if plan.IntegrationContract != "" {
-		if err := validateToken("integration_contract", plan.IntegrationContract); err != nil {
-			return err
-		}
-	}
-	if err := validateIntegrationInstructions(plan, actorIDs); err != nil {
+	if err := validateInstructions(plan, actorIDs); err != nil {
 		return err
 	}
 	return eventlog.ValidatePortableValue(portableProjection(plan))
 }
 
-func validateIntegrationInstructions(plan Plan, actors map[string]bool) error {
-	instructions := plan.IntegrationInstructions
+func validateInstructions(plan Plan, actors map[string]bool) error {
+	instructions := plan.Instructions
 	if instructions == nil {
 		return nil
-	}
-	if plan.IntegrationContract == "" {
-		return errors.New("integration instructions require integration_contract")
 	}
 	turns := make(map[int]struct{}, len(instructions.Turns))
 	for _, turn := range instructions.Turns {
 		if turn.ParticipantTurn < 1 {
-			return errors.New("integration instruction participant_turn must be positive")
+			return errors.New("instruction participant_turn must be positive")
+		}
+		if turn.ParticipantTurn > plan.Schedule.Turns {
+			return fmt.Errorf("instruction participant_turn %d is outside the schedule", turn.ParticipantTurn)
 		}
 		if _, exists := turns[turn.ParticipantTurn]; exists {
-			return fmt.Errorf("plan contains duplicate integration instruction for participant turn %d", turn.ParticipantTurn)
+			return fmt.Errorf("plan contains duplicate instruction for participant turn %d", turn.ParticipantTurn)
 		}
 		turns[turn.ParticipantTurn] = struct{}{}
 		if _, exists := actors[turn.Actor]; !exists {
-			return fmt.Errorf("integration instruction names unknown actor %q", turn.Actor)
+			return fmt.Errorf("instruction names unknown actor %q", turn.Actor)
 		}
 		if (plan.Facilitator != nil && turn.Actor == plan.Facilitator.Actor) ||
 			(plan.Reducer != nil && turn.Actor == plan.Reducer.Actor) {
-			return fmt.Errorf("integration instruction must name a participant actor, got %q", turn.Actor)
+			return fmt.Errorf("instruction must name a participant actor, got %q", turn.Actor)
 		}
 		if strings.TrimSpace(turn.Instructions) == "" || strings.Contains(turn.Instructions, "\x00") {
-			return fmt.Errorf("integration instruction for participant turn %d is invalid", turn.ParticipantTurn)
+			return fmt.Errorf("instruction for participant turn %d is invalid", turn.ParticipantTurn)
 		}
 	}
 	if instructions.ReducerInstructions != "" {
 		if plan.Reducer == nil {
-			return errors.New("integration reducer instructions require a reducer")
+			return errors.New("reducer instructions require a reducer")
 		}
 		if strings.Contains(instructions.ReducerInstructions, "\x00") {
-			return errors.New("integration reducer instructions contain a control character")
+			return errors.New("reducer instructions contain a control character")
 		}
 	}
 	if plan.Result.Source == "reducer" && strings.TrimSpace(instructions.ReducerInstructions) == "" {
-		return errors.New("integration reducer result requires reducer instructions")
+		return errors.New("reducer result requires reducer instructions")
 	}
 	return nil
 }
@@ -682,8 +677,13 @@ func validateInputs(label string, inputs []Input) error {
 			return fmt.Errorf("plan contains duplicate %s %q", label, input.Name)
 		}
 		names[input.Name] = struct{}{}
-		if err := blobstore.ValidateRef(input.Content); err != nil {
-			return err
+		if len(input.Contents) == 0 {
+			return fmt.Errorf("%s %q must contain at least one payload", label, input.Name)
+		}
+		for _, content := range input.Contents {
+			if err := blobstore.ValidateRef(content); err != nil {
+				return err
+			}
 		}
 	}
 	return nil

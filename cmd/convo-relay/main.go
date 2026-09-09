@@ -682,6 +682,8 @@ func runRelay(args []string) {
 	flags := flag.NewFlagSet("run", flag.ExitOnError)
 	task := flags.String("task", "", "Task text for the relay")
 	recipeID := flags.String("recipe", "", "Run a configured recipe as the direct root execution")
+	planPath := flags.String("plan", "", "Run a supplied immutable plan JSON document")
+	blobsPath := flags.String("blobs", "", "Content-addressed blob directory for a supplied plan")
 	integrationBundlePath := flags.String("integration-bundle", "", "Integration bundle JSON for an integration-bound root recipe")
 	workspaceMode := flags.String("workspace", "current", "Root recipe workspace mode: current or head-copy")
 	allowDirtySource := flags.Bool("allow-dirty-source", false, "Use committed HEAD for isolated root execution when the source is dirty")
@@ -725,14 +727,42 @@ func runRelay(args []string) {
 	if err := parseFlags(flags, cleanedArgs); err != nil {
 		os.Exit(2)
 	}
-	if _, err := v2WorkspaceMode(*workspaceMode); err != nil {
-		fmt.Fprintf(os.Stderr, "error: %s\n", err)
-		os.Exit(2)
-	}
 	if *task == "" && len(flags.Args()) > 0 {
 		*task = strings.Join(flags.Args(), " ")
 	}
 	visited := visitedFlagNames(flags)
+	for _, name := range []string{"context", "skill", "recipe-file", "generated-recipe-file"} {
+		if len(extracted[name]) > 0 {
+			visited[name] = true
+		}
+	}
+	planRequested := strings.TrimSpace(*planPath) != "" || visited["plan"]
+	if planRequested {
+		if len(flags.Args()) > 0 || visited["task"] {
+			fmt.Fprintln(os.Stderr, "error: run --plan does not accept --task or a positional task")
+			os.Exit(2)
+		}
+		if err := validateSuppliedPlanRunStructuralOverrides(visited); err != nil {
+			fmt.Fprintf(os.Stderr, "error: %s\n", err)
+			os.Exit(2)
+		}
+		ctx, stop := signal.NotifyContext(context.Background(), commandInterruptSignals()...)
+		defer stop()
+		result, err := v2RunSuppliedPlan(ctx, v2SuppliedPlanRunOptions{
+			SessionDir:   *sessionDir,
+			RelayHome:    *relayHome,
+			PlanPath:     *planPath,
+			BlobsPath:    *blobsPath,
+			SettingsPath: *settingsPath,
+			LaunchCWD:    *launchCWD,
+		})
+		writeRunnerResult(result, err, *jsonOutput, output)
+		return
+	}
+	if _, err := v2WorkspaceMode(*workspaceMode); err != nil {
+		fmt.Fprintf(os.Stderr, "error: %s\n", err)
+		os.Exit(2)
+	}
 	recipeRequested := strings.TrimSpace(*recipeID) != "" || visited["recipe"] || visited["integration-bundle"] || visited["workspace"] || visited["allow-dirty-source"] || visited["input"]
 	if recipeRequested {
 		if strings.TrimSpace(*recipeID) == "" {
@@ -864,6 +894,23 @@ func validateRecipeRunStructuralOverrides(visited map[string]bool) error {
 		"facilitator-backend", "facilitator-model", "facilitator-effort",
 		"mode", "rounds", "max-rounds", "quick", "dynamic",
 	}
+	return validateRunStructuralOverrides("run --recipe", structural, visited)
+}
+
+func validateSuppliedPlanRunStructuralOverrides(visited map[string]bool) error {
+	structural := []string{
+		"recipe", "task", "agents",
+		"model-a", "effort-a", "model-b", "effort-b",
+		"facilitator-backend", "facilitator-model", "facilitator-effort",
+		"rounds", "max-rounds", "quick", "timeout", "stall-timeout",
+		"mode", "dynamic", "investigation", "workspace", "allow-dirty-source",
+		"context", "skill", "input", "task-plan", "integration-bundle",
+		"recipe-file", "generated-recipe-file", "session-id",
+	}
+	return validateRunStructuralOverrides("run --plan", structural, visited)
+}
+
+func validateRunStructuralOverrides(command string, structural []string, visited map[string]bool) error {
 	conflicts := []string{}
 	for _, name := range structural {
 		if visited[name] {
@@ -873,7 +920,7 @@ func validateRecipeRunStructuralOverrides(visited map[string]bool) error {
 	if len(conflicts) == 0 {
 		return nil
 	}
-	return fmt.Errorf("run --recipe does not accept structural overrides: %s", strings.Join(conflicts, ", "))
+	return fmt.Errorf("%s does not accept structural overrides: %s", command, strings.Join(conflicts, ", "))
 }
 
 func resolveRunRecipeSourceAnchor(value string) (string, error) {
@@ -1535,6 +1582,8 @@ func usageTo(writer io.Writer) {
 	fmt.Fprintln(writer, "usage:")
 	fmt.Fprintln(writer, "  convo-relay run --task <task> --agents codex,codex --rounds 2 --json")
 	fmt.Fprintln(writer, "  convo-relay run --task <task> --recipe <id> [--integration-bundle <path>] [--input name=path] [--workspace current|head-copy] --json")
+	fmt.Fprintln(writer, "  convo-relay run --plan <file> --json")
+	fmt.Fprintln(writer, "  convo-relay run --plan <file> --blobs <dir> --json")
 	fmt.Fprintln(writer, "  convo-relay resume <session-id-prefix> --mode steelman --rounds 1 --json")
 	fmt.Fprintln(writer, "  convo-relay list --home <relay-home> --json")
 	fmt.Fprintln(writer, "  convo-relay show <session-id-prefix> --json")

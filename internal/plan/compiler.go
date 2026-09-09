@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/charlesnpx/convo-relay/internal/blobstore"
 	"github.com/charlesnpx/convo-relay/internal/session"
 )
 
@@ -144,14 +145,17 @@ func copyPlan(plan session.Plan) session.Plan {
 	if plan.Inputs == nil {
 		plan.Inputs = []session.Input{}
 	}
+	copyInputContents(plan.Inputs)
 	plan.Context = append([]session.Input{}, plan.Context...)
 	if plan.Context == nil {
 		plan.Context = []session.Input{}
 	}
+	copyInputContents(plan.Context)
 	plan.Skills = append([]session.Input{}, plan.Skills...)
 	if plan.Skills == nil {
 		plan.Skills = []session.Input{}
 	}
+	copyInputContents(plan.Skills)
 	plan.TaskPlan = append(json.RawMessage{}, plan.TaskPlan...)
 	plan.ChildPolicy.AllowedRecipes = append([]string{}, plan.ChildPolicy.AllowedRecipes...)
 	if plan.ChildPolicy.AllowedRecipes == nil {
@@ -162,5 +166,22 @@ func copyPlan(plan session.Plan) session.Plan {
 		lifecycle := *plan.Lifecycle
 		plan.Lifecycle = &lifecycle
 	}
+	if plan.Instructions != nil {
+		instructions := *plan.Instructions
+		instructions.Turns = append([]session.TurnInstruction{}, instructions.Turns...)
+		if instructions.Turns == nil {
+			instructions.Turns = []session.TurnInstruction{}
+		}
+		plan.Instructions = &instructions
+	}
 	return plan
+}
+
+func copyInputContents(inputs []session.Input) {
+	for index := range inputs {
+		inputs[index].Contents = append([]blobstore.BlobRef{}, inputs[index].Contents...)
+		if inputs[index].Contents == nil {
+			inputs[index].Contents = []blobstore.BlobRef{}
+		}
+	}
 }

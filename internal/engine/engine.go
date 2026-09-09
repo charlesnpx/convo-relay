@@ -695,7 +695,14 @@ func (r *runner) reduceEvent(event eventlog.Event) error {
 			if input.Name != payload.LogicalName {
 				continue
 			}
-			if !input.Content.Equal(payload.Content) {
+			matches := false
+			for _, content := range input.Contents {
+				if content.Equal(payload.Content) {
+					matches = true
+					break
+				}
+			}
+			if !matches {
 				return fmt.Errorf("input.ingested for %q does not match immutable plan", payload.LogicalName)
 			}
 			state.provisionedInputs[payload.LogicalName] = payload.Content
@@ -1972,8 +1979,8 @@ func (r *runner) promptFor(actor session.Actor, round int, role eventlog.Role, r
 		fmt.Fprintf(&builder, "Resume direction: %s\n", prompt)
 	}
 	if role == eventlog.ParticipantRole {
-		if instructions := r.integrationTurnInstructions(actor.ID, round); instructions != "" {
-			fmt.Fprintf(&builder, "\n--- Integration Contract Instructions for This Turn ---\n%s\n", instructions)
+		if instructions := r.turnInstructions(actor.ID, round); instructions != "" {
+			fmt.Fprintf(&builder, "\n--- Instructions for This Turn ---\n%s\n", instructions)
 		}
 	}
 	if material := r.promptMaterial(); material != "" {
@@ -1998,10 +2005,10 @@ func (r *runner) promptFor(actor session.Actor, round int, role eventlog.Role, r
 		fmt.Fprintf(&builder, "\nReturn a JSON ledger with settled, contested, and withdrawn arrays. Current counts: settled=%d contested=%d withdrawn=%d.\n", counts.Settled, counts.Contested, counts.Withdrawn)
 	}
 	if role == eventlog.ReducerRole {
-		if r.sess.Plan.IntegrationInstructions != nil {
-			instructions := strings.TrimSpace(r.sess.Plan.IntegrationInstructions.ReducerInstructions)
+		if r.sess.Plan.Instructions != nil {
+			instructions := strings.TrimSpace(r.sess.Plan.Instructions.ReducerInstructions)
 			if instructions != "" {
-				fmt.Fprintf(&builder, "\n--- Integration Contract Reducer Instructions ---\n%s\n", instructions)
+				fmt.Fprintf(&builder, "\n--- Reducer Instructions ---\n%s\n", instructions)
 			}
 		}
 		builder.WriteString("\nReturn the final reduced result for this task.\n")
@@ -2009,11 +2016,11 @@ func (r *runner) promptFor(actor session.Actor, round int, role eventlog.Role, r
 	return builder.String()
 }
 
-func (r *runner) integrationTurnInstructions(actorID string, round int) string {
-	if r.sess.Plan.IntegrationInstructions == nil {
+func (r *runner) turnInstructions(actorID string, round int) string {
+	if r.sess.Plan.Instructions == nil {
 		return ""
 	}
-	for _, turn := range r.sess.Plan.IntegrationInstructions.Turns {
+	for _, turn := range r.sess.Plan.Instructions.Turns {
 		if turn.ParticipantTurn == round && turn.Actor == actorID {
 			return strings.TrimSpace(turn.Instructions)
 		}
@@ -2037,19 +2044,21 @@ func loadPromptMaterial(blobs *blobstore.Store, value session.Plan) (string, err
 	var builder strings.Builder
 	for _, group := range groups {
 		for _, input := range group.items {
-			reader, err := blobs.Open(input.Content)
-			if err != nil {
-				return "", fmt.Errorf("open %s %q: %w", group.label, input.Name, err)
+			for _, content := range input.Contents {
+				reader, err := blobs.Open(content)
+				if err != nil {
+					return "", fmt.Errorf("open %s %q: %w", group.label, input.Name, err)
+				}
+				body, readErr := io.ReadAll(reader)
+				closeErr := reader.Close()
+				if readErr != nil {
+					return "", fmt.Errorf("read %s %q: %w", group.label, input.Name, readErr)
+				}
+				if closeErr != nil {
+					return "", fmt.Errorf("verify %s %q: %w", group.label, input.Name, closeErr)
+				}
+				fmt.Fprintf(&builder, "[%s:%s]\n%s\n", group.label, input.Name, string(body))
 			}
-			body, readErr := io.ReadAll(reader)
-			closeErr := reader.Close()
-			if readErr != nil {
-				return "", fmt.Errorf("read %s %q: %w", group.label, input.Name, readErr)
-			}
-			if closeErr != nil {
-				return "", fmt.Errorf("verify %s %q: %w", group.label, input.Name, closeErr)
-			}
-			fmt.Fprintf(&builder, "[%s:%s]\n%s\n", group.label, input.Name, string(body))
 		}
 	}
 	if len(value.TaskPlan) > 0 {

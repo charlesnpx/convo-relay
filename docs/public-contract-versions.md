@@ -21,6 +21,14 @@ The plan records actors, schedule, lifecycle policy, workspace mode, named
 inputs, and result policy. Payload-bearing plan fields use the shared BlobRef
 shape below. Resuming a session may add events; it never mutates this plan.
 
+The direct launch form is `convo-relay run --plan FILE`, with `--blobs DIR`
+when the plan references payloads. A plan's generic instruction block is
+`instructions`; it replaces the former `integration_instructions` field, and
+the plan no longer contains `integration_contract`. Each named input carries
+its payloads in `contents`, an ordered list of BlobRef values, rather than a
+single `content` value. The supplied plan is validated as written; launch
+defaults are not applied.
+
 ## `relay.event/v1`
 
 The event log is a canonical JSONL stream. Each record has

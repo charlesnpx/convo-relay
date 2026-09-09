@@ -92,6 +92,17 @@ Once approved, launch the relay using the Bash tool with `run_in_background: tru
 convo-relay run "<task brief>" --mode <mode> --agents <backend_a,backend_b> --investigation <mode> --context <files...> --verbose
 ```
 
+When the caller already has a complete immutable plan document, use the direct
+entry point instead of reconstructing it from flags:
+
+```bash
+convo-relay run --plan <plan.json> [--blobs <blob-directory>] --verbose
+```
+
+The plan is used as written and must contain its own execution values. If it
+contains payload references, `--blobs` points to a directory containing
+`sha256/<lowercase-hex-digest>` files.
+
 Do **not** append `&` — the `run_in_background` parameter handles backgrounding. You will be automatically notified when the process completes.
 
 Always include `--verbose`. The command prints `Session <8-char-id>` to stderr immediately on launch — capture this session ID.

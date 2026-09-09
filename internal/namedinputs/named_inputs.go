@@ -85,9 +85,9 @@ func Read(bindings []Binding, sourceAnchor string, limits Limits) ([]Prepared, e
 		}
 		sum := sha256.Sum256(body)
 		prepared = append(prepared, Prepared{
-			Input: session.Input{Name: name, Content: blobstore.BlobRef{
+			Input: session.Input{Name: name, Contents: []blobstore.BlobRef{{
 				SHA256: hex.EncodeToString(sum[:]), Size: int64(len(body)), MediaType: binaryMediaType,
-			}},
+			}}},
 			body: append([]byte(nil), body...),
 		})
 	}
@@ -137,11 +137,15 @@ func Persist(sess *session.Session, prepared []Prepared) error {
 		return err
 	}
 	for _, item := range prepared {
-		stored, err := blobs.PutBytes(item.body, item.Input.Content.MediaType)
+		if len(item.Input.Contents) != 1 {
+			return fmt.Errorf("named input %q must contain exactly one payload", item.Input.Name)
+		}
+		content := item.Input.Contents[0]
+		stored, err := blobs.PutBytes(item.body, content.MediaType)
 		if err != nil {
 			return err
 		}
-		if !stored.Equal(item.Input.Content) {
+		if !stored.Equal(content) {
 			return fmt.Errorf("ingested named input %q has a digest mismatch", item.Input.Name)
 		}
 	}
@@ -151,10 +155,11 @@ func Persist(sess *session.Session, prepared []Prepared) error {
 	}
 	defer writer.Close()
 	for index, item := range prepared {
+		content := item.Input.Contents[0]
 		if _, err := writer.Append(eventlog.NewEvent(
 			fmt.Sprintf("input-ingested-%d-%d", index, time.Now().UnixNano()),
 			time.Now(),
-			eventlog.InputIngestedPayload{LogicalName: item.Input.Name, Content: item.Input.Content},
+			eventlog.InputIngestedPayload{LogicalName: item.Input.Name, Content: content},
 		)); err != nil {
 			return err
 		}
@@ -179,7 +184,11 @@ func Materialize(sess *session.Session, inputs []session.Input, destination stri
 		if filepath.Base(input.Name) != input.Name || input.Name == "." || input.Name == "" {
 			return fmt.Errorf("unsafe named input path %q", input.Name)
 		}
-		reader, err := blobs.Open(input.Content)
+		if len(input.Contents) != 1 {
+			return fmt.Errorf("named input %q must contain exactly one payload for materialization", input.Name)
+		}
+		content := input.Contents[0]
+		reader, err := blobs.Open(content)
 		if err != nil {
 			return err
 		}
@@ -195,7 +204,7 @@ func Materialize(sess *session.Session, inputs []session.Input, destination stri
 		if err := os.WriteFile(path, body, 0o600); err != nil {
 			return err
 		}
-		if err := VerifyPath(path, input.Content); err != nil {
+		if err := VerifyPath(path, content); err != nil {
 			return err
 		}
 	}
