@@ -122,8 +122,19 @@ and optional recipe-root projection.
 
 `bundle` owns the typed `relay.bundle/v1` manifest and validates its required
 payload names, ordered inventory, BlobRefs, and inventory and manifest
-semantic digests. A decoded manifest can therefore be checked without using
-the CLI's internal verifier implementation.
+semantic digests. `bundle.VerifyPortableDirectory` verifies the complete closed
+directory in Go and returns typed `Manifest`, `SessionPayload`, transcript, and
+diagnostics projections. Optional `bundle.VerifyOptions` lets a caller require
+the submitted plan digest and session ID; the plan digest is checked with
+`plan.Digest`. A successful verification therefore does not require using the
+CLI's internal verifier implementation.
+
+Provider invocation evidence is deliberately presence-sensitive in
+`result.Root.Invocations`: `nil` means no durable invocation-start evidence was
+recorded, while a non-nil `result.Count{Count: 0}` means invocation evidence
+was recorded and the count was explicitly zero. The relay decides that
+presence from the durable `attempt.started` event view before projecting the
+root result, and the bundle preserves the distinction through JSON.
 
 The exported Go types, JSON field names, validation rules, digest meanings, and
 declared constants in these packages are compatibility contracts. A change to

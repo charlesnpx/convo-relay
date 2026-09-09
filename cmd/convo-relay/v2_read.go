@@ -14,8 +14,8 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/charlesnpx/convo-relay/v2/bundle"
 	"github.com/charlesnpx/convo-relay/v2/internal/blobstore"
-	"github.com/charlesnpx/convo-relay/v2/internal/eventlog"
 	"github.com/charlesnpx/convo-relay/v2/internal/format"
 	"github.com/charlesnpx/convo-relay/v2/internal/recipes"
 	"github.com/charlesnpx/convo-relay/v2/internal/relayv2"
@@ -765,22 +765,6 @@ func v2NewPortableBlobPayload(kind string, id string, ref blobstore.BlobRef, bod
 	}
 }
 
-func v2PortableBlobRef(value any) (blobstore.BlobRef, error) {
-	object, ok := value.(map[string]any)
-	if !ok {
-		return blobstore.BlobRef{}, errors.New("blob must be an object")
-	}
-	ref := blobstore.BlobRef{
-		SHA256:    v2String(object["sha256"]),
-		Size:      int64(v2Int(object["size"], -1)),
-		MediaType: v2String(object["media_type"]),
-	}
-	if err := blobstore.ValidateRef(ref); err != nil {
-		return blobstore.BlobRef{}, err
-	}
-	return ref, nil
-}
-
 func v2PublishPortableDirectory(target string, payloads []v2PortablePayload, manifest map[string]any) (returnErr error) {
 	parent := filepath.Dir(target)
 	if err := os.MkdirAll(parent, 0o755); err != nil {
@@ -808,7 +792,7 @@ func v2PublishPortableDirectory(target string, payloads []v2PortablePayload, man
 	if err := v2WriteSyncedFile(filepath.Join(temporary, "manifest.json"), manifestBody); err != nil {
 		return err
 	}
-	if _, err := v2VerifyPortableDirectory(temporary); err != nil {
+	if _, err := bundle.VerifyPortableDirectory(temporary); err != nil {
 		return err
 	}
 	if err := v2SyncDirectory(temporary); err != nil {
@@ -851,214 +835,6 @@ func v2SyncDirectory(directory string) error {
 		err = nil
 	}
 	return errors.Join(err, closeErr)
-}
-
-func v2VerifyPortableDirectory(directory string) (map[string]any, error) {
-	root, err := v2CanonicalDirectory(directory)
-	if err != nil {
-		return nil, err
-	}
-	manifestBody, err := os.ReadFile(filepath.Join(root, "manifest.json"))
-	if err != nil {
-		return nil, err
-	}
-	manifestValue, err := format.DecodeStrictJSONObjectBytes(manifestBody)
-	if err != nil {
-		return nil, err
-	}
-	manifest, err := format.ValidateBundleManifest(manifestValue)
-	if err != nil {
-		return nil, err
-	}
-	expectedFiles := map[string]bool{"manifest.json": true}
-	required := map[string]bool{
-		"root_session:session":              false,
-		"participant_transcript:transcript": false,
-		"diagnostics:diagnostics":           false,
-	}
-	inputEntries := map[string]blobstore.BlobRef{}
-	var rootSessionValue any
-	payloadCount := 0
-	for _, raw := range manifest["payload_inventory"].([]any) {
-		entry := raw.(map[string]any)
-		kind := v2String(entry["kind"])
-		portableID := v2String(entry["portable_id"])
-		key := kind + ":" + portableID
-		isInput := kind == "input"
-		if _, accepted := required[key]; !accepted && !isInput {
-			return nil, format.NewValidationError("portable export contains unsupported payload %s", key)
-		}
-		if isInput && portableID == "" {
-			return nil, format.NewValidationError("portable export input payload has an empty identity")
-		}
-		if !isInput {
-			required[key] = true
-		}
-		relative := v2String(entry["path"])
-		expectedFiles[relative] = true
-		filename := filepath.Join(root, filepath.FromSlash(relative))
-		info, err := os.Lstat(filename)
-		if err != nil || !info.Mode().IsRegular() {
-			return nil, format.NewValidationError("portable export payload %s is missing or not a regular file", relative)
-		}
-		blob, err := v2PortableBlobRef(entry["blob"])
-		if err != nil {
-			return nil, format.NewValidationError("portable export payload %s has invalid blob metadata", relative)
-		}
-		if info.Size() != blob.Size {
-			return nil, format.NewValidationError("portable export payload %s size or digest mismatch", relative)
-		}
-		body, err := os.ReadFile(filename)
-		if err != nil {
-			return nil, err
-		}
-		if got := blobstore.RefForBytes(body, blob.MediaType); !got.Equal(blob) {
-			return nil, format.NewValidationError("portable export payload %s size or digest mismatch", relative)
-		}
-		if isInput {
-			if blob.SHA256 != portableID {
-				return nil, format.NewValidationError("portable export input payload %s identity does not match its blob", relative)
-			}
-			inputEntries[portableID] = blob
-		} else {
-			value, err := format.DecodeStrictJSONBytes(body)
-			if err != nil {
-				return nil, fmt.Errorf("decode portable export payload %s: %w", relative, err)
-			}
-			if key == "root_session:session" {
-				if err := v2VerifyPortableRootSessionPayload(value); err != nil {
-					return nil, err
-				}
-				rootSessionValue = value
-			}
-		}
-		payloadCount++
-	}
-	for key, found := range required {
-		if !found {
-			return nil, format.NewValidationError("portable export is missing required payload %s", key)
-		}
-	}
-	expectedInputs, err := v2PortableInputRefs(rootSessionValue)
-	if err != nil {
-		return nil, err
-	}
-	for digest, ref := range expectedInputs {
-		actual, found := inputEntries[digest]
-		if !found {
-			return nil, format.NewValidationError("portable export is missing input payload %s", digest)
-		}
-		if !actual.Equal(ref) {
-			return nil, format.NewValidationError("portable export input payload %s does not match the root plan", digest)
-		}
-	}
-	for digest := range inputEntries {
-		if _, expected := expectedInputs[digest]; !expected {
-			return nil, format.NewValidationError("portable export contains input payload %s not referenced by the root plan", digest)
-		}
-	}
-	if err := v2VerifyClosedPortableFileSet(root, expectedFiles); err != nil {
-		return nil, err
-	}
-	return map[string]any{
-		"format":          manifest["kind"],
-		"status":          "valid",
-		"terminal_status": manifest["terminal_status"],
-		"payload_count":   payloadCount,
-		"manifest_digest": manifest["manifest_digest"],
-	}, nil
-}
-
-func v2VerifyPortableRootSessionPayload(value any) error {
-	payload, ok := value.(map[string]any)
-	if !ok {
-		return format.NewValidationError("portable root session payload must be an object")
-	}
-	if _, found := payload["kind"]; found {
-		return format.NewValidationError("portable root session payload must omit kind; relay.bundle/v1 identifies it")
-	}
-	return nil
-}
-
-func v2PortableInputRefs(value any) (map[string]blobstore.BlobRef, error) {
-	refs := map[string]blobstore.BlobRef{}
-	payload, ok := value.(map[string]any)
-	if !ok {
-		return refs, nil
-	}
-	rawPlan, found := payload["plan"]
-	if !found {
-		return refs, nil
-	}
-	body, err := format.CanonicalJSONBytes(rawPlan)
-	if err != nil {
-		return nil, fmt.Errorf("encode portable root plan: %w", err)
-	}
-	var planValue session.Plan
-	if err := eventlog.DecodeCanonicalJSON(body, &planValue); err != nil {
-		return nil, fmt.Errorf("decode portable root plan: %w", err)
-	}
-	if err := session.ValidatePlan(planValue); err != nil {
-		return nil, fmt.Errorf("validate portable root plan: %w", err)
-	}
-	for _, ref := range session.BlobRefs(planValue) {
-		if previous, exists := refs[ref.SHA256]; exists && !previous.Equal(ref) {
-			return nil, format.NewValidationError("portable root plan references blob %s with conflicting metadata", ref.SHA256)
-		}
-		refs[ref.SHA256] = ref
-	}
-	return refs, nil
-}
-
-func v2VerifyClosedPortableFileSet(root string, expected map[string]bool) error {
-	expectedDirectories := map[string]bool{}
-	for filename := range expected {
-		for directory := path.Dir(filename); directory != "."; directory = path.Dir(directory) {
-			expectedDirectories[directory] = true
-		}
-	}
-	return filepath.WalkDir(root, func(filename string, entry fs.DirEntry, walkErr error) error {
-		if walkErr != nil {
-			return walkErr
-		}
-		if filename == root {
-			return nil
-		}
-		relative, err := filepath.Rel(root, filename)
-		if err != nil {
-			return err
-		}
-		relative = filepath.ToSlash(relative)
-		if entry.Type()&os.ModeSymlink != 0 {
-			return format.NewValidationError("portable export contains a symlink at %s", relative)
-		}
-		if entry.IsDir() {
-			if expectedDirectories[relative] {
-				return nil
-			}
-			return format.NewValidationError("portable export contains an unexpected directory %s", relative)
-		}
-		if !expected[relative] {
-			return format.NewValidationError("portable export contains an unexpected file %s", relative)
-		}
-		return nil
-	})
-}
-
-func v2CanonicalDirectory(directory string) (string, error) {
-	absolute, err := filepath.Abs(strings.TrimSpace(directory))
-	if err != nil {
-		return "", err
-	}
-	resolved, err := filepath.EvalSymlinks(absolute)
-	if err != nil {
-		return "", err
-	}
-	info, err := os.Stat(resolved)
-	if err != nil || !info.IsDir() {
-		return "", format.NewValidationError("path must resolve to a directory")
-	}
-	return filepath.Clean(resolved), nil
 }
 
 func v2EmptyStringAsNil(value string) any {

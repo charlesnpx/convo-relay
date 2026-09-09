@@ -155,11 +155,11 @@ func TestSuppliedPlanWithBlobsExportsPortableBundle(t *testing.T) {
 	if err := relaybundle.Validate(manifest); err != nil {
 		t.Fatalf("validate portable manifest: %v", err)
 	}
-	verified, err := v2VerifyPortableDirectory(bundle)
+	verified, err := relaybundle.VerifyPortableDirectory(bundle)
 	if err != nil {
 		t.Fatalf("verify supplied portable bundle: %v", err)
 	}
-	if verified["status"] != "valid" {
+	if verified.Manifest.Kind != relaybundle.Kind {
 		t.Fatalf("supplied portable verification = %#v", verified)
 	}
 	inputPayloads, err := filepath.Glob(filepath.Join(bundle, "payloads", "input", "*.json"))
@@ -224,11 +224,11 @@ func TestSuppliedPlanWithReducerExportsProducedResult(t *testing.T) {
 	if !ok || rootResult["value"] != "FINAL-ANSWER-ZEBRA" {
 		t.Fatalf("supplied reducer root result = %#v, want produced result", root["result"])
 	}
-	verified, err := v2VerifyPortableDirectory(bundle)
+	verified, err := relaybundle.VerifyPortableDirectory(bundle)
 	if err != nil {
 		t.Fatalf("verify supplied reducer bundle: %v", err)
 	}
-	if verified["status"] != "valid" {
+	if verified.Manifest.Kind != relaybundle.Kind {
 		t.Fatalf("supplied reducer verification = %#v", verified)
 	}
 }

@@ -13,6 +13,9 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	relaybundle "github.com/charlesnpx/convo-relay/v2/bundle"
+	"github.com/charlesnpx/convo-relay/v2/plan"
 )
 
 // The tests in this package deliberately use only the compiled CLI.  The
@@ -883,12 +886,24 @@ func TestPortableExportRoundTripAndTamperDetection(t *testing.T) {
 		"slot_0":      {reply("TRACE_EXPORT_SOURCE")},
 		"facilitator": {ledger("TRACE_EXPORT_LEDGER")},
 	}))
-	run, _ := env.runJSON(t,
+	run, report := env.runJSON(t,
 		"--session-id", "portable-export",
 		"--task", "TRACE_PORTABLE_EXPORT_TASK", "--recipe", "trace-facilitated",
 		"--settings", fixturePath(t, env, "root-recipes.toml"), "--launch-cwd", env.workDir,
 	)
 	requireExit(t, run, 0)
+	sessionBody, err := os.ReadFile(filepath.Join(jsonString(t, requiredJSONField(t, report, "session_dir", "run result"), "run result.session_dir"), "session.json"))
+	if err != nil {
+		t.Fatalf("read exported session plan: %v", err)
+	}
+	var submitted plan.Plan
+	if err := json.Unmarshal(sessionBody, &submitted); err != nil {
+		t.Fatalf("decode exported session plan: %v", err)
+	}
+	planDigest, err := plan.Digest(submitted)
+	if err != nil {
+		t.Fatalf("digest exported session plan: %v", err)
+	}
 
 	bundle := filepath.Join(env.root, "portable-bundle")
 	exported := env.run(t, "export", "create", "--home", env.relayHome, "--portable", "-o", bundle, "--json", "portable-export")
@@ -897,11 +912,25 @@ func TestPortableExportRoundTripAndTamperDetection(t *testing.T) {
 	if got := requiredJSONField(t, exportedReport, "output", "portable export result"); got != bundle {
 		t.Fatalf("portable export output = %#v, want %q", got, bundle)
 	}
-	verified := env.run(t, "export", "verify", "--json", bundle)
-	requireExit(t, verified, 0)
-	verifiedReport := mustJSON(t, verified)
-	if resultStatus(t, verifiedReport) != "valid" {
-		t.Fatalf("portable verification = %#v", verifiedReport)
+	verified, err := relaybundle.VerifyPortableDirectory(bundle, relaybundle.VerifyOptions{
+		ExpectedPlanDigest: planDigest,
+		ExpectedSessionID:  submitted.SessionID,
+	})
+	if err != nil {
+		t.Fatalf("public portable verification: %v", err)
+	}
+	if verified.Manifest.Kind != relaybundle.Kind || verified.Session.Plan.SessionID != submitted.SessionID {
+		t.Fatalf("public portable verification = %#v", verified)
+	}
+	last := planDigest[len(planDigest)-1]
+	if last == '0' {
+		last = '1'
+	} else {
+		last = '0'
+	}
+	wrongDigest := planDigest[:len(planDigest)-1] + string(last)
+	if _, err := relaybundle.VerifyPortableDirectory(bundle, relaybundle.VerifyOptions{ExpectedPlanDigest: wrongDigest}); err == nil || !strings.Contains(err.Error(), wrongDigest) || !strings.Contains(err.Error(), planDigest) {
+		t.Fatalf("wrong expected plan digest error = %v", err)
 	}
 
 	target := portableInventoryPayload(t, bundle, "participant_transcript")
@@ -921,6 +950,9 @@ func TestPortableExportRoundTripAndTamperDetection(t *testing.T) {
 	}
 	if info, statErr := os.Stat(target); statErr != nil || info.Size() != int64(len(data)) {
 		t.Fatalf("tampered payload size changed or cannot be read: info=%#v err=%v", info, statErr)
+	}
+	if _, err := relaybundle.VerifyPortableDirectory(bundle); err == nil || !strings.Contains(err.Error(), "size or digest mismatch") || !strings.Contains(err.Error(), "expected sha256") || !strings.Contains(err.Error(), "actual sha256") {
+		t.Fatalf("public tampered verification error = %v", err)
 	}
 	tampered := env.run(t, "export", "verify", "--json", bundle)
 	if tampered.exitCode == 0 {

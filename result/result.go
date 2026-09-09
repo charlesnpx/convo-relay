@@ -347,9 +347,10 @@ type Root struct {
 	// ProviderRetry records nested retry mode; an empty value is retained for a
 	// pending nested projection.
 	ProviderRetry string `json:"provider_retry"`
-	// Invocations records provider invocation count; a negative count makes Root
-	// invalid.
-	Invocations Count `json:"invocations"`
+	// Invocations records provider invocation evidence. Nil means no invocation
+	// evidence was recorded; a non-nil count is present even when Count is zero.
+	// A negative present count makes Root invalid.
+	Invocations *Count `json:"invocations,omitempty"`
 	// ReducerAttempts records nested reducer invocation count; a negative count
 	// makes Root invalid.
 	ReducerAttempts Count `json:"reducer_attempts"`
@@ -494,7 +495,7 @@ func Validate(value Result) error {
 		if value.Root.Turns.Configured < 0 || value.Root.Turns.Completed < 0 {
 			return errors.New("result root.turns counts must not be negative")
 		}
-		if value.Root.Invocations.Count < 0 || value.Root.ReducerAttempts.Count < 0 {
+		if (value.Root.Invocations != nil && value.Root.Invocations.Count < 0) || value.Root.ReducerAttempts.Count < 0 {
 			return errors.New("result root invocation counts must not be negative")
 		}
 	}

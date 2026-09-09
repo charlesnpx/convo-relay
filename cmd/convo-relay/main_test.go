@@ -13,6 +13,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/charlesnpx/convo-relay/v2/bundle"
 	"github.com/charlesnpx/convo-relay/v2/internal/blobstore"
 	"github.com/charlesnpx/convo-relay/v2/internal/eventlog"
 	"github.com/charlesnpx/convo-relay/v2/internal/format"
@@ -244,14 +245,27 @@ func TestVersionJSONReportsFlatFormatsWithoutProviderProbes(t *testing.T) {
 
 func TestExportVerifyJSONReportsPortableBundle(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "portable")
+	planValue := suppliedPlanFixture("verify-session", nil)
 	payloads := []struct {
 		kind  string
 		id    string
 		value any
 	}{
-		{kind: "root_session", id: "session", value: map[string]any{"terminal_status": "completed"}},
+		{kind: "root_session", id: "session", value: map[string]any{
+			"plan": planValue, "terminal_status": "completed", "stop_reason": nil,
+			"result_source": "last_turn", "validation_status": "pending",
+			"workspace_content_source": "working_tree", "working_tree_changes_included": false,
+			"root": map[string]any{
+				"execution_kind": "supplied", "status": "completed", "recipe": map[string]any{},
+				"turns":     map[string]any{"configured": 1, "completed": 0},
+				"result":    map[string]any{"source": "last_turn", "validation_status": "pending", "value": ""},
+				"workspace": map[string]any{"mode": "current", "commit": "", "tree_hash": "", "workspace_content_source": "working_tree", "working_tree_changes_included": false},
+				"providers": map[string]string{}, "provider_retry": "forbid",
+				"invocations": map[string]any{"count": 0}, "reducer_attempts": map[string]any{"count": 0},
+			},
+		}},
 		{kind: "participant_transcript", id: "transcript", value: []any{}},
-		{kind: "diagnostics", id: "diagnostics", value: map[string]any{"execution_kind": "recipe", "status": "completed"}},
+		{kind: "diagnostics", id: "diagnostics", value: map[string]any{"abandoned_attempts": []any{}, "unreferenced_blobs": []any{}, "budget_state": ""}},
 	}
 	inventory := make([]any, 0, len(payloads))
 	for _, payload := range payloads {
@@ -396,7 +410,7 @@ func TestExportVerifyJSONReportsPortableBundle(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(dir, "manifest.json"), legacyManifestBody, 0o644); err != nil {
 		t.Fatalf("write legacy manifest: %v", err)
 	}
-	if _, err := v2VerifyPortableDirectory(dir); err == nil || !strings.Contains(err.Error(), "must omit kind") {
+	if _, err := bundle.VerifyPortableDirectory(dir); err == nil || !strings.Contains(err.Error(), "must omit kind") {
 		t.Fatalf("legacy root marker verification error = %v", err)
 	}
 }

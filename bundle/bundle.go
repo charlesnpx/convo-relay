@@ -1,4 +1,4 @@
-// Package bundle defines and validates the portable export manifest.
+// Package bundle defines, validates, and verifies portable export bundles.
 package bundle
 
 import (

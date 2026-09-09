@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/charlesnpx/convo-relay/v2/bundle"
 	"github.com/charlesnpx/convo-relay/v2/internal/engine"
 	"github.com/charlesnpx/convo-relay/v2/internal/eventlog"
 	"github.com/charlesnpx/convo-relay/v2/internal/format"
@@ -588,7 +589,7 @@ func runExportVerify(args []string) {
 		fmt.Fprintln(os.Stderr, "error: export verify requires a portable export directory")
 		os.Exit(2)
 	}
-	report, err := v2VerifyPortableDirectory(flags.Args()[0])
+	verified, err := bundle.VerifyPortableDirectory(flags.Args()[0])
 	if err != nil {
 		if *jsonOutput {
 			writeJSON(map[string]any{
@@ -600,6 +601,13 @@ func runExportVerify(args []string) {
 		}
 		fmt.Fprintf(os.Stderr, "error: %s\n", err)
 		os.Exit(1)
+	}
+	report := map[string]any{
+		"format":          verified.Manifest.Kind,
+		"status":          "valid",
+		"terminal_status": verified.Manifest.TerminalStatus,
+		"payload_count":   verified.PayloadCount,
+		"manifest_digest": verified.Manifest.ManifestDigest,
 	}
 	if *jsonOutput {
 		writeJSON(report)

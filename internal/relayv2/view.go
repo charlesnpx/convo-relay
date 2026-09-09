@@ -163,7 +163,12 @@ func BuildReport(sess *session.Session, options ProjectionOptions) (relayresult.
 	if sess.Plan.Provenance == relayplan.ProvenanceRecipe ||
 		sess.Plan.Provenance == relayplan.ProvenanceChild ||
 		sess.Plan.Provenance == relayplan.ProvenanceSupplied {
-		report["root"] = rootProjection(sess.Plan, status, participantTurns, result, validation, workspaceState, providerSessions, len(ledgerView.Attempts), reducerAttempts)
+		var invocationCount *int
+		if statusView.Counts.AttemptsStarted > 0 {
+			count := len(ledgerView.Attempts)
+			invocationCount = &count
+		}
+		report["root"] = rootProjection(sess.Plan, status, participantTurns, result, validation, workspaceState, providerSessions, invocationCount, reducerAttempts)
 	}
 	body, err := json.Marshal(report)
 	if err != nil {
@@ -339,8 +344,8 @@ func resultProjection(events []eventlog.Event, blobs *blobstore.Store) (string, 
 	return text, validation
 }
 
-func rootProjection(value session.Plan, status string, turns int, result string, validation string, workspaceState map[string]any, providerSessions map[string]string, invocations int, reducerAttempts int) map[string]any {
-	return map[string]any{
+func rootProjection(value session.Plan, status string, turns int, result string, validation string, workspaceState map[string]any, providerSessions map[string]string, invocations *int, reducerAttempts int) map[string]any {
+	projection := map[string]any{
 		"execution_kind": executionKind(value),
 		"status":         status,
 		"recipe":         recipeProjection(value),
@@ -356,9 +361,12 @@ func rootProjection(value session.Plan, status string, turns int, result string,
 		"workspace":        workspaceState,
 		"providers":        providerSessions,
 		"provider_retry":   value.ProviderRetry.Mode,
-		"invocations":      map[string]any{"count": invocations},
 		"reducer_attempts": map[string]any{"count": reducerAttempts},
 	}
+	if invocations != nil {
+		projection["invocations"] = map[string]any{"count": *invocations}
+	}
+	return projection
 }
 
 func recipeProjection(value session.Plan) map[string]any {
