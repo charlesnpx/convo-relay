@@ -4,6 +4,18 @@ Orchestrate live dialogues between AI coding backends such as **OpenAI Codex CLI
 
 Give it a task like "review this auth module for vulnerabilities", "debate monorepo vs polyrepo", or "collaboratively write integration tests", and it runs a structured back-and-forth conversation between two backend slots. Every debater turn is saved, and a separate facilitator tracks what is settled, contested, and withdrawn. The common case is `codex,claude`, but the relay also supports reversed ordering, mixed pairs such as `codex,gemini`, same-backend pairs such as `claude,claude` or `codex,codex`, and single-value shorthand like `--agents claude`, `--agents codex`, or `--agents gemini`.
 
+## Depends on / Depended on by
+
+**Depends on:** `github.com/charlesnpx/agentbus` (embeds `engine/` and its
+adapters, pinned at `v0.14.4`).
+
+**Depended on by:** `witness`, which invokes the `convo-relay` CLI and, once its
+migration lands, imports `github.com/charlesnpx/convo-relay/v2/plan`,
+`github.com/charlesnpx/convo-relay/v2/result`, and
+`github.com/charlesnpx/convo-relay/v2/bundle`. These public packages are a
+published boundary; a change to them is a breaking change. See
+[docs/public-contract-versions.md](docs/public-contract-versions.md).
+
 ## Why this approach
 
 I found myself often in a situation where I was building a spec, diving into code or a problem, or other similarly complex problems, where I would want to paste context from one AI agent dialogue into another, to see if I could escape one being tunnel visioned, or to benefit from having a different perspective on things. Different models come to different conclusions, which compounds the degree to which the differences between different toolsets (like the differences between how codex and claude code operate) lead to different conclusions (I won't say "different" again in this README, I promise). This approach is a convenient way to automate this process.
