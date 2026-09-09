@@ -44,6 +44,22 @@ cross-compile:
 	done
 
 release-gate: cross-compile
+	@set -eu; \
+	awk '\
+	  /^archives:/ { in_archives=1; next } \
+	  in_archives && /^    files:/ { in_files=1; next } \
+	  in_files && /^      - / { sub(/^      - /, ""); print; next } \
+	  in_files { exit } \
+	' .goreleaser.yaml | while IFS= read -r pattern; do \
+		found=false; \
+		for match in $$pattern; do \
+			if [ -e "$$match" ]; then found=true; break; fi; \
+		done; \
+		if [ "$$found" = false ]; then \
+			printf 'release-gate: archive file pattern has no matches: %s\n' "$$pattern" >&2; \
+			exit 1; \
+		fi; \
+	done
 
 package: build
 	rm -rf "$(DIST_DIR)"

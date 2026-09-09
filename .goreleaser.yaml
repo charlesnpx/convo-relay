@@ -34,9 +34,7 @@ archives:
     files:
       - README.md
       - LICENSE
-      - install-skill.sh
       - skill/**
-      - scripts/render_display_pdf.py
 
 checksum:
   name_template: checksums.txt
