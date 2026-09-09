@@ -42,9 +42,11 @@ referenced blobs, is the authority for all session views.
 ## `relay.bundle/v1`
 
 A portable bundle is a closed directory with a `manifest.json` whose
-`kind` is `relay.bundle/v1`. Its manifest names exactly three exported
+`kind` is `relay.bundle/v1`. Its manifest names three required exported
 payloads: the root-session projection, participant transcript, and diagnostics
-projection. `payload_inventory` is sorted by path and each entry has:
+projection. A plan's referenced input, context, and skill blobs are optional
+additional `input` inventory entries. `payload_inventory` is sorted by path and
+each entry has:
 
 ```json
 {
@@ -61,9 +63,10 @@ projection. `payload_inventory` is sorted by path and each entry has:
 
 The verifier rejects a missing payload, altered payload, symlink, unexpected
 file, unknown manifest field, duplicate identity, out-of-order inventory, or
-digest mismatch. `inventory_digest` is the semantic JSON digest of the ordered
-inventory. `manifest_digest` is the semantic JSON digest of the manifest with
-only `manifest_digest` omitted.
+digest mismatch. Required projection payloads are canonical JSON; `input`
+entries retain the referenced raw blob bytes and media type. `inventory_digest`
+is the semantic JSON digest of the ordered inventory. `manifest_digest` is the
+semantic JSON digest of the manifest with only `manifest_digest` omitted.
 
 ## Shared BlobRef
 

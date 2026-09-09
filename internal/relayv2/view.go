@@ -567,6 +567,9 @@ func executionKind(value session.Plan) string {
 	if value.Provenance == session.ProvenanceChild {
 		return "child"
 	}
+	if value.Provenance == session.ProvenanceSupplied {
+		return "supplied"
+	}
 	return "ordinary"
 }
 

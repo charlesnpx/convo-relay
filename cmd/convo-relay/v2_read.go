@@ -3,6 +3,7 @@ package main
 import (
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"os"
 	"path"
@@ -13,6 +14,7 @@ import (
 	"strings"
 
 	"github.com/charlesnpx/convo-relay/internal/blobstore"
+	"github.com/charlesnpx/convo-relay/internal/eventlog"
 	"github.com/charlesnpx/convo-relay/internal/format"
 	"github.com/charlesnpx/convo-relay/internal/recipes"
 	"github.com/charlesnpx/convo-relay/internal/relayv2"
@@ -597,7 +599,7 @@ func v2ExportPortable(sess *session.Session, targetDir string, version string) (
 	} else if !os.IsNotExist(err) {
 		return nil, err
 	}
-	if sess.Plan.Provenance != session.ProvenanceRecipe {
+	if sess.Plan.Provenance != session.ProvenanceRecipe && sess.Plan.Provenance != session.ProvenanceSupplied {
 		return nil, format.NewValidationError("portable export requires a direct root session")
 	}
 	report, err := relayv2.BuildReport(sess, relayv2.ProjectionOptions{})
@@ -622,7 +624,11 @@ func v2ExportPortable(sess *session.Session, targetDir string, version string) (
 		"root":                          root,
 	}
 	diagnostics, _ := report["diagnostics"].(map[string]any)
-	payloads := make([]v2PortablePayload, 0, 3)
+	inputPayloads, err := v2PortableInputPayloads(sess)
+	if err != nil {
+		return nil, err
+	}
+	payloads := make([]v2PortablePayload, 0, 3+len(inputPayloads))
 	for _, item := range []struct {
 		kind string
 		id   string
@@ -638,6 +644,7 @@ func v2ExportPortable(sess *session.Session, targetDir string, version string) (
 		}
 		payloads = append(payloads, payload)
 	}
+	payloads = append(payloads, inputPayloads...)
 	sort.Slice(payloads, func(left, right int) bool {
 		return v2String(payloads[left].entry["path"]) < v2String(payloads[right].entry["path"])
 	})
@@ -677,6 +684,68 @@ func v2NewPortablePayload(kind string, id string, value any) (v2PortablePayload,
 		},
 		body: body,
 	}, nil
+}
+
+// v2PortableInputPayloads carries the raw plan-input blobs into the display
+// bundle. The plan keeps the references; the input entries keep the bytes
+// available to a consumer that receives only the bundle.
+func v2PortableInputPayloads(sess *session.Session) ([]v2PortablePayload, error) {
+	if sess == nil {
+		return nil, errors.New("portable export requires a session")
+	}
+	refs := session.BlobRefs(sess.Plan)
+	if len(refs) == 0 {
+		return nil, nil
+	}
+	blobs, err := sess.BlobStore(blobstore.Limits{})
+	if err != nil {
+		return nil, fmt.Errorf("open input blobs for portable export: %w", err)
+	}
+	byDigest := make(map[string]blobstore.BlobRef, len(refs))
+	for _, ref := range refs {
+		if previous, exists := byDigest[ref.SHA256]; exists {
+			if !previous.Equal(ref) {
+				return nil, format.NewValidationError("portable export cannot represent blob %s with conflicting metadata", ref.SHA256)
+			}
+			continue
+		}
+		byDigest[ref.SHA256] = ref
+	}
+	digests := make([]string, 0, len(byDigest))
+	for digest := range byDigest {
+		digests = append(digests, digest)
+	}
+	sort.Strings(digests)
+	payloads := make([]v2PortablePayload, 0, len(digests))
+	for _, digest := range digests {
+		ref := byDigest[digest]
+		reader, err := blobs.Open(ref)
+		if err != nil {
+			return nil, fmt.Errorf("open input blob %s for portable export: %w", digest, err)
+		}
+		body, readErr := io.ReadAll(reader)
+		closeErr := reader.Close()
+		if readErr != nil {
+			return nil, fmt.Errorf("read input blob %s for portable export: %w", digest, readErr)
+		}
+		if closeErr != nil {
+			return nil, fmt.Errorf("verify input blob %s for portable export: %w", digest, closeErr)
+		}
+		payloads = append(payloads, v2NewPortableBlobPayload("input", digest, ref, body))
+	}
+	return payloads, nil
+}
+
+func v2NewPortableBlobPayload(kind string, id string, ref blobstore.BlobRef, body []byte) v2PortablePayload {
+	return v2PortablePayload{
+		entry: map[string]any{
+			"kind":        kind,
+			"portable_id": id,
+			"path":        path.Join("payloads", kind, id+".json"),
+			"blob":        ref,
+		},
+		body: body,
+	}
 }
 
 func v2PortableBlobRef(value any) (blobstore.BlobRef, error) {
@@ -790,16 +859,24 @@ func v2VerifyPortableDirectory(directory string) (map[string]any, error) {
 		"participant_transcript:transcript": false,
 		"diagnostics:diagnostics":           false,
 	}
+	inputEntries := map[string]blobstore.BlobRef{}
+	var rootSessionValue any
 	payloadCount := 0
 	for _, raw := range manifest["payload_inventory"].([]any) {
 		entry := raw.(map[string]any)
 		kind := v2String(entry["kind"])
 		portableID := v2String(entry["portable_id"])
 		key := kind + ":" + portableID
-		if _, accepted := required[key]; !accepted {
+		isInput := kind == "input"
+		if _, accepted := required[key]; !accepted && !isInput {
 			return nil, format.NewValidationError("portable export contains unsupported payload %s", key)
 		}
-		required[key] = true
+		if isInput && portableID == "" {
+			return nil, format.NewValidationError("portable export input payload has an empty identity")
+		}
+		if !isInput {
+			required[key] = true
+		}
 		relative := v2String(entry["path"])
 		expectedFiles[relative] = true
 		filename := filepath.Join(root, filepath.FromSlash(relative))
@@ -818,16 +895,24 @@ func v2VerifyPortableDirectory(directory string) (map[string]any, error) {
 		if err != nil {
 			return nil, err
 		}
-		if got := blobstore.RefForBytes(body, "application/json"); !got.Equal(blob) {
+		if got := blobstore.RefForBytes(body, blob.MediaType); !got.Equal(blob) {
 			return nil, format.NewValidationError("portable export payload %s size or digest mismatch", relative)
 		}
-		value, err := format.DecodeStrictJSONBytes(body)
-		if err != nil {
-			return nil, fmt.Errorf("decode portable export payload %s: %w", relative, err)
-		}
-		if key == "root_session:session" {
-			if err := v2VerifyPortableRootSessionPayload(value); err != nil {
-				return nil, err
+		if isInput {
+			if blob.SHA256 != portableID {
+				return nil, format.NewValidationError("portable export input payload %s identity does not match its blob", relative)
+			}
+			inputEntries[portableID] = blob
+		} else {
+			value, err := format.DecodeStrictJSONBytes(body)
+			if err != nil {
+				return nil, fmt.Errorf("decode portable export payload %s: %w", relative, err)
+			}
+			if key == "root_session:session" {
+				if err := v2VerifyPortableRootSessionPayload(value); err != nil {
+					return nil, err
+				}
+				rootSessionValue = value
 			}
 		}
 		payloadCount++
@@ -835,6 +920,24 @@ func v2VerifyPortableDirectory(directory string) (map[string]any, error) {
 	for key, found := range required {
 		if !found {
 			return nil, format.NewValidationError("portable export is missing required payload %s", key)
+		}
+	}
+	expectedInputs, err := v2PortableInputRefs(rootSessionValue)
+	if err != nil {
+		return nil, err
+	}
+	for digest, ref := range expectedInputs {
+		actual, found := inputEntries[digest]
+		if !found {
+			return nil, format.NewValidationError("portable export is missing input payload %s", digest)
+		}
+		if !actual.Equal(ref) {
+			return nil, format.NewValidationError("portable export input payload %s does not match the root plan", digest)
+		}
+	}
+	for digest := range inputEntries {
+		if _, expected := expectedInputs[digest]; !expected {
+			return nil, format.NewValidationError("portable export contains input payload %s not referenced by the root plan", digest)
 		}
 	}
 	if err := v2VerifyClosedPortableFileSet(root, expectedFiles); err != nil {
@@ -858,6 +961,36 @@ func v2VerifyPortableRootSessionPayload(value any) error {
 		return format.NewValidationError("portable root session payload must omit kind; relay.bundle/v1 identifies it")
 	}
 	return nil
+}
+
+func v2PortableInputRefs(value any) (map[string]blobstore.BlobRef, error) {
+	refs := map[string]blobstore.BlobRef{}
+	payload, ok := value.(map[string]any)
+	if !ok {
+		return refs, nil
+	}
+	rawPlan, found := payload["plan"]
+	if !found {
+		return refs, nil
+	}
+	body, err := format.CanonicalJSONBytes(rawPlan)
+	if err != nil {
+		return nil, fmt.Errorf("encode portable root plan: %w", err)
+	}
+	var planValue session.Plan
+	if err := eventlog.DecodeCanonicalJSON(body, &planValue); err != nil {
+		return nil, fmt.Errorf("decode portable root plan: %w", err)
+	}
+	if err := session.ValidatePlan(planValue); err != nil {
+		return nil, fmt.Errorf("validate portable root plan: %w", err)
+	}
+	for _, ref := range session.BlobRefs(planValue) {
+		if previous, exists := refs[ref.SHA256]; exists && !previous.Equal(ref) {
+			return nil, format.NewValidationError("portable root plan references blob %s with conflicting metadata", ref.SHA256)
+		}
+		refs[ref.SHA256] = ref
+	}
+	return refs, nil
 }
 
 func v2VerifyClosedPortableFileSet(root string, expected map[string]bool) error {

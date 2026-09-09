@@ -367,11 +367,13 @@ convo-relay export verify evidence-bundle --json
 
 `export create` requires an explicit `-o` / `--output` path. Markdown exports include session status, incomplete state, task, session id, final ledger details, compact per-turn ledger counts, and transcript turns. JSON exports include the same structured session report as `show --json`, including diagnostics, and succeed for incomplete sessions when the partial transcript can be read.
 
-`--portable` is separate from display exports. It accepts a terminal recipe
-root session and atomically publishes a closed `relay.bundle/v1` directory:
-one manifest plus the root-session, transcript, and diagnostics payloads. The
-manifest inventory carries a BlobRef for each payload. `export verify`
-rechecks the closed file set, canonical payload JSON, and every blob digest.
+`--portable` is separate from display exports. It accepts a terminal direct
+root session (a recipe or supplied plan) and atomically publishes a closed
+`relay.bundle/v1` directory: one manifest plus the root-session, transcript,
+and diagnostics payloads. When the plan references input, context, or skill
+blobs, the bundle also carries each raw referenced blob under its `input`
+inventory entry. The manifest inventory carries a BlobRef for each payload.
+`export verify` rechecks the closed file set and every payload digest.
 With `--json`, an invalid export writes `status: "invalid"` to stdout and exits
 with status 1. Running, incomplete, tampered, or non-root sessions fail without
 publishing the final target.

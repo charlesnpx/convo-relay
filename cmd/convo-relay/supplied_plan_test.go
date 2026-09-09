@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/json"
@@ -36,6 +37,75 @@ func TestSuppliedPlanRunsAndPersistsItsFields(t *testing.T) {
 	}
 	if !reflect.DeepEqual(got.Plan, planValue) {
 		t.Fatalf("stored plan = %#v, want %#v", got.Plan, planValue)
+	}
+	report, err := relayv2.BuildReport(got, relayv2.ProjectionOptions{})
+	if err != nil {
+		t.Fatalf("build supplied report: %v", err)
+	}
+	if report["execution_kind"] != "supplied" {
+		t.Fatalf("supplied execution_kind = %v, want supplied", report["execution_kind"])
+	}
+}
+
+func TestSuppliedPlanWithBlobsExportsPortableBundle(t *testing.T) {
+	root := t.TempDir()
+	installSuppliedCodex(t, fakeCodexAppServerScript)
+	input := []byte("portable supplied input")
+	ref := blobstore.RefForBytes(input, "text/plain")
+	sourceDir := filepath.Join(root, "source")
+	writeSuppliedBlob(t, sourceDir, ref, input)
+	planValue := suppliedPlanFixture("portable-supplied-session", []session.Input{{
+		Name:     "brief",
+		Contents: []blobstore.BlobRef{ref},
+	}})
+	sessionDir := filepath.Join(root, "session")
+	launchCWD := filepath.Join(root, "launch")
+	if err := os.MkdirAll(launchCWD, 0o700); err != nil {
+		t.Fatalf("create supplied portable launch CWD: %v", err)
+	}
+	if _, err := v2RunSuppliedPlan(context.Background(), v2SuppliedPlanRunOptions{
+		SessionDir: sessionDir,
+		PlanPath:   writeSuppliedPlan(t, planValue),
+		BlobsPath:  sourceDir,
+		LaunchCWD:  launchCWD,
+	}); err != nil {
+		t.Fatalf("run supplied plan with portable input: %v", err)
+	}
+	sess, err := session.Open(sessionDir)
+	if err != nil {
+		t.Fatalf("open supplied portable session: %v", err)
+	}
+	for _, jsonMode := range []bool{false, true} {
+		report, err := v2ExportReport(sess, jsonMode)
+		if err != nil {
+			t.Fatalf("build supplied export report (json=%t): %v", jsonMode, err)
+		}
+		output := filepath.Join(root, map[bool]string{false: "export.md", true: "export.json"}[jsonMode])
+		if _, err := writeExportOutput(report, output, jsonMode); err != nil {
+			t.Fatalf("write supplied export (json=%t): %v", jsonMode, err)
+		}
+	}
+	bundle := filepath.Join(root, "portable")
+	if _, err := v2ExportPortable(sess, bundle, "test"); err != nil {
+		t.Fatalf("export supplied portable bundle: %v", err)
+	}
+	verified, err := v2VerifyPortableDirectory(bundle)
+	if err != nil {
+		t.Fatalf("verify supplied portable bundle: %v", err)
+	}
+	if verified["status"] != "valid" {
+		t.Fatalf("supplied portable verification = %#v", verified)
+	}
+	inputPayloads, err := filepath.Glob(filepath.Join(bundle, "payloads", "input", "*.json"))
+	if err != nil || len(inputPayloads) != 1 {
+		t.Fatalf("supplied portable input payloads = %v, %v", inputPayloads, err)
+	}
+	payload, err := os.ReadFile(inputPayloads[0])
+	if err != nil {
+		t.Fatalf("read supplied portable input payload: %v", err)
+	}
+	if !bytes.Equal(payload, input) {
+		t.Fatalf("supplied portable input payload = %q, want %q", payload, input)
 	}
 }
 
