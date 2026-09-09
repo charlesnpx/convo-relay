@@ -20,7 +20,6 @@ import (
 
 	"github.com/charlesnpx/convo-relay/internal/engine"
 	"github.com/charlesnpx/convo-relay/internal/eventlog"
-	"github.com/charlesnpx/convo-relay/internal/integration"
 	"github.com/charlesnpx/convo-relay/internal/plan"
 	"github.com/charlesnpx/convo-relay/internal/provider"
 	"github.com/charlesnpx/convo-relay/internal/recipes"
@@ -328,7 +327,7 @@ func recipeFromRecord(
 	actors = append(actors, facilitator)
 	resultSource := stringValue(normalized["result_source"])
 	var reducer *session.Reducer
-	if resultSource == integration.ResultSourceReducer {
+	if resultSource == recipes.ResultSourceReducer {
 		reducerActor, err := actorFromProfile("reducer", stringValue(normalized["reducer"]), profiles, relayRecipes)
 		if err != nil {
 			return plan.Recipe{}, fmt.Errorf("recipe %q reducer: %w", id, err)
@@ -359,18 +358,17 @@ func recipeFromRecord(
 			Kind:  "dialogue",
 			Turns: intValue(normalized["participant_turns"], intValue(normalized["max_rounds"], 1)),
 		},
-		Mode:                stringValue(normalized["mode"]),
-		Facilitator:         &session.Facilitator{Actor: facilitator.ID, Cadence: 1},
-		Reducer:             reducer,
-		MaxRounds:           intValue(normalized["max_rounds"], 1),
-		ParticipantTurns:    intValue(normalized["participant_turns"], intValue(normalized["max_rounds"], 1)),
-		ResultSource:        resultSource,
-		ProviderRetry:       retry,
-		IntegrationContract: stringValue(normalized["integration_contract"]),
-		MaxDepth:            intValue(normalized["max_depth"], 1),
-		AutoApproval:        stringValue(normalized["auto_approval"]),
-		Lifecycle:           lifecycle,
-		Workspace:           workspacePlan,
+		Mode:             stringValue(normalized["mode"]),
+		Facilitator:      &session.Facilitator{Actor: facilitator.ID, Cadence: 1},
+		Reducer:          reducer,
+		MaxRounds:        intValue(normalized["max_rounds"], 1),
+		ParticipantTurns: intValue(normalized["participant_turns"], intValue(normalized["max_rounds"], 1)),
+		ResultSource:     resultSource,
+		ProviderRetry:    retry,
+		MaxDepth:         intValue(normalized["max_depth"], 1),
+		AutoApproval:     stringValue(normalized["auto_approval"]),
+		Lifecycle:        lifecycle,
+		Workspace:        workspacePlan,
 		ChildPolicy: session.ChildPolicy{
 			Mode:           childPolicyMode(stringValue(normalized["auto_approval"])),
 			MaxDepth:       intValue(normalized["max_depth"], 1),

@@ -200,7 +200,7 @@ convo-relay control approve a1b2c3d4 sp_123456789abc
 convo-relay control reject a1b2c3d4 sp_123456789abc --reason "too broad"
 ```
 
-Dynamic expansion uses predeclared backend profiles and relay recipes. Built-in profiles include `codex-deep`, `codex-fast`, `claude-code`, `gemini-vision`, and `review-panel-child`; built-in recipes include `review-panel`, `vision-review`, and `one-pass-review`. Override or extend them with a TOML file:
+Dynamic expansion uses predeclared backend profiles and relay recipes. Built-in profiles include `codex-deep`, `codex-fast`, and `gemini-vision`; built-in recipes include `review-panel`, `vision-review`, and `one-pass-review`. Override or extend them with a TOML file:
 
 ```toml
 [backend_profiles.codex-reviewer]
@@ -272,16 +272,17 @@ convo-relay recipes doctor
 convo-relay recipes compile review-panel --json
 ```
 
-`recipes list` shows usable recipes and recipes that require an integration bundle by default in human output. JSON output includes all statuses unless `--status` is supplied, including invalid or skipped parseable records that would otherwise be hidden by runtime normalization. `recipes show` reports declared recipe data, integration binding, and resolved participant/backend readiness. `recipes doctor` validates settings parseability, recipe/profile references, installation-only backend readiness, and grouped root-cause diagnostics. A missing integration bundle reports `requires_integration` without degrading list or doctor; pass `--integration-bundle <file>` to list, show, doctor, or `recipes compile` to bind an exact contract.
-
-The optional Witness defaults are consumer-specific recipe aliases. They
-declare orchestration topology and policy only; prompts, result schemas, and
-adjudication remain consumer-owned bundle data. The relay treats each
-integration contract id as opaque.
+`recipes list` shows usable recipes by default in human output. JSON output
+includes all statuses unless `--status` is supplied, including invalid or
+skipped parseable records that would otherwise be hidden by runtime
+normalization. `recipes show` reports declared recipe data and resolved
+participant/backend readiness. `recipes doctor` validates settings parseability,
+recipe/profile references, installation-only backend readiness, and grouped
+root-cause diagnostics.
 
 `recipes compile <id>` is a side-effect-free root-launch preflight. It emits a
-machine-readable plan preview and binds a matching integration bundle when the
-recipe declares a contract; it does not execute providers or create a session.
+machine-readable plan preview; it does not execute providers or create a
+session.
 
 Run a configured recipe directly as the root session:
 
@@ -289,15 +290,14 @@ Run a configured recipe directly as the root session:
 convo-relay run "Evaluate the supplied records" \
   --recipe bounded-procedure \
   --settings ./settings.toml \
-  --integration-bundle ./integration.json \
   --input source=./source.json \
   --workspace head-copy \
   --json -o ./session-result.json
 ```
 
-Root recipe mode uses the recipe's exact participant-turn schedule, optional fresh reducer, named inputs, and declarative result contract. It has no compile-target flag because it always selects the root target. Ordinary runs continue to use their existing path.
+Root recipe mode uses the recipe's exact participant-turn schedule, optional fresh reducer, named inputs, and result policy. It has no compile-target flag because it always selects the root target. Ordinary runs continue to use their existing path.
 
-For contracts with named inputs, `--input name=path` reads each source once,
+For recipes with named inputs, `--input name=path` reads each source once,
 stores it as a content-addressed session blob, and records its stable name and
 digest in the plan.
 
@@ -305,15 +305,9 @@ Root recipes may set `provider_retry = "forbid"` to permit only one runner
 launch per provider invocation; omission preserves the legacy `allow` policy.
 Retries performed internally by a provider remain outside runner accounting.
 
-Integration bundle v2 adds a `prompt_context` projection. Participant history
-is complete; `facilitator_ledger = "trace_only"` retains facilitator artifacts
-while excluding that ledger from later participant and reducer prompts.
-
 Provider CLIs are trusted same-user processes. They run with the invoking user's authority and are not a sandbox or security boundary: they can access any source, session, credential, network, or other path the user can access. Named-input source paths do not survive ingestion; providers receive prompt material loaded from the digest-bound session blobs.
 
 Root recipes use `--workspace current|head-copy`. `current` executes in the launch directory, while `head-copy` executes in a detached worktree at the recorded HEAD commit and tree hash. Neither mode is a security boundary.
-
-See [Root recipe and integration contracts](docs/root-recipe-integration.md) for the unified compiler API, bundle contracts, JSON Schema result validation, blob ingestion, workspace modes, recovery, persistence, inspection, cleanup, and trust-boundary contracts.
 
 Limit a run to 3 rounds:
 
@@ -503,9 +497,8 @@ Then read /tmp/auth-review.md and summarize what each agent found.
 | `-o, --output` | run, resume, export create | Write an export to a specific file. Required for `export create`; optional for `run` and `resume` |
 | `--portable` | export create | Write a complete terminal successor root session as a new portable directory |
 | `--json` | run, resume, list, show, control, export, recipes, clean, doctor, version | Use JSON instead of markdown |
-| `--status {usable,requires_integration,unavailable,invalid,skipped,all}` | recipes list | Filter recipes by catalog status |
+| `--status {usable,unavailable,invalid,skipped,all}` | recipes list | Filter recipes by catalog status |
 | `--view {all,declared,resolved}` | recipes show | Select declared and/or resolved recipe details |
-| `--integration-bundle FILE` | run --recipe, recipes list/show/doctor/compile | Bind a root run, catalog records, or preflight compilation to a strict integration bundle |
 | `--all` | clean | Mark orphaned sessions across a relay home |
 | `--probe-auth` | doctor | Run supported non-model authentication probes |
 | `--limit N` | list, clean --all | Max sessions to show or scan |

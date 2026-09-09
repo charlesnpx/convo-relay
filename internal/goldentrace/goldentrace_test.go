@@ -291,16 +291,6 @@ func resultActualRounds(t *testing.T, result map[string]any) int {
 	return jsonInt(t, requiredJSONField(t, result, "actual_rounds", "result"), "result.actual_rounds")
 }
 
-func resultSource(t *testing.T, result map[string]any) string {
-	t.Helper()
-	return jsonString(t, requiredJSONField(t, result, "result_source", "result"), "result.result_source")
-}
-
-func resultValidationStatus(t *testing.T, result map[string]any) string {
-	t.Helper()
-	return jsonString(t, requiredJSONField(t, result, "validation_status", "result"), "result.validation_status")
-}
-
 func requireExit(t *testing.T, result commandResult, want int) {
 	t.Helper()
 	if result.exitCode != want {
@@ -441,15 +431,6 @@ func fixturePath(t *testing.T, env *traceEnv, name string) string {
 	return path
 }
 
-func writeTraceFixture(t *testing.T, env *traceEnv, name string, contents string) string {
-	t.Helper()
-	path := filepath.Join(env.root, name)
-	if err := os.WriteFile(path, []byte(contents), 0o600); err != nil {
-		t.Fatalf("write trace fixture %s: %v", name, err)
-	}
-	return path
-}
-
 func reply(text string) map[string]any {
 	return map[string]any{"text": text}
 }
@@ -586,65 +567,6 @@ func TestDeclarativeRecipeRun(t *testing.T) {
 	root := resultRoot(t, showReport)
 	if jsonMap(t, requiredJSONField(t, root, "recipe", "result.root"), "recipe report")["id"] != "trace-declarative" || resultActualRounds(t, resultSummary(t, showReport)) != 2 {
 		t.Fatalf("recipe public report = %#v", showReport)
-	}
-}
-
-func TestFixedSequenceWithReducer(t *testing.T) {
-	env := newTraceEnv(t, scriptedPlan(map[string][]map[string]any{
-		"slot_0":      {reply("TRACE_FIXED_SEQUENCE_FIRST")},
-		"slot_1":      {reply("TRACE_FIXED_SEQUENCE_SECOND")},
-		"facilitator": {ledger("TRACE_FIXED_SEQUENCE_LEDGER")},
-		"reducer": {{
-			"text":           `{"result":"TRACE_REDUCER_RESULT"}`,
-			"require_prompt": "TRACE_FIXED_SEQUENCE_SECOND",
-		}},
-	}))
-	bundle := writeTraceFixture(t, env, "reducer-bundle.json", `{
-  "schema_version": "relay-integration-bundle-v2",
-  "id": "goldentrace/reducer-bundle",
-  "contracts": {
-    "goldentrace/reducer-v1": {
-      "turns": [
-        {"participant_turn": 1, "slot": "slot_0", "instructions": "Provide the first fixed-sequence response."},
-        {"participant_turn": 2, "slot": "slot_1", "instructions": "Provide the second fixed-sequence response."}
-      ],
-      "reducer": {"instructions": "Return the final reducer JSON object."},
-      "inputs": {},
-      "result": {
-        "transport": "json",
-        "schema": {
-          "type": "object",
-          "required": ["result"],
-          "properties": {"result": {"type": "string", "enum": ["TRACE_REDUCER_RESULT"]}}
-        }
-      },
-      "prompt_context": {"participant_transcript": "complete", "facilitator_ledger": "include"}
-    }
-  }
-}`)
-
-	run, report := env.runJSON(t,
-		"--session-id", "fixed-reducer",
-		"--task", "TRACE_FIXED_REDUCER_TASK", "--recipe", "trace-reducer",
-		"--settings", fixturePath(t, env, "root-recipes.toml"), "--integration-bundle", bundle,
-		"--launch-cwd", env.workDir,
-	)
-	requireExit(t, run, 0)
-	if resultStatus(t, report) != "completed" || resultSource(t, report) != "reducer" || resultValidationStatus(t, report) != "validated" {
-		t.Fatalf("fixed reducer run result = %#v", report)
-	}
-
-	show, showReport := env.showJSON(t, "fixed-reducer")
-	requireExit(t, show, 0)
-	entries := transcript(t, showReport)
-	if len(entries) != 2 || entries[0]["content"] != "TRACE_FIXED_SEQUENCE_FIRST" || entries[1]["content"] != "TRACE_FIXED_SEQUENCE_SECOND" {
-		t.Fatalf("fixed participant sequence = %#v", entries)
-	}
-	root := resultRoot(t, showReport)
-	result := jsonMap(t, requiredJSONField(t, root, "result", "result.root"), "root result")
-	reducerAttempts := jsonMap(t, requiredJSONField(t, root, "reducer_attempts", "result.root"), "reducer attempts")
-	if jsonString(t, requiredJSONField(t, result, "source", "root result"), "root result.source") != "reducer" || resultValidationStatus(t, result) != "validated" || jsonInt(t, requiredJSONField(t, reducerAttempts, "count", "reducer attempts"), "reducer attempt count") != 1 {
-		t.Fatalf("public reducer result projection = %#v", root)
 	}
 }
 

@@ -5,6 +5,9 @@ import "strings"
 const (
 	ProviderRetryAllow  = "allow"
 	ProviderRetryForbid = "forbid"
+
+	ResultSourceLastTurn = "last_turn"
+	ResultSourceReducer  = "reducer"
 )
 
 // normalizeRecipePayload is the one configuration projection consumed by the
@@ -26,9 +29,6 @@ func normalizeRecipePayload(data map[string]any) map[string]any {
 		"result_source":     normalizeResultSource(data["result_source"]),
 		"lifecycle":         normalizeLifecyclePayload(data["lifecycle"]),
 	}
-	if integrationID := strings.TrimSpace(stringValue(data["integration_contract"])); integrationID != "" {
-		payload["integration_contract"] = integrationID
-	}
 	if strings.TrimSpace(stringValue(data["origin"])) == "generated" {
 		payload["origin"] = "generated"
 		if value := strings.TrimSpace(stringValue(data["generated_from_ref"])); value != "" {
@@ -47,10 +47,10 @@ func normalizeRecipePayload(data map[string]any) map[string]any {
 func RecipePayload(data map[string]any) map[string]any { return normalizeRecipePayload(data) }
 
 func normalizeResultSource(value any) string {
-	if strings.TrimSpace(stringValue(value)) == "reducer" {
-		return "reducer"
+	if strings.TrimSpace(stringValue(value)) == ResultSourceReducer {
+		return ResultSourceReducer
 	}
-	return "last_turn"
+	return ResultSourceLastTurn
 }
 
 func EffectiveProviderRetry(recipe map[string]any) string {

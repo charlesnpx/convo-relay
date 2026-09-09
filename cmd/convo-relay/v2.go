@@ -16,7 +16,6 @@ import (
 	"github.com/charlesnpx/convo-relay/internal/blobstore"
 	"github.com/charlesnpx/convo-relay/internal/engine"
 	"github.com/charlesnpx/convo-relay/internal/eventlog"
-	"github.com/charlesnpx/convo-relay/internal/integration"
 	"github.com/charlesnpx/convo-relay/internal/namedinputs"
 	"github.com/charlesnpx/convo-relay/internal/plan"
 	"github.com/charlesnpx/convo-relay/internal/recipes"
@@ -79,25 +78,24 @@ type v2OrdinaryRunOptions struct {
 }
 
 type v2RecipeRunOptions struct {
-	SessionDir            string
-	SessionID             string
-	RelayHome             string
-	Task                  string
-	RecipeID              string
-	ContextFiles          []string
-	SkillFiles            []string
-	TransientSources      []recipes.TransientRecipeSource
-	IntegrationBundlePath string
-	InputBindings         []string
-	WorkspaceMode         string
-	AllowDirtySource      bool
-	SettingsPath          string
-	LaunchCWD             string
-	TimeoutSeconds        int
-	StallTimeoutSeconds   int
-	Investigation         string
-	LaunchPlan            any
-	WorkspaceWarning      func(v2WorkspaceWarning)
+	SessionDir          string
+	SessionID           string
+	RelayHome           string
+	Task                string
+	RecipeID            string
+	ContextFiles        []string
+	SkillFiles          []string
+	TransientSources    []recipes.TransientRecipeSource
+	InputBindings       []string
+	WorkspaceMode       string
+	AllowDirtySource    bool
+	SettingsPath        string
+	LaunchCWD           string
+	TimeoutSeconds      int
+	StallTimeoutSeconds int
+	Investigation       string
+	LaunchPlan          any
+	WorkspaceWarning    func(v2WorkspaceWarning)
 }
 
 type v2SuppliedPlanRunOptions struct {
@@ -254,10 +252,6 @@ func v2RunRecipe(ctx context.Context, options v2RecipeRunOptions) (map[string]an
 	if err != nil {
 		return nil, err
 	}
-	bundle, err := recipes.LoadIntegrationBundle(config.SettingsPath, options.IntegrationBundlePath)
-	if err != nil {
-		return nil, err
-	}
 	planValue, catalog, err := v2RecipePlan(
 		config,
 		options.RecipeID,
@@ -269,7 +263,6 @@ func v2RunRecipe(ctx context.Context, options v2RecipeRunOptions) (map[string]an
 		skills,
 		namedinputs.Inputs(inputs),
 		taskPlan,
-		bundle,
 	)
 	if err != nil {
 		return nil, err
@@ -663,7 +656,6 @@ func v2RecipePlan(
 	skills []v2Input,
 	inputs []session.Input,
 	taskPlan json.RawMessage,
-	bundle *integration.Bundle,
 ) (session.Plan, []plan.Recipe, error) {
 	recipe, err := relayv2.RecipeFromRuntime(config, recipeID)
 	if err != nil {
@@ -672,52 +664,6 @@ func v2RecipePlan(
 	recipe.Inputs = append([]session.Input(nil), inputs...)
 	if strings.TrimSpace(investigation) != "" {
 		recipe.Investigation = investigation
-	}
-	if recipe.IntegrationContract != "" {
-		schedule, err := integration.AlternatingSchedule(recipe.ParticipantTurns)
-		if err != nil {
-			return session.Plan{}, nil, err
-		}
-		selected, err := integration.SelectContract(bundle, recipe.IntegrationContract, integration.ScheduleRequirement{Turns: schedule, ResultSource: recipe.ResultSource})
-		if err != nil {
-			return session.Plan{}, nil, err
-		}
-		contract := selected.Contract()
-		if contract != nil {
-			recipe.Result.Format = contract.Result.Format
-			if contract.Result.Schema != nil {
-				body, err := json.Marshal(contract.Result.Schema)
-				if err != nil {
-					return session.Plan{}, nil, err
-				}
-				recipe.Result.Schema = body
-			}
-		}
-		instructions, err := v2InstructionsFromContract(selected)
-		if err != nil {
-			return session.Plan{}, nil, err
-		}
-		compiled, err := plan.FromRecipe(plan.RecipeInput{
-			SessionID: sessionID,
-			Task:      task,
-			Inline:    &recipe,
-			Timeouts:  timeouts,
-			Context:   v2Inputs(contexts),
-			Skills:    v2Inputs(skills),
-			TaskPlan:  taskPlan,
-		})
-		if err != nil {
-			return session.Plan{}, nil, err
-		}
-		compiled.Instructions = instructions
-		if err := session.ValidatePlan(compiled); err != nil {
-			return session.Plan{}, nil, err
-		}
-		catalog, err := relayv2.RecipesFromRuntime(config)
-		if err != nil {
-			return session.Plan{}, nil, err
-		}
-		return compiled, catalog, nil
 	}
 	compiled, err := plan.FromRecipe(plan.RecipeInput{
 		SessionID: sessionID,
@@ -736,28 +682,4 @@ func v2RecipePlan(
 		return session.Plan{}, nil, err
 	}
 	return compiled, catalog, nil
-}
-
-func v2InstructionsFromContract(selected *integration.SelectedContract) (*session.Instructions, error) {
-	if selected == nil {
-		return nil, nil
-	}
-	contract := selected.Contract()
-	if contract == nil {
-		return nil, errors.New("selected integration contract has no contract body")
-	}
-	value := &session.Instructions{
-		Turns: make([]session.TurnInstruction, 0, len(contract.Turns)),
-	}
-	for _, turn := range contract.Turns {
-		value.Turns = append(value.Turns, session.TurnInstruction{
-			ParticipantTurn: turn.ParticipantTurn,
-			Actor:           turn.Slot,
-			Instructions:    turn.Instructions,
-		})
-	}
-	if contract.Reducer != nil {
-		value.ReducerInstructions = contract.Reducer.Instructions
-	}
-	return value, nil
 }

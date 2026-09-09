@@ -56,14 +56,13 @@ type Recipe struct {
 	Facilitator   *session.Facilitator `json:"facilitator,omitempty"`
 	Reducer       *session.Reducer     `json:"reducer,omitempty"`
 
-	MaxRounds           int                   `json:"max_rounds"`
-	ParticipantTurns    int                   `json:"participant_turns"`
-	ResultSource        string                `json:"result_source"`
-	ProviderRetry       session.ProviderRetry `json:"provider_retry"`
-	IntegrationContract string                `json:"integration_contract,omitempty"`
-	MaxDepth            int                   `json:"max_depth"`
-	AutoApproval        string                `json:"auto_approval"`
-	Lifecycle           session.Lifecycle     `json:"lifecycle"`
+	MaxRounds        int                   `json:"max_rounds"`
+	ParticipantTurns int                   `json:"participant_turns"`
+	ResultSource     string                `json:"result_source"`
+	ProviderRetry    session.ProviderRetry `json:"provider_retry"`
+	MaxDepth         int                   `json:"max_depth"`
+	AutoApproval     string                `json:"auto_approval"`
+	Lifecycle        session.Lifecycle     `json:"lifecycle"`
 
 	Workspace   session.Workspace   `json:"workspace"`
 	Inputs      []session.Input     `json:"inputs"`

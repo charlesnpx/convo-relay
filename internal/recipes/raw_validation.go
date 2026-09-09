@@ -21,20 +21,19 @@ const (
 )
 
 var allowedRecipeFields = map[string]bool{
-	"id":                   true,
-	"purpose":              true,
-	"participants":         true,
-	"facilitator":          true,
-	"reducer":              true,
-	"mode":                 true,
-	"max_rounds":           true,
-	"participant_turns":    true,
-	"result_source":        true,
-	"provider_retry":       true,
-	"integration_contract": true,
-	"max_depth":            true,
-	"auto_approval":        true,
-	"lifecycle":            true,
+	"id":                true,
+	"purpose":           true,
+	"participants":      true,
+	"facilitator":       true,
+	"reducer":           true,
+	"mode":              true,
+	"max_rounds":        true,
+	"participant_turns": true,
+	"result_source":     true,
+	"provider_retry":    true,
+	"max_depth":         true,
+	"auto_approval":     true,
+	"lifecycle":         true,
 	// Generated-source metadata is retained by normalization and is valid in
 	// runtime snapshots that are reapplied with transient sources.
 	"origin":              true,
@@ -89,7 +88,7 @@ func validateRecipeRecord(recipe map[string]any, path string) []format.Diagnosti
 		))
 	}
 
-	for _, field := range []string{"id", "purpose", "facilitator", "reducer", "integration_contract", "origin", "generated_from_ref", "generated_source", "generated_recipe_id"} {
+	for _, field := range []string{"id", "purpose", "facilitator", "reducer", "origin", "generated_from_ref", "generated_source", "generated_recipe_id"} {
 		value, exists := recipe[field]
 		if !exists {
 			continue
@@ -130,7 +129,7 @@ func validateRecipeRecord(recipe map[string]any, path string) []format.Diagnosti
 	}
 	validateRecipeChoice("mode", "cooperative", "adversarial", "steelman")
 	validateRecipeChoice("auto_approval", "ask", "auto-safe", "never")
-	validateRecipeChoice("result_source", "last_turn", "reducer")
+	validateRecipeChoice("result_source", ResultSourceLastTurn, ResultSourceReducer)
 	validateRecipeChoice("provider_retry", ProviderRetryAllow, ProviderRetryForbid)
 
 	for _, field := range []string{"max_rounds", "max_depth"} {
@@ -167,7 +166,7 @@ func validateRecipeRecord(recipe map[string]any, path string) []format.Diagnosti
 		}
 	}
 
-	if stringValue(recipe["result_source"]) == "reducer" {
+	if stringValue(recipe["result_source"]) == ResultSourceReducer {
 		if rawReducer, exists := recipe["reducer"]; exists {
 			reducer, ok := rawReducer.(string)
 			if !ok || strings.TrimSpace(reducer) == "" {

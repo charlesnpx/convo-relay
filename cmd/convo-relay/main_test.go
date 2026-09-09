@@ -127,7 +127,7 @@ func TestParseFlagsSupportsShortValueAfterPositionals(t *testing.T) {
 }
 
 func TestRecipeCLIValidators(t *testing.T) {
-	for _, status := range []string{"all", "usable", "requires_integration", "unavailable", "invalid", "skipped"} {
+	for _, status := range []string{"all", "usable", "unavailable", "invalid", "skipped"} {
 		if err := validateRecipeStatusFilter(status); err != nil {
 			t.Fatalf("status %q unexpectedly invalid: %v", status, err)
 		}
@@ -627,55 +627,9 @@ steering = "allow"
 dynamic = "forbid"
 workspace_isolation = "inherited"
 
-[relay_recipes.bound-root]
-purpose = "Neutral integration-bound CLI root recipe"
-participants = ["cli-a", "cli-b"]
-facilitator = "cli-f"
-reducer = "cli-r"
-mode = "cooperative"
-max_rounds = 2
-participant_turns = 2
-result_source = "last_turn"
-integration_contract = "neutral/contract-v1"
-max_depth = 1
-auto_approval = "never"
-
-[relay_recipes.bound-root.lifecycle]
-resume = "allow"
-steering = "forbid"
-dynamic = "forbid"
-workspace_isolation = "inherited"
 `
 	if err := os.WriteFile(recipePath, []byte(recipeSource), 0o644); err != nil {
 		t.Fatalf("write recipe source: %v", err)
-	}
-	bundlePath := filepath.Join(launchCWD, "bundle.json")
-	bundleSource := `{
-  "id": "neutral/integration-v1",
-  "contracts": {
-    "neutral/contract-v1": {
-      "turns": [
-        {"participant_turn": 1, "slot": "slot_0", "instructions": "Present the payload."},
-        {"participant_turn": 2, "slot": "slot_1", "instructions": "Challenge the payload."}
-      ],
-      "inputs": {
-        "payload": {
-          "required": true,
-          "cardinality": "one",
-          "media_type": "application/json",
-          "max_bytes": 1024,
-          "schema": {"type": "object"}
-        }
-      },
-      "result": {"transport": "json", "schema": {"type": "object"}}
-    }
-  }
-}`
-	if err := os.WriteFile(bundlePath, []byte(bundleSource), 0o644); err != nil {
-		t.Fatalf("write bundle: %v", err)
-	}
-	if err := os.WriteFile(filepath.Join(launchCWD, "payload.json"), []byte(`{"value":"cli"}`), 0o644); err != nil {
-		t.Fatalf("write named input: %v", err)
 	}
 	generatedRecipePath := filepath.Join(launchCWD, "generated-recipes.toml")
 	generatedRecipeSource := `
@@ -771,51 +725,6 @@ workspace_isolation = "inherited"
 		t.Fatalf("v2 root graph = %#v", graphPayload)
 	}
 
-	boundSessionDir := filepath.Join(tempDir, "bound-session")
-	boundCommand := exec.Command(binary,
-		"run", "Bound CLI task",
-		"--recipe", "bound-root",
-		"--settings", "settings.toml",
-		"--recipe-file", "root-recipes.toml",
-		"--integration-bundle", "bundle.json",
-		"--input", "payload=payload.json",
-		"--session-dir", boundSessionDir,
-		"--launch-cwd", launchCWD,
-		"--json",
-	)
-	boundCommand.Env = command.Env
-	boundOutput, err := boundCommand.CombinedOutput()
-	if err != nil {
-		t.Fatalf("run bound recipe CLI: %v\n%s", err, boundOutput)
-	}
-	boundResult := decodeJSONObject(t, string(boundOutput))
-	if boundResult["status"] != "completed" || boundResult["validation_status"] != "validated" {
-		t.Fatalf("bound root result = %#v", boundResult)
-	}
-	boundSession, err := session.Open(boundSessionDir)
-	if err != nil {
-		t.Fatalf("open bound v2 session: %v", err)
-	}
-	if boundSession.Plan.Instructions == nil ||
-		len(boundSession.Plan.Instructions.Turns) != 2 ||
-		boundSession.Plan.Result.Format != "json" {
-		t.Fatalf("bound v2 plan = %#v", boundSession.Plan)
-	}
-	if len(boundSession.Plan.Inputs) != 1 || boundSession.Plan.Inputs[0].Name != "payload" {
-		t.Fatalf("bound v2 plan inputs = %#v", boundSession.Plan.Inputs)
-	}
-	if _, statErr := os.Stat(filepath.Join(boundSessionDir, "meta.json")); !errors.Is(statErr, os.ErrNotExist) {
-		t.Fatalf("bound v2 session unexpectedly wrote legacy metadata: %v", statErr)
-	}
-
-	logData, err = os.ReadFile(providerLog)
-	if err != nil {
-		t.Fatalf("read provider log after bound run: %v", err)
-	}
-	if lines := strings.Split(strings.TrimSpace(string(logData)), "\n"); len(lines) != 8 {
-		t.Fatalf("unexpected provider invocation log after bound run:\n%s", logData)
-	}
-
 	compatibilityHome := filepath.Join(tempDir, "compatibility-home")
 	compatibilityOutput := filepath.Join(tempDir, "compatibility-output.json")
 	compatibilityCommand := exec.Command(binary,
@@ -875,7 +784,7 @@ workspace_isolation = "inherited"
 	if err != nil {
 		t.Fatalf("read provider log after compatible run: %v", err)
 	}
-	if lines := strings.Split(strings.TrimSpace(string(logData)), "\n"); len(lines) != 12 {
+	if lines := strings.Split(strings.TrimSpace(string(logData)), "\n"); len(lines) != 8 {
 		t.Fatalf("unexpected provider invocation log after compatible run:\n%s", logData)
 	}
 
@@ -913,105 +822,6 @@ workspace_isolation = "inherited"
 	}
 	if warning := dirtyStderr.String(); warning != "" {
 		t.Fatalf("head-copy run wrote unexpected stderr: %q", warning)
-	}
-
-	for _, mode := range []struct {
-		name       string
-		jsonOutput bool
-		withOutput bool
-	}{
-		{name: "plain stdout"},
-		{name: "plain output file", withOutput: true},
-		{name: "json stdout", jsonOutput: true},
-		{name: "json output file", jsonOutput: true, withOutput: true},
-	} {
-		t.Run("invalid result "+mode.name, func(t *testing.T) {
-			sessionDir := filepath.Join(tempDir, strings.ReplaceAll("invalid-"+mode.name, " ", "-"))
-			args := []string{
-				"run", "Invalid structured result",
-				"--recipe", "bound-root",
-				"--settings", "settings.toml",
-				"--recipe-file", "root-recipes.toml",
-				"--integration-bundle", "bundle.json",
-				"--input", "payload=payload.json",
-				"--session-dir", sessionDir,
-				"--launch-cwd", launchCWD,
-			}
-			if mode.jsonOutput {
-				args = append(args, "--json")
-			}
-			outputPath := ""
-			if mode.withOutput {
-				extension := ".md"
-				if mode.jsonOutput {
-					extension = ".json"
-				}
-				outputPath = filepath.Join(tempDir, strings.ReplaceAll(mode.name, " ", "-")+extension)
-				args = append(args, "-o", outputPath)
-			}
-			invalid := exec.Command(binary, args...)
-			invalid.Env = command.Env
-			var stdout strings.Builder
-			var stderr strings.Builder
-			invalid.Stdout = &stdout
-			invalid.Stderr = &stderr
-			runErr := invalid.Run()
-			var exitErr *exec.ExitError
-			if !errors.As(runErr, &exitErr) || exitErr.ExitCode() != 1 {
-				t.Fatalf("invalid result exit = %v, stdout=%s, stderr=%s", runErr, stdout.String(), stderr.String())
-			}
-			if !strings.Contains(stderr.String(), "result is not valid JSON") {
-				t.Fatalf("invalid result stderr = %s", stderr.String())
-			}
-			if mode.jsonOutput {
-				stdoutResult := decodeJSONObject(t, stdout.String())
-				if stdoutResult["status"] != "invalid_result" ||
-					stdoutResult["stop_reason"] != "invalid_result" ||
-					stdoutResult["validation_status"] != "invalid" {
-					t.Fatalf("invalid JSON stdout = %#v", stdoutResult)
-				}
-			} else if !strings.Contains(stdout.String(), " invalid_result at ") || !strings.Contains(stdout.String(), "Participant turns: 2/2") {
-				t.Fatalf("invalid plain stdout = %s", stdout.String())
-			}
-			invalidSession, openErr := session.Open(sessionDir)
-			if openErr != nil {
-				t.Fatalf("open invalid v2 session: %v", openErr)
-			}
-			invalidEvents, eventsErr := relayv2.Events(invalidSession)
-			if eventsErr != nil {
-				t.Fatalf("read invalid v2 events: %v", eventsErr)
-			}
-			resultInvalid := false
-			terminalInvalid := false
-			for _, event := range invalidEvents {
-				switch payload := event.Payload.(type) {
-				case eventlog.ResultProducedPayload:
-					resultInvalid = payload.ValidationOutcome == "invalid"
-				case eventlog.SessionFinishedPayload:
-					terminalInvalid = payload.Status == "failed" && payload.StopReason == "invalid_result"
-				}
-			}
-			if !resultInvalid || !terminalInvalid {
-				t.Fatalf("persisted invalid v2 events = %#v", invalidEvents)
-			}
-			if _, statErr := os.Stat(filepath.Join(sessionDir, "meta.json")); !errors.Is(statErr, os.ErrNotExist) {
-				t.Fatalf("invalid v2 session unexpectedly wrote legacy metadata: %v", statErr)
-			}
-			if mode.withOutput {
-				outputData, readErr := os.ReadFile(outputPath)
-				if readErr != nil {
-					t.Fatalf("read invalid output file: %v", readErr)
-				}
-				if mode.jsonOutput {
-					fileResult := decodeJSONObject(t, string(outputData))
-					if fileResult["status"] != "invalid_result" || fileResult["session_id"] != invalidSession.Plan.SessionID {
-						t.Fatalf("invalid JSON output file = %#v", fileResult)
-					}
-				} else if !strings.Contains(string(outputData), "not a JSON result") {
-					t.Fatalf("invalid Markdown output file = %s", outputData)
-				}
-			}
-		})
 	}
 
 	for _, rejection := range []struct {

@@ -9,22 +9,19 @@ import (
 )
 
 const (
-	DefaultIntegrationBundleMaxBytes int64 = 1_048_576
-	DefaultNamedInputMaxBytes        int64 = 16 * 1024 * 1024
-	DefaultNamedInputTotalMaxBytes   int64 = 64 * 1024 * 1024
+	DefaultNamedInputMaxBytes      int64 = 16 * 1024 * 1024
+	DefaultNamedInputTotalMaxBytes int64 = 64 * 1024 * 1024
 )
 
 type RuntimeLimits struct {
-	IntegrationBundleMaxBytes int64 `json:"integration_bundle_max_bytes"`
-	NamedInputMaxBytes        int64 `json:"named_input_max_bytes"`
-	NamedInputTotalMaxBytes   int64 `json:"named_input_total_max_bytes"`
+	NamedInputMaxBytes      int64 `json:"named_input_max_bytes"`
+	NamedInputTotalMaxBytes int64 `json:"named_input_total_max_bytes"`
 }
 
 func DefaultRuntimeLimits() RuntimeLimits {
 	return RuntimeLimits{
-		IntegrationBundleMaxBytes: DefaultIntegrationBundleMaxBytes,
-		NamedInputMaxBytes:        DefaultNamedInputMaxBytes,
-		NamedInputTotalMaxBytes:   DefaultNamedInputTotalMaxBytes,
+		NamedInputMaxBytes:      DefaultNamedInputMaxBytes,
+		NamedInputTotalMaxBytes: DefaultNamedInputTotalMaxBytes,
 	}
 }
 
@@ -34,9 +31,6 @@ func (c RuntimeConfig) EffectiveLimits() RuntimeLimits {
 
 func runtimeLimitsWithDefaults(limits RuntimeLimits) RuntimeLimits {
 	defaults := DefaultRuntimeLimits()
-	if limits.IntegrationBundleMaxBytes == 0 {
-		limits.IntegrationBundleMaxBytes = defaults.IntegrationBundleMaxBytes
-	}
 	if limits.NamedInputMaxBytes == 0 {
 		limits.NamedInputMaxBytes = defaults.NamedInputMaxBytes
 	}
@@ -51,7 +45,6 @@ func ValidateRuntimeLimits(limits RuntimeLimits) error {
 		name  string
 		value int64
 	}{
-		{name: "integration_bundle_max_bytes", value: limits.IntegrationBundleMaxBytes},
 		{name: "named_input_max_bytes", value: limits.NamedInputMaxBytes},
 		{name: "named_input_total_max_bytes", value: limits.NamedInputTotalMaxBytes},
 	}
@@ -77,9 +70,8 @@ func ParseRuntimeLimits(value any) (RuntimeLimits, error) {
 		return RuntimeLimits{}, fmt.Errorf("limits must be a table")
 	}
 	known := map[string]bool{
-		"integration_bundle_max_bytes": true,
-		"named_input_max_bytes":        true,
-		"named_input_total_max_bytes":  true,
+		"named_input_max_bytes":       true,
+		"named_input_total_max_bytes": true,
 	}
 	unknown := make([]string, 0)
 	for key := range object {
@@ -97,7 +89,6 @@ func ParseRuntimeLimits(value any) (RuntimeLimits, error) {
 		name   string
 		assign func(int64)
 	}{
-		{name: "integration_bundle_max_bytes", assign: func(value int64) { limits.IntegrationBundleMaxBytes = value }},
 		{name: "named_input_max_bytes", assign: func(value int64) { limits.NamedInputMaxBytes = value }},
 		{name: "named_input_total_max_bytes", assign: func(value int64) { limits.NamedInputTotalMaxBytes = value }},
 	}

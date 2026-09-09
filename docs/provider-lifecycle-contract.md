@@ -55,7 +55,7 @@ codes, warning lists, recovery sources, and raw provider detail remain runtime
 observations rather than durable event fields. The immutable `relay.plan/v1`
 determines the provider policy that applies to the session.
 
-When an integration input is named, its bytes are read once before execution,
+When a named input is supplied, its bytes are read once before execution,
 stored as a session blob, and bound into the plan. Provider prompts load that
 recorded blob; the source path is not part of the provider lifecycle.
 

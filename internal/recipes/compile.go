@@ -5,7 +5,6 @@ import (
 	"strings"
 
 	"github.com/charlesnpx/convo-relay/internal/format"
-	"github.com/charlesnpx/convo-relay/internal/integration"
 )
 
 type CompileTarget string
@@ -23,33 +22,29 @@ type CompileOptions struct {
 	MaxRelayBackendDepth int
 	ValidateExecutable   bool
 	TransientSources     []TransientRecipeSource
-	IntegrationBundle    *integration.Bundle
 }
 
-// RootOnlyRecipeError identifies a recipe that requires a root launch because
-// it binds an integration input bundle.
-type RootOnlyRecipeError struct {
-	RecipeID            string `json:"recipe_id"`
-	IntegrationContract string `json:"integration_contract"`
-}
-
-func (e *RootOnlyRecipeError) Error() string {
-	if e == nil {
-		return ""
+func AlternatingSchedule(participantTurns int) ([]struct {
+	ParticipantTurn int
+	Slot            string
+}, error) {
+	if participantTurns < 1 {
+		return nil, fmt.Errorf("participant turns must be positive")
 	}
-	return fmt.Sprintf("recipe %q declares integration contract %q and can only compile for the root target", e.RecipeID, e.IntegrationContract)
-}
-
-func (e *RootOnlyRecipeError) ToMap() map[string]any {
-	if e == nil {
-		return map[string]any{}
+	turns := make([]struct {
+		ParticipantTurn int
+		Slot            string
+	}, participantTurns)
+	for index := range turns {
+		turns[index] = struct {
+			ParticipantTurn int
+			Slot            string
+		}{
+			ParticipantTurn: index + 1,
+			Slot:            fmt.Sprintf("slot_%d", index%2),
+		}
 	}
-	return map[string]any{
-		"code":                 "root_only_recipe",
-		"message":              e.Error(),
-		"recipe_id":            e.RecipeID,
-		"integration_contract": e.IntegrationContract,
-	}
+	return turns, nil
 }
 
 // CompileRecipe checks a recipe and returns a non-durable plan preview. The
@@ -68,9 +63,6 @@ func CompileRecipe(
 		return nil, format.NewDiagnosticError("Relay recipe configuration is invalid.", diagnostics...)
 	}
 	payload := normalizeRecipePayload(recipe)
-	if target == CompileTargetChild && strings.TrimSpace(stringValue(payload["integration_contract"])) != "" {
-		return nil, &RootOnlyRecipeError{RecipeID: stringValue(payload["id"]), IntegrationContract: stringValue(payload["integration_contract"])}
-	}
 	var (
 		compiled map[string]any
 		err      error
@@ -118,13 +110,9 @@ func validateNestedChildCompileTargets(
 			return format.NewDiagnosticError("Relay recipe configuration is invalid.", diagnostics...)
 		}
 		childPayload := normalizeRecipePayload(childRecipe)
-		if integrationID := strings.TrimSpace(stringValue(childPayload["integration_contract"])); integrationID != "" {
-			return &RootOnlyRecipeError{RecipeID: stringValue(childPayload["id"]), IntegrationContract: integrationID}
-		}
 		childOptions := options
 		childOptions.CompositionPath = fmt.Sprintf("%s.slot_%d", compositionPath, index)
 		childOptions.RelayBackendDepth++
-		childOptions.IntegrationBundle = nil
 		if _, err := compileChildPlan(childPayload, profiles, relayRecipes, childOptions); err != nil {
 			return err
 		}
@@ -205,7 +193,7 @@ func compileRootPlan(
 	if err != nil {
 		return nil, err
 	}
-	schedule, err := integration.AlternatingSchedule(turns)
+	schedule, err := AlternatingSchedule(turns)
 	if err != nil {
 		return nil, format.NewValidationError("root recipe participant schedule: %v", err)
 	}
@@ -215,7 +203,7 @@ func compileRootPlan(
 	}
 	resultSource := normalizeResultSource(recipe["result_source"])
 	var reducer map[string]any
-	if resultSource == integration.ResultSourceReducer {
+	if resultSource == ResultSourceReducer {
 		reducer, err = compiledProfile(stringValue(recipe["reducer"]), profiles, relayRecipes, "reducer", compositionPath+".reducer")
 		if err != nil {
 			return nil, rootCompileDiagnostic("invalid_root_reducer", "/reducer", "Root recipe reducer profile could not be resolved.", map[string]any{"cause": err.Error()})
@@ -233,18 +221,6 @@ func compileRootPlan(
 	result["workspace_mode"] = "current"
 	if lifecycle["workspace_isolation"] == "ephemeral" {
 		result["workspace_mode"] = "head-copy"
-	}
-	if integrationID := strings.TrimSpace(stringValue(recipe["integration_contract"])); integrationID != "" {
-		selected, err := integration.SelectContract(options.IntegrationBundle, integrationID, integration.ScheduleRequirement{Turns: schedule, ResultSource: resultSource})
-		if err != nil {
-			return nil, err
-		}
-		result["integration"] = map[string]any{
-			"id":              selected.ID(),
-			"bundle_digest":   options.IntegrationBundle.Digest(),
-			"contract_digest": selected.Digest(),
-			"prompt_context":  selected.PromptContext().ToMap(),
-		}
 	}
 	return result, nil
 }

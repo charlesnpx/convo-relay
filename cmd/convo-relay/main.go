@@ -112,7 +112,6 @@ func runVersion(args []string) {
 func runRecipesCompile(args []string) {
 	flags := flag.NewFlagSet("recipes compile", flag.ExitOnError)
 	settingsPath := flags.String("settings", "", "Optional settings.toml path")
-	integrationBundlePath := flags.String("integration-bundle", "", "Optional integration bundle JSON path")
 	compositionPath := flags.String("composition-path", "root", "Composition path for compiled profile slots")
 	relayDepth := flags.Int("relay-backend-depth", 0, "Current relay-backend nesting depth")
 	maxRelayDepth := flags.Int("max-relay-backend-depth", 0, "Maximum relay-backend nesting depth; defaults to recipe max_depth")
@@ -143,10 +142,6 @@ func runRecipesCompile(args []string) {
 		fmt.Fprintf(os.Stderr, "error: %s\n", err)
 		os.Exit(1)
 	}
-	bundle, loadErr := recipes.LoadIntegrationBundle(*settingsPath, *integrationBundlePath)
-	if loadErr != nil {
-		failCompileRecipe(loadErr, *jsonOutput)
-	}
 	compileOptions := recipes.CompileOptions{
 		CompositionPath:      *compositionPath,
 		RelayBackendDepth:    *relayDepth,
@@ -154,7 +149,6 @@ func runRecipesCompile(args []string) {
 		ValidateExecutable:   true,
 		TransientSources:     transientSources,
 	}
-	compileOptions.IntegrationBundle = bundle
 	report, err := recipes.BuildCompileReport(recipeID, config, recipes.CompileTargetRoot, compileOptions)
 	if err != nil {
 		failCompileRecipe(err, *jsonOutput)
@@ -214,8 +208,7 @@ func runRecipes(args []string) {
 func runRecipesList(args []string) {
 	flags := flag.NewFlagSet("recipes list", flag.ExitOnError)
 	settingsPath := flags.String("settings", "", "Optional settings.toml path")
-	integrationBundlePath := flags.String("integration-bundle", "", "Optional integration bundle JSON path")
-	statusFilter := flags.String("status", "", "Filter by status: usable, requires_integration, unavailable, invalid, skipped, or all")
+	statusFilter := flags.String("status", "", "Filter by status: usable, unavailable, invalid, skipped, or all")
 	jsonOutput := flags.Bool("json", false, "Emit machine-readable recipe list JSON")
 	if err := parseFlags(flags, args); err != nil {
 		os.Exit(2)
@@ -230,18 +223,13 @@ func runRecipesList(args []string) {
 			os.Exit(2)
 		}
 	}
-	bundle, err := recipes.LoadIntegrationBundle(*settingsPath, *integrationBundlePath)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "error: %s\n", err)
-		os.Exit(1)
-	}
-	report, err := recipes.BuildRecipeCatalogReportWithOptions(*settingsPath, recipes.RecipeCatalogOptions{IntegrationBundle: bundle})
+	report, err := recipes.BuildRecipeCatalogReportWithOptions(*settingsPath, recipes.RecipeCatalogOptions{})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error: %s\n", err)
 		os.Exit(1)
 	}
 	if filter == "" {
-		records := recipes.FilterRecipeRecordsByStatuses(report.Recipes, recipes.RecipeStatusUsable, recipes.RecipeStatusRequiresIntegration)
+		records := recipes.FilterRecipeRecordsByStatuses(report.Recipes, recipes.RecipeStatusUsable)
 		fmt.Println(recipes.FormatRecipeList(records))
 		return
 	}
@@ -257,7 +245,6 @@ func runRecipesList(args []string) {
 func runRecipesShow(args []string) {
 	flags := flag.NewFlagSet("recipes show", flag.ExitOnError)
 	settingsPath := flags.String("settings", "", "Optional settings.toml path")
-	integrationBundlePath := flags.String("integration-bundle", "", "Optional integration bundle JSON path")
 	view := flags.String("view", "all", "View: all, declared, or resolved")
 	jsonOutput := flags.Bool("json", false, "Emit machine-readable recipe JSON")
 	if err := parseFlags(flags, args); err != nil {
@@ -275,12 +262,7 @@ func runRecipesShow(args []string) {
 		fmt.Fprintf(os.Stderr, "error: %s\n", err)
 		os.Exit(2)
 	}
-	bundle, err := recipes.LoadIntegrationBundle(*settingsPath, *integrationBundlePath)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "error: %s\n", err)
-		os.Exit(1)
-	}
-	report, err := recipes.BuildRecipeCatalogReportWithOptions(*settingsPath, recipes.RecipeCatalogOptions{IntegrationBundle: bundle})
+	report, err := recipes.BuildRecipeCatalogReportWithOptions(*settingsPath, recipes.RecipeCatalogOptions{})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error: %s\n", err)
 		os.Exit(1)
@@ -300,7 +282,6 @@ func runRecipesShow(args []string) {
 func runRecipesDoctor(args []string) {
 	flags := flag.NewFlagSet("recipes doctor", flag.ExitOnError)
 	settingsPath := flags.String("settings", "", "Optional settings.toml path")
-	integrationBundlePath := flags.String("integration-bundle", "", "Optional integration bundle JSON path")
 	jsonOutput := flags.Bool("json", false, "Emit machine-readable doctor JSON")
 	_ = flags.String("recipe-file", "", "Attach a transient recipe TOML source; may be repeated")
 	_ = flags.String("generated-recipe-file", "", "Attach a generated transient recipe TOML source; may be repeated")
@@ -313,18 +294,8 @@ func runRecipesDoctor(args []string) {
 		os.Exit(2)
 	}
 	sources := readTransientRecipeSourcesOrExit(extracted["recipe-file"], extracted["generated-recipe-file"])
-	bundle, err := recipes.LoadIntegrationBundle(*settingsPath, *integrationBundlePath)
-	if err != nil {
-		if *jsonOutput {
-			writeJSON(map[string]any{"scope": "recipes", "status": "error", "error": err.Error()})
-		} else {
-			fmt.Fprintf(os.Stderr, "error: %s\n", err)
-		}
-		os.Exit(1)
-	}
 	report, err := recipes.BuildRecipeCatalogReportWithOptions(*settingsPath, recipes.RecipeCatalogOptions{
-		TransientSources:  sources,
-		IntegrationBundle: bundle,
+		TransientSources: sources,
 	})
 	if err != nil {
 		if *jsonOutput {
@@ -346,24 +317,21 @@ func runRecipesDoctor(args []string) {
 
 func validateRecipeStatusFilter(status string) error {
 	switch strings.TrimSpace(status) {
-	case "all", recipes.RecipeStatusUsable, recipes.RecipeStatusRequiresIntegration, recipes.RecipeStatusUnavailable, recipes.RecipeStatusInvalid, recipes.RecipeStatusSkipped:
+	case "all", recipes.RecipeStatusUsable, recipes.RecipeStatusUnavailable, recipes.RecipeStatusInvalid, recipes.RecipeStatusSkipped:
 		return nil
 	default:
-		return fmt.Errorf("--status must be one of usable, requires_integration, unavailable, invalid, skipped, or all")
+		return fmt.Errorf("--status must be one of usable, unavailable, invalid, skipped, or all")
 	}
 }
 
 func failCompileRecipe(err error, jsonOutput bool) {
 	if jsonOutput {
 		var configErr recipes.ChildRelayConfigError
-		var rootOnly *recipes.RootOnlyRecipeError
 		var diagnosticErr *format.DiagnosticError
 		var validationErr format.ValidationError
 		switch {
 		case errors.As(err, &configErr):
 			writeJSON(configErr.ToMap())
-		case errors.As(err, &rootOnly):
-			writeJSON(rootOnly.ToMap())
 		case errors.As(err, &diagnosticErr):
 			writeJSON(diagnosticErr.ToMap())
 		case errors.As(err, &validationErr):
@@ -684,7 +652,6 @@ func runRelay(args []string) {
 	recipeID := flags.String("recipe", "", "Run a configured recipe as the direct root execution")
 	planPath := flags.String("plan", "", "Run a supplied immutable plan JSON document")
 	blobsPath := flags.String("blobs", "", "Content-addressed blob directory for a supplied plan")
-	integrationBundlePath := flags.String("integration-bundle", "", "Integration bundle JSON for an integration-bound root recipe")
 	workspaceMode := flags.String("workspace", "current", "Root recipe workspace mode: current or head-copy")
 	allowDirtySource := flags.Bool("allow-dirty-source", false, "Use committed HEAD for isolated root execution when the source is dirty")
 	var inputBindings repeatableFlagValue
@@ -763,7 +730,7 @@ func runRelay(args []string) {
 		fmt.Fprintf(os.Stderr, "error: %s\n", err)
 		os.Exit(2)
 	}
-	recipeRequested := strings.TrimSpace(*recipeID) != "" || visited["recipe"] || visited["integration-bundle"] || visited["workspace"] || visited["allow-dirty-source"] || visited["input"]
+	recipeRequested := strings.TrimSpace(*recipeID) != "" || visited["recipe"] || visited["workspace"] || visited["allow-dirty-source"] || visited["input"]
 	if recipeRequested {
 		if strings.TrimSpace(*recipeID) == "" {
 			fmt.Fprintln(os.Stderr, "error: --recipe is required when root recipe run options are used")
@@ -791,24 +758,23 @@ func runRelay(args []string) {
 		ctx, stop := signal.NotifyContext(context.Background(), commandInterruptSignals()...)
 		defer stop()
 		result, err := v2RunRecipe(ctx, v2RecipeRunOptions{
-			SessionDir:            *sessionDir,
-			SessionID:             *sessionID,
-			RelayHome:             *relayHome,
-			Task:                  *task,
-			RecipeID:              *recipeID,
-			ContextFiles:          contextFiles,
-			SkillFiles:            skillFiles,
-			TransientSources:      transientRecipeSources,
-			IntegrationBundlePath: anchorRecipeCLIPath(sourceAnchor, *integrationBundlePath),
-			InputBindings:         append([]string{}, inputBindings...),
-			WorkspaceMode:         *workspaceMode,
-			AllowDirtySource:      *allowDirtySource,
-			SettingsPath:          anchorRecipeCLIPath(sourceAnchor, *settingsPath),
-			LaunchCWD:             sourceAnchor,
-			TimeoutSeconds:        *timeout,
-			StallTimeoutSeconds:   *stallTimeout,
-			Investigation:         *investigationMode,
-			LaunchPlan:            launchPlan,
+			SessionDir:          *sessionDir,
+			SessionID:           *sessionID,
+			RelayHome:           *relayHome,
+			Task:                *task,
+			RecipeID:            *recipeID,
+			ContextFiles:        contextFiles,
+			SkillFiles:          skillFiles,
+			TransientSources:    transientRecipeSources,
+			InputBindings:       append([]string{}, inputBindings...),
+			WorkspaceMode:       *workspaceMode,
+			AllowDirtySource:    *allowDirtySource,
+			SettingsPath:        anchorRecipeCLIPath(sourceAnchor, *settingsPath),
+			LaunchCWD:           sourceAnchor,
+			TimeoutSeconds:      *timeout,
+			StallTimeoutSeconds: *stallTimeout,
+			Investigation:       *investigationMode,
+			LaunchPlan:          launchPlan,
 			WorkspaceWarning: func(warning v2WorkspaceWarning) {
 				fmt.Fprintf(
 					os.Stderr,
@@ -904,7 +870,7 @@ func validateSuppliedPlanRunStructuralOverrides(visited map[string]bool) error {
 		"facilitator-backend", "facilitator-model", "facilitator-effort",
 		"rounds", "max-rounds", "quick", "timeout", "stall-timeout",
 		"mode", "dynamic", "investigation", "workspace", "allow-dirty-source",
-		"context", "skill", "input", "task-plan", "integration-bundle",
+		"context", "skill", "input", "task-plan",
 		"recipe-file", "generated-recipe-file", "session-id",
 	}
 	return validateRunStructuralOverrides("run --plan", structural, visited)
@@ -1581,7 +1547,7 @@ func usage() {
 func usageTo(writer io.Writer) {
 	fmt.Fprintln(writer, "usage:")
 	fmt.Fprintln(writer, "  convo-relay run --task <task> --agents codex,codex --rounds 2 --json")
-	fmt.Fprintln(writer, "  convo-relay run --task <task> --recipe <id> [--integration-bundle <path>] [--input name=path] [--workspace current|head-copy] --json")
+	fmt.Fprintln(writer, "  convo-relay run --task <task> --recipe <id> [--input name=path] [--workspace current|head-copy] --json")
 	fmt.Fprintln(writer, "  convo-relay run --plan <file> --json")
 	fmt.Fprintln(writer, "  convo-relay run --plan <file> --blobs <dir> --json")
 	fmt.Fprintln(writer, "  convo-relay resume <session-id-prefix> --mode steelman --rounds 1 --json")
@@ -1598,7 +1564,7 @@ func usageTo(writer io.Writer) {
 	fmt.Fprintln(writer, "  convo-relay recipes list --json")
 	fmt.Fprintln(writer, "  convo-relay recipes show review-panel")
 	fmt.Fprintln(writer, "  convo-relay recipes doctor")
-	fmt.Fprintln(writer, "  convo-relay recipes compile <id> [--integration-bundle <path>] --json")
+	fmt.Fprintln(writer, "  convo-relay recipes compile <id> --json")
 	fmt.Fprintln(writer, "  convo-relay clean <session-id-prefix>")
 	fmt.Fprintln(writer, "  convo-relay clean --all --home <relay-home> --json")
 	fmt.Fprintln(writer, "  convo-relay doctor [session-id-prefix] [--probe-auth] --json")

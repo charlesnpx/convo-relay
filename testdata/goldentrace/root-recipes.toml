@@ -74,7 +74,6 @@ mode = "cooperative"
 participant_turns = 2
 max_rounds = 2
 result_source = "reducer"
-integration_contract = "goldentrace/reducer-v1"
 provider_retry = "forbid"
 max_depth = 1
 auto_approval = "never"

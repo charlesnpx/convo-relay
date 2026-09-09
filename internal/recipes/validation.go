@@ -105,7 +105,7 @@ func validateRecipeComposition(
 		facilitator = participants[0]
 	}
 	validateReference(issues, facilitator, profiles, childRecipes, depthPolicy, "recipe.facilitator", "facilitator", false, compositionPath, stack)
-	if includeReducer && normalizeResultSource(recipe["result_source"]) == "reducer" {
+	if includeReducer && normalizeResultSource(recipe["result_source"]) == ResultSourceReducer {
 		reducer := strings.TrimSpace(stringValue(recipe["reducer"]))
 		if reducer == "" {
 			reducer = facilitator
