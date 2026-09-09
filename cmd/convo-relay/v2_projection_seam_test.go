@@ -12,9 +12,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/charlesnpx/convo-relay/internal/blobstore"
-	"github.com/charlesnpx/convo-relay/internal/eventlog"
-	"github.com/charlesnpx/convo-relay/internal/relayv2"
+	"github.com/charlesnpx/convo-relay/v2/internal/blobstore"
+	"github.com/charlesnpx/convo-relay/v2/internal/eventlog"
+	"github.com/charlesnpx/convo-relay/v2/internal/relayv2"
 )
 
 type u2db3CLIResult struct {

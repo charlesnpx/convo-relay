@@ -10,7 +10,7 @@ import (
 	"runtime"
 	"sync"
 
-	"github.com/charlesnpx/convo-relay/internal/blobstore"
+	"github.com/charlesnpx/convo-relay/v2/internal/blobstore"
 )
 
 const EventsFilename = "events.jsonl"

@@ -9,7 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/charlesnpx/convo-relay/internal/format"
+	"github.com/charlesnpx/convo-relay/v2/internal/format"
 	"github.com/pelletier/go-toml/v2"
 )
 

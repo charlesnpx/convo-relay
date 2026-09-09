@@ -15,6 +15,8 @@ import (
 	"sort"
 	"strings"
 	"sync"
+
+	"github.com/charlesnpx/convo-relay/v2/plan"
 )
 
 const (
@@ -23,13 +25,9 @@ const (
 	defaultMediaType = "application/octet-stream"
 )
 
-// BlobRef is the sole payload-reference shape used by the v2 store. SHA256 is
-// the lower-case hexadecimal digest of the raw bytes, without a prefix.
-type BlobRef struct {
-	SHA256    string `json:"sha256"`
-	Size      int64  `json:"size"`
-	MediaType string `json:"media_type"`
-}
+// BlobRef is retained as an internal alias for the public plan reference. The
+// public plan package owns the document definition.
+type BlobRef = plan.BlobRef
 
 // RefForBytes describes raw bytes using the one portable payload-reference
 // shape. It does not write anything to a store.
@@ -40,11 +38,6 @@ func RefForBytes(body []byte, mediaType string) BlobRef {
 	}
 	sum := sha256.Sum256(body)
 	return BlobRef{SHA256: hex.EncodeToString(sum[:]), Size: int64(len(body)), MediaType: mediaType}
-}
-
-// Equal reports whether two references identify the same payload and metadata.
-func (r BlobRef) Equal(other BlobRef) bool {
-	return r.SHA256 == other.SHA256 && r.Size == other.Size && r.MediaType == other.MediaType
 }
 
 // Limits bounds durable payload storage. A zero value means no limit for that

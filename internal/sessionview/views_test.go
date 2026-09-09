@@ -4,9 +4,9 @@ import (
 	"bytes"
 	"testing"
 
-	"github.com/charlesnpx/convo-relay/internal/blobstore"
-	"github.com/charlesnpx/convo-relay/internal/eventlog"
-	"github.com/charlesnpx/convo-relay/internal/session"
+	"github.com/charlesnpx/convo-relay/v2/internal/blobstore"
+	"github.com/charlesnpx/convo-relay/v2/internal/eventlog"
+	"github.com/charlesnpx/convo-relay/v2/internal/session"
 )
 
 func TestAllViewsAreDerivedFromPlanEventsAndBlobs(t *testing.T) {

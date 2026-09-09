@@ -7,7 +7,7 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/charlesnpx/convo-relay/internal/format"
+	"github.com/charlesnpx/convo-relay/v2/internal/format"
 )
 
 const (

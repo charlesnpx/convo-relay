@@ -12,10 +12,12 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/charlesnpx/convo-relay/internal/blobstore"
-	"github.com/charlesnpx/convo-relay/internal/eventlog"
-	"github.com/charlesnpx/convo-relay/internal/relayv2"
-	"github.com/charlesnpx/convo-relay/internal/session"
+	relaybundle "github.com/charlesnpx/convo-relay/v2/bundle"
+	"github.com/charlesnpx/convo-relay/v2/internal/blobstore"
+	"github.com/charlesnpx/convo-relay/v2/internal/eventlog"
+	"github.com/charlesnpx/convo-relay/v2/internal/relayv2"
+	"github.com/charlesnpx/convo-relay/v2/internal/session"
+	"github.com/charlesnpx/convo-relay/v2/result"
 )
 
 func TestSuppliedPlanRunsAndPersistsItsFields(t *testing.T) {
@@ -24,11 +26,12 @@ func TestSuppliedPlanRunsAndPersistsItsFields(t *testing.T) {
 	planPath := writeSuppliedPlan(t, planValue)
 	sessionDir := filepath.Join(t.TempDir(), "session")
 
-	if _, err := v2RunSuppliedPlan(context.Background(), v2SuppliedPlanRunOptions{
+	runResult, err := v2RunSuppliedPlan(context.Background(), v2SuppliedPlanRunOptions{
 		SessionDir: sessionDir,
 		PlanPath:   planPath,
 		LaunchCWD:  t.TempDir(),
-	}); err != nil {
+	})
+	if err != nil {
 		t.Fatalf("run supplied plan: %v", err)
 	}
 	got, err := session.Open(sessionDir)
@@ -42,8 +45,19 @@ func TestSuppliedPlanRunsAndPersistsItsFields(t *testing.T) {
 	if err != nil {
 		t.Fatalf("build supplied report: %v", err)
 	}
-	if report["execution_kind"] != "supplied" {
-		t.Fatalf("supplied execution_kind = %v, want supplied", report["execution_kind"])
+	if report.ExecutionKind != "supplied" {
+		t.Fatalf("supplied execution_kind = %v, want supplied", report.ExecutionKind)
+	}
+	reportBody, err := json.Marshal(runResult)
+	if err != nil {
+		t.Fatalf("encode run result: %v", err)
+	}
+	var decoded result.Result
+	if err := json.Unmarshal(reportBody, &decoded); err != nil {
+		t.Fatalf("decode run result: %v", err)
+	}
+	if err := result.Validate(decoded); err != nil {
+		t.Fatalf("validate run result: %v", err)
 	}
 }
 
@@ -88,6 +102,17 @@ func TestSuppliedPlanWithBlobsExportsPortableBundle(t *testing.T) {
 	bundle := filepath.Join(root, "portable")
 	if _, err := v2ExportPortable(sess, bundle, "test"); err != nil {
 		t.Fatalf("export supplied portable bundle: %v", err)
+	}
+	manifestBody, err := os.ReadFile(filepath.Join(bundle, "manifest.json"))
+	if err != nil {
+		t.Fatalf("read portable manifest: %v", err)
+	}
+	var manifest relaybundle.Manifest
+	if err := json.Unmarshal(manifestBody, &manifest); err != nil {
+		t.Fatalf("decode portable manifest: %v", err)
+	}
+	if err := relaybundle.Validate(manifest); err != nil {
+		t.Fatalf("validate portable manifest: %v", err)
 	}
 	verified, err := v2VerifyPortableDirectory(bundle)
 	if err != nil {

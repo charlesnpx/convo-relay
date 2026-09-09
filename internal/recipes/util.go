@@ -7,7 +7,7 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/charlesnpx/convo-relay/internal/format"
+	"github.com/charlesnpx/convo-relay/v2/internal/format"
 )
 
 func mergeNamedRecords(defaults map[string]map[string]any, overrides map[string]any) map[string]map[string]any {

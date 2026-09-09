@@ -5,15 +5,17 @@ import (
 	"fmt"
 	"sort"
 
-	"github.com/charlesnpx/convo-relay/internal/eventlog"
+	"github.com/charlesnpx/convo-relay/v2/bundle"
+	"github.com/charlesnpx/convo-relay/v2/internal/eventlog"
+	"github.com/charlesnpx/convo-relay/v2/plan"
 )
 
 const (
-	PlanV1   = "relay.plan/v1"
+	PlanV1   = plan.PlanKind
 	EventV1  = eventlog.FormatV1
-	BundleV1 = "relay.bundle/v1"
+	BundleV1 = bundle.Kind
 
-	SessionSchemaVersion = 1
+	SessionSchemaVersion = plan.SchemaVersion
 
 	DigestClassRawBytes     = "raw-bytes"
 	DigestClassSemanticJSON = "semantic-json"

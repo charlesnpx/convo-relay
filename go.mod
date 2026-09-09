@@ -1,4 +1,4 @@
-module github.com/charlesnpx/convo-relay
+module github.com/charlesnpx/convo-relay/v2
 
 go 1.26.0
 

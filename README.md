@@ -42,10 +42,63 @@ Requires Go 1.23+ to build. `make install` writes the binary to `~/.local/bin/co
 
 The Go binary is the only relay CLI. Python is not used for relay orchestration.
 
+### Programmatic plan and result boundary
+
+Programs that compile their own verification recipe or execution profile can
+build a complete plan with the public `/v2/plan` package, validate it, write it,
+and hand it to `convo-relay run --plan`. Decode `run --json` with `/v2/result`
+and portable `export create --portable` manifests with `/v2/bundle`; none of
+these consumers need an `internal/` import.
+
+This complete example writes `plan.json` for a one-turn supplied run:
+
+```go
+package main
+
+import (
+	"log"
+	"os"
+
+	"github.com/charlesnpx/convo-relay/v2/plan"
+)
+
+func main() {
+	value := plan.Plan{
+		Kind:          plan.PlanKind,
+		SchemaVersion: plan.SchemaVersion,
+		SessionID:     "verification-profile",
+		Provenance:    plan.ProvenanceSupplied,
+		Task:          "verify the supplied execution profile",
+		Timeouts:      plan.Timeouts{TurnSeconds: 60, StallSeconds: 30},
+		Mode:          plan.ModeCooperative,
+		Investigation: plan.InvestigationNormal,
+		Actors:        []plan.Actor{{ID: "verifier", Backend: plan.ActorBackendCodex}},
+		Schedule:      plan.Schedule{Kind: plan.ScheduleSequence, Turns: 1, Order: []string{"verifier"}},
+		ProviderRetry: plan.ProviderRetry{Mode: plan.ProviderRetryForbid, MaxAttempts: 1},
+		Workspace:     plan.Workspace{Mode: plan.WorkspaceModeCurrent},
+		Inputs:        []plan.Input{},
+		Context:       []plan.Input{},
+		Skills:        []plan.Input{},
+		ChildPolicy:   plan.ChildPolicy{Mode: plan.ChildPolicyDeny, AllowedRecipes: []string{}},
+		Result:        plan.Result{Source: plan.ResultSourceLastTurn, Format: plan.ResultFormatText},
+	}
+	if err := plan.Validate(value); err != nil {
+		log.Fatal(err)
+	}
+	body, err := plan.CanonicalBytes(value)
+	if err != nil {
+		log.Fatal(err)
+	}
+	if err := os.WriteFile("plan.json", body, 0o600); err != nil {
+		log.Fatal(err)
+	}
+}
+```
+
 For a release install with Go:
 
 ```bash
-go install github.com/charlesnpx/convo-relay/cmd/convo-relay@latest
+go install github.com/charlesnpx/convo-relay/v2/cmd/convo-relay@latest
 ```
 
 `go install` installs only the executable. Use the release archive or

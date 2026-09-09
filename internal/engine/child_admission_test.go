@@ -5,10 +5,10 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/charlesnpx/convo-relay/internal/eventlog"
-	"github.com/charlesnpx/convo-relay/internal/plan"
-	"github.com/charlesnpx/convo-relay/internal/provider"
-	"github.com/charlesnpx/convo-relay/internal/session"
+	"github.com/charlesnpx/convo-relay/v2/internal/eventlog"
+	"github.com/charlesnpx/convo-relay/v2/internal/plan"
+	"github.com/charlesnpx/convo-relay/v2/internal/provider"
+	"github.com/charlesnpx/convo-relay/v2/internal/session"
 )
 
 func TestAskChildRequestWaitsForOperatorDecision(t *testing.T) {

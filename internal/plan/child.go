@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/charlesnpx/convo-relay/internal/session"
+	"github.com/charlesnpx/convo-relay/v2/internal/session"
 )
 
 // ForChild resolves the requested typed recipe and compiles that recipe's

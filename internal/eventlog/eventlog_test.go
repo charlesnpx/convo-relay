@@ -10,7 +10,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/charlesnpx/convo-relay/internal/blobstore"
+	"github.com/charlesnpx/convo-relay/v2/internal/blobstore"
 )
 
 func TestRoundTripEveryTypedEvent(t *testing.T) {

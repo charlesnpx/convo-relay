@@ -7,8 +7,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/charlesnpx/convo-relay/internal/plan"
-	"github.com/charlesnpx/convo-relay/internal/session"
+	"github.com/charlesnpx/convo-relay/v2/internal/plan"
+	"github.com/charlesnpx/convo-relay/v2/internal/session"
 )
 
 func TestAlteredMaterializedNamedInputIsRejectedWithDigestMismatch(t *testing.T) {

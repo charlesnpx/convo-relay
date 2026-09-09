@@ -7,8 +7,8 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/charlesnpx/convo-relay/internal/format"
-	"github.com/charlesnpx/convo-relay/internal/readiness"
+	"github.com/charlesnpx/convo-relay/v2/internal/format"
+	"github.com/charlesnpx/convo-relay/v2/internal/readiness"
 )
 
 const (

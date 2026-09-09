@@ -15,13 +15,13 @@ import (
 	"testing"
 	"time"
 
-	"github.com/charlesnpx/convo-relay/internal/blobstore"
-	"github.com/charlesnpx/convo-relay/internal/eventlog"
-	"github.com/charlesnpx/convo-relay/internal/plan"
-	"github.com/charlesnpx/convo-relay/internal/provider"
-	"github.com/charlesnpx/convo-relay/internal/session"
-	"github.com/charlesnpx/convo-relay/internal/sessionview"
-	"github.com/charlesnpx/convo-relay/internal/workspace"
+	"github.com/charlesnpx/convo-relay/v2/internal/blobstore"
+	"github.com/charlesnpx/convo-relay/v2/internal/eventlog"
+	"github.com/charlesnpx/convo-relay/v2/internal/plan"
+	"github.com/charlesnpx/convo-relay/v2/internal/provider"
+	"github.com/charlesnpx/convo-relay/v2/internal/session"
+	"github.com/charlesnpx/convo-relay/v2/internal/sessionview"
+	"github.com/charlesnpx/convo-relay/v2/internal/workspace"
 )
 
 func TestOrderedInputContentsBindDigestAndPromptOrder(t *testing.T) {

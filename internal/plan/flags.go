@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/charlesnpx/convo-relay/internal/session"
+	"github.com/charlesnpx/convo-relay/v2/internal/session"
 )
 
 // FromFlags compiles the ordinary run flags into a dialogue plan.

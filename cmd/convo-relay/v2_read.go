@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -13,20 +14,36 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/charlesnpx/convo-relay/internal/blobstore"
-	"github.com/charlesnpx/convo-relay/internal/eventlog"
-	"github.com/charlesnpx/convo-relay/internal/format"
-	"github.com/charlesnpx/convo-relay/internal/recipes"
-	"github.com/charlesnpx/convo-relay/internal/relayv2"
-	"github.com/charlesnpx/convo-relay/internal/session"
+	"github.com/charlesnpx/convo-relay/v2/internal/blobstore"
+	"github.com/charlesnpx/convo-relay/v2/internal/eventlog"
+	"github.com/charlesnpx/convo-relay/v2/internal/format"
+	"github.com/charlesnpx/convo-relay/v2/internal/recipes"
+	"github.com/charlesnpx/convo-relay/v2/internal/relayv2"
+	"github.com/charlesnpx/convo-relay/v2/internal/session"
 )
 
 func v2ShowTranscriptReport(sess *session.Session, fromRound int, roundsSpec string) (map[string]any, error) {
-	report, err := relayv2.BuildReport(sess, relayv2.ProjectionOptions{})
+	report, err := v2BuildReportMap(sess)
 	if err != nil {
 		return nil, err
 	}
 	return v2ProjectShowTranscriptReport(report, fromRound, roundsSpec)
+}
+
+func v2BuildReportMap(sess *session.Session) (map[string]any, error) {
+	report, err := relayv2.BuildReport(sess, relayv2.ProjectionOptions{})
+	if err != nil {
+		return nil, err
+	}
+	body, err := json.Marshal(report)
+	if err != nil {
+		return nil, err
+	}
+	var value map[string]any
+	if err := json.Unmarshal(body, &value); err != nil {
+		return nil, err
+	}
+	return value, nil
 }
 
 // v2ProjectShowTranscriptReport keeps the public show envelope stable while
@@ -602,7 +619,7 @@ func v2ExportPortable(sess *session.Session, targetDir string, version string) (
 	if sess.Plan.Provenance != session.ProvenanceRecipe && sess.Plan.Provenance != session.ProvenanceSupplied {
 		return nil, format.NewValidationError("portable export requires a direct root session")
 	}
-	report, err := relayv2.BuildReport(sess, relayv2.ProjectionOptions{})
+	report, err := v2BuildReportMap(sess)
 	if err != nil {
 		return nil, err
 	}

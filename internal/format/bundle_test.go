@@ -3,7 +3,7 @@ package format
 import (
 	"testing"
 
-	"github.com/charlesnpx/convo-relay/internal/blobstore"
+	"github.com/charlesnpx/convo-relay/v2/internal/blobstore"
 )
 
 func TestBundleManifestRoundTripsBlobRef(t *testing.T) {

@@ -4,6 +4,13 @@ Convo Relay has three durable public formats. `convo-relay version --json`
 reports them under `formats` and reports the supported digest classes under
 `digest_classes`. It does not inspect a session or run a provider.
 
+The Go publication of those boundaries is the three root packages
+`github.com/charlesnpx/convo-relay/v2/plan`,
+`github.com/charlesnpx/convo-relay/v2/result`, and
+`github.com/charlesnpx/convo-relay/v2/bundle`. They are the only packages in
+this release intended for programmatic construction or consumption of relay
+documents.
+
 | Format | Purpose | Durable location |
 |---|---|---|
 | `relay.plan/v1` | Immutable compiled execution plan | `session.json` |
@@ -100,3 +107,25 @@ Only the formats above are accepted for new durable data. There is no registry
 of parallel public contract families and no conversion path for retired
 durable versions. Configuration files and command JSON reports are inputs or
 projections, not additional durable format families.
+
+## Go package guarantees
+
+`plan` owns the complete `relay.plan/v1` execution document, its nested types,
+constants, validation, canonical bytes, semantic digest, and ordered BlobRef
+walk. A caller can construct a plan without importing `internal/`, validate it,
+and pass the resulting file to `convo-relay run --plan`.
+
+`result` owns the typed JSON document emitted by `run --json` and validates the
+report shape derived from the immutable plan, event log, blobs, and workspace
+projection. It includes the transcript, summary, provider slots, diagnostics,
+and optional recipe-root projection.
+
+`bundle` owns the typed `relay.bundle/v1` manifest and validates its required
+payload names, ordered inventory, BlobRefs, and inventory and manifest
+semantic digests. A decoded manifest can therefore be checked without using
+the CLI's internal verifier implementation.
+
+The exported Go types, JSON field names, validation rules, digest meanings, and
+declared constants in these packages are compatibility contracts. A change to
+any of them is a breaking public-contract change and must be released as such;
+consumers must not copy or reconstruct these definitions from `internal/`.

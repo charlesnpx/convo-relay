@@ -11,11 +11,13 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/charlesnpx/convo-relay/internal/blobstore"
-	"github.com/charlesnpx/convo-relay/internal/eventlog"
-	"github.com/charlesnpx/convo-relay/internal/session"
-	"github.com/charlesnpx/convo-relay/internal/sessionview"
-	"github.com/charlesnpx/convo-relay/internal/workspace"
+	"github.com/charlesnpx/convo-relay/v2/internal/blobstore"
+	"github.com/charlesnpx/convo-relay/v2/internal/eventlog"
+	"github.com/charlesnpx/convo-relay/v2/internal/session"
+	"github.com/charlesnpx/convo-relay/v2/internal/sessionview"
+	"github.com/charlesnpx/convo-relay/v2/internal/workspace"
+	relayplan "github.com/charlesnpx/convo-relay/v2/plan"
+	relayresult "github.com/charlesnpx/convo-relay/v2/result"
 )
 
 // ProjectionOptions alters only the CLI projection of a just-completed
@@ -58,29 +60,29 @@ func Events(sess *session.Session) ([]eventlog.Event, error) {
 // BuildReport projects a session entirely from its immutable plan, event log,
 // blobs, and the existing workspace artifact. It deliberately keeps Outcome
 // minimal and does not widen it into a report transport.
-func BuildReport(sess *session.Session, options ProjectionOptions) (map[string]any, error) {
+func BuildReport(sess *session.Session, options ProjectionOptions) (relayresult.Result, error) {
 	events, err := Events(sess)
 	if err != nil {
-		return nil, fmt.Errorf("read v2 events: %w", err)
+		return relayresult.Result{}, fmt.Errorf("read v2 events: %w", err)
 	}
 	blobs, err := sess.BlobStore(blobstore.Limits{})
 	if err != nil {
-		return nil, fmt.Errorf("open v2 blobs: %w", err)
+		return relayresult.Result{}, fmt.Errorf("open v2 blobs: %w", err)
 	}
 	statusView := sessionview.Status(sess.Plan, events)
 	transcriptView, err := sessionview.Transcript(sess.Plan, events, blobs)
 	if err != nil {
-		return nil, fmt.Errorf("derive v2 transcript: %w", err)
+		return relayresult.Result{}, fmt.Errorf("derive v2 transcript: %w", err)
 	}
 	ledgerView := sessionview.Ledger(sess.Plan, events)
 	diagnostics, err := sessionview.Diagnostics(sess.Plan, events, blobs)
 	if err != nil {
-		return nil, fmt.Errorf("derive v2 diagnostics: %w", err)
+		return relayresult.Result{}, fmt.Errorf("derive v2 diagnostics: %w", err)
 	}
 	providerSessions := sessionview.ProviderSessions(sess.Plan, events)
 	entries, latestLedger, err := publicTranscript(sess.Plan, transcriptView, events, blobs)
 	if err != nil {
-		return nil, err
+		return relayresult.Result{}, err
 	}
 	participantTurns := participantTurnCount(transcriptView)
 	status := firstNonEmpty(options.Status, statusView.Status)
@@ -103,7 +105,7 @@ func BuildReport(sess *session.Session, options ProjectionOptions) (map[string]a
 	}
 	workspaceState, err := workspaceProjection(sess)
 	if err != nil {
-		return nil, err
+		return relayresult.Result{}, err
 	}
 	reducerAttempts := reducerAttemptCount(sess.Plan, ledgerView)
 	providerFailures := providerFailureMaps(ledgerView)
@@ -158,10 +160,21 @@ func BuildReport(sess *session.Session, options ProjectionOptions) (map[string]a
 			"budget_state":       diagnostics.BudgetState,
 		},
 	}
-	if sess.Plan.Provenance == session.ProvenanceRecipe || sess.Plan.Provenance == session.ProvenanceChild {
+	if sess.Plan.Provenance == relayplan.ProvenanceRecipe || sess.Plan.Provenance == relayplan.ProvenanceChild {
 		report["root"] = rootProjection(sess.Plan, status, participantTurns, result, validation, workspaceState, providerSessions, len(ledgerView.Attempts), reducerAttempts)
 	}
-	return report, nil
+	body, err := json.Marshal(report)
+	if err != nil {
+		return relayresult.Result{}, fmt.Errorf("encode v2 result: %w", err)
+	}
+	var typed relayresult.Result
+	if err := json.Unmarshal(body, &typed); err != nil {
+		return relayresult.Result{}, fmt.Errorf("decode v2 result: %w", err)
+	}
+	if err := relayresult.Validate(typed); err != nil {
+		return relayresult.Result{}, fmt.Errorf("validate v2 result: %w", err)
+	}
+	return typed, nil
 }
 
 // BuildGraphReport retains the public graph envelope while deriving every
@@ -372,7 +385,7 @@ func workspaceProjectionForSession(sess *session.Session, visited map[string]boo
 	if !errors.Is(err, os.ErrNotExist) {
 		return nil, fmt.Errorf("load v2 workspace state: %w", err)
 	}
-	if sess.Plan.Provenance != session.ProvenanceChild {
+	if sess.Plan.Provenance != relayplan.ProvenanceChild {
 		return nil, errors.New("v2 session has no durable workspace state")
 	}
 	return inheritedWorkspaceProjection(sess, visited)
@@ -561,13 +574,13 @@ func roundLimitMode(value session.Plan) string {
 }
 
 func executionKind(value session.Plan) string {
-	if value.Provenance == session.ProvenanceRecipe {
+	if value.Provenance == relayplan.ProvenanceRecipe {
 		return "recipe"
 	}
-	if value.Provenance == session.ProvenanceChild {
+	if value.Provenance == relayplan.ProvenanceChild {
 		return "child"
 	}
-	if value.Provenance == session.ProvenanceSupplied {
+	if value.Provenance == relayplan.ProvenanceSupplied {
 		return "supplied"
 	}
 	return "ordinary"

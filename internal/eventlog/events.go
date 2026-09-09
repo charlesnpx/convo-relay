@@ -12,7 +12,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/charlesnpx/convo-relay/internal/blobstore"
+	"github.com/charlesnpx/convo-relay/v2/internal/blobstore"
+	"github.com/charlesnpx/convo-relay/v2/internal/semanticjson"
 )
 
 // FormatV1 identifies the canonical append-only event envelope.
@@ -502,14 +503,20 @@ func decodeEvent(body []byte) (Event, error) {
 }
 
 func decodeCanonicalUint64(body json.RawMessage) (uint64, error) {
-	node, err := parseSemanticJSON(body)
-	if err != nil {
+	if _, err := semanticjson.SemanticJSONBytesRaw(body); err != nil {
 		return 0, err
 	}
-	if node.kind != semanticNumber {
+	decoder := json.NewDecoder(bytes.NewReader(body))
+	decoder.UseNumber()
+	var value any
+	if err := decoder.Decode(&value); err != nil {
+		return 0, err
+	}
+	number, ok := value.(json.Number)
+	if !ok {
 		return 0, errors.New("event seq must be a number")
 	}
-	plain, err := plainSemanticNumber(node.text)
+	plain, err := semanticjson.PlainSemanticNumber(number.String())
 	if err != nil {
 		return 0, err
 	}

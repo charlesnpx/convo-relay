@@ -24,7 +24,7 @@ install-assets:
 	cp -R skill "$(DATADIR)/skill"
 
 fmt-check:
-	@unformatted="$$(gofmt -l cmd internal)"; \
+	@unformatted="$$(gofmt -l cmd internal plan result bundle)"; \
 	test -z "$$unformatted" || { printf '%s\n' "$$unformatted"; exit 1; }
 
 test: fmt-check

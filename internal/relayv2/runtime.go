@@ -18,13 +18,13 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/charlesnpx/convo-relay/internal/engine"
-	"github.com/charlesnpx/convo-relay/internal/eventlog"
-	"github.com/charlesnpx/convo-relay/internal/plan"
-	"github.com/charlesnpx/convo-relay/internal/provider"
-	"github.com/charlesnpx/convo-relay/internal/recipes"
-	"github.com/charlesnpx/convo-relay/internal/session"
-	"github.com/charlesnpx/convo-relay/internal/workspace"
+	"github.com/charlesnpx/convo-relay/v2/internal/engine"
+	"github.com/charlesnpx/convo-relay/v2/internal/eventlog"
+	"github.com/charlesnpx/convo-relay/v2/internal/plan"
+	"github.com/charlesnpx/convo-relay/v2/internal/provider"
+	"github.com/charlesnpx/convo-relay/v2/internal/recipes"
+	"github.com/charlesnpx/convo-relay/v2/internal/session"
+	"github.com/charlesnpx/convo-relay/v2/internal/workspace"
 )
 
 const runtimeFilename = "v2-runtime.json"

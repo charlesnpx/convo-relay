@@ -12,14 +12,14 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/charlesnpx/convo-relay/internal/engine"
-	"github.com/charlesnpx/convo-relay/internal/eventlog"
-	"github.com/charlesnpx/convo-relay/internal/format"
-	"github.com/charlesnpx/convo-relay/internal/readiness"
-	"github.com/charlesnpx/convo-relay/internal/recipes"
-	"github.com/charlesnpx/convo-relay/internal/relayv2"
-	"github.com/charlesnpx/convo-relay/internal/session"
-	"github.com/charlesnpx/convo-relay/internal/sessionstore"
+	"github.com/charlesnpx/convo-relay/v2/internal/engine"
+	"github.com/charlesnpx/convo-relay/v2/internal/eventlog"
+	"github.com/charlesnpx/convo-relay/v2/internal/format"
+	"github.com/charlesnpx/convo-relay/v2/internal/readiness"
+	"github.com/charlesnpx/convo-relay/v2/internal/recipes"
+	"github.com/charlesnpx/convo-relay/v2/internal/relayv2"
+	"github.com/charlesnpx/convo-relay/v2/internal/session"
+	"github.com/charlesnpx/convo-relay/v2/internal/sessionstore"
 )
 
 func main() {

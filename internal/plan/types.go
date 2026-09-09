@@ -5,7 +5,7 @@ package plan
 import (
 	"encoding/json"
 
-	"github.com/charlesnpx/convo-relay/internal/session"
+	"github.com/charlesnpx/convo-relay/v2/internal/session"
 )
 
 // Flags is the typed subset of the ordinary run flags that changes execution

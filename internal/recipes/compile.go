@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/charlesnpx/convo-relay/internal/format"
+	"github.com/charlesnpx/convo-relay/v2/internal/format"
 )
 
 type CompileTarget string

@@ -13,11 +13,11 @@ import (
 	"strings"
 	"time"
 
-	"github.com/charlesnpx/convo-relay/internal/blobstore"
-	"github.com/charlesnpx/convo-relay/internal/eventlog"
-	"github.com/charlesnpx/convo-relay/internal/session"
-	"github.com/charlesnpx/convo-relay/internal/sessionview"
-	"github.com/charlesnpx/convo-relay/internal/workspace"
+	"github.com/charlesnpx/convo-relay/v2/internal/blobstore"
+	"github.com/charlesnpx/convo-relay/v2/internal/eventlog"
+	"github.com/charlesnpx/convo-relay/v2/internal/session"
+	"github.com/charlesnpx/convo-relay/v2/internal/sessionview"
+	"github.com/charlesnpx/convo-relay/v2/internal/workspace"
 )
 
 var errSessionRunning = errors.New("session is running")

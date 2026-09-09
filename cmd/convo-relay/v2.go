@@ -13,16 +13,16 @@ import (
 	"strings"
 	"unicode/utf8"
 
-	"github.com/charlesnpx/convo-relay/internal/blobstore"
-	"github.com/charlesnpx/convo-relay/internal/engine"
-	"github.com/charlesnpx/convo-relay/internal/eventlog"
-	"github.com/charlesnpx/convo-relay/internal/namedinputs"
-	"github.com/charlesnpx/convo-relay/internal/plan"
-	"github.com/charlesnpx/convo-relay/internal/recipes"
-	"github.com/charlesnpx/convo-relay/internal/relayv2"
-	"github.com/charlesnpx/convo-relay/internal/session"
-	"github.com/charlesnpx/convo-relay/internal/sessionview"
-	"github.com/charlesnpx/convo-relay/internal/workspace"
+	"github.com/charlesnpx/convo-relay/v2/internal/blobstore"
+	"github.com/charlesnpx/convo-relay/v2/internal/engine"
+	"github.com/charlesnpx/convo-relay/v2/internal/eventlog"
+	"github.com/charlesnpx/convo-relay/v2/internal/namedinputs"
+	"github.com/charlesnpx/convo-relay/v2/internal/plan"
+	"github.com/charlesnpx/convo-relay/v2/internal/recipes"
+	"github.com/charlesnpx/convo-relay/v2/internal/relayv2"
+	"github.com/charlesnpx/convo-relay/v2/internal/session"
+	"github.com/charlesnpx/convo-relay/v2/internal/sessionview"
+	"github.com/charlesnpx/convo-relay/v2/internal/workspace"
 )
 
 const (
@@ -638,7 +638,7 @@ func v2Run(ctx context.Context, sess *session.Session, runtime relayv2.Runtime, 
 	} else {
 		_, runErr = engine.Run(ctx, sess, deps)
 	}
-	report, reportErr := relayv2.BuildReport(sess, relayv2.ProjectionOptions{})
+	report, reportErr := v2BuildReportMap(sess)
 	if reportErr != nil {
 		return nil, errors.Join(runErr, reportErr)
 	}

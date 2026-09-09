@@ -9,7 +9,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/charlesnpx/convo-relay/internal/recipes"
+	"github.com/charlesnpx/convo-relay/v2/internal/recipes"
 )
 
 type TurnOptions struct {

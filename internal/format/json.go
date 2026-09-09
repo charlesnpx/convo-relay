@@ -11,7 +11,7 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/charlesnpx/convo-relay/internal/eventlog"
+	"github.com/charlesnpx/convo-relay/v2/internal/eventlog"
 )
 
 // CanonicalJSONBytes is the semantic-json representation used by plans and
