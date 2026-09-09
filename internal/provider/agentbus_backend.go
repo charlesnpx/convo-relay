@@ -64,7 +64,6 @@ func newEmbeddedCodexBackend(sessionRoot string, slotID string, label string, cw
 		config,
 		newEmbeddedCodexEngine(codexcli.Options{
 			Binary:           "codex",
-			CachePath:        "",
 			SupportedModels:  nil,
 			SupportedEfforts: nil,
 			// Trusted posture is the user-decided policy for convo-relay.
@@ -83,7 +82,6 @@ func newEmbeddedClaudeBackend(sessionRoot string, slotID string, label string, c
 		config,
 		newEmbeddedClaudeEngine(claudecli.Options{
 			Binary:           "claude",
-			CachePath:        "",
 			SupportedModels:  nil,
 			SupportedEfforts: nil,
 		}),
