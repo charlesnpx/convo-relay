@@ -24,29 +24,6 @@ type CompileOptions struct {
 	TransientSources     []TransientRecipeSource
 }
 
-func AlternatingSchedule(participantTurns int) ([]struct {
-	ParticipantTurn int
-	Slot            string
-}, error) {
-	if participantTurns < 1 {
-		return nil, fmt.Errorf("participant turns must be positive")
-	}
-	turns := make([]struct {
-		ParticipantTurn int
-		Slot            string
-	}, participantTurns)
-	for index := range turns {
-		turns[index] = struct {
-			ParticipantTurn int
-			Slot            string
-		}{
-			ParticipantTurn: index + 1,
-			Slot:            fmt.Sprintf("slot_%d", index%2),
-		}
-	}
-	return turns, nil
-}
-
 // CompileRecipe checks a recipe and returns a non-durable plan preview. The
 // only durable plan is session.Plan, produced by plan.FromRecipe at launch.
 func CompileRecipe(
@@ -193,13 +170,15 @@ func compileRootPlan(
 	if err != nil {
 		return nil, err
 	}
-	schedule, err := AlternatingSchedule(turns)
-	if err != nil {
-		return nil, format.NewValidationError("root recipe participant schedule: %v", err)
+	if turns < 1 {
+		return nil, format.NewValidationError("root recipe participant schedule: participant turns must be positive")
 	}
-	participantSchedule := make([]any, 0, len(schedule))
-	for _, turn := range schedule {
-		participantSchedule = append(participantSchedule, map[string]any{"participant_turn": turn.ParticipantTurn, "slot": turn.Slot})
+	participantSchedule := make([]any, turns)
+	for index := range participantSchedule {
+		participantSchedule[index] = map[string]any{
+			"participant_turn": index + 1,
+			"slot":             fmt.Sprintf("slot_%d", index%2),
+		}
 	}
 	resultSource := normalizeResultSource(recipe["result_source"])
 	var reducer map[string]any

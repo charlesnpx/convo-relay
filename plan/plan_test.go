@@ -93,3 +93,35 @@ func TestPlanRejectsInstructionForUnscheduledActor(t *testing.T) {
 		t.Fatalf("unscheduled instruction error = %v, want turn and both actors", err)
 	}
 }
+
+func TestPlanRejectsFacilitatorOnSequenceSchedule(t *testing.T) {
+	value := Plan{
+		Kind:          PlanKind,
+		SchemaVersion: SchemaVersion,
+		SessionID:     "sequence-facilitator",
+		Provenance:    ProvenanceSupplied,
+		Task:          "validate sequence controls",
+		Timeouts:      Timeouts{TurnSeconds: 10, StallSeconds: 5},
+		Mode:          ModeCooperative,
+		Investigation: InvestigationNormal,
+		Actors: []Actor{
+			{ID: "participant", Backend: ActorBackendCodex},
+			{ID: "facilitator", Backend: ActorBackendCodex},
+		},
+		Schedule:    Schedule{Kind: ScheduleSequence, Turns: 1, Order: []string{"participant"}},
+		Facilitator: &Facilitator{Actor: "facilitator", Cadence: 1},
+		ProviderRetry: ProviderRetry{
+			Mode:        ProviderRetryForbid,
+			MaxAttempts: 1,
+		},
+		Workspace:   Workspace{Mode: WorkspaceModeCurrent},
+		Inputs:      []Input{},
+		Context:     []Input{},
+		Skills:      []Input{},
+		ChildPolicy: ChildPolicy{Mode: ChildPolicyDeny, AllowedRecipes: []string{}},
+		Result:      Result{Source: ResultSourceLastTurn, Format: ResultFormatText},
+	}
+	if err := Validate(value); err == nil || err.Error() != "sequence schedule must not declare a facilitator" {
+		t.Fatalf("sequence facilitator error = %v, want sequence schedule rejection", err)
+	}
+}

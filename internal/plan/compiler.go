@@ -166,14 +166,6 @@ func copyPlan(plan session.Plan) session.Plan {
 		lifecycle := *plan.Lifecycle
 		plan.Lifecycle = &lifecycle
 	}
-	if plan.Instructions != nil {
-		instructions := *plan.Instructions
-		instructions.Turns = append([]session.TurnInstruction{}, instructions.Turns...)
-		if instructions.Turns == nil {
-			instructions.Turns = []session.TurnInstruction{}
-		}
-		plan.Instructions = &instructions
-	}
 	return plan
 }
 

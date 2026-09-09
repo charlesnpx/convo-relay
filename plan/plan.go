@@ -539,6 +539,9 @@ func Validate(value Plan) error {
 	if value.Schedule.Turns < 1 {
 		return errors.New("schedule turns must be positive")
 	}
+	if value.Schedule.Kind == ScheduleSequence && value.Facilitator != nil {
+		return errors.New("sequence schedule must not declare a facilitator")
+	}
 	if value.Facilitator != nil {
 		if _, exists := actorIDs[value.Facilitator.Actor]; !exists {
 			return errors.New("facilitator actor is not in actors")
