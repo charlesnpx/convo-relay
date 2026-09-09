@@ -4,9 +4,9 @@ description: "Launch a relay dialogue between backend slots such as Codex CLI, C
 argument-hint: "<request — e.g. 'audit this', 'pressure-test the approach', 'help me think through this'>"
 ---
 
-You are initiating a structured dialogue between two backend slots using `convo-relay`. The usual pairing is Codex CLI plus Claude Code, but the tool can also run reversed ordering, Gemini pairings, same-backend pairings, the composite Relay backend, or single-value shorthand like `--agents claude`, `--agents codex`, `--agents gemini`, and `--agents relay` when that is the right fit.
+You are initiating a structured dialogue between two backend slots using `convo-relay`. The usual pairing is Codex CLI plus Claude Code, but the tool can also run reversed ordering, Gemini pairings, same-backend pairings, or single-value shorthand like `--agents claude`, `--agents codex`, and `--agents gemini` when that is the right fit.
 
-Your job is to translate the current conversation context and the user's request into a well-formed `convo-relay run` invocation — not to be a blind passthrough for CLI flags. Still, when the user explicitly provides a valid relay preference such as `--agents relay`, `--agents codex,relay`, `--agents relay,relay`, a recipe name, or a round cap, treat it as operator intent and preserve it unless it conflicts with the task.
+Your job is to translate the current conversation context and the user's request into a well-formed `convo-relay run` invocation — not to be a blind passthrough for CLI flags. Still, when the user explicitly provides a valid backend preference, recipe name, or round cap, treat it as operator intent and preserve it unless it conflicts with the task.
 
 ## Step 1: Synthesize a task brief
 
@@ -42,11 +42,9 @@ Most requests will be adversarial or steelman. Default to **adversarial** when u
 
 **Rounds**: Default to auto-stop mode. Let the relay continue until it converges: either the facilitator has no contested disagreements left, or both sides explicitly signal completion. Use `--max-rounds` to raise or lower the safety cap when needed. Use `--quick` only for a strict 3-round relay. Use `--rounds N` only when the user explicitly wants an exact fixed number of rounds.
 
-**Agent pairing**: Default to `--agents codex,claude`. Consider `--agents claude,codex` if you want the opening turn to come from a different perspective than what's been discussed. Use `codex,gemini`, same-backend pairs, Relay backend pairings, or single-value shorthand when that comparison fits the request. Mixed pairs default to a Codex facilitator. `--agents claude`, `--agents codex`, or `--agents gemini` means two slots plus a facilitator on that backend. `--agents relay` means both parent slots are composite Relay backends, with a Codex facilitator. Honor explicit user requests for `relay`, `codex,relay`, `relay,codex`, or `relay,relay`. The CLI flag remains `--agents`; approval previews use `Recipes/slots` because each slot value may be a direct backend profile, builtin backend shorthand, or relay recipe.
+**Agent pairing**: Default to `--agents codex,claude`. Consider `--agents claude,codex` if you want the opening turn to come from a different perspective than what's been discussed. Use `codex,gemini`, same-backend pairs, or single-value shorthand when that comparison fits the request. Mixed pairs default to a Codex facilitator. `--agents claude`, `--agents codex`, or `--agents gemini` means two slots plus a facilitator on that backend. The CLI flag remains `--agents`; approval previews use `Recipes/slots` because each slot value may be a direct backend profile or builtin backend shorthand.
 
-**Relay backend slots**: A Relay backend slot answers one parent turn by running a nested child relay through a recipe, then returning one collapsed result to the parent relay. For a slot whose backend is `relay`, `--model-a` / `--model-b` is the relay recipe id, not an LLM model name, and `--effort-a` / `--effort-b` is the child relay round-count override, not model reasoning effort. The default recipe is `review-panel`. Built-in recipes include `review-panel`, `vision-review`, and `one-pass-review`; use `convo-relay recipes list`, `convo-relay recipes show <id>`, and `convo-relay recipes doctor` when the available or resolved recipe configuration is unclear. Configure the nested child models through `~/.convo-relay/settings.toml` backend profiles and relay recipes, not by putting LLM model names on the parent Relay slot.
-
-**Slot overrides**: The first backend is agent A (`slot_0`) and the second is agent B (`slot_1`). Only add `--model-a`, `--effort-a`, `--model-b`, or `--effort-b` when the user has asked for specific models/effort levels, a Relay recipe/child round count, or there is a clear reason to bias one slot. Do not add Codex/Claude/Gemini model names to a slot whose backend is `relay`; use recipe ids there.
+**Slot overrides**: The first backend is agent A (`slot_0`) and the second is agent B (`slot_1`). Only add `--model-a`, `--effort-a`, `--model-b`, or `--effort-b` when the user has asked for specific models or effort levels, or there is a clear reason to bias one slot.
 
 **Context files**: Identify the 2-5 most relevant files from the conversation — the code under discussion, architecture docs, CLAUDE.md, etc. Pass these via `--context`. Don't dump everything; pick what grounds the discussion. Context files must be UTF-8 text, up to 1 MiB each and 2 MiB total; the CLI labels them as `ctx1`, `ctx2`, persists digests, and asks agents to cite those labels when relevant.
 
@@ -94,6 +92,17 @@ Once approved, launch the relay using the Bash tool with `run_in_background: tru
 convo-relay run "<task brief>" --mode <mode> --agents <backend_a,backend_b> --investigation <mode> --context <files...> --verbose
 ```
 
+When the caller already has a complete immutable plan document, use the direct
+entry point instead of reconstructing it from flags:
+
+```bash
+convo-relay run --plan <plan.json> [--blobs <blob-directory>] --verbose
+```
+
+The plan is used as written and must contain its own execution values. If it
+contains payload references, `--blobs` points to a directory containing
+`sha256/<lowercase-hex-digest>` files.
+
 Do **not** append `&` — the `run_in_background` parameter handles backgrounding. You will be automatically notified when the process completes.
 
 Always include `--verbose`. The command prints `Session <8-char-id>` to stderr immediately on launch — capture this session ID.
@@ -118,25 +127,26 @@ Report completed rounds, session status, latest turn summary, ledger counts, and
 
 Status handling should be practical and non-refusal-shaped: perform the requested status check, wait for the active command handle, or state the current known session ID and what command can be run externally.
 
-### Graph and contract inspection
+### Graph and portable export inspection
 
-Use the transcript commands for ordinary status and summaries. Use graph/contract commands only when the user asks to inspect execution internals, child relay artifacts, portable contracts, or debug state:
+Use the transcript commands for ordinary status and summaries. Use graph or portable-export commands only when the user asks to inspect execution internals, child relay artifacts, a portable export, or debug state:
 
 ```bash
 convo-relay show <session-id> --graph --json
-convo-relay contracts <session-id>
-convo-relay contracts <session-id> --json
-convo-relay contracts <session-id> --ref <artifact-ref-id> --digest sha256:...
+convo-relay export create <session-id> --portable -o <bundle-directory> --json
+convo-relay export verify <bundle-directory> --json
 ```
 
-`show --graph --json` returns raw v1 `session_event` objects with `event_type`, `timestamp`, and `payload`; do not expect legacy flattened `type` or `ts` fields. Public artifact values are `artifact_ref` objects with `id` and `digest`, not filesystem path strings. Use `contracts` to verify strict v1 event validation, artifact index entries, relay-backend child contract bundles, dynamic child contract bundles, and whether recipe/compiled-plan/invocation/result refs load and digest-check.
+`show --graph --json` returns a derived graph and summaries from the canonical
+event log. Treat BlobRef values as path-independent payload references. Use
+`export verify` to validate a portable bundle directory and its manifest.
 
 ### Status interpretation
 
 - If the relay is still running with no completed rounds yet, say that the opening turn is still in progress rather than speculating that the relay is stuck.
 - Never say you cannot summarize until the relay finishes. Summarize what is known, label what is pending.
 - Long silent periods are normal. One backend may think for minutes before the transcript changes.
-- Do not kill or restart a relay just because the first turn is taking several minutes.
+- Do not cancel or restart a relay just because the first turn is taking several minutes.
 - `started: false`, empty transcript, or missing session subdirectories are **not** sufficient evidence of failure while the relay process is still alive.
 
 ## Step 5: Present results
@@ -183,13 +193,13 @@ Treat resume exactly like a fresh long-running relay:
 - if the user asks for a summary so far during resume, inspect the live session and summarize whatever has completed
 - avoid inferring failure from stale session files; if the user asks for progress, inspect the live session and summarize whatever has completed
 
-If the user wants to steer a relay that is already running, queue the direction instead of restarting:
+Steering queues on an idle or interrupted session and applies at its next resume. If a relay is running, interrupt its process first, then queue the direction:
 
 ```bash
-convo-relay steer <session-id> "<new direction>"
+convo-relay control steer <session-id> "<new direction>"
 ```
 
-If the user asks to stop a running relay, use `convo-relay stop <session-id>`. Use `convo-relay kill <session-id>` only when they explicitly want a force kill.
+If the user asks to stop a running relay, tell them to send `SIGINT` to its owning process. `convo-relay control cancel <session-id>` checks whether that process is still active and tells them when direct interruption is required; it does not send a signal itself. After it is interrupted, use `resume` to continue its remaining work.
 
 ## Error handling
 

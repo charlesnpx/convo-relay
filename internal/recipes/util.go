@@ -7,7 +7,7 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/charlesnpx/convo-relay/internal/contracts"
+	"github.com/charlesnpx/convo-relay/v2/internal/format"
 )
 
 func mergeNamedRecords(defaults map[string]map[string]any, overrides map[string]any) map[string]map[string]any {
@@ -26,7 +26,7 @@ func mergeNamedRecords(defaults map[string]map[string]any, overrides map[string]
 			base = cloneObject(existing)
 		}
 		for key, value := range override {
-			base[key] = contracts.Materialize(value)
+			base[key] = format.Materialize(value)
 		}
 		base["id"] = itemID
 		merged[itemID] = base
@@ -168,7 +168,7 @@ func asObject(value any) map[string]any {
 }
 
 func materializeMap(value map[string]any) map[string]any {
-	materialized, ok := contracts.Materialize(value).(map[string]any)
+	materialized, ok := format.Materialize(value).(map[string]any)
 	if !ok {
 		return map[string]any{}
 	}
@@ -186,7 +186,7 @@ func cloneNestedObject(value map[string]map[string]any) map[string]map[string]an
 func cloneObject(value map[string]any) map[string]any {
 	result := make(map[string]any, len(value))
 	for key, item := range value {
-		result[key] = contracts.Materialize(item)
+		result[key] = format.Materialize(item)
 	}
 	return result
 }

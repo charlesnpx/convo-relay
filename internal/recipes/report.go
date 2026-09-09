@@ -7,28 +7,22 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/charlesnpx/convo-relay/internal/contracts"
-	"github.com/charlesnpx/convo-relay/internal/integration"
-	"github.com/charlesnpx/convo-relay/internal/readiness"
+	"github.com/charlesnpx/convo-relay/v2/internal/format"
+	"github.com/charlesnpx/convo-relay/v2/internal/readiness"
 )
 
 const (
-	RecipeStatusUsable              = "usable"
-	RecipeStatusRequiresIntegration = "requires_integration"
-	RecipeStatusUnavailable         = "unavailable"
-	RecipeStatusInvalid             = "invalid"
-	RecipeStatusSkipped             = "skipped"
-
-	RecipeIntegrationStatusRequired = "required"
-	RecipeIntegrationStatusBound    = "bound"
+	RecipeStatusUsable      = "usable"
+	RecipeStatusUnavailable = "unavailable"
+	RecipeStatusInvalid     = "invalid"
+	RecipeStatusSkipped     = "skipped"
 )
 
 type RecipeCatalogOptions struct {
-	Context           context.Context
-	TransientSources  []TransientRecipeSource
-	IntegrationBundle *integration.Bundle
-	ReadinessOptions  readiness.Options
-	ReadinessCheck    func(context.Context, []string, readiness.Options) ([]readiness.Record, error)
+	Context          context.Context
+	TransientSources []TransientRecipeSource
+	ReadinessOptions readiness.Options
+	ReadinessCheck   func(context.Context, []string, readiness.Options) ([]readiness.Record, error)
 }
 
 type RecipeCatalogReport struct {
@@ -41,24 +35,15 @@ type RecipeCatalogReport struct {
 }
 
 type RecipeRecord struct {
-	ID               string                    `json:"id"`
-	Status           string                    `json:"status"`
-	Source           string                    `json:"source"`
-	SourceDigest     string                    `json:"source_digest,omitempty"`
-	RecipeDigest     string                    `json:"recipe_digest,omitempty"`
-	Declared         map[string]any            `json:"declared,omitempty"`
-	Resolved         map[string]any            `json:"resolved,omitempty"`
-	Integration      *RecipeIntegrationBinding `json:"integration,omitempty"`
-	BackendReadiness []readiness.Record        `json:"backend_readiness,omitempty"`
-	Diagnostics      []ChildRecipeIssue        `json:"diagnostics,omitempty"`
-}
-
-type RecipeIntegrationBinding struct {
-	Status         string `json:"status"`
-	ContractID     string `json:"contract_id"`
-	ContractDigest string `json:"contract_digest,omitempty"`
-	BundleID       string `json:"bundle_id,omitempty"`
-	BundleDigest   string `json:"bundle_digest,omitempty"`
+	ID               string             `json:"id"`
+	Status           string             `json:"status"`
+	Source           string             `json:"source"`
+	SourceDigest     string             `json:"source_digest,omitempty"`
+	RecipeDigest     string             `json:"recipe_digest,omitempty"`
+	Declared         map[string]any     `json:"declared,omitempty"`
+	Resolved         map[string]any     `json:"resolved,omitempty"`
+	BackendReadiness []readiness.Record `json:"backend_readiness,omitempty"`
+	Diagnostics      []ChildRecipeIssue `json:"diagnostics,omitempty"`
 }
 
 type RecipeIssueGroup struct {
@@ -66,33 +51,6 @@ type RecipeIssueGroup struct {
 	Count   int                `json:"count"`
 	Issues  []ChildRecipeIssue `json:"issues"`
 	Recipes []string           `json:"recipes,omitempty"`
-}
-
-func BuildRecipeCatalogReport(settingsPath string) (RecipeCatalogReport, error) {
-	return BuildRecipeCatalogReportWithOptions(settingsPath, RecipeCatalogOptions{})
-}
-
-func BuildRecipeCatalogReportWithTransientSources(settingsPath string, sources []TransientRecipeSource) (RecipeCatalogReport, error) {
-	return BuildRecipeCatalogReportWithOptions(settingsPath, RecipeCatalogOptions{TransientSources: sources})
-}
-
-// LoadIntegrationBundle applies the settings-scoped bundle byte limit without
-// requiring every catalog recipe to be executable first.
-func LoadIntegrationBundle(settingsPath string, bundlePath string) (*integration.Bundle, error) {
-	bundlePath = strings.TrimSpace(bundlePath)
-	if bundlePath == "" {
-		return nil, nil
-	}
-	path := resolveSettingsPath(settingsPath)
-	settings, err := loadTOML(path)
-	if err != nil {
-		return nil, fmt.Errorf("load settings %s: %w", path, err)
-	}
-	limits, err := ParseRuntimeLimits(settings["limits"])
-	if err != nil {
-		return nil, err
-	}
-	return integration.LoadBundleFile(expandUser(bundlePath), limits.IntegrationBundleMaxBytes)
 }
 
 func BuildRecipeCatalogReportWithOptions(settingsPath string, options RecipeCatalogOptions) (RecipeCatalogReport, error) {
@@ -164,8 +122,7 @@ func BuildRecipeCatalogReportWithOptions(settingsPath string, options RecipeCata
 			records = append(records, record)
 			continue
 		}
-		participantTurns, turnErr := validatedRootParticipantTurns(recipe)
-		if turnErr != nil {
+		if _, turnErr := validatedRootParticipantTurns(recipe); turnErr != nil {
 			record.Status = RecipeStatusInvalid
 			record.Diagnostics = catalogDiagnosticIssues(turnErr, "invalid_config", "invalid_participant_turns")
 			records = append(records, record)
@@ -176,7 +133,7 @@ func BuildRecipeCatalogReportWithOptions(settingsPath string, options RecipeCata
 		record.Diagnostics = issues
 		record.Resolved = resolveRecipeView(recipe, normalizedProfiles, normalizedRecipes)
 		backends, closureErr := readiness.ResolveBackendClosure(recipe, normalizedProfiles, normalizedRecipes, readiness.ClosureOptions{
-			IncludeReducer:        normalizeResultSource(recipe["result_source"]) == integration.ResultSourceReducer,
+			IncludeReducer:        normalizeResultSource(recipe["result_source"]) == ResultSourceReducer,
 			IncludeNestedReducers: true,
 		})
 		if closureErr == nil {
@@ -195,19 +152,12 @@ func BuildRecipeCatalogReportWithOptions(settingsPath string, options RecipeCata
 			records = append(records, record)
 			continue
 		}
-		record.Integration, issues = catalogIntegrationBinding(recipe, participantTurns, options.IntegrationBundle)
-		record.Diagnostics = append(record.Diagnostics, issues...)
-		switch {
-		case record.Integration != nil && record.Integration.Status != RecipeIntegrationStatusBound:
-			record.Status = RecipeStatusRequiresIntegration
-		default:
-			readinessCandidates = append(readinessCandidates, readinessCandidate{
-				recordIndex: len(records),
-				backends:    backends,
-			})
-			for _, backend := range backends {
-				allBackends[backend] = true
-			}
+		readinessCandidates = append(readinessCandidates, readinessCandidate{
+			recordIndex: len(records),
+			backends:    backends,
+		})
+		for _, backend := range backends {
+			allBackends[backend] = true
 		}
 		records = append(records, record)
 	}
@@ -345,12 +295,6 @@ func FormatRecipeShow(record RecipeRecord, view string) string {
 	}
 	if record.RecipeDigest != "" {
 		lines = append(lines, fmt.Sprintf("Recipe digest: %s", record.RecipeDigest))
-	}
-	if record.Integration != nil {
-		lines = append(lines, fmt.Sprintf("Integration: %s contract=%s", record.Integration.Status, record.Integration.ContractID))
-		if record.Integration.BundleID != "" {
-			lines = append(lines, fmt.Sprintf("Integration bundle: %s digest=%s", record.Integration.BundleID, record.Integration.BundleDigest))
-		}
 	}
 	if view == "all" || view == "declared" {
 		lines = append(lines, "Declared:")
@@ -605,54 +549,8 @@ func flattenProfileDiagnostics(profileIssues map[string][]ChildRecipeIssue) []Ch
 	return issues
 }
 
-func catalogIntegrationBinding(recipe map[string]any, participantTurns int, bundle *integration.Bundle) (*RecipeIntegrationBinding, []ChildRecipeIssue) {
-	contractID := stringValue(recipe["integration_contract"])
-	if strings.TrimSpace(contractID) == "" {
-		return nil, nil
-	}
-	binding := &RecipeIntegrationBinding{
-		Status:     RecipeIntegrationStatusRequired,
-		ContractID: contractID,
-	}
-	if bundle == nil {
-		return binding, []ChildRecipeIssue{{
-			Category: "integration_binding",
-			Code:     "integration_required",
-			Message:  fmt.Sprintf("Recipe '%s' requires integration contract '%s'.", stringValue(recipe["id"]), contractID),
-			Path:     "recipe.integration_contract",
-			Detail:   map[string]any{"contract_id": contractID},
-		}}
-	}
-	binding.BundleID = bundle.ID()
-	binding.BundleDigest = bundle.Digest()
-	scheduledTurns, err := integration.AlternatingSchedule(participantTurns)
-	if err != nil {
-		return binding, []ChildRecipeIssue{{
-			Category: "integration_binding",
-			Code:     "integration_schedule_invalid",
-			Message:  "Recipe participant schedule cannot be matched to an integration contract.",
-			Path:     "recipe.participant_turns",
-			Detail:   map[string]any{"cause": err.Error()},
-		}}
-	}
-	selected, err := integration.SelectContract(bundle, contractID, integration.ScheduleRequirement{
-		Turns:        scheduledTurns,
-		ResultSource: normalizeResultSource(recipe["result_source"]),
-	})
-	if err != nil {
-		return binding, catalogIntegrationIssues(err)
-	}
-	binding.Status = RecipeIntegrationStatusBound
-	binding.ContractDigest = selected.Digest()
-	return binding, nil
-}
-
-func catalogIntegrationIssues(err error) []ChildRecipeIssue {
-	return catalogDiagnosticIssues(err, "integration_binding", "integration_binding_failed")
-}
-
 func catalogDiagnosticIssues(err error, category string, fallbackCode string) []ChildRecipeIssue {
-	var diagnosticError *contracts.DiagnosticError
+	var diagnosticError *format.DiagnosticError
 	if errors.As(err, &diagnosticError) && len(diagnosticError.Diagnostics) > 0 {
 		issues := make([]ChildRecipeIssue, 0, len(diagnosticError.Diagnostics))
 		for _, diagnostic := range diagnosticError.Diagnostics {
@@ -714,7 +612,7 @@ func catalogStatus(records []RecipeRecord, profileIssues map[string][]ChildRecip
 		return "degraded"
 	}
 	for _, record := range records {
-		if record.Status != RecipeStatusUsable && record.Status != RecipeStatusRequiresIntegration {
+		if record.Status != RecipeStatusUsable {
 			return "degraded"
 		}
 	}

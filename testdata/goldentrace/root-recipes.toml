@@ -1,0 +1,132 @@
+[backend_profiles.trace-alpha]
+backend = "codex"
+model = "trace-alpha"
+effort = "low"
+capabilities = []
+
+[backend_profiles.trace-beta]
+backend = "codex"
+model = "trace-beta"
+effort = "low"
+capabilities = []
+
+[backend_profiles.trace-facilitator]
+backend = "codex"
+model = "trace-facilitator"
+effort = "low"
+capabilities = []
+
+[backend_profiles.trace-reducer]
+backend = "codex"
+model = "trace-reducer"
+effort = "low"
+capabilities = []
+
+[backend_profiles.trace-gemini]
+backend = "gemini"
+model = "trace-gemini"
+effort = "low"
+capabilities = []
+
+[relay_recipes.trace-facilitated]
+purpose = "Expose a facilitator ledger through the public transcript."
+participants = ["trace-alpha", "trace-beta"]
+facilitator = "trace-facilitator"
+reducer = "trace-reducer"
+mode = "cooperative"
+participant_turns = 1
+max_rounds = 1
+result_source = "last_turn"
+provider_retry = "forbid"
+max_depth = 1
+auto_approval = "never"
+
+[relay_recipes.trace-facilitated.lifecycle]
+resume = "allow"
+steering = "allow"
+dynamic = "forbid"
+workspace_isolation = "inherited"
+
+[relay_recipes.trace-declarative]
+purpose = "Use the declared profiles and turn count without structural CLI flags."
+participants = ["trace-alpha", "trace-beta"]
+facilitator = "trace-facilitator"
+reducer = "trace-reducer"
+mode = "cooperative"
+participant_turns = 2
+max_rounds = 2
+result_source = "last_turn"
+max_depth = 1
+auto_approval = "never"
+
+[relay_recipes.trace-declarative.lifecycle]
+resume = "allow"
+steering = "allow"
+dynamic = "forbid"
+workspace_isolation = "inherited"
+
+[relay_recipes.trace-reducer]
+purpose = "Run the fixed participant schedule and select the fresh reducer result."
+participants = ["trace-alpha", "trace-beta"]
+facilitator = "trace-facilitator"
+reducer = "trace-reducer"
+mode = "cooperative"
+participant_turns = 2
+max_rounds = 2
+result_source = "reducer"
+provider_retry = "forbid"
+max_depth = 1
+auto_approval = "never"
+
+[relay_recipes.trace-reducer.lifecycle]
+resume = "allow"
+steering = "allow"
+dynamic = "forbid"
+workspace_isolation = "inherited"
+
+[relay_recipes.trace-retry]
+purpose = "Expose a retried provider invocation through the root inspection report."
+participants = ["trace-gemini", "trace-gemini"]
+facilitator = "trace-gemini"
+reducer = "trace-reducer"
+mode = "cooperative"
+participant_turns = 1
+max_rounds = 1
+result_source = "last_turn"
+provider_retry = "allow"
+max_depth = 1
+auto_approval = "never"
+
+[relay_recipes.trace-retry.lifecycle]
+resume = "allow"
+steering = "allow"
+dynamic = "forbid"
+workspace_isolation = "inherited"
+
+[relay_recipes.trace-isolated]
+purpose = "Run against a detached committed-HEAD workspace."
+participants = ["trace-alpha", "trace-beta"]
+facilitator = "trace-facilitator"
+reducer = "trace-reducer"
+mode = "cooperative"
+participant_turns = 1
+max_rounds = 1
+result_source = "last_turn"
+max_depth = 1
+auto_approval = "never"
+
+[relay_recipes.trace-isolated.lifecycle]
+resume = "allow"
+steering = "allow"
+dynamic = "forbid"
+workspace_isolation = "ephemeral"
+
+[relay_recipes.review-panel]
+purpose = "Resolve the trace child contested item in one bounded child turn."
+participants = ["trace-alpha", "trace-beta"]
+facilitator = "trace-facilitator"
+reducer = "trace-reducer"
+mode = "cooperative"
+max_rounds = 1
+max_depth = 1
+auto_approval = "never"

@@ -9,7 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/charlesnpx/convo-relay/internal/contracts"
+	"github.com/charlesnpx/convo-relay/v2/internal/format"
 	"github.com/pelletier/go-toml/v2"
 )
 
@@ -91,33 +91,6 @@ func LoadRuntimeConfigWithTransientSources(settingsPath string, sources []Transi
 		RelayRecipes:    normalizedRecipes,
 		Limits:          limits,
 		SettingsPath:    path,
-	}, transientFiles, nil
-}
-
-func ApplyTransientRecipeSources(base RuntimeConfig, sources []TransientRecipeSource) (RuntimeConfig, []TransientRecipeSource, error) {
-	if err := ValidateRuntimeLimits(base.EffectiveLimits()); err != nil {
-		return RuntimeConfig{}, nil, err
-	}
-	rawProfiles := runtimeMapAsRaw(base.BackendProfiles)
-	rawRecipes := runtimeMapAsRaw(base.RelayRecipes)
-	transientFiles, err := loadTransientRecipeSources(sources, rawProfiles, rawRecipes)
-	if err != nil {
-		return RuntimeConfig{}, nil, err
-	}
-	if err := ValidateRawRelayRecipes(rawRecipes); err != nil {
-		return RuntimeConfig{}, nil, err
-	}
-	normalizedProfiles := NormalizeBackendProfiles(rawProfiles)
-	normalizedRecipes := NormalizeRelayRecipes(rawRecipes)
-	populateTransientRecipeDigests(transientFiles, normalizedRecipes)
-	if err := validateTransientRecipes(transientFiles, normalizedProfiles, normalizedRecipes); err != nil {
-		return RuntimeConfig{}, nil, err
-	}
-	return RuntimeConfig{
-		BackendProfiles: normalizedProfiles,
-		RelayRecipes:    normalizedRecipes,
-		Limits:          base.EffectiveLimits(),
-		SettingsPath:    strings.TrimSpace(base.SettingsPath),
 	}, transientFiles, nil
 }
 
@@ -206,12 +179,11 @@ func NormalizeBackendProfiles(rawProfiles map[string]any) map[string]map[string]
 			continue
 		}
 		normalized[profileID] = map[string]any{
-			"id":           profileID,
-			"backend":      backend,
-			"model":        profile["model"],
-			"effort":       profile["effort"],
-			"description":  strings.TrimSpace(stringValue(profile["description"])),
-			"capabilities": cleanStringList(profile["capabilities"], false),
+			"id":          profileID,
+			"backend":     backend,
+			"model":       profile["model"],
+			"effort":      profile["effort"],
+			"description": strings.TrimSpace(stringValue(profile["description"])),
 		}
 		if strings.TrimSpace(stringValue(profile["origin"])) == "generated" {
 			normalized[profileID]["origin"] = "generated"
@@ -251,25 +223,22 @@ func normalizeRelayRecipesWithDefaults(rawRecipes map[string]any, defaults map[s
 			reducer = facilitator
 		}
 		payload := map[string]any{
-			"id":                    recipeID,
-			"purpose":               strings.TrimSpace(stringValue(recipe["purpose"])),
-			"participants":          participants,
-			"facilitator":           facilitator,
-			"reducer":               reducer,
-			"mode":                  normalizeMode(recipe["mode"]),
-			"max_rounds":            positiveInt(recipe["max_rounds"], 1),
-			"participant_turns":     positiveInt(recipe["participant_turns"], positiveInt(recipe["max_rounds"], 1)),
-			"result_source":         normalizeResultSource(recipe["result_source"]),
-			"integration_contract":  recipe["integration_contract"],
-			"max_depth":             positiveInt(recipe["max_depth"], 1),
-			"required_capabilities": cleanStringList(recipe["required_capabilities"], false),
-			"auto_approval":         normalizeAutoApproval(recipe["auto_approval"]),
-			"match_keywords":        cleanStringList(recipe["match_keywords"], true),
-			"lifecycle":             recipe["lifecycle"],
-			"origin":                recipe["origin"],
-			"generated_from_ref":    recipe["generated_from_ref"],
-			"generated_source":      recipe["generated_source"],
-			"generated_recipe_id":   recipe["generated_recipe_id"],
+			"id":                  recipeID,
+			"purpose":             strings.TrimSpace(stringValue(recipe["purpose"])),
+			"participants":        participants,
+			"facilitator":         facilitator,
+			"reducer":             reducer,
+			"mode":                normalizeMode(recipe["mode"]),
+			"max_rounds":          positiveInt(recipe["max_rounds"], 1),
+			"participant_turns":   positiveInt(recipe["participant_turns"], positiveInt(recipe["max_rounds"], 1)),
+			"result_source":       normalizeResultSource(recipe["result_source"]),
+			"max_depth":           positiveInt(recipe["max_depth"], 1),
+			"auto_approval":       normalizeAutoApproval(recipe["auto_approval"]),
+			"lifecycle":           recipe["lifecycle"],
+			"origin":              recipe["origin"],
+			"generated_from_ref":  recipe["generated_from_ref"],
+			"generated_source":    recipe["generated_source"],
+			"generated_recipe_id": recipe["generated_recipe_id"],
 		}
 		if _, represented := recipe["provider_retry"]; represented {
 			payload["provider_retry"] = recipe["provider_retry"]
@@ -377,7 +346,7 @@ func loadTransientRecipeSources(sources []TransientRecipeSource, rawProfiles map
 		source.ProfileIDs = profileIDs
 		effectiveRawRecipes := make(map[string]any, len(recipeIDs))
 		for _, recipeID := range recipeIDs {
-			effectiveRawRecipes[recipeID] = contracts.Materialize(rawRecipes[recipeID])
+			effectiveRawRecipes[recipeID] = format.Materialize(rawRecipes[recipeID])
 		}
 		source.effectiveRawRecipes = effectiveRawRecipes
 		files = append(files, source)
@@ -519,7 +488,7 @@ func recipeDigestsForIDs(recipeIDs []string, normalizedRecipes map[string]map[st
 		if recipe == nil {
 			continue
 		}
-		digest, err := contracts.ContractDigest(ChildRecipeContractPayload(recipe))
+		digest, err := format.SemanticJSONDigest(RecipePayload(recipe))
 		if err == nil {
 			result[recipeID] = digest
 		}
@@ -536,14 +505,6 @@ func populateTransientRecipeDigests(files []TransientRecipeSource, normalizedRec
 		files[index].RecipeDigests = recipeDigestsForIDs(files[index].RecipeIDs, effectiveRecipes)
 		files[index].effectiveRawRecipes = nil
 	}
-}
-
-func runtimeMapAsRaw(values map[string]map[string]any) map[string]any {
-	result := make(map[string]any, len(values))
-	for key, value := range values {
-		result[key] = cloneObject(value)
-	}
-	return result
 }
 
 func validateTransientRecipes(files []TransientRecipeFile, profiles map[string]map[string]any, relayRecipes map[string]map[string]any) error {

@@ -9,15 +9,91 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"runtime"
 	"sort"
 	"strings"
 	"testing"
 
-	"github.com/charlesnpx/convo-relay/internal/contracts"
-	"github.com/charlesnpx/convo-relay/internal/recipes"
-	"github.com/charlesnpx/convo-relay/internal/store"
+	"github.com/charlesnpx/convo-relay/v2/bundle"
+	"github.com/charlesnpx/convo-relay/v2/internal/blobstore"
+	"github.com/charlesnpx/convo-relay/v2/internal/eventlog"
+	"github.com/charlesnpx/convo-relay/v2/internal/format"
+	"github.com/charlesnpx/convo-relay/v2/internal/relayv2"
+	"github.com/charlesnpx/convo-relay/v2/internal/session"
 )
+
+const fakeCodexAppServerScript = `#!/usr/bin/env python3
+import json
+import os
+import sys
+from pathlib import Path
+
+root_recipe_log = os.environ.get("ROOT_RECIPE_CLI_LOG", "")
+if root_recipe_log:
+    with open(root_recipe_log, "a", encoding="utf-8") as log:
+        log.write(" ".join(sys.argv[1:]) + "\n")
+
+def send(value):
+    print(json.dumps(value), flush=True)
+
+def response(request, result):
+    send({"id": request.get("id"), "result": result})
+
+def prompt_from(params):
+    items = params.get("input", [])
+    if items and isinstance(items[0], dict):
+        return str(items[0].get("text", ""))
+    return ""
+
+def main():
+    if "--version" in sys.argv:
+        print("0.143.0")
+        return 0
+    if len(sys.argv) < 2 or sys.argv[1] != "app-server":
+        print("expected codex app-server", file=sys.stderr)
+        return 2
+    thread_id = "root-recipe-codex"
+    turn_number = 0
+    for raw in sys.stdin:
+        try:
+            request = json.loads(raw)
+        except json.JSONDecodeError:
+            continue
+        method = request.get("method", "")
+        params = request.get("params", {}) or {}
+        if method == "initialize":
+            response(request, {"serverInfo": {"name": "root-recipe-codex"}})
+        elif method in ("thread/start", "thread/resume"):
+            thread_id = params.get("threadId") or thread_id
+            response(request, {"thread": {"id": thread_id}})
+        elif method == "model/list":
+            response(request, {"data": [{"id": "root-recipe-codex", "supportedReasoningEfforts": ["low", "high"]}]})
+        elif method == "turn/start":
+            turn_number += 1
+            turn_id = f"turn-{turn_number}"
+            response(request, {"turn": {"id": turn_id}})
+            prompt = prompt_from(params)
+            if "Return the updated ledger as JSON" in prompt:
+                text = '{"settled":["root"],"contested":[],"withdrawn":[]}'
+            elif root_recipe_log and "Invalid structured result" in prompt:
+                text = "not a JSON result"
+            elif root_recipe_log and "Instructions for This Turn" in prompt:
+                text = '{"value":"cli"}'
+            else:
+                text = "Fake Codex root recipe"
+            send({"method": "item/completed", "params": {
+                "item": {"id": f"item-{turn_number}", "type": "agentMessage", "text": text},
+            }})
+            send({"method": "turn/completed", "params": {
+                "threadId": thread_id,
+                "turn": {"id": turn_id, "status": "completed"},
+            }})
+        elif method == "turn/interrupt":
+            response(request, {})
+    return 0
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+`
 
 func TestParseFlagsAllowsFlagsAfterPositionals(t *testing.T) {
 	flags := flag.NewFlagSet("test", flag.ContinueOnError)
@@ -52,7 +128,7 @@ func TestParseFlagsSupportsShortValueAfterPositionals(t *testing.T) {
 }
 
 func TestRecipeCLIValidators(t *testing.T) {
-	for _, status := range []string{"all", "usable", "requires_integration", "unavailable", "invalid", "skipped"} {
+	for _, status := range []string{"all", "usable", "unavailable", "invalid", "skipped"} {
 		if err := validateRecipeStatusFilter(status); err != nil {
 			t.Fatalf("status %q unexpectedly invalid: %v", status, err)
 		}
@@ -68,24 +144,28 @@ func TestRecipeCLIValidators(t *testing.T) {
 	if err := validateRecipeView("raw"); err == nil {
 		t.Fatalf("invalid view accepted")
 	}
-	for input, want := range map[string]recipes.CompileTarget{
-		"":      recipes.CompileTargetChild,
-		"child": recipes.CompileTargetChild,
-		"root":  recipes.CompileTargetRoot,
-	} {
-		if got, err := parseCompileTarget(input); err != nil || got != want {
-			t.Fatalf("target %q = %q, %v; want %q", input, got, err, want)
-		}
-	}
-	if _, err := parseCompileTarget("automatic"); err == nil {
-		t.Fatal("invalid compile target accepted")
-	}
 	if got := strings.Join(stringItemsLocal([]any{"codex", "gemini"}), ","); got != "codex,gemini" {
 		t.Fatalf("stringItemsLocal = %q", got)
 	}
 }
 
-func TestBackendsStatusJSONRunsOnlyVersionProbesByDefault(t *testing.T) {
+func TestV2WorkspaceModeAcceptsOnlySurvivingModes(t *testing.T) {
+	for _, want := range []string{"current", "head-copy"} {
+		got, err := v2WorkspaceMode(want)
+		if err != nil || got != want {
+			t.Fatalf("workspace mode %q = %q, %v", want, got, err)
+		}
+	}
+	for _, invalid := range []string{"ephemeral", " current "} {
+		if _, err := v2WorkspaceMode(invalid); err == nil ||
+			!strings.Contains(err.Error(), "current") ||
+			!strings.Contains(err.Error(), "head-copy") {
+			t.Fatalf("invalid workspace mode %q error = %v", invalid, err)
+		}
+	}
+}
+
+func TestDoctorJSONRetainsBackendReadinessByDefault(t *testing.T) {
 	dir := t.TempDir()
 	logPath := filepath.Join(dir, "backends.log")
 	t.Setenv("BACKENDS_TEST_LOG", logPath)
@@ -107,15 +187,20 @@ esac`)
 	t.Setenv("PATH", dir)
 
 	oldArgs := os.Args
-	os.Args = []string{"convo-relay", "backends", "status", "--json"}
+	os.Args = []string{"convo-relay", "doctor", "--json"}
 	defer func() { os.Args = oldArgs }()
 	output := captureStdout(t, main)
-	report := decodeJSONObject(t, output)
-	if report["scope"] != "backends" || report["probe_auth"] != false {
-		t.Fatalf("backend report metadata = %#v", report)
+	doctor := decodeJSONObject(t, output)
+	health, ok := doctor["health"].(map[string]any)
+	if !ok || health["scope"] != "global" {
+		t.Fatalf("doctor health report = %#v", doctor["health"])
+	}
+	report, ok := doctor["backends"].(map[string]any)
+	if !ok || report["scope"] != "backends" || report["probe_auth"] != false {
+		t.Fatalf("doctor backend report metadata = %#v", doctor["backends"])
 	}
 	backends, ok := report["backends"].([]any)
-	if !ok || len(backends) != 4 {
+	if !ok || len(backends) != 3 {
 		t.Fatalf("backend records = %#v", report["backends"])
 	}
 	for _, raw := range backends[:3] {
@@ -128,14 +213,10 @@ esac`)
 			t.Fatalf("default authentication probe = %#v", auth)
 		}
 	}
-	relay := backends[3].(map[string]any)
-	if relay["backend"] != "relay" || relay["status"] != "ready" || relay["executable_path"] != "built-in" {
-		t.Fatalf("relay record = %#v", relay)
-	}
 	assertBackendProbeLog(t, logPath, []string{"claude:--version", "codex:--version", "gemini:--version"})
 }
 
-func TestCapabilitiesJSONMatchesRegistryWithoutProviderProbes(t *testing.T) {
+func TestVersionJSONReportsFlatFormatsWithoutProviderProbes(t *testing.T) {
 	dir := t.TempDir()
 	logPath := filepath.Join(dir, "provider.log")
 	t.Setenv("BACKENDS_TEST_LOG", logPath)
@@ -145,60 +226,50 @@ func TestCapabilitiesJSONMatchesRegistryWithoutProviderProbes(t *testing.T) {
 	t.Setenv("PATH", dir)
 
 	oldArgs := os.Args
-	os.Args = []string{"convo-relay", "capabilities", "--json"}
+	os.Args = []string{"convo-relay", "version", "--json"}
 	defer func() { os.Args = oldArgs }()
 	output := captureStdout(t, main)
 	want := map[string]any{
-		"schema_version":      contracts.CapabilitiesV1,
-		"convo_relay_version": cliVersion,
-		"build_platform":      map[string]any{"goos": runtime.GOOS, "goarch": runtime.GOARCH},
-		"contracts": map[string]any{
-			"recipe":                        []int{1, 2},
-			"root_recipe_plan":              []int{1, 2},
-			"integration_bundle":            []string{contracts.IntegrationBundleV1, contracts.IntegrationBundleV2},
-			"selected_integration_contract": []int{1, 2},
-			"root_artifact":                 []int{1, 2},
-			"execution_workspace":           []int{1, 2},
-			"root_session_result":           []int{1, 2},
-		},
-		"prompt_policy":             []string{contracts.PromptPolicyV1, contracts.PromptPolicyV2},
-		"prompt_context_projection": []string{contracts.PromptContextProjectionV1},
-		"provider_retry_policy":     []string{contracts.ProviderRetryPolicyV1},
-		"provider_invocation":       []string{contracts.ProviderInvocationV2},
-		"rendered_prompt":           []string{contracts.RenderedPromptV1},
-		"portable_export":           []string{contracts.PortableExportV2},
-		"digest_profile":            []string{contracts.DigestProfileV1},
-		"workspace_mechanisms":      []string{"inherited", "detached_writable_git_worktree"},
-		"isolation_report":          []string{contracts.WorkspaceIsolationReportV1},
+		"version":        cliVersion,
+		"formats":        format.PublicFormats(),
+		"digest_classes": format.DigestClasses(),
 	}
 	wantBody, err := json.MarshalIndent(want, "", "  ")
 	if err != nil || output != string(wantBody)+"\n" {
-		t.Fatalf("capabilities output = %s, want %s, marshal error %v", output, wantBody, err)
+		t.Fatalf("version output = %s, want %s, marshal error %v", output, wantBody, err)
 	}
 	if _, err := os.Stat(logPath); !os.IsNotExist(err) {
-		t.Fatalf("capabilities probed a provider: %v", err)
-	}
-	_, err = contracts.BuildCapabilityAdvertisement(cliVersion, runtime.GOOS, runtime.GOARCH, "relay-capabilities-v2")
-	var diagnosticErr *contracts.DiagnosticError
-	if !errors.As(err, &diagnosticErr) || diagnosticErr.Diagnostics[0].Code != contracts.DiagnosticCodeUnsupportedContractVersion {
-		t.Fatalf("unsupported schema error = %T %v", err, err)
+		t.Fatalf("version probed a provider: %v", err)
 	}
 }
 
-func TestVerifyExportJSONReportsPortableV2(t *testing.T) {
+func TestExportVerifyJSONReportsPortableBundle(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "portable")
+	planValue := suppliedPlanFixture("verify-session", nil)
 	payloads := []struct {
 		kind  string
 		id    string
 		value any
 	}{
-		{kind: "root_session", id: "session", value: map[string]any{"kind": "portable_root_session", "terminal_status": "completed"}},
+		{kind: "root_session", id: "session", value: map[string]any{
+			"plan": planValue, "terminal_status": "completed", "stop_reason": nil,
+			"result_source": "last_turn", "validation_status": "pending",
+			"workspace_content_source": "working_tree", "working_tree_changes_included": false,
+			"root": map[string]any{
+				"execution_kind": "supplied", "status": "completed", "recipe": map[string]any{},
+				"turns":     map[string]any{"configured": 1, "completed": 0},
+				"result":    map[string]any{"source": "last_turn", "validation_status": "pending", "value": ""},
+				"workspace": map[string]any{"mode": "current", "commit": "", "tree_hash": "", "workspace_content_source": "working_tree", "working_tree_changes_included": false},
+				"providers": map[string]string{}, "provider_retry": "forbid",
+				"invocations": map[string]any{"count": 0}, "reducer_attempts": map[string]any{"count": 0},
+			},
+		}},
 		{kind: "participant_transcript", id: "transcript", value: []any{}},
-		{kind: "diagnostics", id: "diagnostics", value: map[string]any{"execution_kind": "recipe", "status": "completed"}},
+		{kind: "diagnostics", id: "diagnostics", value: map[string]any{"abandoned_attempts": []any{}, "unreferenced_blobs": []any{}, "budget_state": ""}},
 	}
 	inventory := make([]any, 0, len(payloads))
 	for _, payload := range payloads {
-		body, err := contracts.CanonicalJSONBytes(payload.value)
+		body, err := format.CanonicalJSONBytes(payload.value)
 		if err != nil {
 			t.Fatalf("encode payload: %v", err)
 		}
@@ -210,19 +281,16 @@ func TestVerifyExportJSONReportsPortableV2(t *testing.T) {
 			t.Fatalf("write payload: %v", err)
 		}
 		inventory = append(inventory, map[string]any{
-			"kind":         payload.kind,
-			"portable_id":  payload.id,
-			"path":         relative,
-			"media_type":   "application/json",
-			"size_bytes":   len(body),
-			"digest_class": string(contracts.DigestClassRawBytes),
-			"digest":       contracts.RawBytesDigest(body),
+			"kind":        payload.kind,
+			"portable_id": payload.id,
+			"path":        relative,
+			"blob":        blobstore.RefForBytes(body, "application/json"),
 		})
 	}
 	sort.Slice(inventory, func(left int, right int) bool {
 		return inventory[left].(map[string]any)["path"].(string) < inventory[right].(map[string]any)["path"].(string)
 	})
-	manifest, err := contracts.PortableExportManifest(map[string]any{
+	manifest, err := format.BundleManifest(map[string]any{
 		"convo_relay_version": "test",
 		"terminal_status":     "completed",
 		"stop_reason":         nil,
@@ -234,7 +302,7 @@ func TestVerifyExportJSONReportsPortableV2(t *testing.T) {
 	if err != nil {
 		t.Fatalf("portable manifest: %v", err)
 	}
-	body, err := contracts.CanonicalJSONBytes(manifest)
+	body, err := format.CanonicalJSONBytes(manifest)
 	if err != nil {
 		t.Fatalf("encode manifest: %v", err)
 	}
@@ -243,26 +311,118 @@ func TestVerifyExportJSONReportsPortableV2(t *testing.T) {
 	}
 
 	oldArgs := os.Args
-	os.Args = []string{"convo-relay", "verify-export", dir, "--json"}
+	os.Args = []string{"convo-relay", "export", "verify", dir, "--json"}
 	defer func() { os.Args = oldArgs }()
 	output := captureStdout(t, main)
 	var report map[string]any
 	if err := json.Unmarshal([]byte(output), &report); err != nil {
-		t.Fatalf("decode verify-export output %q: %v", output, err)
+		t.Fatalf("decode export verify output %q: %v", output, err)
 	}
-	if report["status"] != "valid" || report["schema_version"] != contracts.PortableExportV2 {
-		t.Fatalf("verify-export report = %#v", report)
+	if report["status"] != "valid" || report["format"] != format.BundleV1 || report["payload_count"] != float64(len(payloads)) {
+		t.Fatalf("export verify report = %#v", report)
+	}
+	binary := filepath.Join(t.TempDir(), "convo-relay")
+	build := exec.Command("go", "build", "-o", binary, ".")
+	if output, err := build.CombinedOutput(); err != nil {
+		t.Fatalf("build export verifier: %v\n%s", err, output)
+	}
+	for _, test := range []struct {
+		name   string
+		mutate func(map[string]any)
+	}{
+		{name: "manifest", mutate: func(value map[string]any) {
+			value["unexpected_manifest_field"] = true
+		}},
+		{name: "inventory", mutate: func(value map[string]any) {
+			value["payload_inventory"].([]any)[0].(map[string]any)["unexpected_inventory_field"] = true
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			candidateBody, err := json.Marshal(manifest)
+			if err != nil {
+				t.Fatalf("clone manifest: %v", err)
+			}
+			var candidate map[string]any
+			if err := json.Unmarshal(candidateBody, &candidate); err != nil {
+				t.Fatalf("decode cloned manifest: %v", err)
+			}
+			test.mutate(candidate)
+			invalidBody, err := format.CanonicalJSONBytes(candidate)
+			if err != nil {
+				t.Fatalf("encode invalid manifest: %v", err)
+			}
+			if err := os.WriteFile(filepath.Join(dir, "manifest.json"), invalidBody, 0o644); err != nil {
+				t.Fatalf("write invalid manifest: %v", err)
+			}
+			command := exec.Command(binary, "export", "verify", dir, "--json")
+			var stdout, stderr bytes.Buffer
+			command.Stdout = &stdout
+			command.Stderr = &stderr
+			err = command.Run()
+			var exitErr *exec.ExitError
+			if !errors.As(err, &exitErr) || exitErr.ExitCode() != 1 {
+				t.Fatalf("export verify unknown %s field exit = %v, stdout=%q, stderr=%q", test.name, err, stdout.String(), stderr.String())
+			}
+			if stderr.Len() != 0 {
+				t.Fatalf("export verify unknown %s field stderr = %q", test.name, stderr.String())
+			}
+			invalidReport := decodeJSONObject(t, stdout.String())
+			if invalidReport["format"] != format.BundleV1 || invalidReport["status"] != "invalid" {
+				t.Fatalf("export verify unknown %s field report = %#v", test.name, invalidReport)
+			}
+		})
+	}
+
+	legacyRoot := map[string]any{
+		"kind":            strings.Join([]string{"portable", "v2", "root", "session"}, "_"),
+		"terminal_status": "completed",
+	}
+	legacyBody, err := format.CanonicalJSONBytes(legacyRoot)
+	if err != nil {
+		t.Fatalf("encode legacy root payload: %v", err)
+	}
+	rootPath := filepath.Join(dir, "payloads", "root_session", "session.json")
+	if err := os.WriteFile(rootPath, legacyBody, 0o644); err != nil {
+		t.Fatalf("write legacy root payload: %v", err)
+	}
+	for _, raw := range inventory {
+		entry := raw.(map[string]any)
+		if entry["path"] == filepath.ToSlash(filepath.Join("payloads", "root_session", "session.json")) {
+			entry["blob"] = blobstore.RefForBytes(legacyBody, "application/json")
+		}
+	}
+	legacyManifest, err := format.BundleManifest(map[string]any{
+		"convo_relay_version": "test",
+		"terminal_status":     "completed",
+		"stop_reason":         nil,
+		"session_payload":     "payloads/root_session/session.json",
+		"transcript_payload":  "payloads/participant_transcript/transcript.json",
+		"diagnostics_payload": "payloads/diagnostics/diagnostics.json",
+		"payload_inventory":   inventory,
+	})
+	if err != nil {
+		t.Fatalf("legacy portable manifest: %v", err)
+	}
+	legacyManifestBody, err := format.CanonicalJSONBytes(legacyManifest)
+	if err != nil {
+		t.Fatalf("encode legacy manifest: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "manifest.json"), legacyManifestBody, 0o644); err != nil {
+		t.Fatalf("write legacy manifest: %v", err)
+	}
+	if _, err := bundle.VerifyPortableDirectory(dir); err == nil || !strings.Contains(err.Error(), "must omit kind") {
+		t.Fatalf("legacy root marker verification error = %v", err)
 	}
 }
 
-func TestVerifyExportJSONFailureIsMachineReadable(t *testing.T) {
+func TestExportVerifyJSONFailureIsMachineReadable(t *testing.T) {
 	binary := filepath.Join(t.TempDir(), "convo-relay")
 	build := exec.Command("go", "build", "-o", binary, ".")
 	if output, err := build.CombinedOutput(); err != nil {
 		t.Fatalf("build CLI: %v\n%s", err, output)
 	}
 
-	command := exec.Command(binary, "verify-export", t.TempDir(), "--json")
+	command := exec.Command(binary, "export", "verify", t.TempDir(), "--json")
 	var stdout bytes.Buffer
 	var stderr bytes.Buffer
 	command.Stdout = &stdout
@@ -270,18 +430,18 @@ func TestVerifyExportJSONFailureIsMachineReadable(t *testing.T) {
 	err := command.Run()
 	var exitErr *exec.ExitError
 	if !errors.As(err, &exitErr) || exitErr.ExitCode() != 1 {
-		t.Fatalf("verify-export invalid exit = %v, stdout=%q, stderr=%q", err, stdout.String(), stderr.String())
+		t.Fatalf("export verify invalid exit = %v, stdout=%q, stderr=%q", err, stdout.String(), stderr.String())
 	}
 	if stderr.Len() != 0 {
-		t.Fatalf("verify-export invalid stderr = %q", stderr.String())
+		t.Fatalf("export verify invalid stderr = %q", stderr.String())
 	}
 	report := decodeJSONObject(t, stdout.String())
-	if report["schema_version"] != contracts.PortableExportV2 || report["status"] != "invalid" || strings.TrimSpace(stringValue(report["error"])) == "" {
-		t.Fatalf("verify-export invalid report = %#v", report)
+	if report["format"] != format.BundleV1 || report["status"] != "invalid" || strings.TrimSpace(stringValue(report["error"])) == "" {
+		t.Fatalf("export verify invalid report = %#v", report)
 	}
 }
 
-func TestBackendsStatusProbeAuthHumanOutput(t *testing.T) {
+func TestDoctorProbeAuthHumanOutput(t *testing.T) {
 	dir := t.TempDir()
 	logPath := filepath.Join(dir, "backends.log")
 	t.Setenv("BACKENDS_TEST_LOG", logPath)
@@ -305,9 +465,9 @@ esac`)
 	t.Setenv("PATH", dir)
 
 	output := captureStdout(t, func() {
-		runBackends([]string{"status", "--probe-auth"})
+		runDoctor([]string{"--probe-auth"})
 	})
-	for _, expected := range []string{"Backend readiness:", "claude  ready", "codex   auth_failed", "gemini  unsupported_probe", "relay   ready", "auth=unauthenticated", "auth=unsupported"} {
+	for _, expected := range []string{"Health:", "Backend readiness:", "claude  ready", "codex   auth_failed", "gemini  unsupported_probe", "auth=unauthenticated", "auth=unsupported"} {
 		if !strings.Contains(output, expected) {
 			t.Fatalf("human backend output missing %q:\n%s", expected, output)
 		}
@@ -354,8 +514,8 @@ auto_approval = "auto-safe"
 `
 	withStdin(t, generatedTOML, func() {
 		output := captureStdout(t, func() {
-			runCompileRecipe([]string{
-				"--recipe", "gen-cli-review",
+			runRecipesCompile([]string{
+				"gen-cli-review",
 				"--settings", filepath.Join(t.TempDir(), "missing.toml"),
 				"--generated-recipe-file", "-",
 				"--json",
@@ -370,9 +530,8 @@ auto_approval = "auto-safe"
 			t.Fatalf("generated recipe normalization = %#v", recipe)
 		}
 		compiledPlan := report["compiled_plan"].(map[string]any)
-		recipeRef := compiledPlan["recipe_ref"].(map[string]any)
-		if recipeRef["id"] != "recipe:gen-cli-review" || recipeRef["digest"] != report["recipe_digest"] {
-			t.Fatalf("compiled recipe ref = %#v, report digest = %v", recipeRef, report["recipe_digest"])
+		if compiledPlan["recipe_id"] != "gen-cli-review" || report["compiled_plan_digest"] == "" {
+			t.Fatalf("compiled plan preview = %#v", compiledPlan)
 		}
 	})
 
@@ -390,8 +549,8 @@ auto_approval = "auto-safe"
 		t.Fatalf("write ordinary recipe file: %v", err)
 	}
 	output := captureStdout(t, func() {
-		runCompileRecipe([]string{
-			"--recipe", "cli-review",
+		runRecipesCompile([]string{
+			"cli-review",
 			"--settings", filepath.Join(t.TempDir(), "missing.toml"),
 			"--recipe-file", recipePath,
 			"--json",
@@ -404,89 +563,6 @@ auto_approval = "auto-safe"
 	recipe := report["recipe"].(map[string]any)
 	if recipe["auto_approval"] != "auto-safe" || recipe["origin"] != nil {
 		t.Fatalf("ordinary recipe normalization = %#v", recipe)
-	}
-}
-
-func TestRunCompatibilityFlagsBuildContextSkillsPlanAndQuickMode(t *testing.T) {
-	tempDir := t.TempDir()
-	contextPath := filepath.Join(tempDir, "context.md")
-	skillPath := filepath.Join(tempDir, "skill.md")
-	recipePath := filepath.Join(tempDir, "recipes.toml")
-	generatedRecipePath := filepath.Join(tempDir, "generated-recipes.toml")
-	planPath := filepath.Join(tempDir, "plan.json")
-	if err := os.WriteFile(contextPath, []byte("context body"), 0o644); err != nil {
-		t.Fatalf("write context: %v", err)
-	}
-	if err := os.WriteFile(skillPath, []byte("skill body"), 0o644); err != nil {
-		t.Fatalf("write skill: %v", err)
-	}
-	if err := os.WriteFile(recipePath, []byte("[relay_recipes.example]\nparticipants = [\"codex\", \"codex\"]\n"), 0o644); err != nil {
-		t.Fatalf("write recipe: %v", err)
-	}
-	if err := os.WriteFile(generatedRecipePath, []byte("[relay_recipes.generated]\nparticipants = [\"codex\", \"codex\"]\n"), 0o644); err != nil {
-		t.Fatalf("write generated recipe: %v", err)
-	}
-	if err := os.WriteFile(planPath, []byte(`{"explanation":"Prepare","plan":[{"step":"Run quick relay","status":"completed"}]}`), 0o644); err != nil {
-		t.Fatalf("write plan: %v", err)
-	}
-
-	args := []string{
-		"Pressure-test this",
-		"--context", contextPath,
-		"--skill", skillPath,
-		"--recipe-file", recipePath,
-		"--generated-recipe-file", generatedRecipePath,
-		"--task-plan", planPath,
-		"--quick",
-		"--verbose",
-		"--stream",
-		"-o", filepath.Join(tempDir, "transcript.md"),
-	}
-	extracted, cleaned, err := extractMultiValueFlags(args, "context", "skill", "recipe-file", "generated-recipe-file")
-	if err != nil {
-		t.Fatalf("extract flags: %v", err)
-	}
-	flags := flag.NewFlagSet("run", flag.ContinueOnError)
-	flags.SetOutput(io.Discard)
-	taskPlan := flags.String("task-plan", "", "plan")
-	quick := flags.Bool("quick", false, "quick")
-	verbose := false
-	stream := false
-	output := ""
-	flags.BoolVar(&verbose, "verbose", false, "verbose")
-	flags.BoolVar(&stream, "stream", false, "stream")
-	flags.StringVar(&output, "o", "", "output")
-	if err := parseFlags(flags, cleaned); err != nil {
-		t.Fatalf("parse flags: %v", err)
-	}
-	taskWithContext, skillsText, err := buildTaskWithContext(flags.Arg(0), extracted["context"], extracted["skill"])
-	if err != nil {
-		t.Fatalf("build context: %v", err)
-	}
-	launchPlan, err := loadLaunchPlanFile(*taskPlan)
-	if err != nil {
-		t.Fatalf("load plan: %v", err)
-	}
-
-	if !*quick || !verbose || !stream || output == "" {
-		t.Fatalf("compat flags quick=%v verbose=%v stream=%v output=%q", *quick, verbose, stream, output)
-	}
-	if !strings.Contains(taskWithContext, "--- Launch Context ---") || !strings.Contains(taskWithContext, "ctx1") || !strings.Contains(taskWithContext, "context body") {
-		t.Fatalf("task context not injected:\n%s", taskWithContext)
-	}
-	if !strings.Contains(skillsText, "skill body") {
-		t.Fatalf("skills text not injected:\n%s", skillsText)
-	}
-	if len(extracted["recipe-file"]) != 1 || extracted["recipe-file"][0] != recipePath {
-		t.Fatalf("recipe files = %#v", extracted["recipe-file"])
-	}
-	if len(extracted["generated-recipe-file"]) != 1 || extracted["generated-recipe-file"][0] != generatedRecipePath {
-		t.Fatalf("generated recipe files = %#v", extracted["generated-recipe-file"])
-	}
-	plan, _ := launchPlan.(map[string]any)
-	steps, _ := plan["plan"].([]any)
-	if plan["explanation"] != "Prepare" || len(steps) != 1 {
-		t.Fatalf("launch plan = %#v", launchPlan)
 	}
 }
 
@@ -536,7 +612,6 @@ func TestRecipeRunStructuralOverridesUseOnlyVisitedFlags(t *testing.T) {
 		{name: "rounds", value: "1"},
 		{name: "max-rounds", value: "1"},
 		{name: "quick"},
-		{name: "dynamic", value: "ask"},
 	}
 	for _, override := range structural {
 		t.Run(override.name, func(t *testing.T) {
@@ -578,25 +653,21 @@ func TestRunRecipeCLIDispatchesDirectRootExecution(t *testing.T) {
 backend = "codex"
 model = "fake-a"
 effort = "medium"
-capabilities = []
 
 [backend_profiles.cli-b]
 backend = "codex"
 model = "fake-b"
 effort = "medium"
-capabilities = []
 
 [backend_profiles.cli-f]
 backend = "codex"
 model = "fake-f"
 effort = "medium"
-capabilities = []
 
 [backend_profiles.cli-r]
 backend = "codex"
 model = "fake-r"
 effort = "medium"
-capabilities = []
 `
 	if err := os.WriteFile(settingsPath, []byte(settings), 0o644); err != nil {
 		t.Fatalf("write settings: %v", err)
@@ -613,9 +684,7 @@ max_rounds = 2
 participant_turns = 2
 result_source = "last_turn"
 max_depth = 1
-required_capabilities = []
 auto_approval = "never"
-match_keywords = []
 
 [relay_recipes.neutral-root.lifecycle]
 resume = "allow"
@@ -623,58 +692,9 @@ steering = "allow"
 dynamic = "forbid"
 workspace_isolation = "inherited"
 
-[relay_recipes.bound-root]
-purpose = "Neutral integration-bound CLI root recipe"
-participants = ["cli-a", "cli-b"]
-facilitator = "cli-f"
-reducer = "cli-r"
-mode = "cooperative"
-max_rounds = 2
-participant_turns = 2
-result_source = "last_turn"
-integration_contract = "neutral/contract-v1"
-max_depth = 1
-required_capabilities = []
-auto_approval = "never"
-match_keywords = []
-
-[relay_recipes.bound-root.lifecycle]
-resume = "allow"
-steering = "forbid"
-dynamic = "forbid"
-workspace_isolation = "inherited"
 `
 	if err := os.WriteFile(recipePath, []byte(recipeSource), 0o644); err != nil {
 		t.Fatalf("write recipe source: %v", err)
-	}
-	bundlePath := filepath.Join(launchCWD, "bundle.json")
-	bundleSource := `{
-  "schema_version": "relay-integration-bundle-v1",
-  "id": "neutral/integration-v1",
-  "contracts": {
-    "neutral/contract-v1": {
-      "turns": [
-        {"participant_turn": 1, "slot": "slot_0", "instructions": "Present the payload."},
-        {"participant_turn": 2, "slot": "slot_1", "instructions": "Challenge the payload."}
-      ],
-      "inputs": {
-        "payload": {
-          "required": true,
-          "cardinality": "one",
-          "media_type": "application/json",
-          "max_bytes": 1024,
-          "schema": {"type": "object"}
-        }
-      },
-      "result": {"transport": "json", "schema": {"type": "object"}}
-    }
-  }
-}`
-	if err := os.WriteFile(bundlePath, []byte(bundleSource), 0o644); err != nil {
-		t.Fatalf("write bundle: %v", err)
-	}
-	if err := os.WriteFile(filepath.Join(launchCWD, "payload.json"), []byte(`{"value":"cli"}`), 0o644); err != nil {
-		t.Fatalf("write named input: %v", err)
 	}
 	generatedRecipePath := filepath.Join(launchCWD, "generated-recipes.toml")
 	generatedRecipeSource := `
@@ -688,9 +708,7 @@ max_rounds = 2
 participant_turns = 2
 result_source = "last_turn"
 max_depth = 1
-required_capabilities = []
 auto_approval = "never"
-match_keywords = []
 
 [relay_recipes.generated-helper.lifecycle]
 resume = "allow"
@@ -743,63 +761,33 @@ workspace_isolation = "inherited"
 	if result["execution_kind"] != "recipe" || result["status"] != "completed" || result["recipe_id"] != "neutral-root" || intValue(result["actual_participant_turns"]) != 2 {
 		t.Fatalf("root CLI result = %#v", result)
 	}
-	if result["root_recipe_plan_ref"] == nil || result["latest_root_checkpoint_ref"] == nil {
-		t.Fatalf("root CLI result refs = %#v", result)
+	v2Session, err := session.Open(sessionDir)
+	if err != nil {
+		t.Fatalf("open v2 root session: %v", err)
 	}
-	if len(result["transient_recipe_refs"].([]any)) != 1 || len(result["transient_recipe_contract_refs"].([]any)) != 2 {
-		t.Fatalf("root CLI transient recipe refs = %#v / %#v", result["transient_recipe_refs"], result["transient_recipe_contract_refs"])
+	if v2Session.Plan.RecipeID != "neutral-root" || v2Session.Plan.Provenance != session.ProvenanceRecipe {
+		t.Fatalf("v2 root plan = %#v", v2Session.Plan)
+	}
+	events, err := relayv2.Events(v2Session)
+	if err != nil || len(events) == 0 {
+		t.Fatalf("v2 root events = %#v, %v", events, err)
 	}
 	logData, err := os.ReadFile(providerLog)
 	if err != nil {
 		t.Fatalf("read provider log: %v", err)
 	}
-	if lines := strings.Split(strings.TrimSpace(string(logData)), "\n"); len(lines) != 5 {
+	if lines := strings.Split(strings.TrimSpace(string(logData)), "\n"); len(lines) != 4 {
 		t.Fatalf("unexpected provider invocation log:\n%s", logData)
 	}
-	graphData, err := os.ReadFile(filepath.Join(sessionDir, "graph.json"))
+	if _, statErr := os.Stat(filepath.Join(sessionDir, "meta.json")); !errors.Is(statErr, os.ErrNotExist) {
+		t.Fatalf("v2 root unexpectedly wrote legacy metadata: %v", statErr)
+	}
+	graphPayload, err := relayv2.BuildGraphReport(v2Session)
 	if err != nil {
-		t.Fatalf("read graph: %v", err)
+		t.Fatalf("build v2 graph: %v", err)
 	}
-	graphPayload := decodeJSONObject(t, string(graphData))
-	nodes := graphPayload["nodes"].(map[string]any)
-	if len(nodes) != 1 || nodes["root"] == nil || len(graphPayload["edges"].([]any)) != 0 {
-		t.Fatalf("root CLI graph = %#v", graphPayload)
-	}
-
-	boundSessionDir := filepath.Join(tempDir, "bound-session")
-	boundCommand := exec.Command(binary,
-		"run", "Bound CLI task",
-		"--recipe", "bound-root",
-		"--settings", "settings.toml",
-		"--recipe-file", "root-recipes.toml",
-		"--integration-bundle", "bundle.json",
-		"--input", "payload=payload.json",
-		"--session-dir", boundSessionDir,
-		"--launch-cwd", launchCWD,
-		"--json",
-	)
-	boundCommand.Env = command.Env
-	boundOutput, err := boundCommand.CombinedOutput()
-	if err != nil {
-		t.Fatalf("run bound recipe CLI: %v\n%s", err, boundOutput)
-	}
-	boundResult := decodeJSONObject(t, string(boundOutput))
-	for _, field := range []string{"integration_bundle_ref", "integration_contract_ref", "named_input_manifest_ref", "execution_workspace_ref"} {
-		if boundResult[field] == nil {
-			t.Fatalf("bound root CLI result missing %s: %#v", field, boundResult)
-		}
-	}
-	boundInputs := boundResult["provider_inputs"].(map[string]any)["inputs"].([]any)
-	if len(boundInputs) != 1 || boundInputs[0].(map[string]any)["name"] != "payload" {
-		t.Fatalf("bound root provider inputs = %#v", boundInputs)
-	}
-
-	logData, err = os.ReadFile(providerLog)
-	if err != nil {
-		t.Fatalf("read provider log after bound run: %v", err)
-	}
-	if lines := strings.Split(strings.TrimSpace(string(logData)), "\n"); len(lines) != 10 {
-		t.Fatalf("unexpected provider invocation log after bound run:\n%s", logData)
+	if graphPayload["graph"] == nil {
+		t.Fatalf("v2 root graph = %#v", graphPayload)
 	}
 
 	compatibilityHome := filepath.Join(tempDir, "compatibility-home")
@@ -820,8 +808,6 @@ workspace_isolation = "inherited"
 		"--launch-cwd", launchCWD,
 		"--session-id", "compat-session",
 		"--home", compatibilityHome,
-		"--verbose",
-		"--stream",
 		"--output", compatibilityOutput,
 		"--json",
 	)
@@ -837,18 +823,19 @@ workspace_isolation = "inherited"
 	if intValue(compatibilityResult["timeout_seconds"]) != 77 || intValue(compatibilityResult["stall_timeout_seconds"]) != 33 {
 		t.Fatalf("compatible run timeouts = %#v / %#v", compatibilityResult["timeout_seconds"], compatibilityResult["stall_timeout_seconds"])
 	}
-	canonicalLaunchCWD, err := filepath.EvalSymlinks(launchCWD)
+	compatibilitySession, err := session.Open(stringValue(compatibilityResult["session_dir"]))
 	if err != nil {
-		t.Fatalf("canonical launch CWD: %v", err)
+		t.Fatalf("open compatible v2 session: %v", err)
 	}
-	if compatibilityResult["investigation_mode"] != "context_only" || compatibilityResult["source_launch_cwd"] != canonicalLaunchCWD {
-		t.Fatalf("compatible run launch policy = %#v", compatibilityResult)
+	if compatibilitySession.Plan.Investigation != "context_only" ||
+		len(compatibilitySession.Plan.Context) != 1 ||
+		len(compatibilitySession.Plan.Skills) != 1 ||
+		len(compatibilitySession.Plan.TaskPlan) == 0 {
+		t.Fatalf("compatible v2 plan = %#v", compatibilitySession.Plan)
 	}
-	if len(compatibilityResult["launch_context_refs"].([]any)) != 1 || len(compatibilityResult["input_bundle_refs"].([]any)) != 2 {
-		t.Fatalf("compatible context and skill refs = %#v / %#v", compatibilityResult["launch_context_refs"], compatibilityResult["input_bundle_refs"])
-	}
-	if compatibilityResult["launch_plan"] == nil || len(compatibilityResult["transient_recipe_refs"].([]any)) != 2 {
-		t.Fatalf("compatible task plan or recipe sources missing = %#v", compatibilityResult)
+	compatibilityRuntime, err := relayv2.LoadRuntime(compatibilitySession)
+	if err != nil || len(compatibilityRuntime.Recipes) < 3 {
+		t.Fatalf("compatible v2 runtime = %#v, %v", compatibilityRuntime, err)
 	}
 	outputData, err := os.ReadFile(compatibilityOutput)
 	if err != nil {
@@ -862,7 +849,7 @@ workspace_isolation = "inherited"
 	if err != nil {
 		t.Fatalf("read provider log after compatible run: %v", err)
 	}
-	if lines := strings.Split(strings.TrimSpace(string(logData)), "\n"); len(lines) != 15 {
+	if lines := strings.Split(strings.TrimSpace(string(logData)), "\n"); len(lines) != 8 {
 		t.Fatalf("unexpected provider invocation log after compatible run:\n%s", logData)
 	}
 
@@ -882,8 +869,8 @@ workspace_isolation = "inherited"
 		"--recipe-file", "root-recipes.toml",
 		"--session-dir", dirtySessionDir,
 		"--launch-cwd", launchCWD,
-		"--workspace-isolation", "ephemeral",
-		"--allow-dirty-source",
+		// U3b §2 (mode collapse): exercise the surviving head-copy operator mode.
+		"--workspace", "head-copy",
 		"--json",
 	)
 	dirtyCommand.Env = command.Env
@@ -898,99 +885,8 @@ workspace_isolation = "inherited"
 	if dirtyResult["status"] != "completed" || dirtyResult["session_id"] == nil {
 		t.Fatalf("dirty-source JSON stdout = %#v", dirtyResult)
 	}
-	if strings.Contains(dirtyStdout.String(), "warning:") {
-		t.Fatalf("dirty-source warning contaminated JSON stdout:\n%s", dirtyStdout.String())
-	}
-	if warning := dirtyStderr.String(); !strings.Contains(warning, "warning:") ||
-		!strings.Contains(warning, "staged=0") ||
-		!strings.Contains(warning, "unstaged=1") ||
-		!strings.Contains(warning, "untracked=0") {
-		t.Fatalf("dirty-source stderr warning = %q", warning)
-	}
-
-	for _, mode := range []struct {
-		name       string
-		jsonOutput bool
-		withOutput bool
-	}{
-		{name: "plain stdout"},
-		{name: "plain output file", withOutput: true},
-		{name: "json stdout", jsonOutput: true},
-		{name: "json output file", jsonOutput: true, withOutput: true},
-	} {
-		t.Run("invalid result "+mode.name, func(t *testing.T) {
-			sessionDir := filepath.Join(tempDir, strings.ReplaceAll("invalid-"+mode.name, " ", "-"))
-			args := []string{
-				"run", "Invalid structured result",
-				"--recipe", "bound-root",
-				"--settings", "settings.toml",
-				"--recipe-file", "root-recipes.toml",
-				"--integration-bundle", "bundle.json",
-				"--input", "payload=payload.json",
-				"--session-dir", sessionDir,
-				"--launch-cwd", launchCWD,
-			}
-			if mode.jsonOutput {
-				args = append(args, "--json")
-			}
-			outputPath := ""
-			if mode.withOutput {
-				extension := ".md"
-				if mode.jsonOutput {
-					extension = ".json"
-				}
-				outputPath = filepath.Join(tempDir, strings.ReplaceAll(mode.name, " ", "-")+extension)
-				args = append(args, "-o", outputPath)
-			}
-			invalid := exec.Command(binary, args...)
-			invalid.Env = command.Env
-			var stdout strings.Builder
-			var stderr strings.Builder
-			invalid.Stdout = &stdout
-			invalid.Stderr = &stderr
-			runErr := invalid.Run()
-			var exitErr *exec.ExitError
-			if !errors.As(runErr, &exitErr) || exitErr.ExitCode() != 1 {
-				t.Fatalf("invalid result exit = %v, stdout=%s, stderr=%s", runErr, stdout.String(), stderr.String())
-			}
-			if !strings.Contains(stderr.String(), "JSON input is not syntactically valid") {
-				t.Fatalf("invalid result stderr = %s", stderr.String())
-			}
-			if mode.jsonOutput {
-				stdoutResult := decodeJSONObject(t, stdout.String())
-				if stdoutResult["status"] != "invalid_result" || stdoutResult["result_validation_failed"] != true {
-					t.Fatalf("invalid JSON stdout = %#v", stdoutResult)
-				}
-			} else if !strings.Contains(stdout.String(), " invalid_result at ") || !strings.Contains(stdout.String(), "Participant turns: 2/2") {
-				t.Fatalf("invalid plain stdout = %s", stdout.String())
-			}
-			metaData, readErr := os.ReadFile(filepath.Join(sessionDir, "meta.json"))
-			if readErr != nil {
-				t.Fatalf("read invalid result metadata: %v", readErr)
-			}
-			meta := decodeJSONObject(t, string(metaData))
-			if meta["status"] != "invalid_result" || meta["raw_result_ref"] == nil || meta["result_validation_ref"] == nil || meta["canonical_result_ref"] != nil {
-				t.Fatalf("persisted invalid result = %#v", meta)
-			}
-			validation, loadErr := store.New(sessionDir).LoadArtifact(meta["result_validation_ref"].(map[string]any))
-			if loadErr != nil || validation["status"] != "failed" || len(validation["diagnostics"].([]any)) == 0 {
-				t.Fatalf("persisted invalid diagnostics = %#v, %v", validation, loadErr)
-			}
-			if mode.withOutput {
-				outputData, readErr := os.ReadFile(outputPath)
-				if readErr != nil {
-					t.Fatalf("read invalid output file: %v", readErr)
-				}
-				if mode.jsonOutput {
-					fileResult := decodeJSONObject(t, string(outputData))
-					if fileResult["status"] != "invalid_result" || fileResult["session_id"] != meta["session_id"] {
-						t.Fatalf("invalid JSON output file = %#v", fileResult)
-					}
-				} else if !strings.Contains(string(outputData), "not a JSON result") {
-					t.Fatalf("invalid Markdown output file = %s", outputData)
-				}
-			}
-		})
+	if warning := dirtyStderr.String(); warning != "" {
+		t.Fatalf("head-copy run wrote unexpected stderr: %q", warning)
 	}
 
 	for _, rejection := range []struct {
@@ -1028,22 +924,178 @@ workspace_isolation = "inherited"
 	}
 }
 
+func TestRunRecipeCLIExecutesStaticChildParticipant(t *testing.T) {
+	tempDir := t.TempDir()
+	binary := filepath.Join(tempDir, "convo-relay")
+	build := exec.Command("go", "build", "-o", binary, ".")
+	if output, err := build.CombinedOutput(); err != nil {
+		t.Fatalf("build CLI: %v\n%s", err, output)
+	}
+
+	launchCWD := filepath.Join(tempDir, "launch")
+	if err := os.MkdirAll(launchCWD, 0o755); err != nil {
+		t.Fatalf("mkdir launch CWD: %v", err)
+	}
+	settingsPath := filepath.Join(launchCWD, "settings.toml")
+	settings := `
+[backend_profiles.parent]
+backend = "codex"
+model = "fake-parent"
+effort = "medium"
+
+[backend_profiles.facilitator]
+backend = "codex"
+model = "fake-facilitator"
+effort = "medium"
+
+[backend_profiles.static-child]
+backend = "child"
+model = "child-review"
+effort = 1
+`
+	if err := os.WriteFile(settingsPath, []byte(settings), 0o644); err != nil {
+		t.Fatalf("write settings: %v", err)
+	}
+	recipePath := filepath.Join(launchCWD, "static-recipes.toml")
+	recipes := `
+[relay_recipes.static-parent]
+purpose = "Root recipe with a declared static child participant."
+participants = ["parent", "static-child"]
+facilitator = "facilitator"
+mode = "cooperative"
+max_rounds = 2
+participant_turns = 2
+result_source = "last_turn"
+max_depth = 1
+auto_approval = "never"
+
+[relay_recipes.static-parent.lifecycle]
+resume = "allow"
+steering = "allow"
+dynamic = "forbid"
+workspace_isolation = "inherited"
+
+[relay_recipes.child-review]
+purpose = "Child review used by the static participant."
+participants = ["parent", "parent"]
+facilitator = "facilitator"
+mode = "cooperative"
+max_rounds = 1
+participant_turns = 1
+result_source = "last_turn"
+max_depth = 1
+auto_approval = "never"
+
+[relay_recipes.child-review.lifecycle]
+resume = "allow"
+steering = "allow"
+dynamic = "forbid"
+workspace_isolation = "inherited"
+`
+	if err := os.WriteFile(recipePath, []byte(recipes), 0o644); err != nil {
+		t.Fatalf("write recipes: %v", err)
+	}
+
+	compile := exec.Command(binary,
+		"recipes", "compile", "static-parent",
+		"--settings", settingsPath,
+		"--recipe-file", recipePath,
+		"--json",
+	)
+	compiledOutput, err := compile.CombinedOutput()
+	if err != nil {
+		t.Fatalf("compile static child recipe: %v\n%s", err, compiledOutput)
+	}
+	compiled := decodeJSONObject(t, string(compiledOutput))
+	compiledPlan, _ := compiled["compiled_plan"].(map[string]any)
+	participants, _ := compiledPlan["participants"].([]any)
+	if len(participants) != 2 {
+		t.Fatalf("compiled static child participants = %#v", compiledPlan["participants"])
+	}
+	childStep, _ := participants[1].(map[string]any)
+	if childStep["kind"] != "child_step" || childStep["recipe_id"] != "child-review" || intValue(childStep["turns"]) != 1 {
+		t.Fatalf("compiled child step = %#v", childStep)
+	}
+
+	fakeBin := filepath.Join(tempDir, "bin")
+	if err := os.MkdirAll(fakeBin, 0o755); err != nil {
+		t.Fatalf("mkdir fake bin: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(fakeBin, "codex"), []byte(fakeCodexAppServerScript), 0o755); err != nil {
+		t.Fatalf("write fake codex: %v", err)
+	}
+	sessionDir := filepath.Join(tempDir, "session")
+	command := exec.Command(binary,
+		"run", "Execute the declared static child.",
+		"--recipe", "static-parent",
+		"--settings", settingsPath,
+		"--recipe-file", recipePath,
+		"--session-dir", sessionDir,
+		"--launch-cwd", launchCWD,
+		"--json",
+	)
+	command.Env = append(os.Environ(), "PATH="+fakeBin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	rawResult, err := command.CombinedOutput()
+	if err != nil {
+		t.Fatalf("run static child recipe: %v\n%s", err, rawResult)
+	}
+	result := decodeJSONObject(t, string(rawResult))
+	if result["status"] != "completed" || result["execution_kind"] != "recipe" || result["recipe_id"] != "static-parent" {
+		t.Fatalf("static child recipe result = %#v", result)
+	}
+
+	sess, err := session.Open(sessionDir)
+	if err != nil {
+		t.Fatalf("open static child parent session: %v", err)
+	}
+	events, err := relayv2.Events(sess)
+	if err != nil {
+		t.Fatalf("read static child events: %v", err)
+	}
+	var requested eventlog.ChildRequestedPayload
+	var decided eventlog.ChildDecidedPayload
+	var completed eventlog.ChildCompletedPayload
+	for _, event := range events {
+		switch payload := event.Payload.(type) {
+		case eventlog.ChildRequestedPayload:
+			requested = payload
+		case eventlog.ChildDecidedPayload:
+			decided = payload
+		case eventlog.ChildCompletedPayload:
+			completed = payload
+		}
+	}
+	if requested.RequesterActorID != "slot_1" || requested.RecipeID != "child-review" {
+		t.Fatalf("static child request = %#v", requested)
+	}
+	if !decided.Admitted || decided.Reason != "admitted by static child step" || decided.Plan == nil {
+		t.Fatalf("static child decision = %#v", decided)
+	}
+	if completed.RequestID != requested.RequestID || completed.Status != "completed" || completed.ChildSessionID == "" {
+		t.Fatalf("static child completion = %#v", completed)
+	}
+}
+
 func TestSaveRunnerOutputWritesMarkdownAndJSON(t *testing.T) {
 	sessionDir := filepath.Join(t.TempDir(), "session")
-	if err := os.MkdirAll(sessionDir, 0o755); err != nil {
-		t.Fatalf("mkdir session: %v", err)
-	}
-	meta := `{"task":"Output task","title":"Output title","status":"completed","mode":"adversarial","actual_rounds":1,"max_rounds":1,"ledger":{"settled":[],"contested":[],"withdrawn":[]},"slots":[{"backend":"codex"}]}`
-	transcript := `[{"round":1,"from":"Codex","content":"Output body","ledger":{"settled":[],"contested":[],"withdrawn":[]}}]`
-	if err := os.WriteFile(filepath.Join(sessionDir, "meta.json"), []byte(meta), 0o644); err != nil {
-		t.Fatalf("write meta: %v", err)
-	}
-	if err := os.WriteFile(filepath.Join(sessionDir, "transcript.json"), []byte(transcript), 0o644); err != nil {
-		t.Fatalf("write transcript: %v", err)
+	report := map[string]any{
+		"session_id":    "abc123",
+		"session_dir":   sessionDir,
+		"task":          "Output task",
+		"title":         "Output title",
+		"status":        "completed",
+		"mode":          "adversarial",
+		"actual_rounds": 1,
+		"max_rounds":    1,
+		"slots":         []any{map[string]any{"backend": "codex"}},
+		"transcript": []any{map[string]any{
+			"round": 1, "from": "Codex", "content": "Output body",
+			"ledger": map[string]any{"settled": []any{}, "contested": []any{}, "withdrawn": []any{}},
+		}},
 	}
 
 	markdownPath := filepath.Join(t.TempDir(), "relay.md")
-	if saved, err := saveRunnerOutput(map[string]any{"session_dir": sessionDir}, markdownPath, false); err != nil || saved != markdownPath {
+	if saved, err := saveRunnerOutput(report, markdownPath, false); err != nil || saved != markdownPath {
 		t.Fatalf("save markdown = %q, %v", saved, err)
 	}
 	markdown, err := os.ReadFile(markdownPath)
@@ -1055,7 +1107,7 @@ func TestSaveRunnerOutputWritesMarkdownAndJSON(t *testing.T) {
 	}
 
 	jsonPath := filepath.Join(t.TempDir(), "relay.json")
-	if saved, err := saveRunnerOutput(map[string]any{"session_id": "abc123", "session_dir": sessionDir}, jsonPath, true); err != nil || saved != jsonPath {
+	if saved, err := saveRunnerOutput(report, jsonPath, true); err != nil || saved != jsonPath {
 		t.Fatalf("save json = %q, %v", saved, err)
 	}
 	jsonData, err := os.ReadFile(jsonPath)
@@ -1107,25 +1159,16 @@ func TestEmitRunnerResultStillWritesStdoutWhenOutputSaveFails(t *testing.T) {
 
 func TestEmitRunnerResultWithRunErrorPersistsSelectedOutputRepresentation(t *testing.T) {
 	sessionDir := filepath.Join(t.TempDir(), "root-session")
-	if err := os.MkdirAll(sessionDir, 0o755); err != nil {
-		t.Fatalf("mkdir root session: %v", err)
-	}
-	meta := `{"execution_kind":"recipe","recipe_id":"neutral-root","task":"Output task","title":"Output title","status":"invalid_result","mode":"cooperative","participant_turns":2,"participant_turns_completed":2,"actual_participant_turns":2,"actual_rounds":2,"max_rounds":2,"result_source":"reducer","validation_status":"failed","ledger":{"settled":[],"contested":[],"withdrawn":[]},"slots":[{"backend":"codex"},{"backend":"codex"}]}`
-	transcript := `[{"round":1,"from":"Participant A","content":"First participant body","ledger":{"settled":[],"contested":[],"withdrawn":[]}},{"round":2,"from":"Participant B","content":"Second participant body","ledger":{"settled":[],"contested":[],"withdrawn":[]}}]`
-	if err := os.WriteFile(filepath.Join(sessionDir, "meta.json"), []byte(meta), 0o644); err != nil {
-		t.Fatalf("write root meta: %v", err)
-	}
-	if err := os.WriteFile(filepath.Join(sessionDir, "transcript.json"), []byte(transcript), 0o644); err != nil {
-		t.Fatalf("write root transcript: %v", err)
-	}
-	canonicalRef := map[string]any{
-		"kind": "artifact_ref", "schema_version": 1, "id": "canonical_result:selected",
-		"digest": contracts.DigestPrefix + strings.Repeat("0", 64),
-	}
 	result := map[string]any{
 		"execution_kind": "recipe", "session_id": "invalid123", "session_dir": sessionDir,
-		"status": "invalid_result", "actual_participant_turns": 2, "participant_turns": 2,
-		"canonical_result_ref": canonicalRef, "transcript": []any{map[string]any{"content": "machine envelope body"}},
+		"task": "Output task", "title": "Output title", "mode": "cooperative", "status": "invalid_result",
+		"actual_participant_turns": 2, "participant_turns": 2, "actual_rounds": 2, "max_rounds": 2,
+		"result": "canonical result",
+		"slots":  []any{map[string]any{"backend": "codex"}, map[string]any{"backend": "codex"}},
+		"transcript": []any{
+			map[string]any{"round": 1, "from": "Participant A", "content": "First participant body", "ledger": map[string]any{"settled": []any{}, "contested": []any{}, "withdrawn": []any{}}},
+			map[string]any{"round": 2, "from": "Participant B", "content": "Second participant body", "ledger": map[string]any{"settled": []any{}, "contested": []any{}, "withdrawn": []any{}}},
+		},
 	}
 	runErr := errors.New("invalid root result")
 
@@ -1138,7 +1181,7 @@ func TestEmitRunnerResultWithRunErrorPersistsSelectedOutputRepresentation(t *tes
 	if err != nil {
 		t.Fatalf("read markdown output: %v", err)
 	}
-	if !strings.Contains(string(markdown), "# Relay Dialogue") || !strings.Contains(string(markdown), "Second participant body") || strings.Contains(string(markdown), `"canonical_result_ref"`) {
+	if !strings.Contains(string(markdown), "# Relay Dialogue") || !strings.Contains(string(markdown), "Second participant body") || strings.Contains(string(markdown), `"result"`) {
 		t.Fatalf("plain run output =\n%s", markdown)
 	}
 	if !strings.Contains(plainStdout.String(), "invalid_result") || !strings.Contains(plainStdout.String(), markdownPath) {
@@ -1157,7 +1200,7 @@ func TestEmitRunnerResultWithRunErrorPersistsSelectedOutputRepresentation(t *tes
 	jsonFile := decodeJSONObject(t, string(jsonBody))
 	jsonConsole := decodeJSONObject(t, jsonStdout.String())
 	for label, payload := range map[string]map[string]any{"file": jsonFile, "stdout": jsonConsole} {
-		if payload["status"] != "invalid_result" || payload["canonical_result_ref"] == nil || payload["transcript"] == nil {
+		if payload["status"] != "invalid_result" || payload["result"] != "canonical result" || payload["transcript"] == nil {
 			t.Fatalf("JSON %s envelope = %#v", label, payload)
 		}
 	}
@@ -1197,143 +1240,6 @@ func TestWriteExportOutputWritesMarkdownAndJSON(t *testing.T) {
 	}
 	if !strings.Contains(string(jsonData), `"session_id": "export123"`) || !strings.Contains(string(jsonData), `"incomplete": true`) {
 		t.Fatalf("export json:\n%s", jsonData)
-	}
-}
-
-func TestDisplayOutputPaths(t *testing.T) {
-	htmlPath, pdfPath, openPath := displayOutputPaths("/tmp/session", "", true)
-	if htmlPath != "/tmp/session/transcript.html" || pdfPath != "" || openPath != htmlPath {
-		t.Fatalf("html paths = %q, %q, %q", htmlPath, pdfPath, openPath)
-	}
-
-	htmlPath, pdfPath, openPath = displayOutputPaths("/tmp/session", "/tmp/out.pdf", false)
-	if htmlPath != "/tmp/session/transcript.html" || pdfPath != "/tmp/out.pdf" || openPath != pdfPath {
-		t.Fatalf("pdf paths = %q, %q, %q", htmlPath, pdfPath, openPath)
-	}
-}
-
-func TestWriteDisplayPDFUsesHelperAndCleansFailedOutput(t *testing.T) {
-	tempDir := t.TempDir()
-	successHelper := filepath.Join(tempDir, "pdf-helper")
-	successScript := "#!/bin/sh\n" +
-		"test -f \"$1\" || exit 3\n" +
-		"mkdir -p \"$(dirname \"$2\")\"\n" +
-		"printf 'pdf:%s' \"$(cat \"$1\")\" > \"$2\"\n"
-	if err := os.WriteFile(successHelper, []byte(successScript), 0o755); err != nil {
-		t.Fatalf("write success helper: %v", err)
-	}
-	htmlPath := filepath.Join(tempDir, "session", "transcript.html")
-	pdfPath := filepath.Join(tempDir, "session", "transcript.pdf")
-	if err := writeDisplayPDF("<html>ok</html>", htmlPath, pdfPath, successHelper); err != nil {
-		t.Fatalf("write display pdf: %v", err)
-	}
-	if data, err := os.ReadFile(htmlPath); err != nil || string(data) != "<html>ok</html>" {
-		t.Fatalf("html data = %q, err = %v", data, err)
-	}
-	if data, err := os.ReadFile(pdfPath); err != nil || string(data) != "pdf:<html>ok</html>" {
-		t.Fatalf("pdf data = %q, err = %v", data, err)
-	}
-
-	failHelper := filepath.Join(tempDir, "failing-helper")
-	failScript := "#!/bin/sh\nprintf partial > \"$2\"\necho helper unavailable >&2\nexit 7\n"
-	if err := os.WriteFile(failHelper, []byte(failScript), 0o755); err != nil {
-		t.Fatalf("write failing helper: %v", err)
-	}
-	failedHTML := filepath.Join(tempDir, "failed", "transcript.html")
-	failedPDF := filepath.Join(tempDir, "failed", "transcript.pdf")
-	err := writeDisplayPDF("<html>fail</html>", failedHTML, failedPDF, failHelper)
-	if err == nil || !strings.Contains(err.Error(), "helper unavailable") {
-		t.Fatalf("failing helper err = %v", err)
-	}
-	if _, err := os.Stat(failedHTML); !os.IsNotExist(err) {
-		t.Fatalf("failed html should not exist, err = %v", err)
-	}
-	if _, err := os.Stat(failedPDF); !os.IsNotExist(err) {
-		t.Fatalf("failed pdf should be removed, err = %v", err)
-	}
-}
-
-func TestResolveDisplayPDFHelperEnvMissingIsClear(t *testing.T) {
-	t.Setenv(displayPDFHelperEnv, filepath.Join(t.TempDir(), "missing-helper.py"))
-	_, err := resolveDisplayPDFHelper()
-	if err == nil || !strings.Contains(err.Error(), displayPDFHelperEnv) {
-		t.Fatalf("helper error = %v", err)
-	}
-}
-
-func TestResolveDisplayPDFHelperDefaultMissingIsClear(t *testing.T) {
-	_, err := resolveDisplayPDFHelperFromCandidates([]string{filepath.Join(t.TempDir(), "scripts", "render_display_pdf.py")})
-	if err == nil ||
-		!strings.Contains(err.Error(), "scripts/render_display_pdf.py") ||
-		!strings.Contains(err.Error(), "Playwright") ||
-		!strings.Contains(err.Error(), "--html-only") {
-		t.Fatalf("helper error = %v", err)
-	}
-}
-
-func TestResolveDisplayPDFHelperUsesSourceAndInstalledCandidates(t *testing.T) {
-	tempDir := t.TempDir()
-	sourceHelper := filepath.Join(tempDir, "scripts", "render_display_pdf.py")
-	if err := os.MkdirAll(filepath.Dir(sourceHelper), 0o755); err != nil {
-		t.Fatalf("mkdir source helper: %v", err)
-	}
-	if err := os.WriteFile(sourceHelper, []byte("#!/bin/sh\n"), 0o755); err != nil {
-		t.Fatalf("write source helper: %v", err)
-	}
-	resolved, err := resolveDisplayPDFHelperFromCandidates([]string{sourceHelper})
-	if err != nil || resolved != sourceHelper {
-		t.Fatalf("source helper resolved = %q, err = %v", resolved, err)
-	}
-
-	executable := filepath.Join(tempDir, "pkg", "bin", "convo-relay")
-	installedHelper := filepath.Join(filepath.Dir(executable), "..", "share", installedShareDir, "scripts", "render_display_pdf.py")
-	if err := os.MkdirAll(filepath.Dir(installedHelper), 0o755); err != nil {
-		t.Fatalf("mkdir installed helper: %v", err)
-	}
-	if err := os.WriteFile(installedHelper, []byte("#!/bin/sh\n"), 0o755); err != nil {
-		t.Fatalf("write installed helper: %v", err)
-	}
-	resolved, err = resolveDisplayPDFHelperFromCandidates(displayPDFHelperCandidatesForExecutable(executable))
-	if err != nil || resolved != installedHelper {
-		t.Fatalf("installed helper resolved = %q, err = %v", resolved, err)
-	}
-}
-
-func TestInstalledAssetDiscoveryCandidates(t *testing.T) {
-	executable := filepath.Join(t.TempDir(), "bin", "convo-relay")
-
-	pdfCandidates := displayPDFHelperCandidatesForExecutable(executable)
-	expectedPDF := filepath.Join(filepath.Dir(executable), "..", "share", installedShareDir, "scripts", "render_display_pdf.py")
-	if !containsPath(pdfCandidates, expectedPDF) {
-		t.Fatalf("PDF helper candidates = %#v, want %q", pdfCandidates, expectedPDF)
-	}
-
-	skillCandidates := skillBundleCandidatesForExecutable(executable)
-	expectedSkill := filepath.Join(filepath.Dir(executable), "..", "share", installedShareDir, "skill")
-	if !containsPath(skillCandidates, expectedSkill) {
-		t.Fatalf("skill candidates = %#v, want %q", skillCandidates, expectedSkill)
-	}
-}
-
-func containsPath(paths []string, target string) bool {
-	for _, path := range paths {
-		if path == target {
-			return true
-		}
-	}
-	return false
-}
-
-func TestPDFHelperDoesNotImportRelayOrchestration(t *testing.T) {
-	data, err := os.ReadFile(filepath.Join("..", "..", "scripts", "render_display_pdf.py"))
-	if err != nil {
-		t.Fatalf("read helper: %v", err)
-	}
-	text := string(data)
-	for _, forbidden := range []string{"\nimport relay", "\nfrom relay", "\nimport convo_relay", "\nfrom convo_relay", "\nimport display", "\nfrom display"} {
-		if strings.Contains(text, forbidden) {
-			t.Fatalf("pdf helper imports orchestration boundary %q", forbidden)
-		}
 	}
 }
 
@@ -1400,68 +1306,4 @@ func runCLITestGit(t *testing.T, root string, args ...string) string {
 		t.Fatalf("git %s: %v\n%s", strings.Join(args, " "), err, output)
 	}
 	return strings.TrimSpace(string(output))
-}
-
-func TestDelegatedInstallSkillsPlanUsesInstallRoot(t *testing.T) {
-	stage := filepath.Join(t.TempDir(), "stage")
-	result, err := delegatedInstallSkillsResult("plan", "all", stage, false)
-	if err != nil {
-		t.Fatalf("install skills plan: %v", err)
-	}
-	if result.Operation != "plan" || result.Name != "convo-relay" || result.Kind != "delegated" {
-		t.Fatalf("unexpected result metadata: %#v", result)
-	}
-	claude := result.Targets["claude"].Files
-	codex := result.Targets["codex"].Files
-	tools := result.Targets["tools"].Files
-	if len(claude) != 2 || len(codex) != 2 {
-		t.Fatalf("target files claude=%#v codex=%#v", claude, codex)
-	}
-	if len(tools) < 6 {
-		t.Fatalf("tools target should include binary and bundled assets: %#v", tools)
-	}
-	if !strings.Contains(claude[0].Path, filepath.Join("stage", ".claude", "skills")) {
-		t.Fatalf("claude install path does not use stage root: %#v", claude)
-	}
-	if !strings.Contains(codex[0].Path, filepath.Join("stage", ".codex", "skills")) {
-		t.Fatalf("codex install path does not use stage root: %#v", codex)
-	}
-	if !strings.Contains(tools[0].Path, filepath.Join("stage", ".local", "bin", "convo-relay")) {
-		t.Fatalf("tools binary path does not use stage root: %#v", tools)
-	}
-	if claude[0].SHA256 != "" || codex[0].SHA256 != "" || tools[0].SHA256 != "" {
-		t.Fatalf("plan should not hash missing destination files: claude=%#v codex=%#v tools=%#v", claude, codex, tools)
-	}
-}
-
-func TestDelegatedInstallSkillsCopiesAndHashes(t *testing.T) {
-	stage := filepath.Join(t.TempDir(), "stage")
-	result, err := delegatedInstallSkillsResult("install", "codex", stage, true)
-	if err != nil {
-		t.Fatalf("install codex skills: %v", err)
-	}
-	toolFiles := result.Targets["tools"].Files
-	if len(toolFiles) < 6 {
-		t.Fatalf("tools files = %#v", toolFiles)
-	}
-	if _, err := os.Stat(filepath.Join(stage, ".local", "bin", "convo-relay")); err != nil {
-		t.Fatalf("installed convo-relay tool: %v", err)
-	}
-	for _, file := range toolFiles {
-		if len(file.SHA256) != 64 || strings.HasPrefix(file.SHA256, "sha256:") {
-			t.Fatalf("missing tool sha for %s: %#v", file.Path, file)
-		}
-	}
-	files := result.Targets["codex"].Files
-	if len(files) != 2 {
-		t.Fatalf("codex files = %#v", files)
-	}
-	for _, file := range files {
-		if _, err := os.Stat(file.Path); err != nil {
-			t.Fatalf("installed file %s: %v", file.Path, err)
-		}
-		if len(file.SHA256) != 64 || strings.HasPrefix(file.SHA256, "sha256:") {
-			t.Fatalf("missing sha for %s: %#v", file.Path, file)
-		}
-	}
 }
