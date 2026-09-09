@@ -318,7 +318,7 @@ func TestExportVerifyJSONReportsPortableBundle(t *testing.T) {
 	if err := json.Unmarshal([]byte(output), &report); err != nil {
 		t.Fatalf("decode export verify output %q: %v", output, err)
 	}
-	if report["status"] != "valid" || report["format"] != format.BundleV1 {
+	if report["status"] != "valid" || report["format"] != format.BundleV1 || report["payload_count"] != float64(len(payloads)) {
 		t.Fatalf("export verify report = %#v", report)
 	}
 	binary := filepath.Join(t.TempDir(), "convo-relay")

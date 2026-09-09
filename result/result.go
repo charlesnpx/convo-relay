@@ -398,6 +398,41 @@ type Workspace struct {
 	WorkingTreeChangesIncluded bool `json:"working_tree_changes_included"`
 }
 
+// ValidateRoot checks a decoded or programmatically built root projection. It
+// returns an error naming the invalid field and never panics.
+func ValidateRoot(value Root) error {
+	if strings.TrimSpace(value.ExecutionKind) == "" {
+		return errors.New("result root.execution_kind is required")
+	}
+	if strings.TrimSpace(value.Status) == "" {
+		return errors.New("result root.status is required")
+	}
+	if value.Turns.Configured < 0 || value.Turns.Completed < 0 {
+		return errors.New("result root.turns counts must not be negative")
+	}
+	if (value.Invocations != nil && value.Invocations.Count < 0) || value.ReducerAttempts.Count < 0 {
+		return errors.New("result root invocation counts must not be negative")
+	}
+	return nil
+}
+
+// ValidateTranscript checks the shape of participant transcript entries. It
+// returns an error naming the invalid field and never panics.
+func ValidateTranscript(entries []TranscriptEntry) error {
+	return validateTranscript("transcript", entries)
+}
+
+// ValidateDiagnostics checks the shape of result diagnostics. It returns an
+// error naming the invalid field and never panics.
+func ValidateDiagnostics(value Diagnostics) error {
+	for index, attempt := range value.AbandonedAttempts {
+		if attempt.Attempt < 1 {
+			return fmt.Errorf("result diagnostics.abandoned_attempts[%d].attempt must be positive", index)
+		}
+	}
+	return nil
+}
+
 // Validate checks a decoded or programmatically built run result. It returns an
 // error naming the invalid field and never panics. It rejects missing required
 // projections, negative counts, and invalid nested identity fields.
@@ -448,7 +483,7 @@ func Validate(value Result) error {
 	if value.ReducerAttempts.Count < 0 {
 		return errors.New("result reducer_attempts.count must not be negative")
 	}
-	if err := validateTranscript("transcript", value.Transcript); err != nil {
+	if err := ValidateTranscript(value.Transcript); err != nil {
 		return err
 	}
 	if err := validateTranscript("transcript_payload", value.TranscriptPayload); err != nil {
@@ -459,10 +494,8 @@ func Validate(value Result) error {
 			return fmt.Errorf("result provider_failures[%d].attempts must not be negative", index)
 		}
 	}
-	for index, attempt := range value.Diagnostics.AbandonedAttempts {
-		if attempt.Attempt < 1 {
-			return fmt.Errorf("result diagnostics.abandoned_attempts[%d].attempt must be positive", index)
-		}
+	if err := ValidateDiagnostics(value.Diagnostics); err != nil {
+		return err
 	}
 	for index, slot := range value.Slots {
 		if strings.TrimSpace(slot.SlotID) == "" {
@@ -486,17 +519,8 @@ func Validate(value Result) error {
 		}
 	}
 	if value.Root != nil {
-		if strings.TrimSpace(value.Root.ExecutionKind) == "" {
-			return errors.New("result root.execution_kind is required")
-		}
-		if strings.TrimSpace(value.Root.Status) == "" {
-			return errors.New("result root.status is required")
-		}
-		if value.Root.Turns.Configured < 0 || value.Root.Turns.Completed < 0 {
-			return errors.New("result root.turns counts must not be negative")
-		}
-		if (value.Root.Invocations != nil && value.Root.Invocations.Count < 0) || value.Root.ReducerAttempts.Count < 0 {
-			return errors.New("result root invocation counts must not be negative")
+		if err := ValidateRoot(*value.Root); err != nil {
+			return err
 		}
 	}
 	return nil

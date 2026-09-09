@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"testing"
 
 	"github.com/charlesnpx/convo-relay/v2/internal/semanticjson"
@@ -26,7 +27,9 @@ func TestInvocationEvidencePresenceSurvivesBundle(t *testing.T) {
 		{name: "explicit zero", invocations: &result.Count{Count: 0}, present: true},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			directory := writeVerifyTestBundle(t, value, test.invocations)
+			directory := writeVerifyTestBundle(t, value, test.invocations, result.Diagnostics{
+				AbandonedAttempts: []result.AbandonedAttempt{}, UnreferencedBlobs: []result.BlobDiagnostic{},
+			})
 			verified, err := VerifyPortableDirectory(directory, VerifyOptions{
 				ExpectedPlanDigest: wantDigest,
 				ExpectedSessionID:  value.SessionID,
@@ -38,6 +41,17 @@ func TestInvocationEvidencePresenceSurvivesBundle(t *testing.T) {
 				t.Fatalf("invocation presence = %v, want %v", got, test.present)
 			}
 		})
+	}
+}
+
+func TestInvalidDiagnosticsPayloadFailsBundleVerification(t *testing.T) {
+	directory := writeVerifyTestBundle(t, verifyTestPlan(), nil, result.Diagnostics{
+		AbandonedAttempts: []result.AbandonedAttempt{{Attempt: 0}},
+		UnreferencedBlobs: []result.BlobDiagnostic{},
+	})
+
+	if _, err := VerifyPortableDirectory(directory); err == nil || !strings.Contains(err.Error(), "result diagnostics.abandoned_attempts[0].attempt must be positive") {
+		t.Fatalf("invalid diagnostics verification error = %v", err)
 	}
 }
 
@@ -57,7 +71,7 @@ func verifyTestPlan() plan.Plan {
 	}
 }
 
-func writeVerifyTestBundle(t *testing.T, value plan.Plan, invocations *result.Count) string {
+func writeVerifyTestBundle(t *testing.T, value plan.Plan, invocations *result.Count, diagnostics result.Diagnostics) string {
 	t.Helper()
 	directory := filepath.Join(t.TempDir(), "bundle")
 	root := SessionPayload{
@@ -73,7 +87,6 @@ func writeVerifyTestBundle(t *testing.T, value plan.Plan, invocations *result.Co
 		},
 	}
 	transcript := []result.TranscriptEntry{}
-	diagnostics := result.Diagnostics{AbandonedAttempts: []result.AbandonedAttempt{}, UnreferencedBlobs: []result.BlobDiagnostic{}}
 	payloads := []struct {
 		kind string
 		id   string

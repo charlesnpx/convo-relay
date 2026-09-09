@@ -168,7 +168,7 @@ func VerifyPortableDirectory(directory string, options ...VerifyOptions) (Verifi
 			if err := decodePayload(body, &decoded); err != nil {
 				return Verification{}, fmt.Errorf("decode portable export payload %s: %w", entry.Path, err)
 			}
-			if err := validateTranscript(decoded); err != nil {
+			if err := result.ValidateTranscript(decoded); err != nil {
 				return Verification{}, err
 			}
 			transcript = decoded
@@ -177,7 +177,7 @@ func VerifyPortableDirectory(directory string, options ...VerifyOptions) (Verifi
 			if err := decodePayload(body, &decoded); err != nil {
 				return Verification{}, fmt.Errorf("decode portable export payload %s: %w", entry.Path, err)
 			}
-			if err := validateDiagnostics(decoded); err != nil {
+			if err := result.ValidateDiagnostics(decoded); err != nil {
 				return Verification{}, err
 			}
 			diagnostics = decoded
@@ -269,7 +269,7 @@ func validateSessionPayload(value SessionPayload) error {
 	if strings.TrimSpace(value.ValidationStatus) == "" {
 		return errors.New("portable root session validation_status is required")
 	}
-	if err := validateRoot(value.Root); err != nil {
+	if err := result.ValidateRoot(value.Root); err != nil {
 		return err
 	}
 	if value.Root.Status != value.TerminalStatus {
@@ -283,57 +283,6 @@ func validateSessionPayload(value SessionPayload) error {
 	}
 	if value.Root.Result.ValidationStatus != value.ValidationStatus {
 		return mismatch("validation_status", value.ValidationStatus, value.Root.Result.ValidationStatus)
-	}
-	return nil
-}
-
-func validateRoot(value result.Root) error {
-	if strings.TrimSpace(value.ExecutionKind) == "" {
-		return errors.New("result root.execution_kind is required")
-	}
-	if strings.TrimSpace(value.Status) == "" {
-		return errors.New("result root.status is required")
-	}
-	if value.Turns.Configured < 0 || value.Turns.Completed < 0 {
-		return errors.New("result root.turns counts must not be negative")
-	}
-	if value.Invocations != nil && value.Invocations.Count < 0 {
-		return errors.New("result root invocation counts must not be negative")
-	}
-	if value.ReducerAttempts.Count < 0 {
-		return errors.New("result root invocation counts must not be negative")
-	}
-	return nil
-}
-
-func validateTranscript(entries []result.TranscriptEntry) error {
-	for index, entry := range entries {
-		if entry.Round < 1 {
-			return fmt.Errorf("result transcript[%d].round must be positive", index)
-		}
-		if strings.TrimSpace(entry.From) == "" {
-			return fmt.Errorf("result transcript[%d].from is required", index)
-		}
-		if strings.TrimSpace(entry.Mode) == "" {
-			return fmt.Errorf("result transcript[%d].mode is required", index)
-		}
-		if provider := entry.FacilitatorProviderResult; provider != nil {
-			if strings.TrimSpace(provider.Backend) == "" {
-				return fmt.Errorf("result transcript[%d].facilitator_provider_result.backend is required", index)
-			}
-			if strings.TrimSpace(provider.ActorID) == "" {
-				return fmt.Errorf("result transcript[%d].facilitator_provider_result.actor_id is required", index)
-			}
-		}
-	}
-	return nil
-}
-
-func validateDiagnostics(value result.Diagnostics) error {
-	for index, attempt := range value.AbandonedAttempts {
-		if attempt.Attempt < 1 {
-			return fmt.Errorf("result diagnostics.abandoned_attempts[%d].attempt must be positive", index)
-		}
 	}
 	return nil
 }
