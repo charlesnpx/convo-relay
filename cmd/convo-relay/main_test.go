@@ -1118,6 +1118,7 @@ workspace_isolation = "inherited"
 		"--recipe-file", recipePath,
 		"--session-dir", sessionDir,
 		"--launch-cwd", launchCWD,
+		"--verbose",
 		"--json",
 	)
 	command.Env = append(os.Environ(), "PATH="+fakeBin+string(os.PathListSeparator)+os.Getenv("PATH"))
@@ -1130,7 +1131,7 @@ workspace_isolation = "inherited"
 		t.Fatalf("run static child recipe: %v\nstdout:\n%s\nstderr:\n%s", err, runStdout.String(), runStderr.String())
 	}
 	result := decodeJSONObject(t, runStdout.String())
-	if got, want := runStderr.String(), "Session "+stringValue(result["session_id"])+"\n"; got != want {
+	if got, want := runStderr.String(), "Session "+stringValue(result["session_id"])+"\nRound 1 started\nRound 1 finished\nRound 2 started\nRound 2 finished\n"; got != want {
 		t.Fatalf("static child launch stderr = %q, want %q", got, want)
 	}
 	if result["status"] != "completed" || result["execution_kind"] != "recipe" || result["recipe_id"] != "static-parent" {

@@ -1376,10 +1376,14 @@ func (r *runner) finishActiveTurn(turn *turnState, attempt *attemptState) error 
 	if turn == nil || attempt == nil || attempt.Outcome != "success" {
 		return errors.New("successful attempt is required to finish a turn")
 	}
+	return r.appendTurnFinished(turn, attempt.Content)
+}
+
+func (r *runner) appendTurnFinished(turn *turnState, content blobstore.BlobRef) error {
 	if err := r.append(eventlog.TurnFinishedPayload{
 		ActorID: turn.ActorID,
 		Round:   turn.Round,
-		Content: attempt.Content,
+		Content: content,
 	}); err != nil {
 		return err
 	}
@@ -1515,11 +1519,7 @@ func (r *runner) serviceStaticChildTurn(turn *turnState, actor session.Actor) er
 	if child.Status != statusCompleted || child.Result == (blobstore.BlobRef{}) {
 		return errors.New("static child step did not produce a completed result")
 	}
-	return r.append(eventlog.TurnFinishedPayload{
-		ActorID: turn.ActorID,
-		Round:   turn.Round,
-		Content: child.Result,
-	})
+	return r.appendTurnFinished(turn, child.Result)
 }
 
 func (r *runner) admitStaticChild(actor session.Actor, child *childState) error {
@@ -1716,6 +1716,7 @@ func (r *runner) runChild(child *childState) (bool, error) {
 	}
 	childDeps := r.deps
 	childDeps.Writer = nil
+	childDeps.ProgressWriter = nil
 	childEvents, err := readEvents(childSession.Root)
 	if err != nil {
 		return false, err
