@@ -435,13 +435,14 @@ func TestEmbeddedTurnExecutionFailedWithTerminalAuthErrorReturnsBackendError(t *
 	}
 }
 
-func TestEmbeddedTurnRecordsSuccessfulAuthenticationDiscussion(t *testing.T) {
-	const body = "please sign in with your login credentials"
+func TestEmbeddedTurnRecoversAuthenticationDiscussionAfterExecutionFailure(t *testing.T) {
+	const body = "Please sign in with your login credentials. Authentication error: token expired"
 	session := &fakeEmbeddedSession{events: []engine.Event{
 		{Type: engine.EventAgentText, Text: body},
 		{Type: engine.EventTurnFinal, TurnFinal: &engine.TurnFinalObservation{
 			ReturnCodeKnown: true,
-			ReturnCode:      0,
+			ReturnCode:      17,
+			ExecutionFailed: true,
 		}},
 	}}
 
@@ -449,8 +450,8 @@ func TestEmbeddedTurnRecordsSuccessfulAuthenticationDiscussion(t *testing.T) {
 	if err != nil {
 		t.Fatalf("run turn: %v", err)
 	}
-	if result.Content != body || final == nil || final.ExecutionFailed || final.TimedOut || result.ProviderResult.ReturnCode != 0 {
-		t.Fatalf("successful turn = result %#v, final %#v", result, final)
+	if result.Content != body || final == nil || !final.ExecutionFailed || final.TimedOut || result.ProviderResult.ReturnCode != 17 || !result.Recovered {
+		t.Fatalf("recovered turn = result %#v, final %#v", result, final)
 	}
 }
 

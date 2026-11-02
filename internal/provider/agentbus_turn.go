@@ -205,9 +205,8 @@ eventLoop:
 	// failure. Only suppress that classification when the caller canceled the
 	// turn or the final follows the watchdog's own interruption.
 	cancellationOutcome := callerCanceled || (stalled && final != nil && final.Canceled)
-	abnormalOutcome := stalled || len(terminalErrors) > 0 || final == nil || (final != nil && (final.ExecutionFailed || final.TimedOut || final.Canceled))
 	failureText := ""
-	if abnormalOutcome && !cancellationOutcome {
+	if !cancellationOutcome {
 		failureText = strings.Join(terminalErrors, "; ")
 	}
 	if retryableError := classifyRetryableProviderError(failureText); retryableError != "" {
