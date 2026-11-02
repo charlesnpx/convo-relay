@@ -243,6 +243,9 @@ func publicTranscript(value session.Plan, transcript sessionview.TranscriptView,
 		case eventlog.FacilitatorRole:
 			ledger, ok := ledgerDocument(entry.Text)
 			if ok {
+				if len(participantIndexes) < 2 {
+					ledger["contested"] = []any{}
+				}
 				latestLedger = ledger
 			}
 			index, found := participantIndexes[entry.Round]

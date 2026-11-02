@@ -130,14 +130,16 @@ func TestDialogueStopsConvergedAndNoLedgerSignal(t *testing.T) {
 	cases := []struct {
 		name       string
 		responses  []fakeResponse
+		wantTurns  int
 		stopReason string
 	}{
 		{
-			name: "converged_done_signals",
+			name: "converged_completion_markers",
 			responses: []fakeResponse{
 				{content: "opening"}, {content: "response"},
-				{content: "task is complete"}, {content: "work is complete"},
+				{content: completionMarker}, {content: completionMarker},
 			},
+			wantTurns:  4,
 			stopReason: stopConverged,
 		},
 		{
@@ -146,15 +148,34 @@ func TestDialogueStopsConvergedAndNoLedgerSignal(t *testing.T) {
 				{content: "opening"}, {content: "response"},
 				{content: "more analysis"}, {content: "another view"},
 			},
+			wantTurns:  4,
 			stopReason: stopNoLedgerSignal,
+		},
+		{
+			name: "prose_completion_signals_do_not_converge",
+			responses: []fakeResponse{
+				{content: "opening"}, {content: "response"},
+				{content: "This is not resolved"}, {content: "This is not resolved"},
+				{content: "This is still unresolved"}, {content: "This is still unresolved"},
+			},
+			wantTurns:  6,
+			stopReason: stopCompleted,
 		},
 	}
 	for _, test := range cases {
 		t.Run(test.name, func(t *testing.T) {
 			plan := dialoguePlan(6)
 			plan.Schedule.StopOnConvergence = true
-			alpha := &fakeBackend{name: "codex", slotID: "alpha", responses: []fakeResponse{test.responses[0], test.responses[2]}}
-			beta := &fakeBackend{name: "codex", slotID: "beta", responses: []fakeResponse{test.responses[1], test.responses[3]}}
+			var alphaResponses, betaResponses []fakeResponse
+			for index, response := range test.responses {
+				if index%2 == 0 {
+					alphaResponses = append(alphaResponses, response)
+				} else {
+					betaResponses = append(betaResponses, response)
+				}
+			}
+			alpha := &fakeBackend{name: "codex", slotID: "alpha", responses: alphaResponses}
+			beta := &fakeBackend{name: "codex", slotID: "beta", responses: betaResponses}
 			sess := createSession(t, plan)
 
 			_, err := Run(context.Background(), sess, testDeps(map[string]*fakeBackend{"alpha": alpha, "beta": beta}))
@@ -162,8 +183,8 @@ func TestDialogueStopsConvergedAndNoLedgerSignal(t *testing.T) {
 				t.Fatalf("Run: %v", err)
 			}
 			events := sessionEvents(t, sess)
-			if got := countType(events, eventlog.TurnFinished); got != 4 {
-				t.Fatalf("finished participant turns = %d, want 4", got)
+			if got := countType(events, eventlog.TurnFinished); got != test.wantTurns {
+				t.Fatalf("finished participant turns = %d, want %d", got, test.wantTurns)
 			}
 			finished := sessionFinished(t, events)
 			if finished.StopReason != test.stopReason {
@@ -200,11 +221,125 @@ func TestDialogueStopsConvergedAndNoLedgerSignal(t *testing.T) {
 	})
 }
 
+func TestDialogueCompletionMarkerRequiresBothLatestSlots(t *testing.T) {
+	tests := []struct {
+		name               string
+		mode               string
+		alphaResponses     []string
+		betaResponses      []string
+		wantFinishedTurns  int
+		wantStopReason     string
+		wantOpeningIgnored bool
+	}{
+		{
+			name:               "both slots stop despite contested ledger",
+			mode:               session.ModeSteelman,
+			alphaResponses:     []string{completionMarker, "still considering", "still considering"},
+			betaResponses:      []string{completionMarker, "still considering", "still considering"},
+			wantFinishedTurns:  4,
+			wantStopReason:     stopConverged,
+			wantOpeningIgnored: true,
+		},
+		{
+			name:              "one slot marker does not stop",
+			mode:              session.ModeCooperative,
+			alphaResponses:    []string{completionMarker, "still considering", "still considering"},
+			betaResponses:     []string{"still considering", "still considering", "still considering"},
+			wantFinishedTurns: 12,
+			wantStopReason:    stopCompleted,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			plan := dialoguePlan(6)
+			plan.Mode = test.mode
+			plan.Schedule.StopOnConvergence = true
+			plan.Actors = append(plan.Actors, session.Actor{ID: "facilitator", Backend: "codex"})
+			plan.Facilitator = &session.Facilitator{Actor: "facilitator", Cadence: 1}
+			alpha := &fakeBackend{name: "codex", slotID: "alpha", responses: makeResponses(test.alphaResponses)}
+			beta := &fakeBackend{name: "codex", slotID: "beta", responses: makeResponses(test.betaResponses)}
+			facilitatorResponses := []fakeResponse{{content: `{"settled":[],"contested":["opening claim"],"withdrawn":[]}`}}
+			for range 5 {
+				facilitatorResponses = append(facilitatorResponses, fakeResponse{content: `{"settled":[],"contested":["unresolved claim"],"withdrawn":[]}`})
+			}
+			facilitator := &fakeBackend{name: "codex", slotID: "facilitator", responses: facilitatorResponses}
+			sess := createSession(t, plan)
+
+			if _, err := Run(context.Background(), sess, testDeps(map[string]*fakeBackend{"alpha": alpha, "beta": beta, "facilitator": facilitator})); err != nil {
+				t.Fatalf("Run: %v", err)
+			}
+			events := sessionEvents(t, sess)
+			if got := countType(events, eventlog.TurnFinished); got != test.wantFinishedTurns {
+				t.Fatalf("finished turns = %d, want %d", got, test.wantFinishedTurns)
+			}
+			if got := sessionFinished(t, events).StopReason; got != test.wantStopReason {
+				t.Fatalf("stop reason = %q, want %q", got, test.wantStopReason)
+			}
+			if test.wantOpeningIgnored && !strings.Contains(facilitator.prompts[1], "Current counts: settled=0 contested=0 withdrawn=0") {
+				t.Fatalf("round-1 opening claim remained contested in the next facilitator prompt: %q", facilitator.prompts[1])
+			}
+		})
+	}
+}
+
+func TestParticipantPromptStatesCurrentAndAnsweredRounds(t *testing.T) {
+	plan := dialoguePlan(2)
+	plan.Schedule.StopOnConvergence = true
+	alpha := &fakeBackend{name: "codex", slotID: "alpha", responses: []fakeResponse{{content: "first contribution"}}}
+	beta := &fakeBackend{name: "codex", slotID: "beta", responses: []fakeResponse{{content: "second contribution"}}}
+	sess := createSession(t, plan)
+	if _, err := Run(context.Background(), sess, testDeps(map[string]*fakeBackend{"alpha": alpha, "beta": beta})); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	prompt := beta.prompts[0]
+	for _, expected := range []string{
+		"Current round: 2",
+		"Round of the turn being answered: 1",
+		"Output only your contribution.",
+		completionMarker,
+	} {
+		if !strings.Contains(prompt, expected) {
+			t.Fatalf("participant prompt does not contain %q: %q", expected, prompt)
+		}
+	}
+}
+
+func TestStructuredLastTurnParticipantPromptOmitsCompletionMarker(t *testing.T) {
+	plan := dialoguePlan(2)
+	plan.Schedule.StopOnConvergence = true
+	plan.Result = session.Result{Source: "last_turn", Format: "json"}
+	alpha := &fakeBackend{name: "codex", slotID: "alpha", responses: []fakeResponse{{content: `{}`}}}
+	beta := &fakeBackend{name: "codex", slotID: "beta", responses: []fakeResponse{{content: `{}`}}}
+	sess := createSession(t, plan)
+	if _, err := Run(context.Background(), sess, testDeps(map[string]*fakeBackend{"alpha": alpha, "beta": beta})); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	for _, prompts := range [][]string{alpha.prompts, beta.prompts} {
+		if len(prompts) != 1 {
+			t.Fatalf("participant prompts = %#v, want one prompt", prompts)
+		}
+		if strings.Contains(prompts[0], completionMarker) {
+			t.Fatalf("structured last-turn prompt contains completion marker: %q", prompts[0])
+		}
+		if !strings.Contains(prompts[0], "Output only your contribution.") {
+			t.Fatalf("structured last-turn prompt omits contribution instruction: %q", prompts[0])
+		}
+	}
+}
+
+func makeResponses(contents []string) []fakeResponse {
+	responses := make([]fakeResponse, len(contents))
+	for index, content := range contents {
+		responses[index] = fakeResponse{content: content}
+	}
+	return responses
+}
+
 func TestResumeTurnBudgetGrantRequiresPostGrantDialogueEvidence(t *testing.T) {
 	plan := dialoguePlan(6)
 	plan.Schedule.StopOnConvergence = true
-	alpha := &fakeBackend{name: "codex", slotID: "alpha", responses: []fakeResponse{{content: "opening"}, {content: "task is complete"}, {content: "work remains complete"}}}
-	beta := &fakeBackend{name: "codex", slotID: "beta", responses: []fakeResponse{{content: "response"}, {content: "work is complete"}}}
+	alpha := &fakeBackend{name: "codex", slotID: "alpha", responses: []fakeResponse{{content: "opening"}, {content: completionMarker}, {content: completionMarker}}}
+	beta := &fakeBackend{name: "codex", slotID: "beta", responses: []fakeResponse{{content: "response"}, {content: completionMarker}}}
 	sess := createSession(t, plan)
 	deps := testDeps(map[string]*fakeBackend{"alpha": alpha, "beta": beta})
 
