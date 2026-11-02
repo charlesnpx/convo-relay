@@ -695,7 +695,8 @@ func runRelay(args []string) {
 	effortA := flags.String("effort-a", "", "Effort for slot_0")
 	modelB := flags.String("model-b", "", "Model for slot_1")
 	effortB := flags.String("effort-b", "", "Effort for slot_1")
-	jsonOutput := flags.Bool("json", false, "Emit machine-readable run JSON")
+	jsonOutput := flags.Bool("json", false, "Emit machine-readable run JSON or a detached launch receipt")
+	detach := flags.Bool("detach", false, "Run in a separate session and return a launch receipt")
 	extracted, cleanedArgs, err := extractMultiValueFlags(args, "context", "skill", "recipe-file", "generated-recipe-file")
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error: %s\n", err)
@@ -703,6 +704,15 @@ func runRelay(args []string) {
 	}
 	if err := parseFlags(flags, cleanedArgs); err != nil {
 		os.Exit(2)
+	}
+	if *detach {
+		receipt, err := launchDetachedRun(stripDetachFlag(args), *relayHome)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "error: %s\n", err)
+			os.Exit(1)
+		}
+		writeDetachedLaunchReceipt(receipt, *jsonOutput)
+		return
 	}
 	verboseOutput := *verbose || *verboseAlias
 	if *task == "" && len(flags.Args()) > 0 {
@@ -1574,10 +1584,10 @@ func usage() {
 
 func usageTo(writer io.Writer) {
 	fmt.Fprintln(writer, "usage:")
-	fmt.Fprintln(writer, "  convo-relay run --task <task> --agents codex,codex --rounds 2 --json")
-	fmt.Fprintln(writer, "  convo-relay run --task <task> --recipe <id> [--input name=path] [--workspace current|head-copy] --json")
-	fmt.Fprintln(writer, "  convo-relay run --plan <file> --json")
-	fmt.Fprintln(writer, "  convo-relay run --plan <file> --blobs <dir> --json")
+	fmt.Fprintln(writer, "  convo-relay run --task <task> --agents codex,codex --rounds 2 [--detach] [--json]")
+	fmt.Fprintln(writer, "  convo-relay run --task <task> --recipe <id> [--input name=path] [--workspace current|head-copy] [--detach] [--json]")
+	fmt.Fprintln(writer, "  convo-relay run --plan <file> [--detach] [--json]")
+	fmt.Fprintln(writer, "  convo-relay run --plan <file> --blobs <dir> [--detach] [--json]")
 	fmt.Fprintln(writer, "  convo-relay resume <session-id-prefix> --mode steelman --rounds 1 --json")
 	fmt.Fprintln(writer, "  convo-relay list --home <relay-home> --json")
 	fmt.Fprintln(writer, "  convo-relay show <session-id-prefix> --json")

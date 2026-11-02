@@ -644,6 +644,9 @@ func v2Run(ctx context.Context, sess *session.Session, runtime relayv2.Runtime, 
 	if verbose {
 		deps.ProgressWriter = os.Stderr
 	}
+	if err := writeDetachedStartupAck(sess.Plan.SessionID); err != nil {
+		return nil, fmt.Errorf("acknowledge detached run startup: %w", err)
+	}
 	var runErr error
 	if resume {
 		_, runErr = engine.Resume(ctx, sess, deps, prompt, requestedTurns)
