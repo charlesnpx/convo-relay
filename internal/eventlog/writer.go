@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"sync"
+	"time"
 
 	"github.com/charlesnpx/convo-relay/v2/internal/blobstore"
 )
@@ -114,7 +115,7 @@ type Writer struct {
 // open time.
 func OpenWriter(sessionDir string, blobs BlobVerifier) (*Writer, error) {
 	root := filepath.Clean(sessionDir)
-	lease, err := acquireWriterLease(root)
+	lease, err := acquireWriterLeaseForOpen(root)
 	if err != nil {
 		return nil, err
 	}
@@ -174,6 +175,24 @@ func OpenWriter(sessionDir string, blobs BlobVerifier) (*Writer, error) {
 		blobs:   blobs,
 		nextSeq: uint64(len(events) + 1),
 	}, nil
+}
+
+// acquireWriterLeaseForOpen tolerates a short-lived lease held by a read-side
+// liveness probe. A probe uses the same non-blocking OS lock as writers, so a
+// bounded retry prevents that brief check from making a starting run fail.
+func acquireWriterLeaseForOpen(sessionDir string) (*WriterLease, error) {
+	deadline := time.Now().Add(100 * time.Millisecond)
+	for {
+		lease, err := acquireWriterLease(sessionDir, true)
+		if err == nil {
+			return lease, nil
+		}
+		var locked *WriterLockedError
+		if !errors.As(err, &locked) || !time.Now().Before(deadline) {
+			return nil, err
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
 }
 
 // Append assigns the next contiguous sequence, verifies all direct BlobRefs,

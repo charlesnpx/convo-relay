@@ -26,10 +26,31 @@ type WriterLease struct {
 // AcquireWriterLease acquires the same non-blocking OS lock used by Writer.
 // A WriterLockedError means an event writer currently owns the session.
 func AcquireWriterLease(sessionDir string) (*WriterLease, error) {
-	return acquireWriterLease(sessionDir)
+	return acquireWriterLease(sessionDir, true)
 }
 
-func acquireWriterLease(sessionDir string) (*WriterLease, error) {
+// ProbeWriterLease reports whether an event writer owns the session lock.
+// It only opens an existing lock file and releases any lock it acquires before
+// returning, so a read does not create or leave behind runtime lock state.
+func ProbeWriterLease(sessionDir string) (bool, error) {
+	lease, err := acquireWriterLease(sessionDir, false)
+	if err != nil {
+		var locked *WriterLockedError
+		if errors.As(err, &locked) {
+			return true, nil
+		}
+		return false, err
+	}
+	if lease == nil {
+		return false, nil
+	}
+	if err := lease.Release(); err != nil {
+		return false, err
+	}
+	return false, nil
+}
+
+func acquireWriterLease(sessionDir string, create bool) (*WriterLease, error) {
 	root, err := filepath.Abs(sessionDir)
 	if err != nil {
 		return nil, err
@@ -44,7 +65,14 @@ func acquireWriterLease(sessionDir string) (*WriterLease, error) {
 	}
 
 	runtimeDir := filepath.Join(root, "runtime")
-	if err := os.MkdirAll(runtimeDir, 0o700); err != nil {
+	if create {
+		if err := os.MkdirAll(runtimeDir, 0o700); err != nil {
+			return nil, err
+		}
+	} else if _, err := os.Lstat(runtimeDir); err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, nil
+		}
 		return nil, err
 	}
 	runtimeInfo, err := os.Lstat(runtimeDir)
@@ -65,10 +93,16 @@ func acquireWriterLease(sessionDir string) (*WriterLease, error) {
 		if pathInfo.Mode()&os.ModeSymlink != 0 || !pathInfo.Mode().IsRegular() {
 			return nil, errors.New("event writer lock must be a regular file")
 		}
+	} else if !create && errors.Is(err, os.ErrNotExist) {
+		return nil, nil
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return nil, err
 	}
-	file, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0o600)
+	flags := os.O_RDWR
+	if create {
+		flags |= os.O_CREATE
+	}
+	file, err := os.OpenFile(lockPath, flags, 0o600)
 	if err != nil {
 		return nil, err
 	}

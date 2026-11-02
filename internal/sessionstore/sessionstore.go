@@ -116,7 +116,7 @@ func ListSessions(home string, limit int) ([]map[string]any, error) {
 		if err != nil {
 			continue
 		}
-		statusView := sessionview.Status(sess.Plan, events)
+		statusView := sessionview.StatusWithLiveness(sess.Plan, events, sess.Root)
 		status := sessionview.PublicStatus(statusView.Status, statusView.StopReason)
 		createdAt, hasCreated := firstEventTime(events)
 		createdAtValue := any(nil)
@@ -208,9 +208,8 @@ func cleanSessionWithRemover(sessionDir string, removeSession func(string) error
 	return report, nil
 }
 
-// CleanupSessions removes stale running sessions under a limit. A free writer
-// lock is authoritative evidence that a running session is orphaned; force
-// bypasses that liveness check.
+// CleanupSessions removes event-derived running sessions whose writer lease is
+// free. Force bypasses that liveness check.
 func CleanupSessions(home string, limit int, force bool) (map[string]any, error) {
 	return cleanupSessionsWithRemover(home, limit, force, os.RemoveAll)
 }
@@ -222,7 +221,14 @@ func cleanupSessionsWithRemover(home string, limit int, force bool, removeSessio
 	}
 	marked := []any{}
 	for _, summary := range sessions {
-		if stringValue(summary["status"]) != "running" {
+		candidate, err := cleanupCandidate(summary)
+		if err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				continue
+			}
+			return nil, err
+		}
+		if !candidate {
 			continue
 		}
 		report, err := cleanSessionWithRemover(stringValue(summary["path"]), removeSession, force)
@@ -242,6 +248,25 @@ func cleanupSessionsWithRemover(home string, limit int, force bool, removeSessio
 		"orphaned_count": len(marked),
 		"orphaned":       marked,
 	}, nil
+}
+
+func cleanupCandidate(summary map[string]any) (bool, error) {
+	status := stringValue(summary["status"])
+	if status == "running" {
+		return true, nil
+	}
+	if status != "interrupted" {
+		return false, nil
+	}
+	sess, err := session.Open(stringValue(summary["path"]))
+	if err != nil {
+		return false, err
+	}
+	events, err := readEvents(sess)
+	if err != nil {
+		return false, err
+	}
+	return sessionview.Status(sess.Plan, events).Status == "running", nil
 }
 
 func readEvents(sess *session.Session) ([]eventlog.Event, error) {

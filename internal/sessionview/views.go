@@ -130,6 +130,29 @@ func Status(_ session.Plan, events []eventlog.Event) StatusView {
 	return view
 }
 
+// StatusWithLiveness derives the public session status from events and the
+// session writer lease. A terminal or awaiting-decision event state is kept as
+// derived; otherwise a held lease means running and a free lease means
+// interrupted. Probe errors leave the event-derived status unchanged.
+func StatusWithLiveness(value session.Plan, events []eventlog.Event, sessionDir string) StatusView {
+	view := Status(value, events)
+	if view.Terminal || view.Status == "awaiting_decision" {
+		return view
+	}
+	locked, err := eventlog.ProbeWriterLease(sessionDir)
+	if err != nil {
+		return view
+	}
+	if locked {
+		view.Status = "running"
+		view.StopReason = ""
+		return view
+	}
+	view.Status = "interrupted"
+	view.StopReason = "interrupted"
+	return view
+}
+
 // PublicStatus converts the durable status fields into the public CLI status
 // vocabulary without introducing another execution state.
 func PublicStatus(status string, stopReason string) string {

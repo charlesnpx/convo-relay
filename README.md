@@ -488,9 +488,11 @@ interruption is required:
 convo-relay control cancel a1b2c3d4
 ```
 
-After the owner receives `SIGINT`, the session derives as `interrupted`; use
-`resume` to continue its remaining work. `control cancel` does not send a
-signal itself.
+A session without a pending decision reports `running` while its writer lock
+is held and `interrupted` after the lock is released without a terminal event;
+use `resume` to continue its remaining work. `awaiting_decision` remains
+visible until the pending proposal is resolved. `control cancel` does not send
+a signal itself.
 
 Use `show --diff` for contested and withdrawn ledger evolution by round, and
 `show --proposals` to inspect dynamic spawn proposals. Use `control approve`
@@ -598,6 +600,12 @@ report from that authority rather than from parallel metadata or transcript
 files.
 
 `convo-relay show <id> --json` returns:
+
+Except for `awaiting_decision`, a session without a terminal event reports
+`running` while its event writer lock is held and `interrupted` after the lock
+is free. `attention_required` is true only for `interrupted`, `failed`,
+`invalid_result`, and `awaiting_decision` statuses. For example, the `running`
+session below does not require attention.
 
 ```json
 {
