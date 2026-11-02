@@ -252,10 +252,7 @@ func cleanupSessionsWithRemover(home string, limit int, force bool, removeSessio
 
 func cleanupCandidate(summary map[string]any) (bool, error) {
 	status := stringValue(summary["status"])
-	if status == "running" {
-		return true, nil
-	}
-	if status != "interrupted" {
+	if status != "running" && status != "interrupted" {
 		return false, nil
 	}
 	sess, err := session.Open(stringValue(summary["path"]))

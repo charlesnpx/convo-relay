@@ -14,6 +14,7 @@ import (
 	"github.com/charlesnpx/convo-relay/v2/internal/eventlog"
 	"github.com/charlesnpx/convo-relay/v2/internal/plan"
 	"github.com/charlesnpx/convo-relay/v2/internal/session"
+	"github.com/charlesnpx/convo-relay/v2/internal/sessionview"
 	"github.com/charlesnpx/convo-relay/v2/internal/workspace"
 )
 
@@ -197,6 +198,55 @@ func TestCleanSessionUsesSuppliedRemover(t *testing.T) {
 	}
 	if forced["orphaned_count"] != 1 || len(forceCalls) != 1 || forceCalls[0] != active.Root {
 		t.Fatalf("forced cleanup report = %#v, remover calls = %#v", forced, forceCalls)
+	}
+}
+
+func TestCleanupDoesNotSelectSessionWithUnfinishedAttempt(t *testing.T) {
+	home := t.TempDir()
+	sess := createTestSession(t, home, "unfinished-attempt", testTime(1), false)
+	writer, err := sess.EventWriter(nil)
+	if err != nil {
+		t.Fatalf("open unfinished-attempt writer: %v", err)
+	}
+	defer writer.Close()
+	if _, err := writer.Append(eventlog.NewEvent(
+		"unfinished-attempt-started",
+		testTime(1).Add(time.Second),
+		eventlog.AttemptStartedPayload{ActorID: "actor-a", Attempt: 1},
+	)); err != nil {
+		t.Fatalf("append unfinished attempt: %v", err)
+	}
+
+	events, err := readEvents(sess)
+	if err != nil {
+		t.Fatalf("read unfinished-attempt events: %v", err)
+	}
+	if got := sessionview.Status(sess.Plan, events).Status; got != "interrupted" {
+		t.Fatalf("event-derived status = %q, want interrupted", got)
+	}
+	summaries, err := ListSessions(home, 10)
+	if err != nil {
+		t.Fatalf("list unfinished-attempt session: %v", err)
+	}
+	if len(summaries) != 1 || summaries[0]["status"] != "running" {
+		t.Fatalf("listed session = %#v, want running from the active writer lease", summaries)
+	}
+
+	removed := []string{}
+	for _, force := range []bool{false, true} {
+		report, err := cleanupSessionsWithRemover(home, 10, force, func(path string) error {
+			removed = append(removed, path)
+			return nil
+		})
+		if err != nil {
+			t.Fatalf("cleanup unfinished-attempt session (force=%t): %v", force, err)
+		}
+		if report["orphaned_count"] != 0 {
+			t.Fatalf("cleanup selected unfinished-attempt session (force=%t): %#v", force, report)
+		}
+	}
+	if len(removed) != 0 {
+		t.Fatalf("remover called for unfinished-attempt session: %#v", removed)
 	}
 }
 
