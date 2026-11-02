@@ -104,7 +104,6 @@ func v2ExportReport(sess *session.Session, jsonMode bool) (map[string]any, error
 func v2FormatTranscriptMarkdown(report map[string]any) string {
 	meta, _ := report["meta"].(map[string]any)
 	transcript := v2AsSlice(report["transcript"])
-	diagnostics, _ := report["diagnostics"].(map[string]any)
 	settled, contested, withdrawn := v2LedgerCounts(meta["ledger"])
 	roundsLabel := fmt.Sprintf("%v/%v", v2ValueOr(meta["actual_rounds"], len(transcript)), v2ValueOr(meta["max_rounds"], "?"))
 	switch meta["round_limit_mode"] {
@@ -113,10 +112,7 @@ func v2FormatTranscriptMarkdown(report map[string]any) string {
 	case "fixed":
 		roundsLabel += " (fixed)"
 	}
-	attention := v2String(meta["status"]) != "completed"
-	if value, ok := diagnostics["attention_required"].(bool); ok {
-		attention = value
-	}
+	attention := v2AttentionRequired(v2String(meta["status"]))
 	lines := []string{
 		"# Relay Dialogue",
 		"",
@@ -301,15 +297,16 @@ func v2SessionHealthReport(sess *session.Session) (map[string]any, error) {
 		return nil, err
 	}
 	status := v2String(report["status"])
+	attentionRequired := v2AttentionRequired(status)
 	healthStatus := "ok"
-	if status != "completed" {
+	if attentionRequired {
 		healthStatus = "attention_required"
 	}
 	diagnostics, _ := report["diagnostics"].(map[string]any)
 	if diagnostics == nil {
 		diagnostics = map[string]any{}
 	}
-	diagnostics["attention_required"] = healthStatus != "ok"
+	diagnostics["attention_required"] = attentionRequired
 	result := map[string]any{
 		"scope":       "session",
 		"status":      healthStatus,
@@ -326,6 +323,15 @@ func v2SessionHealthReport(sess *session.Session) (map[string]any, error) {
 		result["root"] = root
 	}
 	return result, nil
+}
+
+func v2AttentionRequired(status string) bool {
+	switch status {
+	case "interrupted", "failed", "invalid_result", "awaiting_decision":
+		return true
+	default:
+		return false
+	}
 }
 
 func v2GlobalHealthReport(settingsPath string) map[string]any {

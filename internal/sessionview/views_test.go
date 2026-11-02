@@ -2,6 +2,8 @@ package sessionview
 
 import (
 	"bytes"
+	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/charlesnpx/convo-relay/v2/internal/blobstore"
@@ -167,6 +169,39 @@ func TestStatusDerivesInterruptedFromAbandonedAttempt(t *testing.T) {
 	status = Status(plan, events)
 	if status.Terminal || status.Status != "running" || status.StopReason != "" {
 		t.Fatalf("classified failure status = %#v", status)
+	}
+}
+
+func TestStatusWithLivenessUsesWriterLeaseForUnfinishedAttempt(t *testing.T) {
+	root := t.TempDir()
+	events := []eventlog.Event{
+		{Seq: 1, Type: eventlog.AttemptStarted, Payload: eventlog.AttemptStartedPayload{ActorID: "actor-a", Attempt: 1}},
+	}
+	lease, err := eventlog.AcquireWriterLease(root)
+	if err != nil {
+		t.Fatalf("acquire writer lease: %v", err)
+	}
+	status := StatusWithLiveness(viewPlan(), events, root)
+	if status.Status != "running" || status.StopReason != "" {
+		t.Fatalf("held writer status = %#v, want running", status)
+	}
+	if err := lease.Release(); err != nil {
+		t.Fatalf("release writer lease: %v", err)
+	}
+	status = StatusWithLiveness(viewPlan(), events, root)
+	if status.Status != "interrupted" || status.StopReason != "interrupted" {
+		t.Fatalf("free writer status = %#v, want interrupted", status)
+	}
+}
+
+func TestStatusWithLivenessMarksIdleUnlockedSessionInterruptedWithoutCreatingLock(t *testing.T) {
+	root := t.TempDir()
+	status := StatusWithLiveness(viewPlan(), nil, root)
+	if status.Status != "interrupted" || status.StopReason != "interrupted" {
+		t.Fatalf("idle unlocked status = %#v, want interrupted", status)
+	}
+	if _, err := os.Stat(filepath.Join(root, "runtime")); !os.IsNotExist(err) {
+		t.Fatalf("status probe created runtime directory: err=%v", err)
 	}
 }
 

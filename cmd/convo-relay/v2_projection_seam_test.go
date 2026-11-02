@@ -53,6 +53,22 @@ func TestV2CancellationProjectionSeam(t *testing.T) {
 		t.Fatal("provider did not reach the cancellable turn")
 	}
 	sessionDir := u2db3SessionDir(t, env.relayHome, "cancelled")
+	liveShow := env.run(t, "show", "--home", env.relayHome, "--json", "cancelled")
+	u2db3RequireExit(t, liveShow, 0)
+	if got := u2db3Status(t, u2db3Report(t, liveShow)); got != "running" {
+		t.Fatalf("live cancellation status = %q", got)
+	}
+	liveDoctor := env.run(t, "doctor", "--home", env.relayHome, "--session-id", "cancelled", "--json")
+	u2db3RequireExit(t, liveDoctor, 0)
+	doctor := u2db3Report(t, liveDoctor)
+	health, ok := doctor["health"].(map[string]any)
+	if !ok || health["status"] != "ok" {
+		t.Fatalf("live session health = %#v", doctor["health"])
+	}
+	diagnostics, ok := health["diagnostics"].(map[string]any)
+	if !ok || diagnostics["attention_required"] != false {
+		t.Fatalf("live session diagnostics = %#v", health["diagnostics"])
+	}
 	beforeCancel, err := os.ReadFile(filepath.Join(sessionDir, "events.jsonl"))
 	if err != nil {
 		t.Fatalf("read events before control cancel: %v", err)
