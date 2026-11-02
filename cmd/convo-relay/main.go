@@ -682,6 +682,8 @@ func runRelay(args []string) {
 	facilitatorEffort := flags.String("facilitator-effort", "", "Facilitator effort override")
 	taskPlanPath := flags.String("task-plan", "", "Attach a launch task plan from a JSON or text file")
 	quick := flags.Bool("quick", false, "Force exactly 3 rounds")
+	verbose := flags.Bool("verbose", false, "Print round progress to stderr")
+	verboseAlias := flags.Bool("v", false, "Alias for --verbose")
 	output := ""
 	_ = flags.String("context", "", "Attach context text files; may be repeated. Limits: 1 MiB per file, 2 MiB total")
 	_ = flags.String("skill", "", "Attach capability text files; may be repeated")
@@ -693,7 +695,8 @@ func runRelay(args []string) {
 	effortA := flags.String("effort-a", "", "Effort for slot_0")
 	modelB := flags.String("model-b", "", "Model for slot_1")
 	effortB := flags.String("effort-b", "", "Effort for slot_1")
-	jsonOutput := flags.Bool("json", false, "Emit machine-readable run JSON")
+	jsonOutput := flags.Bool("json", false, "Emit machine-readable run JSON or a detached launch receipt")
+	detach := flags.Bool("detach", false, "Run in a separate session and return a launch receipt")
 	extracted, cleanedArgs, err := extractMultiValueFlags(args, "context", "skill", "recipe-file", "generated-recipe-file")
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error: %s\n", err)
@@ -702,6 +705,16 @@ func runRelay(args []string) {
 	if err := parseFlags(flags, cleanedArgs); err != nil {
 		os.Exit(2)
 	}
+	if *detach && os.Getenv(detachedStartupAckEnv) == "" {
+		receipt, err := launchDetachedRun(args, *relayHome)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "error: %s\n", err)
+			os.Exit(1)
+		}
+		writeDetachedLaunchReceipt(receipt, *jsonOutput)
+		return
+	}
+	verboseOutput := *verbose || *verboseAlias
 	if *task == "" && len(flags.Args()) > 0 {
 		*task = strings.Join(flags.Args(), " ")
 	}
@@ -725,6 +738,7 @@ func runRelay(args []string) {
 		defer stop()
 		result, err := v2RunSuppliedPlan(ctx, v2SuppliedPlanRunOptions{
 			SessionDir:   *sessionDir,
+			Verbose:      verboseOutput,
 			RelayHome:    *relayHome,
 			PlanPath:     *planPath,
 			BlobsPath:    *blobsPath,
@@ -768,6 +782,7 @@ func runRelay(args []string) {
 		result, err := v2RunRecipe(ctx, v2RecipeRunOptions{
 			SessionDir:          *sessionDir,
 			SessionID:           *sessionID,
+			Verbose:             verboseOutput,
 			RelayHome:           *relayHome,
 			Task:                *task,
 			RecipeID:            *recipeID,
@@ -808,6 +823,7 @@ func runRelay(args []string) {
 	result, err := v2RunOrdinary(ctx, v2OrdinaryRunOptions{
 		SessionDir:          *sessionDir,
 		SessionID:           *sessionID,
+		Verbose:             verboseOutput,
 		RelayHome:           *relayHome,
 		Task:                *task,
 		Agents:              *agentsRaw,
@@ -1100,6 +1116,8 @@ func runResume(args []string) {
 	_ = flags.String("facilitator-model", "", "Facilitator model override")
 	_ = flags.String("facilitator-effort", "", "Facilitator effort override")
 	quick := flags.Bool("quick", false, "Force exactly 3 additional rounds")
+	verbose := flags.Bool("verbose", false, "Print round progress to stderr")
+	verboseAlias := flags.Bool("v", false, "Alias for --verbose")
 	output := ""
 	flags.StringVar(&output, "output", "", "Write transcript or JSON export to file")
 	flags.StringVar(&output, "o", "", "Alias for --output")
@@ -1123,7 +1141,11 @@ func runResume(args []string) {
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), commandInterruptSignals()...)
 	defer stop()
-	result, err := v2RunResume(ctx, resolvedSessionDir, v2ResumeOptions{Prompt: *prompt, RequestedTurns: effectiveRounds})
+	result, err := v2RunResume(ctx, resolvedSessionDir, v2ResumeOptions{
+		Prompt:         *prompt,
+		RequestedTurns: effectiveRounds,
+		Verbose:        *verbose || *verboseAlias,
+	})
 	writeRunnerResult(result, err, *jsonOutput, output)
 }
 
@@ -1432,6 +1454,14 @@ func writeRunnerResult(result map[string]any, err error, jsonOutput bool, output
 	}
 }
 
+// writeLaunchSessionLine writes directly to the stderr destination before the
+// engine starts provider work. os.Stderr is unbuffered, so redirected output
+// is visible immediately.
+func writeLaunchSessionLine(writer io.Writer, sessionID string) error {
+	_, err := fmt.Fprintf(writer, "Session %s\n", sessionID)
+	return err
+}
+
 func emitRunnerResult(writer io.Writer, result map[string]any, runErr error, jsonOutput bool, outputPath string) error {
 	if result == nil {
 		if runErr != nil {
@@ -1554,10 +1584,10 @@ func usage() {
 
 func usageTo(writer io.Writer) {
 	fmt.Fprintln(writer, "usage:")
-	fmt.Fprintln(writer, "  convo-relay run --task <task> --agents codex,codex --rounds 2 --json")
-	fmt.Fprintln(writer, "  convo-relay run --task <task> --recipe <id> [--input name=path] [--workspace current|head-copy] --json")
-	fmt.Fprintln(writer, "  convo-relay run --plan <file> --json")
-	fmt.Fprintln(writer, "  convo-relay run --plan <file> --blobs <dir> --json")
+	fmt.Fprintln(writer, "  convo-relay run --task <task> --agents codex,codex --rounds 2 [--detach] [--json]")
+	fmt.Fprintln(writer, "  convo-relay run --task <task> --recipe <id> [--input name=path] [--workspace current|head-copy] [--detach] [--json]")
+	fmt.Fprintln(writer, "  convo-relay run --plan <file> [--detach] [--json]")
+	fmt.Fprintln(writer, "  convo-relay run --plan <file> --blobs <dir> [--detach] [--json]")
 	fmt.Fprintln(writer, "  convo-relay resume <session-id-prefix> --mode steelman --rounds 1 --json")
 	fmt.Fprintln(writer, "  convo-relay list --home <relay-home> --json")
 	fmt.Fprintln(writer, "  convo-relay show <session-id-prefix> --json")

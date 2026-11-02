@@ -1,18 +1,18 @@
 ---
 name: "relay:steer"
-description: "Queue new operator context or direction into an already running convo-relay session with `convo-relay control steer`. Use when the user invokes $relay:steer or asks to steer, redirect, add context to, or pass instructions into the current running relay."
-argument-hint: "<new context or direction for the running relay>"
+description: "Queue new operator context or direction for the next resume of a convo-relay session with `convo-relay control steer`. Use when the user invokes $relay:steer or asks to steer, redirect, add context to, or pass instructions into a relay."
+argument-hint: "<new context or direction for the next resume>"
 ---
 
-You are steering an already-running `convo-relay` session. Your job is to identify the intended live session, distill the user's new direction, and queue it with `convo-relay control steer`.
+You are adding direction to an existing `convo-relay` session. `convo-relay control steer` only accepts a session that is not running; the queued direction takes effect at its next resume. Identify the session, distill the user's new direction, and queue it with `convo-relay control steer`.
 
 ## Identify the target relay
 
 Use the conversation first. The target is obvious when:
 
 - the user named a session ID or prefix
-- this conversation launched exactly one relay that is still running
-- the user clearly refers to the most recent running relay and there is only one plausible running session
+- this conversation launched exactly one relay and the user refers to it
+- the user clearly refers to the most recent relevant relay and there is only one plausible session
 
 If the target is not obvious, inspect sessions:
 
@@ -20,13 +20,15 @@ If the target is not obvious, inspect sessions:
 convo-relay list --limit 10
 ```
 
-For plausible running sessions, get enough context to summarize them:
+For plausible sessions, get enough context to summarize them:
 
 ```bash
 convo-relay show <session-id> --json
 ```
 
-Use `show --json` to inspect `meta.task`, `meta.title`, `meta.status`, `summary`, agents, and the latest transcript entry. Do not infer failure from a quiet running session.
+Use the top-level `status` and `stop_reason`, `summary`, `meta`, `diagnostics`, `transcript`, `incomplete`, and `export_ready` in `show --json` to identify the session and summarize it. Do not infer failure from a quiet running session.
+
+`doctor --json` wraps health under `health`; its attention flag is `health.diagnostics.attention_required`.
 
 If multiple running relays are plausible, ask the user to choose and do not queue anything yet:
 
@@ -36,7 +38,7 @@ Which relay were you referring to?
 2. <session-id> - <short summary: status, agents, rounds, topic>
 ```
 
-If no running relay exists, say that there is no running relay to steer. If there is a completed or interrupted relevant session, suggest `convo-relay resume <session-id> "<direction>"` instead.
+If the session is `running`, do not queue steering yet. The operator must interrupt the relay process first; after it stops, queue the direction for the next resume. If it is `interrupted`, queue the direction for the next resume. If it is `awaiting_decision`, inspect and resolve the pending proposal before deciding whether to queue direction or resume. For `failed` or `invalid_result`, inspect the session report before choosing a recovery action. If the session is `completed`, continue it with `convo-relay resume <session-id> "<direction>" --rounds <N>`; this grants up to N additional turns and the relay may stop earlier if it converges. `--quick` grants three additional participant turns on resume. Resume rejects new `--context` or `--skill` files and does not apply `--max-rounds` or resume-time settings, mode, timeout, model, effort, facilitator, or backend-replacement overrides.
 
 ## Queue the steering
 

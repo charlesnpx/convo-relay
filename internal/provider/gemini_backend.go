@@ -58,7 +58,7 @@ func (b *geminiBackend) RunTurn(ctx context.Context, prompt string, options Turn
 	}
 	result, err := runSubprocess(ctx, b.buildCommand(), prompt, b.cwd, b.env(), options.TimeoutSeconds)
 	providerResult := newProviderResult("gemini", result)
-	text, sessionRef := parseGeminiOutput(result.Stdout)
+	text, sessionRef, structuredError := parseGeminiOutput(result.Stdout)
 	if sessionRef != "" {
 		b.sessionRef = sessionRef
 	} else if b.sessionRef == "" && text != "" {
@@ -70,15 +70,18 @@ func (b *geminiBackend) RunTurn(ctx context.Context, prompt string, options Turn
 	if err != nil {
 		return TurnResult{}, err
 	}
+	errorDetail := collapseWhitespace(strings.Join([]string{structuredError, result.Stderr}, " "))
 	if result.TimedOut {
+		if retryableError := classifyRetryableProviderError(errorDetail); retryableError != "" {
+			providerResult.RetryableError = retryableError
+			return TurnResult{ProviderResult: providerResult}, RetryableProviderError{Label: b.label, Detail: retryableError}
+		}
+		if errorDetail != "" && providerFailureCategory(errorDetail) == "auth" {
+			return TurnResult{ProviderResult: providerResult}, BackendRunError{Label: b.label, Detail: errorDetail}
+		}
 		if text == "" {
 			providerResult.Warnings = append(providerResult.Warnings, fmt.Sprintf("gemini timed out after %ds with no recoverable response", options.TimeoutSeconds))
 			text = fmt.Sprintf("[%s timed out after %ds]", b.label, options.TimeoutSeconds)
-		} else if retryableError := classifyRetryableProviderError(text); retryableError != "" {
-			providerResult.RetryableError = retryableError
-			return TurnResult{ProviderResult: providerResult}, RetryableProviderError{Label: b.label, Detail: retryableError}
-		} else if providerFailureCategory(text) == "auth" {
-			return TurnResult{ProviderResult: providerResult}, BackendRunError{Label: b.label, Detail: text}
 		} else {
 			providerResult.Recovered = true
 			providerResult.RecoverySource = "output"
@@ -86,26 +89,22 @@ func (b *geminiBackend) RunTurn(ctx context.Context, prompt string, options Turn
 		}
 	} else if result.ReturnCode != 0 {
 		if text == "" {
-			detail := strings.TrimSpace(result.Stderr)
-			if detail == "" {
-				detail = strings.TrimSpace(result.Stdout)
-			}
+			detail := errorDetail
 			if detail == "" {
 				detail = fmt.Sprintf("process exited %d", result.ReturnCode)
 			}
-			detail = collapseWhitespace(detail)
 			if retryableError := classifyRetryableProviderError(detail); retryableError != "" {
 				providerResult.RetryableError = retryableError
 				return TurnResult{ProviderResult: providerResult}, RetryableProviderError{Label: b.label, Detail: retryableError}
 			}
 			return TurnResult{ProviderResult: providerResult}, BackendRunError{Label: b.label, Detail: detail}
 		}
-		if retryableError := classifyRetryableProviderError(text); retryableError != "" {
+		if retryableError := classifyRetryableProviderError(errorDetail); retryableError != "" {
 			providerResult.RetryableError = retryableError
 			return TurnResult{ProviderResult: providerResult}, RetryableProviderError{Label: b.label, Detail: retryableError}
 		}
-		if providerFailureCategory(text) == "auth" {
-			return TurnResult{ProviderResult: providerResult}, BackendRunError{Label: b.label, Detail: text}
+		if errorDetail != "" && providerFailureCategory(errorDetail) == "auth" {
+			return TurnResult{ProviderResult: providerResult}, BackendRunError{Label: b.label, Detail: errorDetail}
 		}
 		providerResult.Recovered = true
 		providerResult.RecoverySource = "output"
@@ -248,29 +247,37 @@ func (b *geminiBackend) ensureGeminiHome() error {
 	return nil
 }
 
-func parseGeminiOutput(stdout string) (string, string) {
+func parseGeminiOutput(stdout string) (string, string, string) {
 	raw := strings.TrimSpace(stdout)
 	if raw == "" {
-		return "", ""
+		return "", "", ""
 	}
 	var data map[string]any
 	if err := json.Unmarshal([]byte(raw), &data); err != nil {
-		return raw, ""
+		return raw, "", ""
 	}
+	errorText := geminiErrorText(data)
 	for _, key := range []string{"response", "text", "content", "message"} {
 		if value, ok := data[key].(string); ok && strings.TrimSpace(value) != "" {
-			return strings.TrimSpace(value), geminiSessionRef(data)
+			return strings.TrimSpace(value), geminiSessionRef(data), errorText
 		}
 	}
-	if errorObject, ok := data["error"].(map[string]any); ok {
-		if message, ok := errorObject["message"].(string); ok && strings.TrimSpace(message) != "" {
-			return strings.TrimSpace(message), geminiSessionRef(data)
+	if _, hasError := data["error"]; hasError {
+		return "", geminiSessionRef(data), errorText
+	}
+	return raw, "", ""
+}
+
+func geminiErrorText(data map[string]any) string {
+	switch value := data["error"].(type) {
+	case string:
+		return strings.TrimSpace(value)
+	case map[string]any:
+		if message, ok := value["message"].(string); ok {
+			return strings.TrimSpace(message)
 		}
 	}
-	if errorText, ok := data["error"].(string); ok && strings.TrimSpace(errorText) != "" {
-		return strings.TrimSpace(errorText), geminiSessionRef(data)
-	}
-	return raw, ""
+	return ""
 }
 
 func geminiSessionRef(data map[string]any) string {

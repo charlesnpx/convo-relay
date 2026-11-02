@@ -69,7 +69,7 @@ func BuildReport(sess *session.Session, options ProjectionOptions) (relayresult.
 	if err != nil {
 		return relayresult.Result{}, fmt.Errorf("open v2 blobs: %w", err)
 	}
-	statusView := sessionview.Status(sess.Plan, events)
+	statusView := sessionview.StatusWithLiveness(sess.Plan, events, sess.Root)
 	transcriptView, err := sessionview.Transcript(sess.Plan, events, blobs)
 	if err != nil {
 		return relayresult.Result{}, fmt.Errorf("derive v2 transcript: %w", err)
@@ -196,6 +196,14 @@ func BuildGraphReport(sess *session.Session) (map[string]any, error) {
 		return nil, err
 	}
 	view := sessionview.Graph(sess.Plan, events)
+	rootStatus := sessionview.StatusWithLiveness(sess.Plan, events, sess.Root)
+	rootNodeID := "session:" + sess.Plan.SessionID
+	for index := range view.Nodes {
+		if view.Nodes[index].ID == rootNodeID {
+			view.Nodes[index].Status = rootStatus.Status
+			break
+		}
+	}
 	nodes := make(map[string]any, len(view.Nodes))
 	for _, node := range view.Nodes {
 		nodes[node.ID] = map[string]any{
@@ -243,6 +251,9 @@ func publicTranscript(value session.Plan, transcript sessionview.TranscriptView,
 		case eventlog.FacilitatorRole:
 			ledger, ok := ledgerDocument(entry.Text)
 			if ok {
+				if len(participantIndexes) < 2 {
+					ledger["contested"] = []any{}
+				}
 				latestLedger = ledger
 			}
 			index, found := participantIndexes[entry.Round]

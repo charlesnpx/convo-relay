@@ -40,13 +40,13 @@ Based on the nature of the request and the conversation context, decide:
 
 Most requests will be adversarial or steelman. Default to **adversarial** when uncertain.
 
-**Rounds**: Default to auto-stop mode. Let the relay continue until it converges: either the facilitator has no contested disagreements left, or both sides explicitly signal completion. Use `--max-rounds` to raise or lower the safety cap when needed. Use `--quick` only for a strict 3-round relay. Use `--rounds N` only when the user explicitly wants an exact fixed number of rounds.
+**Rounds**: Default to auto-stop mode. The relay stops when the facilitator's ledger has no contested items and at least one settled or withdrawn item after both participants have replied, or when the completion-marker string `[[CONVO-RELAY: COMPLETE]]` occurs in both participants' latest turns. Participants are instructed to emit it as a standalone line; detection checks for the marker string in each turn. An empty-ledger stall can also stop with `stop_reason: stalled_no_ledger_signal`. Use `--max-rounds` to change the safety cap. `--quick` sets three participant turns for `run` or three additional participant turns for `resume`. Use `--rounds N` only when the user explicitly wants a fixed turn budget.
 
 **Agent pairing**: Default to `--agents codex,claude`. Consider `--agents claude,codex` if you want the opening turn to come from a different perspective than what's been discussed. Use `codex,gemini`, same-backend pairs, or single-value shorthand when that comparison fits the request. Mixed pairs default to a Codex facilitator. `--agents claude`, `--agents codex`, or `--agents gemini` means two slots plus a facilitator on that backend. The CLI flag remains `--agents`; approval previews use `Recipes/slots` because each slot value may be a direct backend profile or builtin backend shorthand.
 
 **Slot overrides**: The first backend is agent A (`slot_0`) and the second is agent B (`slot_1`). Only add `--model-a`, `--effort-a`, `--model-b`, or `--effort-b` when the user has asked for specific models or effort levels, or there is a clear reason to bias one slot.
 
-**Context files**: Identify the 2-5 most relevant files from the conversation — the code under discussion, architecture docs, CLAUDE.md, etc. Pass these via `--context`. Don't dump everything; pick what grounds the discussion. Context files must be UTF-8 text, up to 1 MiB each and 2 MiB total; the CLI labels them as `ctx1`, `ctx2`, persists digests, and asks agents to cite those labels when relevant.
+**Context files**: Identify the 2-5 most relevant text files from the conversation — the code under discussion, architecture docs, etc. Pass these via `--context`; it accepts text files only, up to 1 MiB each and 2 MiB total. Name the worktree or Git ref that contains every cited file in the task brief, and check that checkout's branch and working-tree state before launch. The CLI labels supplied files as `ctx1`, `ctx2`, persists digests, and asks agents to cite those labels when relevant.
 
 **Investigation mode**: Default to `--investigation auto` for code, repo, data, or operational questions. This tells agents to inspect files/data before empirical claims and cite file paths or launch context labels. Use `--investigation normal` only for conceptual debate where evidence citations would be distracting. Use `--investigation context_only` when the user provided enough context and agents should not explore beyond those files.
 
@@ -86,34 +86,39 @@ Use `Recipe sources: none` and omit the `Generated/transient recipe preview` blo
 
 ## Step 4: Run the relay
 
-Once approved, launch the relay using the Bash tool with `run_in_background: true`:
+Once approved, use native `run --detach` on macOS or Linux. Foreground execution remains the default, and `--detach` applies only to `run`. Do not add shell backgrounding or manual output redirections:
 
 ```bash
-convo-relay run "<task brief>" --mode <mode> --agents <backend_a,backend_b> --investigation <mode> --context <files...> --verbose
+session_id="relay-$(date +%Y%m%d-%H%M%S)-$$-$RANDOM"
+convo-relay run "<task brief>" --session-id "$session_id" \
+  --mode adversarial --agents codex,claude --investigation auto --detach --verbose
 ```
+
+The text receipt is `Detached session <id>` followed by `Log: <path>`. With `--json`, the receipt has `kind: "launch_receipt"`, `session_id`, and `log_path`. The unique log is under the selected relay home's `logs` directory; stdin is null and stdout/stderr, including `--verbose` progress, are captured there. A zero exit from the launch command confirms startup setup reached its acknowledgment; it does not mean the relay has completed. Inspect the returned log path for startup or provider failures.
+
+Always provide a unique `--session-id` on flag-based `run` commands so the caller can refer to the session without searching `list`. A supplied immutable plan already carries its session ID; `run --plan` rejects `--session-id` as a structural override.
 
 When the caller already has a complete immutable plan document, use the direct
 entry point instead of reconstructing it from flags:
 
 ```bash
-convo-relay run --plan <plan.json> [--blobs <blob-directory>] --verbose
+plan_file="/path/to/plan.json"
+convo-relay run --plan "$plan_file" --detach --verbose
 ```
 
 The plan is used as written and must contain its own execution values. If it
-contains payload references, `--blobs` points to a directory containing
-`sha256/<lowercase-hex-digest>` files.
+contains payload references, add `--blobs <directory>` for a directory
+containing `sha256/<lowercase-hex-digest>` files.
 
-Do **not** append `&` — the `run_in_background` parameter handles backgrounding. You will be automatically notified when the process completes.
-
-Always include `--verbose`. The command prints `Session <8-char-id>` to stderr immediately on launch — capture this session ID.
+Always include `--verbose`. The native detached launcher supplies null stdin and captures stdout/stderr in its unique log.
 
 Add `--max-rounds <N>` when you want to adjust the auto-stop cap. Add `--rounds <N>` only when the user wants an exact fixed round count.
 
 ### Execution model
 
-After launching, tell the user the session ID and that the relay is running. Use the current tool's normal long-running command behavior: if it provides a completion notification or command-session handle, wait on that handle when you need the final result; otherwise return control to the user with the session ID. Continue responding to the user normally while waiting.
+Report the launch receipt and session ID. A detached `run` returns after startup acknowledgment, so do not wait on the launcher command's completion handle for relay completion. Use `convo-relay show <session-id> --json` to follow the session. `resume` remains a foreground command; it does not support `--detach`. If the tool returns a foreground command-session handle for `resume`, wait on that handle for the resume process to finish.
 
-When the relay completes, proceed to Step 5 (present results).
+After `show --json` reports `completed`, proceed to Step 5 (present results).
 
 ### Interim status
 
@@ -123,13 +128,11 @@ If the user asks for status while the relay is running, check the session immedi
 convo-relay show <session-id> --json
 ```
 
-Report completed rounds, session status, latest turn summary, ledger counts, and which backend is likely active now. Track what you already summarized in this conversation so repeated status requests report only new rounds or materially changed metadata.
-
-Status handling should be practical and non-refusal-shaped: perform the requested status check, wait for the active command handle, or state the current known session ID and what command can be run externally.
+Use the top-level `status` and `stop_reason`, `summary` for round and ledger counts, `meta` for task and session details, `transcript` for turns, `diagnostics` for recovery facts, and `incomplete` / `export_ready` for export suitability. Report completed rounds, session status, latest turn summary, ledger counts, and which backend is likely active now. Track what you already summarized in this conversation so repeated status requests report only new rounds or materially changed metadata.
 
 ### Graph and portable export inspection
 
-Use the transcript commands for ordinary status and summaries. Use graph or portable-export commands only when the user asks to inspect execution internals, child relay artifacts, a portable export, or debug state:
+Use `convo-relay show <session-id>` for ordinary transcript inspection. To save a transcript or JSON report to a file, use `convo-relay export create <session-id> -o <file>` (add `--json` for JSON). Use graph or portable-export commands only when the user asks to inspect execution internals, child relay artifacts, a portable export, or debug state:
 
 ```bash
 convo-relay show <session-id> --graph --json
@@ -144,6 +147,9 @@ event log. Treat BlobRef values as path-independent payload references. Use
 ### Status interpretation
 
 - If the relay is still running with no completed rounds yet, say that the opening turn is still in progress rather than speculating that the relay is stuck.
+- Public session statuses are `running`, `interrupted`, `awaiting_decision`, `completed`, `failed`, and `invalid_result`. A nonterminal session with a held writer lock is `running`; without the lock it is `interrupted`. `awaiting_decision` means an unresolved proposal needs an operator decision. `invalid_result` is a failed result-validation status.
+- Treat `running` as active work. `completed` is ready for transcript export and summary. `failed` and `invalid_result` are failures; inspect the session report and detached log. `interrupted` and `awaiting_decision` need operator action, so do not keep waiting or report success: inspect partial state and decide whether to resume, or resolve the pending proposal.
+- `doctor <session-id> --json` wraps health under `health`; its attention flag is `health.diagnostics.attention_required`. It is true for `interrupted`, `failed`, `invalid_result`, and `awaiting_decision`, and false for `running` and `completed`.
 - Never say you cannot summarize until the relay finishes. Summarize what is known, label what is pending.
 - Long silent periods are normal. One backend may think for minutes before the transcript changes.
 - Do not cancel or restart a relay just because the first turn is taking several minutes.
@@ -151,7 +157,7 @@ event log. Treat BlobRef values as path-independent payload references. Use
 
 ## Step 5: Present results
 
-Read the transcript file from the path printed by the command and present a structured summary:
+Read the session with `convo-relay show <session-id>`. If a file is needed, create it with `convo-relay export create <session-id> -o <file>`, then read that file. Present a structured summary:
 
 - **What was settled** — points both agents converged on
 - **What remains contested** — where they disagreed, with each position summarized
@@ -164,18 +170,17 @@ Include the session ID so the dialogue can be resumed if needed.
 
 Completion / failure handling:
 
-- If the process exits `0`: read the final transcript/output and summarize normally.
-- If the process is still running and the user asks for progress: inspect the live session and summarize the partial state instead of refusing.
-- If the process is still running and the user did not ask for progress: keep waiting and say only that the relay is still in progress.
-- If the process times out or is interrupted: inspect the latest session state, report whatever partial output exists, and offer `convo-relay resume`.
-- If the process exits nonzero: report the actual CLI error from stderr/stdout. Do not describe the relay as broken solely because the session files did not update quickly enough.
-- If you need deeper confirmation while the relay is still running, prefer checking whether the relay PID is alive before making any failure claim.
+- A zero exit from `run --detach` is only a successful launch receipt. Check `show <session-id> --json` for relay completion.
+- When status is `completed`, export the actual session transcript with `convo-relay export create <session-id> -o <file>` before summarizing.
+- When status is `running` and the user asks for progress, summarize the live session. For `failed` or `invalid_result`, report the failure and inspect the returned log; for `interrupted` or `awaiting_decision`, report the needed action and any partial transcript.
+- If a foreground `resume` process times out or is interrupted: inspect the latest session state, report whatever partial output exists, and offer `convo-relay resume`.
+- If the detached launch exits nonzero, report the CLI error and inspect its log path when available.
 
 ## Resuming a previous dialogue
 
 If the user wants to continue a relay — saying things like "keep going with the relay", "the relay didn't go deep enough", "resume the relay and focus on X" — then:
 
-1. Find the session ID from the previous relay output in this conversation, or run `convo-relay list` to find the most recent session
+1. Use the explicit session ID from the original `run` command or its detached launch receipt.
 2. Synthesize what additional direction is needed based on what the user said and what the relay produced
 3. Show the user the resume plan (similar to Step 3, but noting this is a continuation)
 4. Run:
@@ -184,16 +189,11 @@ If the user wants to continue a relay — saying things like "keep going with th
 convo-relay resume <session-id> "<optional new direction>" --verbose
 ```
 
-Resume inherits the mode, investigation policy, context refs, runtime config snapshot, and agent pairing from the original session. The optional quoted prompt is injected as new direction for the next resumed turn. Default to auto-stop mode with a 50-round additional cap. Use `--max-rounds <N>` to change that cap, or `--rounds <N>` only when the user wants an exact number of additional rounds. Do not add `--settings` on resume for snapshot-backed sessions. If the user wants model or effort changes on resume, use the slot-indexed flags `--model-a`, `--effort-a`, `--model-b`, and `--effort-b`. Use `--facilitator-model <MODEL>` to override the facilitator model.
+Resume inherits the mode, investigation policy, original context refs, runtime config snapshot, and agent pairing from the original session. The optional quoted prompt is injected as new direction for the next resumed turn. To continue a completed session, add `--rounds <N>` to grant up to N additional turns; `--quick` grants three additional participant turns. The relay may stop earlier if it converges. Without a new turn budget, a completed session has no work to resume. Resume rejects new `--context` and `--skill` files. This build does not apply `resume --max-rounds` or resume-time settings, mode, timeout, model, effort, facilitator, or backend-replacement overrides.
 
-Treat resume exactly like a fresh long-running relay:
+Run `resume` in the foreground; do not add `--detach`. Wait on the foreground resume command if the tool provides a command-session handle. If the user asks for progress, inspect `show <session-id> --json` and summarize the current transcript and status.
 
-- wait for the resume process itself, not for immediate transcript growth
-- expect long quiet periods between rounds
-- if the user asks for a summary so far during resume, inspect the live session and summarize whatever has completed
-- avoid inferring failure from stale session files; if the user asks for progress, inspect the live session and summarize whatever has completed
-
-Steering queues on an idle or interrupted session and applies at its next resume. If a relay is running, interrupt its process first, then queue the direction:
+`control steer` queues direction only when the session is not running, and applies it at the next resume. If a relay is running, interrupt its process first, then queue the direction. To continue a completed session with a direction, use `convo-relay resume <session-id> "<direction>" --rounds <N>`:
 
 ```bash
 convo-relay control steer <session-id> "<new direction>"
@@ -204,6 +204,6 @@ If the user asks to stop a running relay, tell them to send `SIGINT` to its owni
 ## Error handling
 
 - If `convo-relay` is not on PATH: tell the user to clone the repository and run `make install` from the checkout so the Go CLI and bundled assets are installed.
-- If the command is still running and the user asks for status: inspect the live session and summarize partial state rather than refusing
+- If a foreground `resume` command is still running and the user asks for status: inspect the live session and summarize partial state rather than refusing
 - If the command times out: read whatever partial output exists, report it, and offer to resume
 - If a selected backing CLI fails: report the specific error from the output

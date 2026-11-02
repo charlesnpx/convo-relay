@@ -170,55 +170,81 @@ Cross-compilation is a release gate, not a runtime certification claim. `make cr
 
 ### Start a dialogue
 
+Foreground execution is the default. On macOS and Linux, use native
+`run --detach` when the relay should outlive the launching tool shell:
+
 ```bash
-convo-relay run "Review src/auth/ for security vulnerabilities" --verbose
+session_id="auth-review-$(date +%Y%m%d-%H%M%S)-$$-$RANDOM"
+convo-relay run "Review src/auth/ for security vulnerabilities" \
+  --session-id "$session_id" --detach --verbose
 ```
+
+The command returns a text receipt with `Detached session <id>` and
+`Log: <path>`. With `--json`, it returns `kind: "launch_receipt"`,
+`session_id`, and `log_path`. Each launch gets a unique log under the selected relay home's
+`logs` directory; stdin is null and stdout/stderr, including `--verbose`
+progress, are captured there. A zero exit confirms detached startup setup was
+acknowledged; it does not mean the relay completed. Inspect the returned log
+for startup or provider failures.
+
+For flag-based `run` commands, pass a unique `--session-id` so the caller can
+refer to the session directly without searching `list`. A supplied immutable
+plan already carries its session ID; `run --plan` rejects `--session-id` as a
+structural override. `--detach` applies only to `run`; `resume` remains a
+foreground command.
 
 The default pairing is `codex,claude`. To have Claude open instead:
 
 ```bash
-convo-relay run "Propose a caching strategy for the API layer" --agents claude,codex
+convo-relay run "Propose a caching strategy for the API layer" --session-id caching-strategy --agents claude,codex
 ```
 
 Use the same backend in both slots:
 
 ```bash
-convo-relay run "Pressure-test this rollout plan" --agents claude,claude
+convo-relay run "Pressure-test this rollout plan" --session-id rollout-claude --agents claude,claude
 ```
 
 Use single-value shorthand to run two slots plus facilitator on the same backend:
 
 ```bash
-convo-relay run "Pressure-test this rollout plan" --agents claude
-convo-relay run "Pressure-test this rollout plan" --agents codex
+convo-relay run "Pressure-test this rollout plan" --session-id rollout-claude-short --agents claude
+convo-relay run "Pressure-test this rollout plan" --session-id rollout-codex-short --agents codex
 ```
 
 Mixed backend runs default the facilitator to Codex with `gpt-5.5` and fallback models. Use `--facilitator-backend` to choose a different facilitator. `--agents codex` defaults the facilitator to `gpt-5.5` with `medium` effort unless you override the facilitator model explicitly.
 
-By default, `run` continues until the relay converges: either the facilitator has no contested disagreements left, or both sides explicitly signal completion. Auto-stop mode still has a safety cap of 50 rounds.
+By default, `run` auto-stops when the facilitator's ledger has no contested
+items and at least one settled or withdrawn item after both participants have
+replied, or when the completion-marker string `[[CONVO-RELAY: COMPLETE]]`
+occurs in both participants' latest turns. Participants are instructed to emit
+it as a standalone line; detection checks for the marker string in each turn.
+An empty-ledger stall can also stop with
+`stop_reason: "stalled_no_ledger_signal"`. Auto-stop mode has a safety cap of
+50 rounds.
 
 Force an exact round count:
 
 ```bash
-convo-relay run "Pressure-test this rollout plan" --rounds 4
+convo-relay run "Pressure-test this rollout plan" --session-id rollout-fixed --rounds 4
 ```
 
 Raise or lower the auto-stop safety cap:
 
 ```bash
-convo-relay run "Pressure-test this rollout plan" --max-rounds 12
+convo-relay run "Pressure-test this rollout plan" --session-id rollout-cap --max-rounds 12
 ```
 
 Use Gemini in a mixed relay:
 
 ```bash
-convo-relay run "Compare implementation risks" --agents codex,gemini
+convo-relay run "Compare implementation risks" --session-id implementation-risks --agents codex,gemini
 ```
 
 Pin different models or effort levels per slot:
 
 ```bash
-convo-relay run "Compare two implementation strategies" \
+convo-relay run "Compare two implementation strategies" --session-id implementation-strategies \
   --agents claude,codex \
   --model-a sonnet --effort-a high \
   --model-b gpt-5.4 --effort-b medium
@@ -227,17 +253,20 @@ convo-relay run "Compare two implementation strategies" \
 Use a different debate mode:
 
 ```bash
-convo-relay run "Evaluate our persistence strategy" --mode steelman
+convo-relay run "Evaluate our persistence strategy" --session-id persistence-steelman --mode steelman
 ```
 
-Attach launch context files. Context files are preflighted before a session is
-created, labeled as `ctx1`, `ctx2`, persisted as digest-checked input-bundle
-artifacts, and embedded in the opening prompt. Skill files use the same preflight
-and artifact model with `skill1`, `skill2` labels. Each input file must be UTF-8
-text, at most 1 MiB, with a 2 MiB total limit per input kind:
+Attach launch context files. `--context` accepts UTF-8 text files only. Context
+files are preflighted before a session is created, labeled as `ctx1`, `ctx2`,
+persisted as digest-checked input-bundle artifacts, and embedded in the opening
+prompt. Skill files use the same preflight and artifact model with `skill1`,
+`skill2` labels. Each input file must be UTF-8 text, at most 1 MiB, with a 2 MiB
+total limit per input kind. Name the worktree or Git ref containing every cited
+file in the task brief, and check that checkout's branch and working-tree state
+before launch:
 
 ```bash
-convo-relay run "Review this migration plan" \
+convo-relay run "Review this migration plan" --session-id migration-plan-review \
   --context docs/plan.md docs/schema.sql \
   --skill docs/review-guidance.md
 ```
@@ -252,17 +281,17 @@ avoid repository exploration beyond those files.
 Attach a launch plan to persist the plan that kicked off the relay:
 
 ```bash
-convo-relay run "Pressure-test this rollout plan" \
+convo-relay run "Pressure-test this rollout plan" --session-id rollout-task-plan \
   --task-plan docs/relay-plan.json
 ```
 
 Enable dynamic expansion proposals without changing the default two-slot relay behavior:
 
 ```bash
-convo-relay run "Pressure-test this rollout plan" --dynamic ask
-convo-relay show a1b2c3d4 --proposals
-convo-relay control approve a1b2c3d4 sp_123456789abc
-convo-relay control reject a1b2c3d4 sp_123456789abc --reason "too broad"
+convo-relay run "Pressure-test this rollout plan" --session-id dynamic-expansion --dynamic ask
+convo-relay show dynamic-expansion --proposals
+convo-relay control approve dynamic-expansion sp_123456789abc
+convo-relay control reject dynamic-expansion sp_123456789abc --reason "too broad"
 ```
 
 Dynamic expansion uses predeclared backend profiles and relay recipes. Built-in profiles include `codex-deep`, `codex-fast`, and `gemini-vision`; built-in recipes include `review-panel`, `vision-review`, and `one-pass-review`. Override or extend them with a TOML file:
@@ -321,7 +350,7 @@ recipes are merged into the launch runtime snapshot, validated through the same
 recipe checks, and persisted as transient recipe artifacts:
 
 ```bash
-convo-relay run "Review this patch" \
+convo-relay run "Review this patch" --session-id patch-review \
   --agents codex,claude \
   --recipe-file ./local-recipes.toml
 ```
@@ -352,7 +381,7 @@ session.
 Run a configured recipe directly as the root session:
 
 ```bash
-convo-relay run "Evaluate the supplied records" \
+convo-relay run "Evaluate the supplied records" --session-id bounded-procedure \
   --recipe bounded-procedure \
   --settings ./settings.toml \
   --input source=./source.json \
@@ -377,19 +406,19 @@ Root recipes use `--workspace current|head-copy`. `current` executes in the laun
 Limit a run to 3 rounds:
 
 ```bash
-convo-relay run "Pressure-test this rollout plan" --quick
+convo-relay run "Pressure-test this rollout plan" --session-id rollout-quick --quick
 ```
 
 Save the transcript to a specific file while running:
 
 ```bash
-convo-relay run "Write integration tests for the payment module" -o transcript.md
+convo-relay run "Write integration tests for the payment module" --session-id payment-tests -o transcript.md
 ```
 
 Print JSON instead of markdown:
 
 ```bash
-convo-relay run "Refactor the database connection pool" --json
+convo-relay run "Refactor the database connection pool" --session-id database-pool-refactor --json
 ```
 
 `run` writes an export only when `-o` / `--output` is supplied. To export an existing or incomplete session later, use `convo-relay export create`.
@@ -409,14 +438,26 @@ convo-relay show a1b2c3d4 --graph  # execution graph summary
 convo-relay show a1b2c3d4 --graph --json
 ```
 
-`show --json` returns a nested object with:
+`show --json` returns a nested object. For status checks, use the top-level
+`status` and `stop_reason`; `summary` contains round and ledger counts, `meta`
+contains task and session details, `transcript` contains turns, `diagnostics`
+contains recovery facts, and `incomplete` / `export_ready` describe export
+suitability. The report also includes `session_id` and `session_dir`.
 
-- `session_id` / `session_dir` for identity and location
-- `meta` for persisted session metadata
-- `transcript` for turn history
-- `summary` for quick status fields and numeric ledger counts
-- `diagnostics` for attention-required status, recent sanitized provider failures, and scan metadata
-- `incomplete` / `export_ready` for export suitability
+Session status values are `running`, `interrupted`, `awaiting_decision`,
+`completed`, `failed`, and `invalid_result`. A nonterminal session is `running`
+while its writer lock is held and `interrupted` after the lock is free;
+`awaiting_decision` means an unresolved proposal needs an operator decision.
+`invalid_result` is a failed result-validation status. `doctor <id> --json`
+wraps health under `health`; its attention flag is
+`health.diagnostics.attention_required`. It is true for `interrupted`,
+`failed`, `invalid_result`, and `awaiting_decision`, and false for `running` and
+`completed`.
+
+After a detached launch, use `show <id> --json` to follow progress. `running`
+means active work; `completed` means the transcript is ready to export. Treat
+`failed` and `invalid_result` as failures. `interrupted` and
+`awaiting_decision` require operator action rather than more waiting.
 
 `show --graph --json` returns a derived graph plus canonical event summaries.
 The event log remains the durable authority; the graph is an inspection view.
@@ -454,27 +495,38 @@ convo-relay doctor a1b2c3d4 --probe-auth --json
 
 `doctor` combines the read-only global or session health report with backend
 readiness. Its JSON report preserves the complete backend readiness body under
-`backends`; add `--probe-auth` for supported authentication probes.
+`backends`; add `--probe-auth` for supported authentication probes. For a
+session, inspect `health.diagnostics.attention_required`; it is true only for
+`interrupted`, `failed`, `invalid_result`, and `awaiting_decision` statuses.
 
 ### Resume a session
 
 ```bash
 convo-relay resume a1b2c3d4
-convo-relay resume a1b2c3d4 "Now focus on error handling"
+convo-relay resume a1b2c3d4 "Now focus on error handling" --rounds 8
 convo-relay resume a1b2c3d4 --rounds 3
-convo-relay resume a1b2c3d4 --mode steelman
-convo-relay resume a1b2c3d4 --context docs/new-evidence.md --skill docs/review-skill.md
-convo-relay resume a1b2c3d4 --model-a sonnet --model-b opus
-convo-relay resume a1b2c3d4 --replace-a gemini --model-a gemini-2.5-pro
 ```
 
-The optional resume prompt is injected into the next resumed turn as new direction without replacing the original launch prompt stored in session metadata. Resume `--context` and `--skill` files are persisted as labeled input-bundle refs and included in that resumed-turn direction. Free-text prompts do not change relay mode, even if they mention one. Use the typed `--mode` flag to apply a mode change at the resume boundary; mode-control events record the queued and applied rounds, and each transcript entry records the mode used for that round. Advanced backend changes are explicit resume-time slot replacements with `--replace-a` or `--replace-b`; the value may be a backend or runtime profile, and the existing `--model-a`/`--effort-a` or `--model-b`/`--effort-b` flags apply to the replacement. Replacement history is append-only, assigns generation-specific provider slot ids such as `slot_0_gen2`, and preserves prior provider artifacts with cleanup hints. Like `run`, `resume` writes an export only when `-o` / `--output` is supplied. It auto-stops once the relay converges unless you force an exact count with `--rounds`. In auto mode, convergence means either no contested disagreements remain or both sides explicitly signal completion. `--max-rounds` caps additional rounds in auto mode. Slot overrides always apply to the persisted slot order: A = logical `slot_0`, B = logical `slot_1`.
+The optional resume prompt is injected into the next resumed turn as new
+direction without replacing the original launch prompt stored in session
+metadata. `resume --rounds N` grants up to N additional participant turns;
+`resume --quick` grants three additional participant turns. The relay may stop
+earlier if it converges. If a session has already completed, provide a new turn
+budget to grant it more work. Without one, a completed session has nothing left
+to resume. Resume inherits the original context refs, mode, and agent pairing.
+It rejects new `--context` and `--skill` files. This build does not apply
+`resume --max-rounds` or resume-time settings, mode, timeout, model, effort,
+facilitator, or backend-replacement overrides.
+Like `run`, `resume` writes an export only when `-o` / `--output` is supplied.
 
-`resume` keeps the original pairing and slot order. It uses the runtime config snapshot saved at launch, so later settings file edits do not change backend profiles or relay recipes for the resumed session. New snapshot-backed sessions reject `resume --settings`; use slot and facilitator model/effort overrides for narrow runtime changes. Override events are recorded separately for slots and facilitators.
+`resume` keeps the original pairing and slot order. It uses the runtime config
+snapshot saved at launch, so later settings file edits do not change backend
+profiles or relay recipes. This build does not apply resume-time settings, mode,
+timeout, model, effort, or backend-replacement overrides.
 
-### Control a running session
+### Steer or stop a session
 
-Queue a prompt that will be injected before the next relay turn:
+Queue a prompt for the next resume of a session that is not running:
 
 ```bash
 convo-relay control steer a1b2c3d4 "Focus on failure modes before continuing"
@@ -488,9 +540,14 @@ interruption is required:
 convo-relay control cancel a1b2c3d4
 ```
 
-After the owner receives `SIGINT`, the session derives as `interrupted`; use
-`resume` to continue its remaining work. `control cancel` does not send a
-signal itself.
+A session without a pending decision reports `running` while its writer lock
+is held and `interrupted` after the lock is released without a terminal event;
+use `resume` to continue its remaining work. Steering is accepted only after
+the session stops and applies at its next resume. For a completed session, use
+`convo-relay resume <id> "<direction>" --rounds <N>` to continue it. This build
+does not accept a new context file on `resume`. `awaiting_decision` remains
+visible until the pending proposal is resolved. `control cancel` does not send
+a signal itself.
 
 Use `show --diff` for contested and withdrawn ledger evolution by round, and
 `show --proposals` to inspect dynamic spawn proposals. Use `control approve`
@@ -505,16 +562,21 @@ convo-relay clean --all --home ~/.convo-relay --json
 
 ### From Claude Code (sub-agent)
 
-The intended primary use case — spawn a sub-agent that runs the relay and summarizes results:
+The intended primary use case is to spawn a sub-agent that runs the relay and
+summarizes results. Launch it with native detach:
 
 ```
-Use the Agent tool to run:
+Use the Agent tool to run this Bash command:
 
+session_id="auth-review-$(date +%Y%m%d-%H%M%S)-$$-$RANDOM"
 convo-relay run \
   "Review the auth module for security issues" \
-  --max-rounds 8 --verbose -o /tmp/auth-review.md
+  --session-id "$session_id" --max-rounds 8 --detach --verbose
 
-Then read /tmp/auth-review.md and summarize what each agent found.
+Use `convo-relay show "$session_id" --json` to follow progress. When its
+status is `completed`, export the actual transcript with
+`convo-relay export create "$session_id" -o "/tmp/${session_id}.md"`, then read
+that file and summarize what each agent found.
 ```
 
 ## Commands
@@ -522,10 +584,10 @@ Then read /tmp/auth-review.md and summarize what each agent found.
 | Command | Description |
 |---------|-------------|
 | `run` | Start a new relay dialogue |
-| `resume` | Continue a previous session until convergence or a round limit |
+| `resume` | Continue a previous session or grant it additional turns |
 | `list` | List existing sessions |
 | `show` | Display a session's transcript |
-| `control` | Steer, admit/reject proposals, or cancel a running session |
+| `control` | Queue steering for a session's next resume, admit/reject proposals, or cancel a running session |
 | `export` | Create or verify transcript and portable exports |
 | `recipes` | List, show, and diagnose relay recipes |
 | `clean` | Delete a session and all its artifacts |
@@ -536,17 +598,18 @@ Then read /tmp/auth-review.md and summarize what each agent found.
 
 | Flag | Commands | Description |
 |------|----------|-------------|
-| `--rounds N` | run, resume | Run exactly `N` rounds. On `resume`, this means `N` additional rounds |
-| `--max-rounds N` | run, resume | Safety cap for auto-stop mode. On `resume`, this means `N` additional rounds (default: 50) |
-| `--timeout N`, `--patience N` | run, resume | Per-turn timeout in seconds (default: 600) |
-| `--mode {cooperative,adversarial,steelman}` | run, resume | Conversation mode. On `resume`, applies a typed mode control for subsequent rounds |
+| `--session-id ID` | run | Choose a stable ID for a flag-based launch; a supplied `--plan` already carries its ID |
+| `--detach` | run | Return a launch receipt while the relay continues; supported on macOS and Linux |
+| `--rounds N` | run, resume | Set the participant-turn budget. On `resume`, this grants up to `N` additional turns |
+| `--max-rounds N` | run | Safety cap for auto-stop mode (default: 50) |
+| `--timeout N`, `--patience N` | run | Per-turn timeout in seconds (default: 600) |
+| `--mode {cooperative,adversarial,steelman}` | run | Conversation mode |
 | `--agents AGENT[,AGENT]` | run | One backend for shorthand (`claude`, `codex`, or `gemini`), or an explicit backend pair (default: `codex,claude`) |
-| `--model-a MODEL`, `--model-b MODEL` | run, resume | Model for slot A / slot B |
-| `--effort-a EFFORT`, `--effort-b EFFORT` | run, resume | Effort for slot A / slot B |
-| `--replace-a BACKEND_OR_PROFILE`, `--replace-b BACKEND_OR_PROFILE` | resume | Explicitly replace logical slot A / slot B at the resume boundary and start a new slot generation |
-| `--quick` | run, resume | Force exactly 3 rounds |
-| `--context FILE [FILE ...]` | run, resume | Attach UTF-8 context files and persist labeled input-bundle artifacts. Limits: 1 MiB per file, 2 MiB total |
-| `--skill FILE [FILE ...]` | run, resume | Attach UTF-8 capability files and persist labeled input-bundle artifacts |
+| `--model-a MODEL`, `--model-b MODEL` | run | Model for slot A / slot B |
+| `--effort-a EFFORT`, `--effort-b EFFORT` | run | Effort for slot A / slot B |
+| `--quick` | run, resume | Force 3 participant turns for `run` or 3 additional participant turns for `resume` |
+| `--context FILE [FILE ...]` | run | Attach UTF-8 text context files and persist labeled input-bundle artifacts. Limits: 1 MiB per file, 2 MiB total |
+| `--skill FILE [FILE ...]` | run | Attach UTF-8 capability files and persist labeled input-bundle artifacts |
 | `--recipe-file FILE` | run | Attach session-scoped transient relay recipes from TOML and persist the source artifact |
 | `--recipe ID` | run | Execute a configured recipe directly as the root session |
 | `--plan FILE` | run | Execute a supplied immutable plan document as the root session |
@@ -556,9 +619,9 @@ Then read /tmp/auth-review.md and summarize what each agent found.
 | `--task-plan FILE` | run | Attach the launch task plan from a JSON or markdown/text file |
 | `--investigation {auto,normal,context_only}` | run | Prompt policy for evidence behavior. Default `auto` cites inspected files/context; `normal` is conceptual; `context_only` requires `--context` and avoids repo exploration |
 | `--dynamic {off,ask,auto-safe}` | run | Enable dynamic spawn proposal handling. Default is `off` |
-| `--settings FILE` | run, resume, doctor, recipes | Read backend profiles and relay recipes from a TOML settings file |
+| `--settings FILE` | run, doctor, recipes | Read backend profiles and relay recipes from a TOML settings file |
 | `--facilitator-backend BACKEND` | run | Override the facilitator backend |
-| `--facilitator-model MODEL` | run, resume | Override the facilitator model. Default is `gpt-5.5` for Codex facilitator runs |
+| `--facilitator-model MODEL` | run | Override the facilitator model. Default is `gpt-5.5` for Codex facilitator runs |
 | `-v, --verbose` | run, resume | Print progress to stderr |
 | `-s, --stream` | run | Stream live subprocess stdout to stderr |
 | `-o, --output` | run, resume, export create | Write an export to a specific file. Required for `export create`; optional for `run` and `resume` |
@@ -597,60 +660,61 @@ resume and does not introduce another public format. `show --json` derives its
 report from that authority rather than from parallel metadata or transcript
 files.
 
-`convo-relay show <id> --json` returns:
+`convo-relay show <id> --json` returns a report derived from the session plan,
+event log, and blobs. For example:
 
 ```json
 {
   "session_id": "...",
   "session_dir": "...",
+  "status": "running",
+  "stop_reason": "",
   "meta": {
     "task": "...",
     "title": "...",
-    "round_limit_mode": "auto",
-    "rounds": null,
-    "max_rounds": 50,
+    "status": "running",
+    "stop_reason": "",
     "mode": "adversarial",
+    "rounds": 50,
+    "round_limit_mode": "auto",
+    "max_rounds": 50,
+    "actual_rounds": 1,
     "slots": [...],
     "ledger": {"settled": [], "contested": [], "withdrawn": []},
-    "status": "running"
+    ...
   },
   "transcript": [
     {
       "round": 1,
-      "slot_id": "slot_0",
       "from": "Claude Code",
       "mode": "adversarial",
       "content": "...",
       "ledger": {"settled": [], "contested": [], "withdrawn": []},
-      "timestamp": "..."
+      ...
     }
   ],
   "summary": {
     "status": "running",
     "mode": "adversarial",
-    "modes": ["adversarial"],
     "agents": ["codex", "claude"],
-    "configured_rounds": null,
+    "configured_rounds": 50,
     "max_rounds": 50,
     "actual_rounds": 1,
+    "filtered_rounds": 1,
     "ledger_counts": {
       "settled": 0,
       "contested": 0,
       "withdrawn": 0
-    }
+    },
+    ...
   },
   "diagnostics": {
-    "attention_required": false,
-    "session_status": "running",
-    "recent_failures": [],
-    "scan": {
-      "transcript_entries_scanned": 1,
-      "event_entries_scanned": 2,
-      "truncated": false
-    }
+    "abandoned_attempts": [],
+    "unreferenced_blobs": [],
+    "budget_state": ""
   },
   "incomplete": true,
-  "export_ready": true
+  "export_ready": false
 }
 ```
 

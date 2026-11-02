@@ -41,6 +41,7 @@ const (
 	mediaTypeChildResult    = "text/plain; charset=utf-8"
 	mediaTypeChildPlan      = "application/vnd.convo-relay.plan+json"
 	maxPromptTranscriptSize = 12
+	completionMarker        = "[[CONVO-RELAY: COMPLETE]]"
 	resultSchemaURL         = "https://convo-relay.invalid/engine-result-schema.json"
 )
 
@@ -70,6 +71,8 @@ type Deps struct {
 	Writer                *eventlog.Writer
 	Recipes               []plan.Recipe
 	ChildRequestExtractor ChildRequestExtractor
+	// ProgressWriter receives best-effort participant round progress; nil disables it.
+	ProgressWriter io.Writer
 	// RetrySleeper waits between retryable provider attempts. A nil value uses
 	// the context-aware production sleeper; tests can replace it to avoid time.
 	RetrySleeper func(context.Context, time.Duration) error
@@ -548,6 +551,12 @@ func (r *runner) append(payload eventlog.Payload) error {
 	return r.reduceEvent(event)
 }
 
+func (r *runner) reportProgress(format string, args ...any) {
+	if r.deps.ProgressWriter != nil {
+		_, _ = fmt.Fprintf(r.deps.ProgressWriter, format, args...)
+	}
+}
+
 func (r *runner) putText(text string) (blobstore.BlobRef, error) {
 	if r.blobs == nil {
 		return blobstore.BlobRef{}, errors.New("blob store is required")
@@ -937,7 +946,11 @@ func (r *runner) recordCompletedTurn(turn *turnState, completed completedTurn) {
 		r.state.conversation = append(r.state.conversation, conversationTurn{ActorID: turn.ActorID, Text: completed.Text})
 		r.state.lastResult = completed
 	case eventlog.FacilitatorRole:
-		r.state.ledger = parseLedger(completed.Text, r.state.ledger)
+		ledger := parseLedger(completed.Text, r.state.ledger)
+		if len(r.state.conversation) < 2 {
+			ledger.contested = []string{}
+		}
+		r.state.ledger = ledger
 	case eventlog.ReducerRole:
 		if r.sess.Plan.Result.Source == "reducer" {
 			r.state.lastResult = completed
@@ -1099,6 +1112,9 @@ func (r *runner) execute() (Outcome, error) {
 		if err := r.append(eventlog.TurnStartedPayload{ActorID: next.Actor.ID, Round: next.Round, Role: next.Role}); err != nil {
 			return Outcome{}, err
 		}
+		if next.Role == eventlog.ParticipantRole {
+			r.reportProgress("Round %d started\n", next.Round)
+		}
 	}
 }
 
@@ -1157,7 +1173,8 @@ func (r *runner) dialogueStopReason() string {
 		return ""
 	}
 	reason := ""
-	if hasConverged(r.state.conversation, r.state.ledger) {
+	if hasCompletionMarkers(r.sess.Plan, r.state.conversation) ||
+		hasConverged(r.state.conversation, r.state.ledger) {
 		reason = stopConverged
 	}
 	if reason == "" && hasNoLedgerSignal(r.state.conversation, r.state.ledger) {
@@ -1365,11 +1382,21 @@ func (r *runner) finishActiveTurn(turn *turnState, attempt *attemptState) error 
 	if turn == nil || attempt == nil || attempt.Outcome != "success" {
 		return errors.New("successful attempt is required to finish a turn")
 	}
-	return r.append(eventlog.TurnFinishedPayload{
+	return r.appendTurnFinished(turn, attempt.Content)
+}
+
+func (r *runner) appendTurnFinished(turn *turnState, content blobstore.BlobRef) error {
+	if err := r.append(eventlog.TurnFinishedPayload{
 		ActorID: turn.ActorID,
 		Round:   turn.Round,
-		Content: attempt.Content,
-	})
+		Content: content,
+	}); err != nil {
+		return err
+	}
+	if turn.Role == eventlog.ParticipantRole {
+		r.reportProgress("Round %d finished\n", turn.Round)
+	}
+	return nil
 }
 
 func (r *runner) applySteering(round int) (string, error) {
@@ -1399,6 +1426,9 @@ func (r *runner) applicableSteering(round int) *steeringState {
 
 func (r *runner) persistChildRequests(turn *turnState, actor session.Actor, result provider.TurnResult) error {
 	if r.deps.ChildRequestExtractor == nil || (turn.Role != eventlog.ParticipantRole && turn.Role != eventlog.FacilitatorRole) {
+		return nil
+	}
+	if turn.Role == eventlog.FacilitatorRole && len(r.state.conversation) < 2 {
 		return nil
 	}
 	for index, child := range r.deps.ChildRequestExtractor(r.sess.Plan, actor, turn.Role, result) {
@@ -1498,11 +1528,7 @@ func (r *runner) serviceStaticChildTurn(turn *turnState, actor session.Actor) er
 	if child.Status != statusCompleted || child.Result == (blobstore.BlobRef{}) {
 		return errors.New("static child step did not produce a completed result")
 	}
-	return r.append(eventlog.TurnFinishedPayload{
-		ActorID: turn.ActorID,
-		Round:   turn.Round,
-		Content: child.Result,
-	})
+	return r.appendTurnFinished(turn, child.Result)
 }
 
 func (r *runner) admitStaticChild(actor session.Actor, child *childState) error {
@@ -1699,6 +1725,7 @@ func (r *runner) runChild(child *childState) (bool, error) {
 	}
 	childDeps := r.deps
 	childDeps.Writer = nil
+	childDeps.ProgressWriter = nil
 	childEvents, err := readEvents(childSession.Root)
 	if err != nil {
 		return false, err
@@ -1951,6 +1978,14 @@ func (r *runner) promptFor(actor session.Actor, round int, role eventlog.Role, r
 	fmt.Fprintf(&builder, "Mode: %s\n", r.sess.Plan.Mode)
 	fmt.Fprintf(&builder, "Investigation: %s\n", r.sess.Plan.Investigation)
 	fmt.Fprintf(&builder, "Actor: %s\nRole: %s\nTurn: %d\n", actor.ID, role, round)
+	if role == eventlog.ParticipantRole {
+		fmt.Fprintf(&builder, "Current round: %d\n", round)
+		if round > 1 {
+			fmt.Fprintf(&builder, "Round of the turn being answered: %d\n", round-1)
+		} else {
+			builder.WriteString("Round of the turn being answered: none (opening turn)\n")
+		}
+	}
 	if prompt := strings.TrimSpace(resumePrompt); prompt != "" {
 		fmt.Fprintf(&builder, "Resume direction: %s\n", prompt)
 	}
@@ -1979,6 +2014,10 @@ func (r *runner) promptFor(actor session.Actor, round int, role eventlog.Role, r
 	if role == eventlog.FacilitatorRole {
 		counts := r.state.ledger.counts()
 		fmt.Fprintf(&builder, "\nReturn a JSON ledger with settled, contested, and withdrawn arrays. Current counts: settled=%d contested=%d withdrawn=%d.\n", counts.Settled, counts.Contested, counts.Withdrawn)
+		builder.WriteString("Do not mark an opening claim contested until the other participant has replied to it.\n")
+		if len(r.state.conversation) < 2 {
+			builder.WriteString("Only the round-1 opening turn has been made; the other participant has not replied, so contested must be an empty array.\n")
+		}
 	}
 	if role == eventlog.ReducerRole {
 		if r.sess.Plan.Instructions != nil {
@@ -1989,7 +2028,21 @@ func (r *runner) promptFor(actor session.Actor, round int, role eventlog.Role, r
 		}
 		builder.WriteString("\nReturn the final reduced result for this task.\n")
 	}
+	if role == eventlog.ParticipantRole {
+		builder.WriteString("\nOutput only your contribution. Do not include working notes, planning, or a preface.\n")
+		if shouldPromptForCompletionMarker(r.sess.Plan) {
+			fmt.Fprintf(&builder, "If you have nothing further to contest, include this exact standalone line: %s\n", completionMarker)
+		}
+	}
 	return builder.String()
+}
+
+func shouldPromptForCompletionMarker(value session.Plan) bool {
+	if value.Schedule.Kind != relayplan.ScheduleDialogue || !value.Schedule.StopOnConvergence {
+		return false
+	}
+	return value.Result.Source != relayplan.ResultSourceLastTurn ||
+		(value.Result.Format != relayplan.ResultFormatJSON && len(value.Result.Schema) == 0)
 }
 
 func (r *runner) turnInstructions(actorID string, round int) string {
@@ -2115,11 +2168,24 @@ func hasConverged(turns []conversationTurn, ledger ledger) bool {
 	if last.ActorID == previous.ActorID {
 		return false
 	}
-	if hasDoneSignal(last.Text) && hasDoneSignal(previous.Text) {
-		return true
-	}
 	counts := ledger.counts()
 	return counts.Contested == 0 && (counts.Settled > 0 || counts.Withdrawn > 0)
+}
+
+func hasCompletionMarkers(value session.Plan, turns []conversationTurn) bool {
+	firstSlot, err := relayplan.ParticipantActorForTurn(value, 1)
+	if err != nil {
+		return false
+	}
+	secondSlot, err := relayplan.ParticipantActorForTurn(value, 2)
+	if err != nil || firstSlot == secondSlot {
+		return false
+	}
+	latest := make(map[string]string, 2)
+	for _, turn := range turns {
+		latest[turn.ActorID] = turn.Text
+	}
+	return strings.Contains(latest[firstSlot], completionMarker) && strings.Contains(latest[secondSlot], completionMarker)
 }
 
 func hasNoLedgerSignal(turns []conversationTurn, ledger ledger) bool {
