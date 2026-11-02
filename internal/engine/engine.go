@@ -1428,6 +1428,9 @@ func (r *runner) persistChildRequests(turn *turnState, actor session.Actor, resu
 	if r.deps.ChildRequestExtractor == nil || (turn.Role != eventlog.ParticipantRole && turn.Role != eventlog.FacilitatorRole) {
 		return nil
 	}
+	if turn.Role == eventlog.FacilitatorRole && len(r.state.conversation) < 2 {
+		return nil
+	}
 	for index, child := range r.deps.ChildRequestExtractor(r.sess.Plan, actor, turn.Role, result) {
 		requestID := strings.TrimSpace(child.ID)
 		if requestID == "" {

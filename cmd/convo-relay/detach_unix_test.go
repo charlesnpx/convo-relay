@@ -104,6 +104,71 @@ func TestDetachedRunSurvivesLauncherProcessGroupCleanup(t *testing.T) {
 	}
 }
 
+func TestDetachedStartupAckSeesRunningBeforeExecutionProgress(t *testing.T) {
+	sess, err := session.CreateWithOptions(session.CreateOptions{
+		RelayHome: t.TempDir(),
+		Plan:      suppliedPlanFixture("ack-running-session", nil),
+	})
+	if err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+
+	readPipe, writePipe, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("create acknowledgment pipe: %v", err)
+	}
+	defer readPipe.Close()
+	ackFD, err := syscall.Dup(int(writePipe.Fd()))
+	if err != nil {
+		_ = writePipe.Close()
+		t.Fatalf("duplicate acknowledgment descriptor: %v", err)
+	}
+	if err := writePipe.Close(); err != nil {
+		t.Fatalf("close original acknowledgment descriptor: %v", err)
+	}
+
+	previousFD, hadPreviousFD := os.LookupEnv(detachedStartupAckEnv)
+	if err := os.Setenv(detachedStartupAckEnv, strconv.Itoa(ackFD)); err != nil {
+		_ = syscall.Close(ackFD)
+		t.Fatalf("set acknowledgment descriptor: %v", err)
+	}
+	t.Cleanup(func() {
+		if hadPreviousFD {
+			_ = os.Setenv(detachedStartupAckEnv, previousFD)
+		} else {
+			_ = os.Unsetenv(detachedStartupAckEnv)
+		}
+	})
+
+	deps, writer, err := v2PrepareExecution(sess, relayv2.NewDeps(relayv2.Runtime{}, "."))
+	if err != nil {
+		t.Fatalf("prepare execution: %v", err)
+	}
+	defer writer.Close()
+	if deps.Writer != writer {
+		t.Fatal("prepared dependencies do not carry the acknowledged writer")
+	}
+
+	var ack detachedStartupAck
+	if err := json.NewDecoder(readPipe).Decode(&ack); err != nil {
+		t.Fatalf("read startup acknowledgment: %v", err)
+	}
+	if ack.SessionID != sess.Plan.SessionID {
+		t.Fatalf("acknowledged session = %q, want %q", ack.SessionID, sess.Plan.SessionID)
+	}
+	events, err := relayv2.Events(sess)
+	if err != nil {
+		t.Fatalf("read events before execution: %v", err)
+	}
+	if len(events) != 0 {
+		t.Fatalf("execution wrote %d events before provider progress", len(events))
+	}
+	status := sessionview.StatusWithLiveness(sess.Plan, events, sess.Root)
+	if status.Status != "running" {
+		t.Fatalf("status after acknowledgment and before provider progress = %q, want running", status.Status)
+	}
+}
+
 func TestDetachedTaskValuesRemainUnchangedWithoutRecursiveLaunch(t *testing.T) {
 	root := t.TempDir()
 	binary := buildDetachTestBinary(t, root)

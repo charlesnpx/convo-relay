@@ -644,20 +644,42 @@ func v2Run(ctx context.Context, sess *session.Session, runtime relayv2.Runtime, 
 	if verbose {
 		deps.ProgressWriter = os.Stderr
 	}
-	if err := writeDetachedStartupAck(sess.Plan.SessionID); err != nil {
-		return nil, fmt.Errorf("acknowledge detached run startup: %w", err)
+	deps, writer, err := v2PrepareExecution(sess, deps)
+	if err != nil {
+		return nil, err
 	}
+	defer writer.Close()
 	var runErr error
 	if resume {
 		_, runErr = engine.Resume(ctx, sess, deps, prompt, requestedTurns)
 	} else {
 		_, runErr = engine.Run(ctx, sess, deps)
 	}
+	if closeErr := writer.Close(); closeErr != nil {
+		runErr = errors.Join(runErr, fmt.Errorf("close event writer: %w", closeErr))
+	}
 	report, reportErr := v2BuildReportMap(sess)
 	if reportErr != nil {
 		return nil, errors.Join(runErr, reportErr)
 	}
 	return report, runErr
+}
+
+func v2PrepareExecution(sess *session.Session, deps engine.Deps) (engine.Deps, *eventlog.Writer, error) {
+	blobs, err := sess.BlobStore(blobstore.Limits{})
+	if err != nil {
+		return engine.Deps{}, nil, fmt.Errorf("open blob store: %w", err)
+	}
+	writer, err := sess.EventWriter(blobs)
+	if err != nil {
+		return engine.Deps{}, nil, fmt.Errorf("open event writer: %w", err)
+	}
+	deps.Writer = writer
+	if err := writeDetachedStartupAck(sess.Plan.SessionID); err != nil {
+		closeErr := writer.Close()
+		return engine.Deps{}, nil, fmt.Errorf("acknowledge detached run startup: %w", errors.Join(err, closeErr))
+	}
+	return deps, writer, nil
 }
 
 func v2RecipePlan(
