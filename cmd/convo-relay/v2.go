@@ -51,6 +51,7 @@ type v2WorkspaceWarning struct {
 type v2OrdinaryRunOptions struct {
 	SessionDir          string
 	SessionID           string
+	Verbose             bool
 	RelayHome           string
 	Task                string
 	Agents              string
@@ -80,6 +81,7 @@ type v2OrdinaryRunOptions struct {
 type v2RecipeRunOptions struct {
 	SessionDir          string
 	SessionID           string
+	Verbose             bool
 	RelayHome           string
 	Task                string
 	RecipeID            string
@@ -100,6 +102,7 @@ type v2RecipeRunOptions struct {
 
 type v2SuppliedPlanRunOptions struct {
 	SessionDir   string
+	Verbose      bool
 	RelayHome    string
 	PlanPath     string
 	BlobsPath    string
@@ -110,6 +113,7 @@ type v2SuppliedPlanRunOptions struct {
 type v2ResumeOptions struct {
 	Prompt         string
 	RequestedTurns int
+	Verbose        bool
 }
 
 // v2ProposalReport derives proposal state from the graph's one event projection.
@@ -209,6 +213,9 @@ func v2RunOrdinary(ctx context.Context, options v2OrdinaryRunOptions) (map[strin
 	if err != nil {
 		return nil, err
 	}
+	if err := writeLaunchSessionLine(os.Stderr, sess.Plan.SessionID); err != nil {
+		return nil, fmt.Errorf("write launch session line: %w", err)
+	}
 	launchCWD := v2LaunchCWD(options.LaunchCWD)
 	runtime := relayv2.Runtime{SettingsPath: config.SettingsPath, Recipes: catalog}
 	if err := v2PersistInputs(sess, contexts, skills); err != nil {
@@ -224,7 +231,7 @@ func v2RunOrdinary(ctx context.Context, options v2OrdinaryRunOptions) (map[strin
 	if err != nil {
 		return nil, err
 	}
-	return v2Run(ctx, sess, runtime, materialized.ExecutionCWD, false, "", 0)
+	return v2Run(ctx, sess, runtime, materialized.ExecutionCWD, false, "", 0, options.Verbose)
 }
 
 func v2RunRecipe(ctx context.Context, options v2RecipeRunOptions) (map[string]any, error) {
@@ -271,6 +278,9 @@ func v2RunRecipe(ctx context.Context, options v2RecipeRunOptions) (map[string]an
 	if err != nil {
 		return nil, err
 	}
+	if err := writeLaunchSessionLine(os.Stderr, sess.Plan.SessionID); err != nil {
+		return nil, fmt.Errorf("write launch session line: %w", err)
+	}
 	launchCWD := v2LaunchCWD(options.LaunchCWD)
 	runtime := relayv2.Runtime{SettingsPath: config.SettingsPath, Recipes: catalog}
 	if err := v2PersistInputs(sess, contexts, skills); err != nil {
@@ -286,7 +296,7 @@ func v2RunRecipe(ctx context.Context, options v2RecipeRunOptions) (map[string]an
 	if err != nil {
 		return nil, err
 	}
-	return v2Run(ctx, sess, runtime, materialized.ExecutionCWD, false, "", 0)
+	return v2Run(ctx, sess, runtime, materialized.ExecutionCWD, false, "", 0, options.Verbose)
 }
 
 func v2RunSuppliedPlan(ctx context.Context, options v2SuppliedPlanRunOptions) (map[string]any, error) {
@@ -312,6 +322,9 @@ func v2RunSuppliedPlan(ctx context.Context, options v2SuppliedPlanRunOptions) (m
 	if err != nil {
 		return nil, err
 	}
+	if err := writeLaunchSessionLine(os.Stderr, sess.Plan.SessionID); err != nil {
+		return nil, fmt.Errorf("write launch session line: %w", err)
+	}
 	if err := materializeSuppliedPlanBlobs(sess, value, options.BlobsPath); err != nil {
 		return nil, err
 	}
@@ -326,7 +339,7 @@ func v2RunSuppliedPlan(ctx context.Context, options v2SuppliedPlanRunOptions) (m
 	if err != nil {
 		return nil, err
 	}
-	return v2Run(ctx, sess, runtime, materialized.ExecutionCWD, false, "", 0)
+	return v2Run(ctx, sess, runtime, materialized.ExecutionCWD, false, "", 0, options.Verbose)
 }
 
 func readSuppliedPlan(filename string) (session.Plan, error) {
@@ -409,7 +422,7 @@ func v2RunResume(ctx context.Context, sessionDir string, options v2ResumeOptions
 	if err != nil {
 		return nil, err
 	}
-	return v2Run(ctx, sess, runtime, executionCWD, true, options.Prompt, options.RequestedTurns)
+	return v2Run(ctx, sess, runtime, executionCWD, true, options.Prompt, options.RequestedTurns, options.Verbose)
 }
 
 func v2WorkspaceMode(mode string) (string, error) {
@@ -626,8 +639,11 @@ func v2PrepareWorkspace(ctx context.Context, sess *session.Session, options v2Wo
 	return workspace.Prepare(ctx, sess, workspace.Options{LaunchCWD: launchCWD, Mode: options.Mode})
 }
 
-func v2Run(ctx context.Context, sess *session.Session, runtime relayv2.Runtime, executionCWD string, resume bool, prompt string, requestedTurns int) (map[string]any, error) {
+func v2Run(ctx context.Context, sess *session.Session, runtime relayv2.Runtime, executionCWD string, resume bool, prompt string, requestedTurns int, verbose bool) (map[string]any, error) {
 	deps := relayv2.NewDeps(runtime, executionCWD)
+	if verbose {
+		deps.ProgressWriter = os.Stderr
+	}
 	var runErr error
 	if resume {
 		_, runErr = engine.Resume(ctx, sess, deps, prompt, requestedTurns)

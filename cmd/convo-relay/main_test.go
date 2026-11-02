@@ -127,6 +127,78 @@ func TestParseFlagsSupportsShortValueAfterPositionals(t *testing.T) {
 	}
 }
 
+func TestTopLevelHelpAndPipedRunLaunchOutput(t *testing.T) {
+	tempDir := t.TempDir()
+	binary := filepath.Join(tempDir, "convo-relay")
+	build := exec.Command("go", "build", "-o", binary, ".")
+	if output, err := build.CombinedOutput(); err != nil {
+		t.Fatalf("build CLI: %v\n%s", err, output)
+	}
+
+	t.Run("top-level help exits successfully", func(t *testing.T) {
+		for _, argument := range []string{"--help", "-h"} {
+			command := exec.Command(binary, argument)
+			var stdout bytes.Buffer
+			var stderr bytes.Buffer
+			command.Stdout = &stdout
+			command.Stderr = &stderr
+			if err := command.Run(); err != nil {
+				t.Errorf("convo-relay %s exit = %v, stdout=%q stderr=%q", argument, err, stdout.String(), stderr.String())
+				continue
+			}
+			if !strings.HasPrefix(stdout.String(), "usage:\n") || stderr.Len() != 0 {
+				t.Errorf("convo-relay %s output = stdout %q, stderr %q", argument, stdout.String(), stderr.String())
+			}
+		}
+	})
+
+	t.Run("session line precedes verbose progress on piped stderr", func(t *testing.T) {
+		fakeBin := filepath.Join(tempDir, "bin")
+		if err := os.MkdirAll(fakeBin, 0o755); err != nil {
+			t.Fatalf("mkdir fake bin: %v", err)
+		}
+		if err := os.WriteFile(filepath.Join(fakeBin, "codex"), []byte(fakeCodexAppServerScript), 0o755); err != nil {
+			t.Fatalf("write fake Codex executable: %v", err)
+		}
+		settingsPath := filepath.Join(tempDir, "settings.toml")
+		if err := os.WriteFile(settingsPath, nil, 0o644); err != nil {
+			t.Fatalf("write settings: %v", err)
+		}
+		command := exec.Command(binary,
+			"run", "--task", "announce the session at launch",
+			"--agents", "codex,codex", "--rounds", "1",
+			"--session-id", "pipe0001", "--home", filepath.Join(tempDir, "relay-home"),
+			"--settings", settingsPath, "--verbose", "--json",
+		)
+		command.Env = append(os.Environ(), "PATH="+fakeBin+string(os.PathListSeparator)+os.Getenv("PATH"))
+		var stdout bytes.Buffer
+		command.Stdout = &stdout
+		stderr, err := command.StderrPipe()
+		if err != nil {
+			t.Fatalf("open stderr pipe: %v", err)
+		}
+		if err := command.Start(); err != nil {
+			t.Fatalf("start CLI: %v", err)
+		}
+		stderrOutput, readErr := io.ReadAll(stderr)
+		waitErr := command.Wait()
+		if readErr != nil {
+			t.Fatalf("read piped stderr: %v", readErr)
+		}
+		if waitErr != nil {
+			t.Fatalf("run CLI: %v\nstdout:\n%s\nstderr:\n%s", waitErr, stdout.String(), stderrOutput)
+		}
+		const wantStderr = "Session pipe0001\nRound 1 started\nRound 1 finished\n"
+		if string(stderrOutput) != wantStderr {
+			t.Fatalf("piped stderr = %q, want %q", stderrOutput, wantStderr)
+		}
+		result := decodeJSONObject(t, stdout.String())
+		if result["session_id"] != "pipe0001" {
+			t.Fatalf("run JSON session id = %v", result["session_id"])
+		}
+	})
+}
+
 func TestRecipeCLIValidators(t *testing.T) {
 	for _, status := range []string{"all", "usable", "unavailable", "invalid", "skipped"} {
 		if err := validateRecipeStatusFilter(status); err != nil {
@@ -753,11 +825,18 @@ workspace_isolation = "inherited"
 		"PATH="+fakeBin+string(os.PathListSeparator)+os.Getenv("PATH"),
 		"ROOT_RECIPE_CLI_LOG="+providerLog,
 	)
-	output, err := command.CombinedOutput()
+	var commandStdout bytes.Buffer
+	var commandStderr bytes.Buffer
+	command.Stdout = &commandStdout
+	command.Stderr = &commandStderr
+	err := command.Run()
 	if err != nil {
-		t.Fatalf("run recipe CLI: %v\n%s", err, output)
+		t.Fatalf("run recipe CLI: %v\nstdout:\n%s\nstderr:\n%s", err, commandStdout.String(), commandStderr.String())
 	}
-	result := decodeJSONObject(t, string(output))
+	result := decodeJSONObject(t, commandStdout.String())
+	if commandStderr.String() != "Session "+stringValue(result["session_id"])+"\n" {
+		t.Fatalf("run recipe launch stderr = %q", commandStderr.String())
+	}
 	if result["execution_kind"] != "recipe" || result["status"] != "completed" || result["recipe_id"] != "neutral-root" || intValue(result["actual_participant_turns"]) != 2 {
 		t.Fatalf("root CLI result = %#v", result)
 	}
@@ -812,11 +891,18 @@ workspace_isolation = "inherited"
 		"--json",
 	)
 	compatibilityCommand.Env = command.Env
-	compatibilityRaw, err := compatibilityCommand.CombinedOutput()
+	var compatibilityStdout bytes.Buffer
+	var compatibilityStderr bytes.Buffer
+	compatibilityCommand.Stdout = &compatibilityStdout
+	compatibilityCommand.Stderr = &compatibilityStderr
+	err = compatibilityCommand.Run()
 	if err != nil {
-		t.Fatalf("run recipe with compatible flags: %v\n%s", err, compatibilityRaw)
+		t.Fatalf("run recipe with compatible flags: %v\nstdout:\n%s\nstderr:\n%s", err, compatibilityStdout.String(), compatibilityStderr.String())
 	}
-	compatibilityResult := decodeJSONObject(t, string(compatibilityRaw))
+	compatibilityResult := decodeJSONObject(t, compatibilityStdout.String())
+	if compatibilityStderr.String() != "Session compat-session\n" {
+		t.Fatalf("compatible run launch stderr = %q", compatibilityStderr.String())
+	}
 	if compatibilityResult["session_id"] != "compat-session" || compatibilityResult["task"] != "Compatible CLI task" {
 		t.Fatalf("compatible run identity = %#v", compatibilityResult)
 	}
@@ -885,8 +971,8 @@ workspace_isolation = "inherited"
 	if dirtyResult["status"] != "completed" || dirtyResult["session_id"] == nil {
 		t.Fatalf("dirty-source JSON stdout = %#v", dirtyResult)
 	}
-	if warning := dirtyStderr.String(); warning != "" {
-		t.Fatalf("head-copy run wrote unexpected stderr: %q", warning)
+	if got, want := dirtyStderr.String(), "Session "+stringValue(dirtyResult["session_id"])+"\n"; got != want {
+		t.Fatalf("head-copy run stderr = %q, want %q", got, want)
 	}
 
 	for _, rejection := range []struct {
@@ -1032,14 +1118,22 @@ workspace_isolation = "inherited"
 		"--recipe-file", recipePath,
 		"--session-dir", sessionDir,
 		"--launch-cwd", launchCWD,
+		"--verbose",
 		"--json",
 	)
 	command.Env = append(os.Environ(), "PATH="+fakeBin+string(os.PathListSeparator)+os.Getenv("PATH"))
-	rawResult, err := command.CombinedOutput()
+	var runStdout bytes.Buffer
+	var runStderr bytes.Buffer
+	command.Stdout = &runStdout
+	command.Stderr = &runStderr
+	err = command.Run()
 	if err != nil {
-		t.Fatalf("run static child recipe: %v\n%s", err, rawResult)
+		t.Fatalf("run static child recipe: %v\nstdout:\n%s\nstderr:\n%s", err, runStdout.String(), runStderr.String())
 	}
-	result := decodeJSONObject(t, string(rawResult))
+	result := decodeJSONObject(t, runStdout.String())
+	if got, want := runStderr.String(), "Session "+stringValue(result["session_id"])+"\nRound 1 started\nRound 1 finished\nRound 2 started\nRound 2 finished\n"; got != want {
+		t.Fatalf("static child launch stderr = %q, want %q", got, want)
+	}
 	if result["status"] != "completed" || result["execution_kind"] != "recipe" || result["recipe_id"] != "static-parent" {
 		t.Fatalf("static child recipe result = %#v", result)
 	}
