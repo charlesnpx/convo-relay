@@ -200,6 +200,96 @@ func TestDialogueStopsConvergedAndNoLedgerSignal(t *testing.T) {
 	})
 }
 
+func TestDialogueCompletionMarkerRequiresBothLatestSlots(t *testing.T) {
+	tests := []struct {
+		name               string
+		mode               string
+		alphaResponses     []string
+		betaResponses      []string
+		wantFinishedTurns  int
+		wantStopReason     string
+		wantOpeningIgnored bool
+	}{
+		{
+			name:               "both slots stop despite contested ledger",
+			mode:               session.ModeSteelman,
+			alphaResponses:     []string{completionMarker, "still considering", "still considering"},
+			betaResponses:      []string{completionMarker, "still considering", "still considering"},
+			wantFinishedTurns:  4,
+			wantStopReason:     stopConverged,
+			wantOpeningIgnored: true,
+		},
+		{
+			name:              "one slot marker does not stop",
+			mode:              session.ModeCooperative,
+			alphaResponses:    []string{completionMarker, "still considering", "still considering"},
+			betaResponses:     []string{"still considering", "still considering", "still considering"},
+			wantFinishedTurns: 12,
+			wantStopReason:    stopCompleted,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			plan := dialoguePlan(6)
+			plan.Mode = test.mode
+			plan.Schedule.StopOnConvergence = true
+			plan.Actors = append(plan.Actors, session.Actor{ID: "facilitator", Backend: "codex"})
+			plan.Facilitator = &session.Facilitator{Actor: "facilitator", Cadence: 1}
+			alpha := &fakeBackend{name: "codex", slotID: "alpha", responses: makeResponses(test.alphaResponses)}
+			beta := &fakeBackend{name: "codex", slotID: "beta", responses: makeResponses(test.betaResponses)}
+			facilitatorResponses := []fakeResponse{{content: `{"settled":[],"contested":["opening claim"],"withdrawn":[]}`}}
+			for range 5 {
+				facilitatorResponses = append(facilitatorResponses, fakeResponse{content: `{"settled":[],"contested":["unresolved claim"],"withdrawn":[]}`})
+			}
+			facilitator := &fakeBackend{name: "codex", slotID: "facilitator", responses: facilitatorResponses}
+			sess := createSession(t, plan)
+
+			if _, err := Run(context.Background(), sess, testDeps(map[string]*fakeBackend{"alpha": alpha, "beta": beta, "facilitator": facilitator})); err != nil {
+				t.Fatalf("Run: %v", err)
+			}
+			events := sessionEvents(t, sess)
+			if got := countType(events, eventlog.TurnFinished); got != test.wantFinishedTurns {
+				t.Fatalf("finished turns = %d, want %d", got, test.wantFinishedTurns)
+			}
+			if got := sessionFinished(t, events).StopReason; got != test.wantStopReason {
+				t.Fatalf("stop reason = %q, want %q", got, test.wantStopReason)
+			}
+			if test.wantOpeningIgnored && !strings.Contains(facilitator.prompts[1], "Current counts: settled=0 contested=0 withdrawn=0") {
+				t.Fatalf("round-1 opening claim remained contested in the next facilitator prompt: %q", facilitator.prompts[1])
+			}
+		})
+	}
+}
+
+func TestParticipantPromptStatesCurrentAndAnsweredRounds(t *testing.T) {
+	plan := dialoguePlan(2)
+	alpha := &fakeBackend{name: "codex", slotID: "alpha", responses: []fakeResponse{{content: "first contribution"}}}
+	beta := &fakeBackend{name: "codex", slotID: "beta", responses: []fakeResponse{{content: "second contribution"}}}
+	sess := createSession(t, plan)
+	if _, err := Run(context.Background(), sess, testDeps(map[string]*fakeBackend{"alpha": alpha, "beta": beta})); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	prompt := beta.prompts[0]
+	for _, expected := range []string{
+		"Current round: 2",
+		"Round of the turn being answered: 1",
+		"Output only your contribution.",
+		completionMarker,
+	} {
+		if !strings.Contains(prompt, expected) {
+			t.Fatalf("participant prompt does not contain %q: %q", expected, prompt)
+		}
+	}
+}
+
+func makeResponses(contents []string) []fakeResponse {
+	responses := make([]fakeResponse, len(contents))
+	for index, content := range contents {
+		responses[index] = fakeResponse{content: content}
+	}
+	return responses
+}
+
 func TestResumeTurnBudgetGrantRequiresPostGrantDialogueEvidence(t *testing.T) {
 	plan := dialoguePlan(6)
 	plan.Schedule.StopOnConvergence = true

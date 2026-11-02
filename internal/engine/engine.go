@@ -41,6 +41,7 @@ const (
 	mediaTypeChildResult    = "text/plain; charset=utf-8"
 	mediaTypeChildPlan      = "application/vnd.convo-relay.plan+json"
 	maxPromptTranscriptSize = 12
+	completionMarker        = "[[CONVO-RELAY: COMPLETE]]"
 	resultSchemaURL         = "https://convo-relay.invalid/engine-result-schema.json"
 )
 
@@ -937,7 +938,11 @@ func (r *runner) recordCompletedTurn(turn *turnState, completed completedTurn) {
 		r.state.conversation = append(r.state.conversation, conversationTurn{ActorID: turn.ActorID, Text: completed.Text})
 		r.state.lastResult = completed
 	case eventlog.FacilitatorRole:
-		r.state.ledger = parseLedger(completed.Text, r.state.ledger)
+		ledger := parseLedger(completed.Text, r.state.ledger)
+		if len(r.state.conversation) < 2 {
+			ledger.contested = []string{}
+		}
+		r.state.ledger = ledger
 	case eventlog.ReducerRole:
 		if r.sess.Plan.Result.Source == "reducer" {
 			r.state.lastResult = completed
@@ -1157,7 +1162,8 @@ func (r *runner) dialogueStopReason() string {
 		return ""
 	}
 	reason := ""
-	if hasConverged(r.state.conversation, r.state.ledger) {
+	if hasCompletionMarkers(r.sess.Plan, r.state.conversation) ||
+		hasConverged(r.state.conversation, r.state.ledger) {
 		reason = stopConverged
 	}
 	if reason == "" && hasNoLedgerSignal(r.state.conversation, r.state.ledger) {
@@ -1951,6 +1957,14 @@ func (r *runner) promptFor(actor session.Actor, round int, role eventlog.Role, r
 	fmt.Fprintf(&builder, "Mode: %s\n", r.sess.Plan.Mode)
 	fmt.Fprintf(&builder, "Investigation: %s\n", r.sess.Plan.Investigation)
 	fmt.Fprintf(&builder, "Actor: %s\nRole: %s\nTurn: %d\n", actor.ID, role, round)
+	if role == eventlog.ParticipantRole {
+		fmt.Fprintf(&builder, "Current round: %d\n", round)
+		if round > 1 {
+			fmt.Fprintf(&builder, "Round of the turn being answered: %d\n", round-1)
+		} else {
+			builder.WriteString("Round of the turn being answered: none (opening turn)\n")
+		}
+	}
 	if prompt := strings.TrimSpace(resumePrompt); prompt != "" {
 		fmt.Fprintf(&builder, "Resume direction: %s\n", prompt)
 	}
@@ -1979,6 +1993,10 @@ func (r *runner) promptFor(actor session.Actor, round int, role eventlog.Role, r
 	if role == eventlog.FacilitatorRole {
 		counts := r.state.ledger.counts()
 		fmt.Fprintf(&builder, "\nReturn a JSON ledger with settled, contested, and withdrawn arrays. Current counts: settled=%d contested=%d withdrawn=%d.\n", counts.Settled, counts.Contested, counts.Withdrawn)
+		builder.WriteString("Do not mark an opening claim contested until the other participant has replied to it.\n")
+		if len(r.state.conversation) < 2 {
+			builder.WriteString("Only the round-1 opening turn has been made; the other participant has not replied, so contested must be an empty array.\n")
+		}
 	}
 	if role == eventlog.ReducerRole {
 		if r.sess.Plan.Instructions != nil {
@@ -1988,6 +2006,10 @@ func (r *runner) promptFor(actor session.Actor, round int, role eventlog.Role, r
 			}
 		}
 		builder.WriteString("\nReturn the final reduced result for this task.\n")
+	}
+	if role == eventlog.ParticipantRole {
+		builder.WriteString("\nOutput only your contribution. Do not include working notes, planning, or a preface.\n")
+		fmt.Fprintf(&builder, "If you have nothing further to contest, include this exact standalone line: %s\n", completionMarker)
 	}
 	return builder.String()
 }
@@ -2120,6 +2142,22 @@ func hasConverged(turns []conversationTurn, ledger ledger) bool {
 	}
 	counts := ledger.counts()
 	return counts.Contested == 0 && (counts.Settled > 0 || counts.Withdrawn > 0)
+}
+
+func hasCompletionMarkers(value session.Plan, turns []conversationTurn) bool {
+	firstSlot, err := relayplan.ParticipantActorForTurn(value, 1)
+	if err != nil {
+		return false
+	}
+	secondSlot, err := relayplan.ParticipantActorForTurn(value, 2)
+	if err != nil || firstSlot == secondSlot {
+		return false
+	}
+	latest := make(map[string]string, 2)
+	for _, turn := range turns {
+		latest[turn.ActorID] = turn.Text
+	}
+	return strings.Contains(latest[firstSlot], completionMarker) && strings.Contains(latest[secondSlot], completionMarker)
 }
 
 func hasNoLedgerSignal(turns []conversationTurn, ledger ledger) bool {

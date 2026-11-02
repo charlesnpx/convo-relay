@@ -7,6 +7,7 @@ import (
 	"github.com/charlesnpx/convo-relay/v2/internal/plan"
 	"github.com/charlesnpx/convo-relay/v2/internal/provider"
 	"github.com/charlesnpx/convo-relay/v2/internal/session"
+	"github.com/charlesnpx/convo-relay/v2/internal/sessionview"
 )
 
 func TestNewDepsSuppliesChildRequestExtractor(t *testing.T) {
@@ -82,5 +83,34 @@ func TestActorFromProfileMapsStaticChildEffort(t *testing.T) {
 				t.Fatalf("static child actor = %#v", actor)
 			}
 		})
+	}
+}
+
+func TestPublicTranscriptDoesNotContestUnansweredOpeningClaim(t *testing.T) {
+	plan := session.Plan{
+		Actors: []session.Actor{
+			{ID: "alpha", Backend: "codex"},
+			{ID: "beta", Backend: "claude"},
+			{ID: "facilitator", Backend: "codex"},
+		},
+		Facilitator: &session.Facilitator{Actor: "facilitator", Cadence: 1},
+	}
+	transcript := sessionview.TranscriptView{Entries: []sessionview.TranscriptEntry{
+		{Round: 1, ActorID: "alpha", Role: eventlog.ParticipantRole, Text: "opening claim"},
+		{Round: 1, ActorID: "facilitator", Role: eventlog.FacilitatorRole, Text: `{"settled":[],"contested":["opening claim"],"withdrawn":[]}`},
+		{Round: 2, ActorID: "beta", Role: eventlog.ParticipantRole, Text: "reply"},
+		{Round: 2, ActorID: "facilitator", Role: eventlog.FacilitatorRole, Text: `{"settled":[],"contested":["replied claim"],"withdrawn":[]}`},
+	}}
+	entries, latest, err := publicTranscript(plan, transcript, nil, nil)
+	if err != nil {
+		t.Fatalf("project transcript: %v", err)
+	}
+	first, _ := entries[0].(map[string]any)
+	firstLedger, _ := first["ledger"].(map[string]any)
+	if got := anyItems(firstLedger["contested"]); len(got) != 0 {
+		t.Fatalf("round-1 opening contested items = %#v, want none", got)
+	}
+	if got := anyItems(latest["contested"]); len(got) != 1 || got[0] != "replied claim" {
+		t.Fatalf("ledger after a reply = %#v, want replied claim", got)
 	}
 }
