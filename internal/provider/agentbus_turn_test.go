@@ -172,8 +172,8 @@ func TestEmbeddedTurnStallWithAgentTextDuringInterruptDrainRecovers(t *testing.T
 	}
 }
 
-func TestEmbeddedTurnStallWithAuthTextReturnsBackendError(t *testing.T) {
-	const authText = "Authentication error: token expired"
+func TestEmbeddedTurnStallWithAuthContentRecovers(t *testing.T) {
+	const authText = "Please sign in with your login credentials. Authentication error: token expired"
 	events := make(chan engine.Event, 1)
 	events <- engine.Event{Type: engine.EventAgentText, Text: authText}
 	session := &fakeEmbeddedSession{
@@ -187,38 +187,11 @@ func TestEmbeddedTurnStallWithAuthTextReturnsBackendError(t *testing.T) {
 	}
 
 	result, _, err := runEmbeddedTurnWithWatchdogTimeout(context.Background(), session, "codex", "Codex", "prompt", true, 0, 1, 10*time.Millisecond)
-	var backendErr BackendRunError
-	if !errors.As(err, &backendErr) {
-		t.Fatalf("error = %T %v, want BackendRunError", err, err)
+	if err != nil {
+		t.Fatalf("stalled turn: %v", err)
 	}
-	if backendErr.Label != "Codex" || backendErr.Detail != authText {
-		t.Fatalf("backend error = %#v", backendErr)
-	}
-	if !result.Stalled || !result.ProviderResult.Stalled || result.Recovered || result.ProviderResult.Recovered {
-		t.Fatalf("stalled auth result = %#v", result)
-	}
-}
-
-func TestEmbeddedTurnClassifiesRetryableContentWithTerminalError(t *testing.T) {
-	const terminalText = "backend exploded"
-	const retryableText = "API Error: rate limit exceeded"
-	session := &fakeEmbeddedSession{events: []engine.Event{
-		{Type: engine.EventAgentText, Text: retryableText},
-		{Type: engine.EventTerminalError, Text: terminalText},
-		{Type: engine.EventTurnFinal, TurnFinal: &engine.TurnFinalObservation{}},
-	}}
-
-	result, _, err := runEmbeddedTurn(context.Background(), session, "codex", "Codex", "prompt", true, 0, 0)
-	var retryableErr RetryableProviderError
-	if !errors.As(err, &retryableErr) {
-		t.Fatalf("error = %T %v, want RetryableProviderError", err, err)
-	}
-	wantDetail := terminalText + "; " + retryableText
-	if retryableErr.Label != "Codex" || retryableErr.Detail != wantDetail {
-		t.Fatalf("retryable error = %#v, want detail %q", retryableErr, wantDetail)
-	}
-	if result.ProviderResult.RetryableError != wantDetail || result.Recovered || result.ProviderResult.Recovered {
-		t.Fatalf("terminal retryable result = %#v", result)
+	if result.Content != authText || !result.Stalled || !result.ProviderResult.Stalled || !result.Recovered || !result.ProviderResult.Recovered {
+		t.Fatalf("stalled auth-content result = %#v", result)
 	}
 }
 
@@ -400,7 +373,7 @@ func TestEmbeddedTurnClassifiesRetryableTerminalError(t *testing.T) {
 	if !errors.As(err, &retryableErr) {
 		t.Fatalf("error = %T %v, want RetryableProviderError", err, err)
 	}
-	wantDetail := retryableText + "; partial response"
+	wantDetail := retryableText
 	if retryableErr.Label != "Codex" || retryableErr.Detail != wantDetail {
 		t.Fatalf("retryable error = %#v", retryableErr)
 	}
@@ -434,10 +407,10 @@ func TestEmbeddedTurnExecutionFailedWithoutOutputReturnsBackendError(t *testing.
 	}
 }
 
-func TestEmbeddedTurnExecutionFailedWithAuthTextReturnsBackendError(t *testing.T) {
+func TestEmbeddedTurnExecutionFailedWithTerminalAuthErrorReturnsBackendError(t *testing.T) {
 	const authText = "Authentication error: token expired"
 	session := &fakeEmbeddedSession{events: []engine.Event{
-		{Type: engine.EventAgentText, Text: authText},
+		{Type: engine.EventTerminalError, Text: authText},
 		{Type: engine.EventTurnFinal, TurnFinal: &engine.TurnFinalObservation{
 			ReturnCodeKnown: true,
 			ReturnCode:      17,
@@ -459,6 +432,25 @@ func TestEmbeddedTurnExecutionFailedWithAuthTextReturnsBackendError(t *testing.T
 	}
 	if result.Recovered || result.ProviderResult.Recovered || result.ProviderResult.RetryableError != "" {
 		t.Fatalf("turn result = %#v", result)
+	}
+}
+
+func TestEmbeddedTurnRecordsSuccessfulAuthenticationDiscussion(t *testing.T) {
+	const body = "please sign in with your login credentials"
+	session := &fakeEmbeddedSession{events: []engine.Event{
+		{Type: engine.EventAgentText, Text: body},
+		{Type: engine.EventTurnFinal, TurnFinal: &engine.TurnFinalObservation{
+			ReturnCodeKnown: true,
+			ReturnCode:      0,
+		}},
+	}}
+
+	result, final, err := runEmbeddedTurn(context.Background(), session, "claude", "Claude Code", "prompt", true, 0, 0)
+	if err != nil {
+		t.Fatalf("run turn: %v", err)
+	}
+	if result.Content != body || final == nil || final.ExecutionFailed || final.TimedOut || result.ProviderResult.ReturnCode != 0 {
+		t.Fatalf("successful turn = result %#v, final %#v", result, final)
 	}
 }
 
@@ -537,7 +529,7 @@ func TestEmbeddedTurnCanceledWithAgentTextRecovers(t *testing.T) {
 	}
 }
 
-func TestEmbeddedTurnCanceledWithRetryableAgentTextReturnsRetryableProviderError(t *testing.T) {
+func TestEmbeddedTurnCanceledWithRetryableTextRecoversWithoutClassifyingContent(t *testing.T) {
 	const retryableText = "API Error: rate limit exceeded"
 	session := &fakeEmbeddedSession{events: []engine.Event{
 		{Type: engine.EventAgentText, Text: retryableText},
@@ -545,18 +537,14 @@ func TestEmbeddedTurnCanceledWithRetryableAgentTextReturnsRetryableProviderError
 	}}
 
 	result, _, err := runEmbeddedTurn(context.Background(), session, "codex", "Codex", "prompt", true, 0, 0)
-	var retryableErr RetryableProviderError
-	if !errors.As(err, &retryableErr) {
-		t.Fatalf("error = %T %v, want RetryableProviderError", err, err)
+	if err != nil {
+		t.Fatalf("run turn: %v", err)
 	}
-	if retryableErr.Label != "Codex" || retryableErr.Detail != retryableText {
-		t.Fatalf("retryable error = %#v", retryableErr)
-	}
-	if result.Content != retryableText || result.Recovered || result.ProviderResult.Recovered || result.ProviderResult.RecoverySource != "" {
+	if result.Content != retryableText || !result.Recovered || !result.ProviderResult.Recovered || result.ProviderResult.RecoverySource != "event_stream" {
 		t.Fatalf("turn result = %#v", result)
 	}
-	if result.ProviderResult.RetryableError != retryableText {
-		t.Fatalf("retryable error = %q, want %q", result.ProviderResult.RetryableError, retryableText)
+	if result.ProviderResult.RetryableError != "" {
+		t.Fatalf("retryable error = %q, want empty", result.ProviderResult.RetryableError)
 	}
 }
 

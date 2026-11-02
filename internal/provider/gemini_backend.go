@@ -70,15 +70,18 @@ func (b *geminiBackend) RunTurn(ctx context.Context, prompt string, options Turn
 	if err != nil {
 		return TurnResult{}, err
 	}
+	errorDetail := collapseWhitespace(result.Stderr)
 	if result.TimedOut {
+		if retryableError := classifyRetryableProviderError(errorDetail); retryableError != "" {
+			providerResult.RetryableError = retryableError
+			return TurnResult{ProviderResult: providerResult}, RetryableProviderError{Label: b.label, Detail: retryableError}
+		}
+		if errorDetail != "" && providerFailureCategory(errorDetail) == "auth" {
+			return TurnResult{ProviderResult: providerResult}, BackendRunError{Label: b.label, Detail: errorDetail}
+		}
 		if text == "" {
 			providerResult.Warnings = append(providerResult.Warnings, fmt.Sprintf("gemini timed out after %ds with no recoverable response", options.TimeoutSeconds))
 			text = fmt.Sprintf("[%s timed out after %ds]", b.label, options.TimeoutSeconds)
-		} else if retryableError := classifyRetryableProviderError(text); retryableError != "" {
-			providerResult.RetryableError = retryableError
-			return TurnResult{ProviderResult: providerResult}, RetryableProviderError{Label: b.label, Detail: retryableError}
-		} else if providerFailureCategory(text) == "auth" {
-			return TurnResult{ProviderResult: providerResult}, BackendRunError{Label: b.label, Detail: text}
 		} else {
 			providerResult.Recovered = true
 			providerResult.RecoverySource = "output"
@@ -86,26 +89,22 @@ func (b *geminiBackend) RunTurn(ctx context.Context, prompt string, options Turn
 		}
 	} else if result.ReturnCode != 0 {
 		if text == "" {
-			detail := strings.TrimSpace(result.Stderr)
-			if detail == "" {
-				detail = strings.TrimSpace(result.Stdout)
-			}
+			detail := errorDetail
 			if detail == "" {
 				detail = fmt.Sprintf("process exited %d", result.ReturnCode)
 			}
-			detail = collapseWhitespace(detail)
 			if retryableError := classifyRetryableProviderError(detail); retryableError != "" {
 				providerResult.RetryableError = retryableError
 				return TurnResult{ProviderResult: providerResult}, RetryableProviderError{Label: b.label, Detail: retryableError}
 			}
 			return TurnResult{ProviderResult: providerResult}, BackendRunError{Label: b.label, Detail: detail}
 		}
-		if retryableError := classifyRetryableProviderError(text); retryableError != "" {
+		if retryableError := classifyRetryableProviderError(errorDetail); retryableError != "" {
 			providerResult.RetryableError = retryableError
 			return TurnResult{ProviderResult: providerResult}, RetryableProviderError{Label: b.label, Detail: retryableError}
 		}
-		if providerFailureCategory(text) == "auth" {
-			return TurnResult{ProviderResult: providerResult}, BackendRunError{Label: b.label, Detail: text}
+		if errorDetail != "" && providerFailureCategory(errorDetail) == "auth" {
+			return TurnResult{ProviderResult: providerResult}, BackendRunError{Label: b.label, Detail: errorDetail}
 		}
 		providerResult.Recovered = true
 		providerResult.RecoverySource = "output"
