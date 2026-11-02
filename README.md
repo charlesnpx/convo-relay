@@ -170,27 +170,28 @@ Cross-compilation is a release gate, not a runtime certification claim. `make cr
 
 ### Start a dialogue
 
-When launching from a tool shell, give the relay its own process lifetime. This
-form works on macOS and Linux: stdin comes from `/dev/null`, and stdout and
-stderr go to a log file. Run it in Bash so `disown` applies to the background
-job.
+Foreground execution is the default. On macOS and Linux, use native
+`run --detach` when the relay should outlive the launching tool shell:
 
 ```bash
 session_id="auth-review-$(date +%Y%m%d-%H%M%S)-$$-$RANDOM"
-log_file="/tmp/convo-relay-${session_id}.log"
-nohup convo-relay run "Review src/auth/ for security vulnerabilities" \
-  --session-id "$session_id" --verbose \
-  < /dev/null > "$log_file" 2>&1 &
-relay_pid=$!
-disown "$relay_pid"
+convo-relay run "Review src/auth/ for security vulnerabilities" \
+  --session-id "$session_id" --detach --verbose
 ```
 
+The command returns a text receipt with `Detached session <id>` and
+`Log: <path>`. With `--json`, it returns `kind: "launch_receipt"`,
+`session_id`, and `log_path`. Each launch gets a unique log under the selected relay home's
+`logs` directory; stdin is null and stdout/stderr, including `--verbose`
+progress, are captured there. A zero exit confirms detached startup setup was
+acknowledged; it does not mean the relay completed. Inspect the returned log
+for startup or provider failures.
+
 For flag-based `run` commands, pass a unique `--session-id` so the caller can
-refer to the session directly without searching `list`. The first stderr line
-is `Session <id>`; the CLI writes it after creating the session and before
-provider work. It appears at the start of the redirected log. A supplied
-immutable plan already carries its session ID; `run --plan` rejects
-`--session-id` as a structural override.
+refer to the session directly without searching `list`. A supplied immutable
+plan already carries its session ID; `run --plan` rejects `--session-id` as a
+structural override. `--detach` applies only to `run`; `resume` remains a
+foreground command.
 
 The default pairing is `codex,claude`. To have Claude open instead:
 
@@ -215,8 +216,10 @@ Mixed backend runs default the facilitator to Codex with `gpt-5.5` and fallback 
 
 By default, `run` auto-stops when the facilitator's ledger has no contested
 items and at least one settled or withdrawn item after both participants have
-replied, or when both participants' latest turns contain the standalone line
-`[[CONVO-RELAY: COMPLETE]]`. An empty-ledger stall can also stop with
+replied, or when the completion-marker string `[[CONVO-RELAY: COMPLETE]]`
+occurs in both participants' latest turns. Participants are instructed to emit
+it as a standalone line; detection checks for the marker string in each turn.
+An empty-ledger stall can also stop with
 `stop_reason: "stalled_no_ledger_signal"`. Auto-stop mode has a safety cap of
 50 rounds.
 
@@ -446,9 +449,15 @@ Session status values are `running`, `interrupted`, `awaiting_decision`,
 while its writer lock is held and `interrupted` after the lock is free;
 `awaiting_decision` means an unresolved proposal needs an operator decision.
 `invalid_result` is a failed result-validation status. `doctor <id> --json`
-reports `diagnostics.attention_required`; it is true for `interrupted`,
+wraps health under `health`; its attention flag is
+`health.diagnostics.attention_required`. It is true for `interrupted`,
 `failed`, `invalid_result`, and `awaiting_decision`, and false for `running` and
 `completed`.
+
+After a detached launch, use `show <id> --json` to follow progress. `running`
+means active work; `completed` means the transcript is ready to export. Treat
+`failed` and `invalid_result` as failures. `interrupted` and
+`awaiting_decision` require operator action rather than more waiting.
 
 `show --graph --json` returns a derived graph plus canonical event summaries.
 The event log remains the durable authority; the graph is an inspection view.
@@ -487,8 +496,8 @@ convo-relay doctor a1b2c3d4 --probe-auth --json
 `doctor` combines the read-only global or session health report with backend
 readiness. Its JSON report preserves the complete backend readiness body under
 `backends`; add `--probe-auth` for supported authentication probes. For a
-session, `diagnostics.attention_required` is true only for `interrupted`,
-`failed`, `invalid_result`, and `awaiting_decision` statuses.
+session, inspect `health.diagnostics.attention_required`; it is true only for
+`interrupted`, `failed`, `invalid_result`, and `awaiting_decision` statuses.
 
 ### Resume a session
 
@@ -500,13 +509,14 @@ convo-relay resume a1b2c3d4 --rounds 3
 
 The optional resume prompt is injected into the next resumed turn as new
 direction without replacing the original launch prompt stored in session
-metadata. `resume --rounds N` grants up to N additional participant turns; the
-relay may stop earlier if it converges. If a session has already completed,
-provide `--rounds N` to grant it more work. Without a new turn budget, a
-completed session has nothing left to resume. Resume inherits the original
-context refs, mode, and agent pairing. This build does not apply
-`resume --max-rounds` or accept new `--context` or `--skill` files on `resume`;
-those flags are supported by `run` only.
+metadata. `resume --rounds N` grants up to N additional participant turns;
+`resume --quick` grants three additional participant turns. The relay may stop
+earlier if it converges. If a session has already completed, provide a new turn
+budget to grant it more work. Without one, a completed session has nothing left
+to resume. Resume inherits the original context refs, mode, and agent pairing.
+It rejects new `--context` and `--skill` files. This build does not apply
+`resume --max-rounds` or resume-time settings, mode, timeout, model, effort,
+facilitator, or backend-replacement overrides.
 Like `run`, `resume` writes an export only when `-o` / `--output` is supplied.
 
 `resume` keeps the original pairing and slot order. It uses the runtime config
@@ -552,22 +562,21 @@ convo-relay clean --all --home ~/.convo-relay --json
 
 ### From Claude Code (sub-agent)
 
-The intended primary use case — spawn a sub-agent that runs the relay and summarizes results. The shell launch remains detached from the tool process:
+The intended primary use case is to spawn a sub-agent that runs the relay and
+summarizes results. Launch it with native detach:
 
 ```
 Use the Agent tool to run this Bash command:
 
 session_id="auth-review-$(date +%Y%m%d-%H%M%S)-$$-$RANDOM"
-log_file="/tmp/convo-relay-${session_id}.log"
-nohup convo-relay run \
+convo-relay run \
   "Review the auth module for security issues" \
-  --session-id "$session_id" --max-rounds 8 --verbose \
-  -o "/tmp/${session_id}.md" \
-  < /dev/null > "$log_file" 2>&1 &
-relay_pid=$!
-disown "$relay_pid"
+  --session-id "$session_id" --max-rounds 8 --detach --verbose
 
-Then read the export file and summarize what each agent found.
+Use `convo-relay show "$session_id" --json` to follow progress. When its
+status is `completed`, export the actual transcript with
+`convo-relay export create "$session_id" -o "/tmp/${session_id}.md"`, then read
+that file and summarize what each agent found.
 ```
 
 ## Commands
@@ -590,6 +599,7 @@ Then read the export file and summarize what each agent found.
 | Flag | Commands | Description |
 |------|----------|-------------|
 | `--session-id ID` | run | Choose a stable ID for a flag-based launch; a supplied `--plan` already carries its ID |
+| `--detach` | run | Return a launch receipt while the relay continues; supported on macOS and Linux |
 | `--rounds N` | run, resume | Set the participant-turn budget. On `resume`, this grants up to `N` additional turns |
 | `--max-rounds N` | run | Safety cap for auto-stop mode (default: 50) |
 | `--timeout N`, `--patience N` | run | Per-turn timeout in seconds (default: 600) |
@@ -597,7 +607,7 @@ Then read the export file and summarize what each agent found.
 | `--agents AGENT[,AGENT]` | run | One backend for shorthand (`claude`, `codex`, or `gemini`), or an explicit backend pair (default: `codex,claude`) |
 | `--model-a MODEL`, `--model-b MODEL` | run | Model for slot A / slot B |
 | `--effort-a EFFORT`, `--effort-b EFFORT` | run | Effort for slot A / slot B |
-| `--quick` | run | Force exactly 3 rounds |
+| `--quick` | run, resume | Force 3 participant turns for `run` or 3 additional participant turns for `resume` |
 | `--context FILE [FILE ...]` | run | Attach UTF-8 text context files and persist labeled input-bundle artifacts. Limits: 1 MiB per file, 2 MiB total |
 | `--skill FILE [FILE ...]` | run | Attach UTF-8 capability files and persist labeled input-bundle artifacts |
 | `--recipe-file FILE` | run | Attach session-scoped transient relay recipes from TOML and persist the source artifact |

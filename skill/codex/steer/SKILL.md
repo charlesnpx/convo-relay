@@ -28,6 +28,8 @@ convo-relay show <session-id> --json
 
 Use the top-level `status` and `stop_reason`, `summary`, `meta`, `diagnostics`, `transcript`, `incomplete`, and `export_ready` in `show --json` to identify the session and summarize it. Do not infer failure from a quiet running session.
 
+`doctor --json` wraps health under `health`; its attention flag is `health.diagnostics.attention_required`.
+
 If multiple running relays are plausible, ask the user to choose and do not queue anything yet:
 
 ```text
@@ -36,7 +38,7 @@ Which relay were you referring to?
 2. <session-id> - <short summary: status, agents, rounds, topic>
 ```
 
-If the session is running, do not queue steering yet. The operator must interrupt the relay process first; after it stops, queue the direction for the next resume. If the session is completed, continue it with `convo-relay resume <session-id> "<direction>" --rounds <N>`; this grants up to N additional turns and the relay may stop earlier if it converges. This build does not apply `resume --max-rounds` or accept new `--context` or `--skill` files on `resume`; those flags are supported by `run` only.
+If the session is `running`, do not queue steering yet. The operator must interrupt the relay process first; after it stops, queue the direction for the next resume. If it is `interrupted`, queue the direction for the next resume. If it is `awaiting_decision`, inspect and resolve the pending proposal before deciding whether to queue direction or resume. For `failed` or `invalid_result`, inspect the session report before choosing a recovery action. If the session is `completed`, continue it with `convo-relay resume <session-id> "<direction>" --rounds <N>`; this grants up to N additional turns and the relay may stop earlier if it converges. `--quick` grants three additional participant turns on resume. Resume rejects new `--context` or `--skill` files and does not apply `--max-rounds` or resume-time settings, mode, timeout, model, effort, facilitator, or backend-replacement overrides.
 
 ## Queue the steering
 
