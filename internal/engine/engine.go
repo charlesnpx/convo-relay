@@ -70,6 +70,8 @@ type Deps struct {
 	Writer                *eventlog.Writer
 	Recipes               []plan.Recipe
 	ChildRequestExtractor ChildRequestExtractor
+	// ProgressWriter receives best-effort participant round progress; nil disables it.
+	ProgressWriter io.Writer
 	// RetrySleeper waits between retryable provider attempts. A nil value uses
 	// the context-aware production sleeper; tests can replace it to avoid time.
 	RetrySleeper func(context.Context, time.Duration) error
@@ -546,6 +548,12 @@ func (r *runner) append(payload eventlog.Payload) error {
 		return err
 	}
 	return r.reduceEvent(event)
+}
+
+func (r *runner) reportProgress(format string, args ...any) {
+	if r.deps.ProgressWriter != nil {
+		_, _ = fmt.Fprintf(r.deps.ProgressWriter, format, args...)
+	}
 }
 
 func (r *runner) putText(text string) (blobstore.BlobRef, error) {
@@ -1099,6 +1107,9 @@ func (r *runner) execute() (Outcome, error) {
 		if err := r.append(eventlog.TurnStartedPayload{ActorID: next.Actor.ID, Round: next.Round, Role: next.Role}); err != nil {
 			return Outcome{}, err
 		}
+		if next.Role == eventlog.ParticipantRole {
+			r.reportProgress("Round %d started\n", next.Round)
+		}
 	}
 }
 
@@ -1365,11 +1376,17 @@ func (r *runner) finishActiveTurn(turn *turnState, attempt *attemptState) error 
 	if turn == nil || attempt == nil || attempt.Outcome != "success" {
 		return errors.New("successful attempt is required to finish a turn")
 	}
-	return r.append(eventlog.TurnFinishedPayload{
+	if err := r.append(eventlog.TurnFinishedPayload{
 		ActorID: turn.ActorID,
 		Round:   turn.Round,
 		Content: attempt.Content,
-	})
+	}); err != nil {
+		return err
+	}
+	if turn.Role == eventlog.ParticipantRole {
+		r.reportProgress("Round %d finished\n", turn.Round)
+	}
+	return nil
 }
 
 func (r *runner) applySteering(round int) (string, error) {
