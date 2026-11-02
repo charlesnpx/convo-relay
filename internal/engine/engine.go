@@ -2009,9 +2009,19 @@ func (r *runner) promptFor(actor session.Actor, round int, role eventlog.Role, r
 	}
 	if role == eventlog.ParticipantRole {
 		builder.WriteString("\nOutput only your contribution. Do not include working notes, planning, or a preface.\n")
-		fmt.Fprintf(&builder, "If you have nothing further to contest, include this exact standalone line: %s\n", completionMarker)
+		if shouldPromptForCompletionMarker(r.sess.Plan) {
+			fmt.Fprintf(&builder, "If you have nothing further to contest, include this exact standalone line: %s\n", completionMarker)
+		}
 	}
 	return builder.String()
+}
+
+func shouldPromptForCompletionMarker(value session.Plan) bool {
+	if value.Schedule.Kind != relayplan.ScheduleDialogue || !value.Schedule.StopOnConvergence {
+		return false
+	}
+	return value.Result.Source != relayplan.ResultSourceLastTurn ||
+		(value.Result.Format != relayplan.ResultFormatJSON && len(value.Result.Schema) == 0)
 }
 
 func (r *runner) turnInstructions(actorID string, round int) string {
@@ -2136,9 +2146,6 @@ func hasConverged(turns []conversationTurn, ledger ledger) bool {
 	previous := turns[len(turns)-2]
 	if last.ActorID == previous.ActorID {
 		return false
-	}
-	if hasDoneSignal(last.Text) && hasDoneSignal(previous.Text) {
-		return true
 	}
 	counts := ledger.counts()
 	return counts.Contested == 0 && (counts.Settled > 0 || counts.Withdrawn > 0)
