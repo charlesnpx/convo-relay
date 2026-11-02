@@ -20,22 +20,6 @@ type detachedStartupAck struct {
 	SessionID string `json:"session_id"`
 }
 
-func stripDetachFlag(args []string) []string {
-	cleaned := make([]string, 0, len(args))
-	for index, arg := range args {
-		if arg == "--" {
-			cleaned = append(cleaned, arg)
-			cleaned = append(cleaned, args[index+1:]...)
-			break
-		}
-		if name, _ := flagName(arg); name == "detach" && isFlagToken(arg) {
-			continue
-		}
-		cleaned = append(cleaned, arg)
-	}
-	return cleaned
-}
-
 func writeDetachedLaunchReceipt(receipt detachedLaunchReceipt, jsonOutput bool) {
 	if jsonOutput {
 		writeJSON(receipt)

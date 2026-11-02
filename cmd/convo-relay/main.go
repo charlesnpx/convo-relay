@@ -705,8 +705,8 @@ func runRelay(args []string) {
 	if err := parseFlags(flags, cleanedArgs); err != nil {
 		os.Exit(2)
 	}
-	if *detach {
-		receipt, err := launchDetachedRun(stripDetachFlag(args), *relayHome)
+	if *detach && os.Getenv(detachedStartupAckEnv) == "" {
+		receipt, err := launchDetachedRun(args, *relayHome)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "error: %s\n", err)
 			os.Exit(1)

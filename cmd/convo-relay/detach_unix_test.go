@@ -104,6 +104,79 @@ func TestDetachedRunSurvivesLauncherProcessGroupCleanup(t *testing.T) {
 	}
 }
 
+func TestDetachedTaskValuesRemainUnchangedWithoutRecursiveLaunch(t *testing.T) {
+	root := t.TempDir()
+	binary := buildDetachTestBinary(t, root)
+	fakeBin := filepath.Join(root, "bin")
+	if err := os.MkdirAll(fakeBin, 0o700); err != nil {
+		t.Fatalf("create fake provider directory: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(fakeBin, "codex"), []byte(detachedFakeCodexScript), 0o700); err != nil {
+		t.Fatalf("write fake provider: %v", err)
+	}
+	settings := filepath.Join(root, "settings.toml")
+	if err := os.WriteFile(settings, nil, 0o600); err != nil {
+		t.Fatalf("write settings: %v", err)
+	}
+
+	for _, test := range []struct {
+		name string
+		task string
+	}{
+		{name: "terminator_value", task: "--"},
+		{name: "detach_value", task: "--detach"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			task := test.task
+			home := filepath.Join(root, "home-"+test.name)
+			sessionDir := filepath.Join(root, "session-"+test.name)
+			statePath := filepath.Join(root, "provider-state-"+test.name+".txt")
+			markerStatePath := filepath.Join(root, "provider-marker-"+test.name+".txt")
+			command := exec.Command(binary,
+				"run", "--task", task, "--agents", "codex", "--rounds", "1",
+				"--settings", settings, "--home", home, "--session-dir", sessionDir,
+				"--detach", "--json",
+			)
+			command.Dir = root
+			command.Env = append(os.Environ(),
+				"PATH="+fakeBin+string(os.PathListSeparator)+os.Getenv("PATH"),
+				"DETACH_PROVIDER_STATE_FILE="+statePath,
+				"DETACH_PROVIDER_MARKER_STATE_FILE="+markerStatePath,
+			)
+			output, err := command.CombinedOutput()
+			if err != nil {
+				t.Fatalf("launch detached run: %v\n%s", err, output)
+			}
+			receipt := decodeJSONObject(t, string(output))
+			if receipt["kind"] != "launch_receipt" {
+				t.Fatalf("detached receipt = %#v", receipt)
+			}
+
+			sess, err := session.Open(sessionDir)
+			if err != nil {
+				t.Fatalf("open detached session: %v", err)
+			}
+			if sess.Plan.Task != task {
+				t.Fatalf("detached task = %q, want %q", sess.Plan.Task, task)
+			}
+			waitForDetachedProvider(t, statePath)
+			marker, err := os.ReadFile(markerStatePath)
+			if err != nil {
+				t.Fatalf("read provider startup marker: %v", err)
+			}
+			if string(marker) != "<unset>" {
+				t.Fatalf("startup acknowledgment marker reached provider: %q", marker)
+			}
+			waitForDetachedCompletion(t, sessionDir)
+
+			logs, err := filepath.Glob(filepath.Join(home, "logs", "run-detached-*.log"))
+			if err != nil || len(logs) != 1 {
+				t.Fatalf("detached launch logs = %v, %v; want exactly one launch", logs, err)
+			}
+		})
+	}
+}
+
 func TestDetachedRunPreflightFailuresAndSpawnFailure(t *testing.T) {
 	root := t.TempDir()
 	binary := buildDetachTestBinary(t, root)
@@ -249,7 +322,7 @@ var detachedFakeCodexScript = func() string {
 	)
 	script = strings.Replace(script,
 		"def main():\n",
-		"def main():\n    state_file = os.environ.get(\"DETACH_PROVIDER_STATE_FILE\", \"\")\n    if state_file:\n        Path(state_file).write_text(f\"{os.getpid()} {os.getsid(0)}\\n\", encoding=\"utf-8\")\n",
+		"def main():\n    marker_state_file = os.environ.get(\"DETACH_PROVIDER_MARKER_STATE_FILE\", \"\")\n    if marker_state_file:\n        Path(marker_state_file).write_text(os.environ.get(\"CONVO_RELAY_INTERNAL_STARTUP_ACK_FD\", \"<unset>\"), encoding=\"utf-8\")\n    state_file = os.environ.get(\"DETACH_PROVIDER_STATE_FILE\", \"\")\n    if state_file:\n        Path(state_file).write_text(f\"{os.getpid()} {os.getsid(0)}\\n\", encoding=\"utf-8\")\n",
 		1,
 	)
 	return strings.Replace(script,
