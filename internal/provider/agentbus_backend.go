@@ -66,8 +66,6 @@ func newEmbeddedCodexBackend(sessionRoot string, slotID string, label string, cw
 			Binary:           "codex",
 			SupportedModels:  nil,
 			SupportedEfforts: nil,
-			// Trusted posture is the user-decided policy for convo-relay.
-			WritePolicy: codexcli.WritePolicyTrusted,
 		}),
 	)
 }
@@ -162,7 +160,7 @@ func (b *embeddedBackend) RunTurn(ctx context.Context, prompt string, options Tu
 		stallTimeoutSeconds = claudeDefaultStallTimeoutSeconds
 		watchdogTimeout = embeddedClaudeDefaultStallTimeout
 	}
-	result, final, err := runEmbeddedTurnWithWatchdogTimeout(ctx, b.session, b.backendName, b.label, prompt, sessionOptions.Write, options.TimeoutSeconds, stallTimeoutSeconds, watchdogTimeout)
+	result, final, err := runEmbeddedTurnWithWatchdogTimeout(ctx, b.session, b.backendName, b.label, prompt, options.TimeoutSeconds, stallTimeoutSeconds, watchdogTimeout)
 	if final != nil && final.TimedOut && result.Content == "" && !result.Recovered {
 		var backendErr BackendRunError
 		if errors.As(err, &backendErr) && backendErr.Detail == embeddedTurnFailureDetail(final) {
@@ -341,7 +339,6 @@ func claudeCleanupPaths(cwd string, sessionID string) (string, string, string, e
 func (b *embeddedBackend) sessionOptions(timeoutSeconds int) engine.SessionOpts {
 	options := engine.SessionOpts{
 		CWD:     b.cwd,
-		Write:   true,
 		Model:   b.model,
 		Effort:  b.effort,
 		Timeout: embeddedTurnTimeout(timeoutSeconds),

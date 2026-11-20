@@ -187,7 +187,7 @@ func TestEmbeddedClaudeStateRoundTripAndValidation(t *testing.T) {
 	}
 }
 
-func TestEmbeddedCodexUsesHomeOverlayTrustedPolicyAndLiveSession(t *testing.T) {
+func TestEmbeddedCodexUsesHomeOverlayAndLiveSession(t *testing.T) {
 	engineBackend := &fakeEmbeddedEngineBackend{name: "codex"}
 	originalFactory := newEmbeddedCodexEngine
 	var captured codexcli.Options
@@ -212,8 +212,8 @@ func TestEmbeddedCodexUsesHomeOverlayTrustedPolicyAndLiveSession(t *testing.T) {
 	}
 	engineBackend.startSession = session
 	backend := newEmbeddedCodexBackend(root, "slot_7", "Codex", "/workspace", SlotConfig{Model: "model-a", Effort: "high"})
-	if captured.WritePolicy != codexcli.WritePolicyTrusted {
-		t.Fatalf("write policy = %v, want trusted", captured.WritePolicy)
+	if captured.Binary != "codex" {
+		t.Fatalf("binary = %q, want codex", captured.Binary)
 	}
 	// The overlay is independent of home seeding. Keep this fake-engine test
 	// hermetic rather than consulting the operator's ~/.codex directory.
@@ -235,14 +235,17 @@ func TestEmbeddedCodexUsesHomeOverlayTrustedPolicyAndLiveSession(t *testing.T) {
 	if startOptions.EnvOverlay["CODEX_HOME"] != wantHome {
 		t.Fatalf("CODEX_HOME overlay = %q, want %q", startOptions.EnvOverlay["CODEX_HOME"], wantHome)
 	}
-	if startOptions.CWD != "/workspace" || !startOptions.Write || startOptions.Model != "model-a" || startOptions.Effort != "high" || startOptions.Timeout != 7*time.Second {
+	if startOptions.CWD != "/workspace" || startOptions.Model != "model-a" || startOptions.Effort != "high" || startOptions.Timeout != 7*time.Second {
 		t.Fatalf("start options = %#v", startOptions)
 	}
 	if len(session.turnInputs) != 2 {
 		t.Fatalf("turn calls = %d, want two", len(session.turnInputs))
 	}
-	if session.turnInputs[0].Prompt != "first" || !session.turnInputs[0].Write || session.turnInputs[0].Timeout != 7*time.Second {
-		t.Fatalf("first turn input = %#v", session.turnInputs[0])
+	for i, prompt := range []string{"first", "second"} {
+		input := session.turnInputs[i]
+		if input.Prompt != prompt || input.Intent != engine.IntentEdit || input.Timeout != 7*time.Second {
+			t.Fatalf("turn %d input = %#v", i, input)
+		}
 	}
 	if got := backend.SessionState()["thread_id"]; got != "thread-confirmed" {
 		t.Fatalf("thread_id = %#v, want provider-confirmed id", got)
@@ -457,12 +460,11 @@ func TestEmbeddedBackendReusesSuccessfulSessionAndForwardsTurnInput(t *testing.T
 	if len(session.turnInputs) != 2 {
 		t.Fatalf("turn calls = %d, want two", len(session.turnInputs))
 	}
-	input := session.turnInputs[0]
-	if input.Prompt != "first" || !input.Write || input.Timeout != 9*time.Second {
-		t.Fatalf("first turn input = %#v", input)
-	}
-	if input.Write != engineBackend.startOptions[0].Write {
-		t.Fatalf("turn write = %t, session write = %t", input.Write, engineBackend.startOptions[0].Write)
+	for i, prompt := range []string{"first", "second"} {
+		input := session.turnInputs[i]
+		if input.Prompt != prompt || input.Intent != engine.IntentEdit || input.Timeout != 9*time.Second {
+			t.Fatalf("turn %d input = %#v", i, input)
+		}
 	}
 }
 
@@ -523,6 +525,12 @@ func TestEmbeddedBackendResumesRestoredSessionLazily(t *testing.T) {
 	if len(engineBackend.resumeCalls) != 1 || engineBackend.resumeCalls[0].id != "thread-restored" {
 		t.Fatalf("resume calls = %#v", engineBackend.resumeCalls)
 	}
+	if got, want := engineBackend.resumeCalls[0].options.EnvOverlay["CODEX_HOME"], backend.codexHome; got != want {
+		t.Fatalf("resumed CODEX_HOME = %q, want %q", got, want)
+	}
+	if len(resumedSession.turnInputs) != 1 || resumedSession.turnInputs[0].Prompt != "continue" || resumedSession.turnInputs[0].Intent != engine.IntentEdit {
+		t.Fatalf("resumed turn inputs = %#v", resumedSession.turnInputs)
+	}
 }
 
 func TestEmbeddedTurnReturnsContextCancellation(t *testing.T) {
@@ -546,7 +554,7 @@ func TestEmbeddedTurnReturnsContextCancellation(t *testing.T) {
 	}
 	done := make(chan turnOutcome, 1)
 	go func() {
-		_, _, err := runEmbeddedTurn(ctx, session, "codex", "Codex", "wait", true, 0, 0)
+		_, _, err := runEmbeddedTurn(ctx, session, "codex", "Codex", "wait", 0, 0)
 		done <- turnOutcome{err: err}
 	}()
 	select {

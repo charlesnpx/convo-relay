@@ -29,7 +29,7 @@ The elegant way to create this is of course to implement your own agentic loop w
 
 1. Creates an isolated session directory under `~/.codex-claude/sessions/`
 2. Initializes a git repo in that directory so Codex always has a valid repository
-3. Runs alternating turns across two backend slots. Codex and Claude Code use embedded agentbus v0.9.1 engine adapters: Codex via `codex app-server` JSON-RPC and Claude via its stream-json CLI transport; Gemini remains `gemini --output-format json`
+3. Runs alternating turns across two backend slots. Codex and Claude Code use embedded agentbus v0.18.0 engine adapters: Codex via `codex app-server` JSON-RPC and Claude via its stream-json CLI transport; Gemini remains `gemini --output-format json`
 4. Uses symmetric framing driven by `--mode`: `cooperative`, `adversarial`, or `steelman`
 5. Runs a lightweight facilitator after every turn to maintain a ledger of settled, contested, and withdrawn points
 6. Persists the original launch directory so resume and clean keep using the same project context
