@@ -22,6 +22,7 @@ type TurnResult struct {
 	TimedOut          bool
 	Stalled           bool
 	Recovered         bool
+	CleanupFailed     bool
 	ProviderResult    ProviderResult
 	ProviderResultRef Metadata
 }

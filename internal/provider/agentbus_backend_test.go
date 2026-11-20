@@ -5,6 +5,7 @@ import (
 	"errors"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 
@@ -465,6 +466,44 @@ func TestEmbeddedBackendReusesSuccessfulSessionAndForwardsTurnInput(t *testing.T
 		if input.Prompt != prompt || input.Intent != engine.IntentEdit || input.Timeout != 9*time.Second {
 			t.Fatalf("turn %d input = %#v", i, input)
 		}
+	}
+}
+
+func TestEmbeddedBackendBlocksAfterCleanupFailure(t *testing.T) {
+	for _, name := range []string{"codex", "claude"} {
+		t.Run(name, func(t *testing.T) {
+			root := t.TempDir()
+			session := &fakeEmbeddedSession{id: "confirmed-session", events: []engine.Event{
+				{Type: engine.EventResultMessage, Text: "accepted answer"},
+				{Type: engine.EventTurnFinal, TurnFinal: &engine.TurnFinalObservation{CleanupFailed: true}},
+			}}
+			engineBackend := &fakeEmbeddedEngineBackend{name: name, startSession: session}
+			backend := newEmbeddedBackend(name, root, "slot_0", name, "/workspace", SlotConfig{}, engineBackend)
+			backend.codexHomeReady = true
+
+			result, err := backend.RunTurn(context.Background(), "first", TurnOptions{})
+			if err != nil || result.Content != "accepted answer" || !result.CleanupFailed {
+				t.Fatalf("first turn = %#v, %v", result, err)
+			}
+			if _, err := backend.RunTurn(context.Background(), "second", TurnOptions{}); err == nil || !strings.Contains(err.Error(), "cleanup failed") {
+				t.Fatalf("second turn error = %v, want cleanup failure", err)
+			}
+			if len(session.turnInputs) != 1 || len(engineBackend.startOptions) != 1 || len(engineBackend.resumeCalls) != 0 {
+				t.Fatalf("turns=%d starts=%d resumes=%d", len(session.turnInputs), len(engineBackend.startOptions), len(engineBackend.resumeCalls))
+			}
+
+			freshEngine := &fakeEmbeddedEngineBackend{name: name}
+			fresh := newEmbeddedBackend(name, root, "slot_0", name, "/workspace", SlotConfig{}, freshEngine)
+			if err := fresh.RestoreState(backend.SessionState(), SlotConfig{}); err != nil {
+				t.Fatalf("restore blocked state: %v", err)
+			}
+			if _, err := fresh.RunTurn(context.Background(), "continue", TurnOptions{}); err == nil || !strings.Contains(err.Error(), "cleanup failed") {
+				t.Fatalf("restored turn error = %v, want cleanup failure", err)
+			}
+			if len(freshEngine.startOptions) != 0 || len(freshEngine.resumeCalls) != 0 {
+				t.Fatalf("restored starts=%d resumes=%d", len(freshEngine.startOptions), len(freshEngine.resumeCalls))
+			}
+		})
 	}
 }
 
