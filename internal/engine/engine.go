@@ -369,9 +369,10 @@ type executionState struct {
 	childrenUsed int
 	childTurns   int
 
-	steering         []*steeringState
-	providerSessions map[string]string
-	resultValidation string
+	steering              []*steeringState
+	providerSessions      map[string]string
+	providerCleanupFailed map[string]bool
+	resultValidation      string
 }
 
 type turnState struct {
@@ -523,11 +524,12 @@ func newAdmissionRunner(ctx context.Context, sess *session.Session, recipes []pl
 
 func newExecutionState() *executionState {
 	return &executionState{
-		phase:             phaseParticipant,
-		ledger:            emptyLedger(),
-		provisionedInputs: make(map[string]blobstore.BlobRef),
-		requests:          make(map[string]*childState),
-		providerSessions:  make(map[string]string),
+		phase:                 phaseParticipant,
+		ledger:                emptyLedger(),
+		provisionedInputs:     make(map[string]blobstore.BlobRef),
+		requests:              make(map[string]*childState),
+		providerSessions:      make(map[string]string),
+		providerCleanupFailed: make(map[string]bool),
 	}
 }
 
@@ -565,6 +567,9 @@ func (r *runner) putText(text string) (blobstore.BlobRef, error) {
 }
 
 func (r *runner) backend(actor session.Actor) (provider.Backend, error) {
+	if r.state.providerCleanupFailed[actor.ID] {
+		return nil, cleanupFailureError(actor.ID)
+	}
 	if backend, exists := r.backends[actor.ID]; exists {
 		return backend, nil
 	}
@@ -585,6 +590,10 @@ func (r *runner) backend(actor session.Actor) (provider.Backend, error) {
 	}
 	r.backends[actor.ID] = backend
 	return backend, nil
+}
+
+func cleanupFailureError(actorID string) error {
+	return fmt.Errorf("provider conversation for %s is blocked: cleanup failed and process retirement is unconfirmed", actorID)
 }
 
 func providerState(backend, continuation string) provider.SlotState {
@@ -769,6 +778,9 @@ func (r *runner) reduceEvent(event eventlog.Event) error {
 		}
 		attempt.Outcome = payload.Outcome
 		attempt.Content = payload.Content
+		if payload.CleanupFailed {
+			state.providerCleanupFailed[payload.ActorID] = true
+		}
 		if payload.Outcome == "success" && strings.TrimSpace(payload.ProviderSessionID) != "" {
 			state.providerSessions[payload.ActorID] = payload.ProviderSessionID
 		}
@@ -1212,6 +1224,9 @@ func (r *runner) serviceActiveTurn() error {
 		return r.finishActiveTurn(turn, success)
 	}
 	if failed := turn.latest("failed"); failed != nil {
+		if r.state.providerCleanupFailed[turn.ActorID] {
+			return &executionFailure{reason: stopProviderFailed, cause: cleanupFailureError(turn.ActorID)}
+		}
 		if failed.Failure != nil && r.shouldRetry(failed.Failure, failed.Attempt) {
 			if err := r.waitForRetry(failed.Attempt); err != nil {
 				return err
@@ -1330,7 +1345,7 @@ func (r *runner) callActiveAttempt(turn *turnState, attemptNumber int) error {
 		TimeoutSeconds:      r.sess.Plan.Timeouts.TurnSeconds,
 		StallTimeoutSeconds: r.sess.Plan.Timeouts.StallSeconds,
 	})
-	if err := r.ctx.Err(); err != nil {
+	if err := r.ctx.Err(); err != nil && !result.CleanupFailed {
 		return err
 	}
 	ref, putErr := r.putText(result.Content)
@@ -1345,8 +1360,12 @@ func (r *runner) callActiveAttempt(turn *turnState, attemptNumber int) error {
 			Outcome:           "success",
 			ProviderOutcome:   providerOutcome,
 			ProviderSessionID: providerSessionID(backend),
+			CleanupFailed:     result.CleanupFailed,
 			Content:           ref,
 		}); err != nil {
+			return err
+		}
+		if err := r.ctx.Err(); err != nil && result.CleanupFailed {
 			return err
 		}
 		// A child request is derived from a successful turn, so record the
@@ -1356,6 +1375,19 @@ func (r *runner) callActiveAttempt(turn *turnState, attemptNumber int) error {
 			return err
 		}
 		return r.finishActiveTurn(r.state.active, r.state.active.Attempts[attemptNumber])
+	}
+	// Record cleanup uncertainty first so an interrupted failure cannot be
+	// replayed as retryable before the conversation block is durable.
+	if result.CleanupFailed {
+		if err := r.append(eventlog.AttemptFinishedPayload{
+			ActorID: actor.ID, Attempt: attemptNumber, Outcome: "failed",
+			ProviderOutcome: providerOutcome, CleanupFailed: true, Content: ref,
+		}); err != nil {
+			return err
+		}
+		if err := r.ctx.Err(); err != nil {
+			return err
+		}
 	}
 	failure := provider.NewProviderFailure("turn", actor.ID, actor.Backend, callErr, provider.ProviderResultForTurn(actor.Backend, result))
 	if err := r.append(eventlog.ProviderFailedPayload{
@@ -1368,6 +1400,9 @@ func (r *runner) callActiveAttempt(turn *turnState, attemptNumber int) error {
 		SanitizedDetail: failure.SanitizedDetail,
 	}); err != nil {
 		return err
+	}
+	if result.CleanupFailed {
+		return nil
 	}
 	return r.append(eventlog.AttemptFinishedPayload{
 		ActorID:         actor.ID,
