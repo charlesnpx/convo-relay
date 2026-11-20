@@ -219,7 +219,7 @@ eventLoop:
 		return result, final, BackendRunError{Label: label, Detail: failureText}
 	}
 	if ctxErr := ctx.Err(); ctxErr != nil && !stalled {
-		if streamDidNotClose {
+		if streamDidNotClose || (final != nil && final.CleanupFailed) {
 			return result, final, ctxErr
 		}
 		return TurnResult{}, final, ctxErr

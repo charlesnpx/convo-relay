@@ -49,6 +49,7 @@ type embeddedBackend struct {
 	sessionID     string
 	started       bool
 	session       engine.Session
+	cleanupFailed bool
 
 	codexHome      string
 	codexHomeReady bool
@@ -132,6 +133,9 @@ func (b *embeddedBackend) RunTurn(ctx context.Context, prompt string, options Tu
 	if err := ctx.Err(); err != nil {
 		return TurnResult{}, err
 	}
+	if b.cleanupFailed {
+		return TurnResult{}, fmt.Errorf("%s conversation is blocked: cleanup failed and process retirement is unconfirmed", b.label)
+	}
 	if b.backendName == "codex" {
 		if err := b.ensureCodexHome(); err != nil {
 			return TurnResult{}, err
@@ -177,7 +181,11 @@ func (b *embeddedBackend) RunTurn(ctx context.Context, prompt string, options Tu
 		}
 	}
 	b.captureSessionID(final)
-	if err != nil || result.Stalled || (final != nil && (final.ExecutionFailed || final.TimedOut || final.Canceled)) {
+	if final != nil && final.CleanupFailed {
+		result.CleanupFailed = true
+		b.cleanupFailed = true
+	}
+	if err != nil || result.Stalled || (final != nil && (final.ExecutionFailed || final.TimedOut || final.Canceled || final.CleanupFailed)) {
 		b.session = nil
 	}
 	return result, err
@@ -205,14 +213,27 @@ func (b *embeddedBackend) SessionState() SlotState {
 	if b.effort != "" {
 		state["effort"] = b.effort
 	}
+	if b.cleanupFailed {
+		state["cleanup_failed"] = true
+	}
 	return state
 }
 
 func (b *embeddedBackend) RestoreState(state SlotState, override SlotConfig) error {
-	if b.backendName == "codex" {
-		return b.restoreCodexState(state, override)
+	cleanupFailed, ok := state["cleanup_failed"].(bool)
+	if state["cleanup_failed"] != nil && !ok {
+		return fmt.Errorf("cleanup_failed must be a bool")
 	}
-	return b.restoreClaudeState(state, override)
+	var err error
+	if b.backendName == "codex" {
+		err = b.restoreCodexState(state, override)
+	} else {
+		err = b.restoreClaudeState(state, override)
+	}
+	if err == nil {
+		b.cleanupFailed = b.cleanupFailed || cleanupFailed
+	}
+	return err
 }
 
 func (b *embeddedBackend) restoreCodexState(state SlotState, override SlotConfig) error {

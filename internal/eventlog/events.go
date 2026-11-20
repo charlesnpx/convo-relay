@@ -168,6 +168,7 @@ type AttemptFinishedPayload struct {
 	Outcome           string            `json:"outcome"`
 	ProviderOutcome   string            `json:"provider_outcome"`
 	ProviderSessionID string            `json:"provider_session_id"`
+	CleanupFailed     bool              `json:"cleanup_failed,omitempty"`
 	Content           blobstore.BlobRef `json:"content"`
 }
 

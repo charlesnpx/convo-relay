@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -1245,6 +1246,98 @@ func TestProviderContinuationIsRecordedAndRestored(t *testing.T) {
 	})
 }
 
+func TestResumeBlocksPersistedCleanupFailure(t *testing.T) {
+	for _, sessionID := range []string{"thread-one", ""} {
+		name := "confirmed session"
+		if sessionID == "" {
+			name = "no confirmed session"
+		}
+		t.Run(name, func(t *testing.T) {
+			sess := createSession(t, dialoguePlan(1))
+			alpha := &fakeBackend{
+				name: "codex", slotID: "alpha", state: provider.SlotState{"thread_id": sessionID},
+				responses: []fakeResponse{{content: "accepted answer", cleanupFailed: true}},
+			}
+			outcome, err := Run(context.Background(), sess, testDeps(map[string]*fakeBackend{"alpha": alpha}))
+			if err != nil || outcome.Status != statusCompleted || outcome.Result != "accepted answer" {
+				t.Fatalf("initial outcome=%#v err=%v", outcome, err)
+			}
+			attempt, found := successfulAttempt(sessionEvents(t, sess), "alpha", 1)
+			if !found || !attempt.CleanupFailed || attempt.ProviderSessionID != sessionID {
+				t.Fatalf("persisted attempt=%#v found=%t", attempt, found)
+			}
+
+			reopened, err := session.Open(sess.Root)
+			if err != nil {
+				t.Fatalf("reopen session: %v", err)
+			}
+			freshAlpha := &fakeBackend{name: "codex", slotID: "alpha"}
+			beta := &fakeBackend{name: "codex", slotID: "beta", responses: []fakeResponse{{content: "other actor"}}}
+			deps := Deps{BackendFactory: func(_ *session.Session, actor session.Actor) (provider.Backend, error) {
+				if actor.ID == "alpha" {
+					return freshAlpha, nil
+				}
+				return beta, nil
+			}}
+			_, err = Resume(context.Background(), reopened, deps, "", 2)
+			if err == nil || !strings.Contains(err.Error(), "cleanup failed") {
+				t.Fatalf("resume error = %v, want cleanup failure", err)
+			}
+			if len(beta.prompts) != 1 || len(freshAlpha.prompts) != 0 {
+				t.Fatalf("beta turns=%d alpha turns=%d", len(beta.prompts), len(freshAlpha.prompts))
+			}
+		})
+	}
+
+	t.Run("canceled turn", func(t *testing.T) {
+		sess := createSession(t, dialoguePlan(1))
+		started := make(chan struct{})
+		alpha := &fakeBackend{
+			name: "codex", slotID: "alpha", state: provider.SlotState{"thread_id": "thread-one"},
+			responses: []fakeResponse{{content: "observed answer", cleanupFailed: true, waitForCancel: true, started: started}},
+		}
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		done := make(chan error, 1)
+		go func() {
+			_, err := Run(ctx, sess, testDeps(map[string]*fakeBackend{"alpha": alpha}))
+			done <- err
+		}()
+		select {
+		case <-started:
+			cancel()
+		case <-time.After(5 * time.Second):
+			t.Fatal("turn did not start")
+		}
+		select {
+		case err := <-done:
+			if !errors.Is(err, context.Canceled) {
+				t.Fatalf("initial error = %v, want cancellation", err)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatal("canceled turn did not finish")
+		}
+		var cleanupRecorded bool
+		for _, event := range sessionEvents(t, sess) {
+			if attempt, ok := event.Payload.(eventlog.AttemptFinishedPayload); ok && attempt.ActorID == "alpha" && attempt.CleanupFailed {
+				cleanupRecorded = true
+			}
+		}
+		if !cleanupRecorded {
+			t.Fatal("canceled attempt did not record cleanup failure")
+		}
+		reopened, err := session.Open(sess.Root)
+		if err != nil {
+			t.Fatalf("reopen session: %v", err)
+		}
+		fresh := &fakeBackend{name: "codex", slotID: "alpha"}
+		_, err = Resume(context.Background(), reopened, testDeps(map[string]*fakeBackend{"alpha": fresh}), "", 0)
+		if err == nil || !strings.Contains(err.Error(), "cleanup failed") || len(fresh.prompts) != 0 {
+			t.Fatalf("resume error=%v turns=%d", err, len(fresh.prompts))
+		}
+	})
+}
+
 func TestChildRequestsAdmitAndRejectWithoutRunningDeniedChildren(t *testing.T) {
 	cases := []struct {
 		name             string
@@ -2094,6 +2187,7 @@ type fakeResponse struct {
 	timedOut      bool
 	stalled       bool
 	recovered     bool
+	cleanupFailed bool
 	waitForCancel bool
 	started       chan struct{}
 }
@@ -2114,6 +2208,9 @@ func (b *fakeBackend) SlotID() string { return b.slotID }
 func (b *fakeBackend) Label() string  { return b.slotID }
 
 func (b *fakeBackend) RunTurn(ctx context.Context, prompt string, _ provider.TurnOptions) (provider.TurnResult, error) {
+	if len(b.restored) > 0 && b.restored[len(b.restored)-1]["cleanup_failed"] == true {
+		return provider.TurnResult{}, fmt.Errorf("provider conversation is blocked: cleanup failed")
+	}
 	b.prompts = append(b.prompts, prompt)
 	if b.calls != nil {
 		*b.calls = append(*b.calls, b.slotID)
@@ -2128,13 +2225,14 @@ func (b *fakeBackend) RunTurn(ctx context.Context, prompt string, _ provider.Tur
 			close(response.started)
 		}
 		<-ctx.Done()
-		return provider.TurnResult{}, ctx.Err()
+		return provider.TurnResult{Content: response.content, CleanupFailed: response.cleanupFailed}, ctx.Err()
 	}
 	return provider.TurnResult{
-		Content:   response.content,
-		TimedOut:  response.timedOut,
-		Stalled:   response.stalled,
-		Recovered: response.recovered,
+		Content:       response.content,
+		TimedOut:      response.timedOut,
+		Stalled:       response.stalled,
+		Recovered:     response.recovered,
+		CleanupFailed: response.cleanupFailed,
 	}, response.err
 }
 
