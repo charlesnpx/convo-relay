@@ -11,14 +11,14 @@ import (
 
 var embeddedDrainGrace = 5 * time.Second
 
-func runEmbeddedTurn(ctx context.Context, session engine.Session, backend string, label string, prompt string, write bool, timeoutSeconds int, stallTimeoutSeconds int) (TurnResult, *engine.TurnFinalObservation, error) {
-	return runEmbeddedTurnWithWatchdogTimeout(ctx, session, backend, label, prompt, write, timeoutSeconds, stallTimeoutSeconds, embeddedTurnTimeout(stallTimeoutSeconds))
+func runEmbeddedTurn(ctx context.Context, session engine.Session, backend string, label string, prompt string, timeoutSeconds int, stallTimeoutSeconds int) (TurnResult, *engine.TurnFinalObservation, error) {
+	return runEmbeddedTurnWithWatchdogTimeout(ctx, session, backend, label, prompt, timeoutSeconds, stallTimeoutSeconds, embeddedTurnTimeout(stallTimeoutSeconds))
 }
 
-func runEmbeddedTurnWithWatchdogTimeout(ctx context.Context, session engine.Session, backend string, label string, prompt string, write bool, timeoutSeconds int, stallTimeoutSeconds int, watchdogTimeout time.Duration) (TurnResult, *engine.TurnFinalObservation, error) {
+func runEmbeddedTurnWithWatchdogTimeout(ctx context.Context, session engine.Session, backend string, label string, prompt string, timeoutSeconds int, stallTimeoutSeconds int, watchdogTimeout time.Duration) (TurnResult, *engine.TurnFinalObservation, error) {
 	events, err := session.Turn(ctx, engine.TurnInput{
 		Prompt:  prompt,
-		Write:   write,
+		Intent:  engine.IntentEdit,
 		Timeout: embeddedTurnTimeout(timeoutSeconds),
 	})
 	if err != nil {
@@ -30,7 +30,7 @@ func runEmbeddedTurnWithWatchdogTimeout(ctx context.Context, session engine.Sess
 
 	var agentText strings.Builder
 	var resultText string
-	var hasResultText bool
+	var hasResult bool
 	var terminalErrors []string
 	var reportedModel string
 	warnings := []string{}
@@ -120,7 +120,7 @@ eventLoop:
 		}
 		switch event.Type {
 		case engine.EventAgentText:
-			agentText.WriteString(event.Text)
+			agentText.WriteString(embeddedEventText(event))
 		case engine.EventModelReported:
 			candidate := event.ModelReported
 			if candidate == "" {
@@ -134,10 +134,8 @@ eventLoop:
 		case engine.EventProgress:
 			// Heartbeats are not persisted by the relay.
 		case engine.EventResultMessage:
-			if event.Text != "" {
-				hasResultText = true
-				resultText = event.Text
-			}
+			hasResult = true
+			resultText = embeddedEventText(event)
 		case engine.EventTerminalError:
 			text := strings.TrimSpace(event.Text)
 			if text == "" {
@@ -180,10 +178,12 @@ eventLoop:
 	}
 
 	content := agentText.String()
-	if hasResultText {
+	if resultText != "" {
 		content = resultText
 	}
-	hasUsableOutput := hasResultText || agentText.Len() > 0
+	// Empty results are authoritative on success but are not recoverable output
+	// on failure; in that case retain any partial assistant text instead.
+	hasUsableOutput := content != ""
 	result := TurnResult{
 		Content:        content,
 		TimedOut:       providerResult.TimedOut,
@@ -282,10 +282,19 @@ eventLoop:
 		result.ProviderResult = providerResult
 		return result, final, nil
 	}
-	if result.Content == "" {
+	if hasResult {
+		result.Content = resultText
+	} else if result.Content == "" {
 		result.Content = fmt.Sprintf("[No response from %s]", label)
 	}
 	return result, final, nil
+}
+
+func embeddedEventText(event engine.Event) string {
+	if event.RawText != "" {
+		return event.RawText
+	}
+	return event.Text
 }
 
 func embeddedTurnFailureDetail(final *engine.TurnFinalObservation) string {
